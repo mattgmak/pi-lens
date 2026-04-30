@@ -77,16 +77,21 @@ export interface ExpandedRead {
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: tree-sitter AST node
-function findEnclosingNode(node: any, targetRow: number, types: string[]): any {
-	const startRow: number = node.startPosition?.row ?? 0;
+function findEnclosingNodeForRange(
+	node: any,
+	startRow: number,
+	endRow: number,
+	types: string[],
+): any {
+	const nodeStartRow: number = node.startPosition?.row ?? 0;
 	// biome-ignore lint/suspicious/noExplicitAny: endPosition not declared in local interface
-	const endRow: number = (node as any).endPosition?.row ?? startRow;
+	const nodeEndRow: number = (node as any).endPosition?.row ?? nodeStartRow;
 
-	if (targetRow < startRow || targetRow > endRow) return undefined;
+	if (endRow < nodeStartRow || startRow > nodeEndRow) return undefined;
 
-	// Prefer deepest match — check children first.
+	// Prefer deepest overlapping match — check children first.
 	for (const child of node.children ?? []) {
-		const match = findEnclosingNode(child, targetRow, types);
+		const match = findEnclosingNodeForRange(child, startRow, endRow, types);
 		if (match) return match;
 	}
 
@@ -129,7 +134,7 @@ function withBudget<T>(
  * Returns undefined when:
  * - The file extension has no grammar
  * - The read is large (> EXPANSION_LIMIT_LINES) — already covers enough
- * - No enclosing symbol found at the start line
+ * - No enclosing symbol overlaps the requested read span
  * - The enclosing symbol is larger than EXPANDED_SIZE_CAP_LINES
  * - Tree-sitter init/parse exceeds EXPANSION_BUDGET_MS
  */
@@ -157,7 +162,10 @@ export async function tryExpandRead(
 		const initOk = await withBudget(tsClient.init(), EXPANSION_BUDGET_MS);
 		if (!initOk) return undefined;
 
-		const remaining = Math.max(0, EXPANSION_BUDGET_MS - (Date.now() - startedAt));
+		const remaining = Math.max(
+			0,
+			EXPANSION_BUDGET_MS - (Date.now() - startedAt),
+		);
 		const tree = await withBudget(
 			tsClient.parseFile(filePath, languageId, content),
 			remaining,
@@ -165,14 +173,24 @@ export async function tryExpandRead(
 		if (!tree) return undefined;
 
 		// tree-sitter rows are 0-indexed; offsets are 1-indexed
-		const targetRow = requestedOffset - 1;
+		const requestedStartRow = requestedOffset - 1;
+		const requestedEndRow = Math.min(
+			totalLines - 1,
+			requestedOffset + requestedLimit - 2,
+		);
 		// biome-ignore lint/suspicious/noExplicitAny: tree-sitter root node
-		const enclosing = findEnclosingNode(tree.rootNode as any, targetRow, enclosingTypes);
+		const enclosing = findEnclosingNodeForRange(
+			tree.rootNode as any,
+			requestedStartRow,
+			requestedEndRow,
+			enclosingTypes,
+		);
 		if (!enclosing) return undefined;
 
 		const symbolStart: number = enclosing.startPosition.row + 1;
 		// biome-ignore lint/suspicious/noExplicitAny: endPosition not in local interface
-		const symbolEnd: number = ((enclosing as any).endPosition?.row ?? enclosing.startPosition.row) + 1;
+		const symbolEnd: number =
+			((enclosing as any).endPosition?.row ?? enclosing.startPosition.row) + 1;
 		const symbolSize = symbolEnd - symbolStart + 1;
 
 		if (symbolSize > EXPANDED_SIZE_CAP_LINES) return undefined;

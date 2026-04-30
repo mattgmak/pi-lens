@@ -42,7 +42,7 @@ function findOccurrenceLines(content: string, needle: string): number[] {
 }
 
 function resolveOldTextEdits(
-	edits: Array<{ oldText?: string }>,
+	edits: Array<{ oldText?: string; originalIndex?: number }>,
 	filePath: string,
 	sessionId: string | undefined,
 ): GuardLineResult {
@@ -69,6 +69,7 @@ function resolveOldTextEdits(
 
 	for (let i = 0; i < edits.length; i++) {
 		const oldText = edits[i].oldText;
+		const editIndex = edits[i].originalIndex ?? i;
 		if (!oldText) continue;
 
 		let needle = normalizeContent(oldText);
@@ -87,7 +88,7 @@ function resolveOldTextEdits(
 						metadata: {
 							tool: "edit",
 							source: "edits_without_ranges",
-							editIndex: i,
+							editIndex,
 						},
 					});
 				}
@@ -97,7 +98,7 @@ function resolveOldTextEdits(
 		if (occurrenceLines.length === 0) {
 			const preview = oldText.trimStart().substring(0, 60).replace(/\n/g, "↵");
 			errors.push(
-				`edits[${i}].oldText ("${preview}") was not found in the current file content. Re-read the file and refresh the edit target before retrying.`,
+				`edits[${editIndex}].oldText ("${preview}") was not found in the current file content. Re-read the file and refresh the edit target before retrying.`,
 			);
 			logReadGuardEvent({
 				event: "oldtext_not_found",
@@ -106,7 +107,7 @@ function resolveOldTextEdits(
 				metadata: {
 					tool: "edit",
 					source: "edits_without_ranges",
-					editIndex: i,
+					editIndex,
 				},
 			});
 		} else if (occurrenceLines.length === 1) {
@@ -120,7 +121,7 @@ function resolveOldTextEdits(
 				metadata: {
 					tool: "edit",
 					source: "edits_without_ranges",
-					editIndex: i,
+					editIndex,
 					touchedLines: [startLine, endLine],
 				},
 			});
@@ -128,7 +129,7 @@ function resolveOldTextEdits(
 			const preview = oldText.trimStart().substring(0, 60).replace(/\n/g, "↵");
 			const lineList = occurrenceLines.map((l) => `  • Line ${l}`).join("\n");
 			errors.push(
-				`edits[${i}].oldText ("${preview}") appears ${occurrenceLines.length} times:\n${lineList}\nAdd more surrounding context to make it unique.`,
+				`edits[${editIndex}].oldText ("${preview}") appears ${occurrenceLines.length} times:\n${lineList}\nAdd more surrounding context to make it unique.`,
 			);
 			logReadGuardEvent({
 				event: "oldtext_duplicate",
@@ -137,7 +138,7 @@ function resolveOldTextEdits(
 				metadata: {
 					tool: "edit",
 					source: "edits_without_ranges",
-					editIndex: i,
+					editIndex,
 					occurrenceCount: occurrenceLines.length,
 					occurrenceLines,
 				},
@@ -293,14 +294,36 @@ export function getTouchedLinesForGuard(
 					return [start, end] as [number, number];
 				})
 				.filter((range): range is [number, number] => range !== null);
+			const unresolvedOldTextEdits = editInput.edits
+				.map((edit, index) => ({ ...edit, originalIndex: index }))
+				.filter(
+					(edit) =>
+						typeof edit.range?.start?.line !== "number" && !!edit.oldText,
+				);
 			if (rangedEdits.length === 0) {
 				if (filePath) {
 					return resolveOldTextEdits(editInput.edits, filePath, sessionId);
 				}
 				return { touchedLines: undefined };
 			}
+			let oldTextTouchedLines: [number, number] | undefined;
+			if (unresolvedOldTextEdits.length > 0 && filePath) {
+				const resolved = resolveOldTextEdits(
+					unresolvedOldTextEdits,
+					filePath,
+					sessionId,
+				);
+				if (resolved.preflightError) {
+					return resolved;
+				}
+				oldTextTouchedLines = resolved.touchedLines;
+			}
 			const starts = rangedEdits.map(([start]) => start);
 			const ends = rangedEdits.map(([, end]) => end);
+			if (oldTextTouchedLines) {
+				starts.push(oldTextTouchedLines[0]);
+				ends.push(oldTextTouchedLines[1]);
+			}
 			const touchedLines: [number, number] = [
 				Math.min(...starts),
 				Math.max(...ends),
@@ -312,9 +335,13 @@ export function getTouchedLinesForGuard(
 					filePath,
 					metadata: {
 						tool: "edit",
-						source: "edits_ranges",
+						source:
+							unresolvedOldTextEdits.length > 0
+								? "edits_mixed"
+								: "edits_ranges",
 						touchedLines,
 						rangedEditCount: rangedEdits.length,
+						resolvedOldTextEditCount: unresolvedOldTextEdits.length,
 						totalEditCount: editInput.edits.length,
 					},
 				});

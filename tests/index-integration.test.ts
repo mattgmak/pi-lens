@@ -514,6 +514,111 @@ describe("index.ts integration", () => {
 		expect(checkEdit).not.toHaveBeenCalled();
 	}, 15_000);
 
+	it("tool_call reports all indentation-mismatched oldText entries in multi-edit calls", async () => {
+		const checkEdit = vi.fn(() => ({ action: "allow" as const }));
+		const sourceFile = path.join(tmpDir, "src", "indent-multi-edit.ts");
+		fs.mkdirSync(path.dirname(sourceFile), { recursive: true });
+		fs.writeFileSync(
+			sourceFile,
+			"function foo() {\n\treturn 1;\n}\n\nfunction bar() {\n\treturn 2;\n}\n",
+		);
+
+		vi.doMock("../clients/runtime-coordinator.js", () => ({
+			RuntimeCoordinator: class {
+				projectRoot = tmpDir;
+				turnIndex = 0;
+				complexityBaselines = new Map();
+				cachedExports = new Map();
+				cachedProjectIndex = null;
+				readGuard = {
+					recordRead: () => {},
+					getReadHistory: () => [],
+					isNewFile: () => false,
+					checkEdit,
+				};
+				shouldWarmLspOnRead() {
+					return false;
+				}
+				markLspReadWarmStarted() {}
+				markLspReadWarmCompleted() {}
+				clearLspReadWarmState() {}
+				nextWriteIndex() {
+					return 1;
+				}
+				peekWriteIndex() {
+					return 1;
+				}
+				beginTurn() {}
+				resetForSession() {}
+				setTelemetryIdentity() {}
+				telemetrySessionId = "test-session";
+			},
+		}));
+		vi.doMock("../clients/bootstrap.js", () => ({
+			loadBootstrapClients: async () => ({
+				metricsClient: { reset: () => {} },
+				todoScanner: {},
+				biomeClient: { isAvailable: () => false },
+				ruffClient: { isAvailable: () => false },
+				knipClient: { isAvailable: () => false },
+				jscpdClient: { isAvailable: () => false },
+				typeCoverageClient: { isAvailable: () => false },
+				depChecker: { isAvailable: () => false },
+				testRunnerClient: { detectRunner: () => null },
+				goClient: { isGoAvailable: () => false },
+				rustClient: { isAvailable: () => false },
+				agentBehaviorClient: {
+					recordToolCall: () => {},
+					formatWarnings: () => "",
+				},
+				complexityClient: {
+					isSupportedFile: () => false,
+					analyzeFile: () => null,
+				},
+			}),
+		}));
+
+		const { default: registerExtension } = await import("../index.ts");
+		const { pi, handlers } = createMockPi({ "no-lsp": true });
+		registerExtension(pi as any);
+
+		const toolCall = handlers.tool_call?.[0];
+		expect(toolCall).toBeTypeOf("function");
+
+		const result = await toolCall?.(
+			{
+				toolName: "edit",
+				input: {
+					path: sourceFile,
+					edits: [
+						{
+							oldText: "function foo() {\n    return 1;\n}",
+							newText: "function foo() {\n    return 10;\n}",
+						},
+						{
+							oldText: "function bar() {\n    return 2;\n}",
+							newText: "function bar() {\n    return 20;\n}",
+						},
+					],
+				},
+			},
+			{ cwd: tmpDir },
+		);
+
+		expect(result).toEqual(
+			expect.objectContaining({
+				block: true,
+				reason: expect.stringContaining(
+					"RETRYABLE — Indentation mismatch in oldText",
+				),
+			}),
+		);
+		const blockedResult = result as { reason?: string } | undefined;
+		expect(blockedResult?.reason).toContain("edits[0].oldText");
+		expect(blockedResult?.reason).toContain("edits[1].oldText");
+		expect(checkEdit).not.toHaveBeenCalled();
+	}, 15_000);
+
 	it("tool_call only warms LSP on the first read until warm state is cleared", async () => {
 		const touchFileMock = vi.fn().mockResolvedValue(undefined);
 		const shouldWarmLspOnRead = vi

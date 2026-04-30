@@ -967,22 +967,50 @@ export default function (pi: ExtensionAPI) {
 				edits?: Array<{ oldText?: string }>;
 			};
 			const oldTexts = editInput.oldText
-				? [editInput.oldText]
-				: ((editInput.edits ?? [])
-						.map((e) => e.oldText)
-						.filter(Boolean) as string[]);
-			for (const oldText of oldTexts) {
-				const corrected = tryCorrectIndentationMismatch(oldText, filePath);
-				if (corrected !== undefined) {
-					const preview = oldText.trimStart().slice(0, 60).replace(/\n/g, "↵");
-					return {
-						block: true,
-						reason:
-							`🔄 RETRYABLE — Indentation mismatch in oldText\n\n` +
-							`oldText ("${preview}…") uses different indentation than the file. ` +
-							`Corrected oldText (use this exactly):\n\n${corrected}`,
-					};
-				}
+				? [{ label: "oldText", value: editInput.oldText }]
+				: (editInput.edits ?? [])
+						.map((e, i) =>
+							e.oldText
+								? { label: `edits[${i}].oldText`, value: e.oldText }
+								: null,
+						)
+						.filter(
+							(
+								entry,
+							): entry is {
+								label: string;
+								value: string;
+							} => entry !== null,
+						);
+			const correctedOldTexts = oldTexts
+				.map(({ label, value }) => ({
+					label,
+					value,
+					corrected: tryCorrectIndentationMismatch(value, filePath),
+				}))
+				.filter(
+					(
+						entry,
+					): entry is {
+						label: string;
+						value: string;
+						corrected: string;
+					} => entry.corrected !== undefined,
+				);
+			if (correctedOldTexts.length > 0) {
+				const details = correctedOldTexts
+					.map(({ label, value, corrected }) => {
+						const preview = value.trimStart().slice(0, 60).replace(/\n/g, "↵");
+						return (
+							`${label} ("${preview}…") uses different indentation than the file. ` +
+							`Corrected value (use this exactly):\n\n${corrected}`
+						);
+					})
+					.join("\n\n");
+				return {
+					block: true,
+					reason: `🔄 RETRYABLE — Indentation mismatch in oldText\n\n${details}`,
+				};
 			}
 		}
 		if (isEditOnly && filePath && !pi.getFlag("no-read-guard")) {

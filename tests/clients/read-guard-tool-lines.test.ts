@@ -5,7 +5,7 @@ import {
 	countFileLines,
 	getTouchedLinesForGuard,
 	tryCorrectIndentationMismatch,
-} from "../../clients/read-guard-tool-lines.js";
+} from "../../clients/read-guard-tool-lines.ts";
 import { setupTestEnvironment } from "./test-utils.js";
 
 describe("read-guard tool line helpers", () => {
@@ -159,6 +159,39 @@ describe("read-guard tool line helpers", () => {
 					path: filePath,
 					edits: [
 						{ oldText: "function bar() {\n  return 2;\n}", newText: "ok" },
+						{ oldText: "function baz() {\n  return 3;\n}", newText: "missing" },
+					],
+				},
+			};
+
+			const result = getTouchedLinesForGuard(event, filePath);
+			expect(result.touchedLines).toBeUndefined();
+			expect(result.preflightError).toMatch(/BLOCKED/);
+			expect(result.preflightError).toMatch(/edits\[1\]/);
+			expect(result.preflightError).toMatch(/was not found/);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("blocks mixed range + oldText edits when an oldText target is unresolved", () => {
+		const env = setupTestEnvironment("read-guard-lines-mixed-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(
+				filePath,
+				"function foo() {\n  return 1;\n}\n\nfunction bar() {\n  return 2;\n}\n",
+			);
+
+			const event = {
+				toolName: "edit",
+				input: {
+					path: filePath,
+					edits: [
+						{
+							range: { start: { line: 1 }, end: { line: 1 } },
+							newText: "function fooRenamed() {",
+						},
 						{ oldText: "function baz() {\n  return 3;\n}", newText: "missing" },
 					],
 				},
