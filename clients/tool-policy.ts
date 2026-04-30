@@ -1495,7 +1495,8 @@ export function hasEslintConfig(cwd: string): boolean {
 		const pkgPath = path.join(dir, "package.json");
 		if (fs.existsSync(pkgPath)) {
 			try {
-				if (JSON.parse(fs.readFileSync(pkgPath, "utf-8")).eslintConfig) return true;
+				if (JSON.parse(fs.readFileSync(pkgPath, "utf-8")).eslintConfig)
+					return true;
 			} catch {}
 		}
 	}
@@ -1523,7 +1524,10 @@ export function hasOxfmtConfig(cwd: string): boolean {
 		const pkgPath = path.join(dir, "package.json");
 		if (fs.existsSync(pkgPath)) {
 			try {
-				const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8")) as Record<string, unknown>;
+				const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8")) as Record<
+					string,
+					unknown
+				>;
 				const deps = {
 					...(pkg.dependencies as Record<string, unknown> | undefined),
 					...(pkg.devDependencies as Record<string, unknown> | undefined),
@@ -1536,15 +1540,18 @@ export function hasOxfmtConfig(cwd: string): boolean {
 }
 
 export function hasStylelintConfig(cwd: string): boolean {
-	if (STYLELINT_CONFIGS.some((cfg) => fs.existsSync(path.join(cwd, cfg)))) {
-		return true;
+	for (const dir of walkUpDirsUntilPackageJson(cwd)) {
+		if (STYLELINT_CONFIGS.some((cfg) => fs.existsSync(path.join(dir, cfg)))) {
+			return true;
+		}
+		const pkgPath = path.join(dir, "package.json");
+		if (fs.existsSync(pkgPath)) {
+			try {
+				const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+				if (pkg.stylelint) return true;
+			} catch {}
+		}
 	}
-	try {
-		const pkg = JSON.parse(
-			fs.readFileSync(path.join(cwd, "package.json"), "utf-8"),
-		);
-		if (pkg.stylelint) return true;
-	} catch {}
 	return false;
 }
 
@@ -1608,7 +1615,8 @@ export function hasMypyConfig(cwd: string): boolean {
 			}
 			if (cfg === "pyproject.toml") {
 				try {
-					if (fs.readFileSync(cfgPath, "utf-8").includes("[tool.mypy]")) return true;
+					if (fs.readFileSync(cfgPath, "utf-8").includes("[tool.mypy]"))
+						return true;
 				} catch {}
 				continue;
 			}
@@ -1657,7 +1665,8 @@ export function hasMarkdownlintConfig(cwd: string): boolean {
 
 export function hasPrettierConfig(cwd: string): boolean {
 	for (const dir of walkUpDirsUntilPackageJson(cwd)) {
-		if (PRETTIER_CONFIGS.some((cfg) => fs.existsSync(path.join(dir, cfg)))) return true;
+		if (PRETTIER_CONFIGS.some((cfg) => fs.existsSync(path.join(dir, cfg))))
+			return true;
 		const pkgPath = path.join(dir, "package.json");
 		if (fs.existsSync(pkgPath)) {
 			try {
@@ -1674,7 +1683,8 @@ export function hasBlackConfig(cwd: string): boolean {
 		const pyproject = path.join(dir, "pyproject.toml");
 		if (fs.existsSync(pyproject)) {
 			try {
-				if (fs.readFileSync(pyproject, "utf-8").includes("[tool.black]")) return true;
+				if (fs.readFileSync(pyproject, "utf-8").includes("[tool.black]"))
+					return true;
 			} catch {}
 		}
 	}
@@ -1684,7 +1694,8 @@ export function hasBlackConfig(cwd: string): boolean {
 		const depPath = path.join(cwd, depFile);
 		if (!fs.existsSync(depPath)) continue;
 		try {
-			if (fs.readFileSync(depPath, "utf-8").toLowerCase().includes("black")) return true;
+			if (fs.readFileSync(depPath, "utf-8").toLowerCase().includes("black"))
+				return true;
 		} catch {}
 	}
 
@@ -1699,7 +1710,8 @@ export function hasRuffConfig(cwd: string): boolean {
 		const pyproject = path.join(dir, "pyproject.toml");
 		if (fs.existsSync(pyproject)) {
 			try {
-				if (fs.readFileSync(pyproject, "utf-8").includes("[tool.ruff]")) return true;
+				if (fs.readFileSync(pyproject, "utf-8").includes("[tool.ruff]"))
+					return true;
 			} catch {}
 		}
 	}
@@ -1745,7 +1757,8 @@ const DETEKT_CONFIGS = [
 
 export function hasDetektConfig(cwd: string): boolean {
 	for (const dir of walkUpDirsUntilPackageJson(cwd)) {
-		if (DETEKT_CONFIGS.some((cfg) => fs.existsSync(path.join(dir, cfg)))) return true;
+		if (DETEKT_CONFIGS.some((cfg) => fs.existsSync(path.join(dir, cfg))))
+			return true;
 	}
 	return false;
 }
@@ -1781,7 +1794,8 @@ export function hasOxlintConfig(cwd: string): boolean {
 		if (
 			fs.existsSync(path.join(dir, ".oxlintrc.json")) ||
 			fs.existsSync(path.join(dir, "oxlint.json"))
-		) return true;
+		)
+			return true;
 	}
 	return false;
 }

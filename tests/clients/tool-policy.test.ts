@@ -16,8 +16,8 @@ import {
 	getSmartDefaultFormatterName,
 	getToolCommandSpec,
 	getToolExecutionPolicy,
-	hasBlackConfig,
 	hasBiomeConfig,
+	hasBlackConfig,
 	hasClangFormatConfig,
 	hasDetektConfig,
 	hasEslintConfig,
@@ -462,7 +462,11 @@ describe("tool-policy", () => {
 	it("hasEslintConfig detects eslintConfig field in parent package.json", () => {
 		const env = setupTestEnvironment("pi-lens-tool-policy-eslint-pkg-walkup-");
 		try {
-			createTempFile(env.tmpDir, "package.json", JSON.stringify({ eslintConfig: { rules: {} } }));
+			createTempFile(
+				env.tmpDir,
+				"package.json",
+				JSON.stringify({ eslintConfig: { rules: {} } }),
+			);
 			const subDir = path.join(env.tmpDir, "src");
 			fs.mkdirSync(subDir, { recursive: true });
 			expect(hasEslintConfig(subDir)).toBe(true);
@@ -484,6 +488,23 @@ describe("tool-policy", () => {
 		}
 	});
 
+	it("hasStylelintConfig detects config file in a parent directory", () => {
+		const env = setupTestEnvironment("pi-lens-tool-policy-stylelint-walkup-");
+		try {
+			createTempFile(env.tmpDir, ".stylelintrc", "{}\n");
+			createTempFile(
+				env.tmpDir,
+				"package.json",
+				JSON.stringify({ name: "root" }),
+			);
+			const subDir = path.join(env.tmpDir, "src");
+			fs.mkdirSync(subDir, { recursive: true });
+			expect(hasStylelintConfig(subDir)).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("hasOxlintConfig detects .oxlintrc.json in a parent directory", () => {
 		const env = setupTestEnvironment("pi-lens-tool-policy-oxlint-walkup-");
 		try {
@@ -499,7 +520,11 @@ describe("tool-policy", () => {
 	it("hasMypyConfig detects [tool.mypy] in a parent directory pyproject.toml", () => {
 		const env = setupTestEnvironment("pi-lens-tool-policy-mypy-walkup-");
 		try {
-			createTempFile(env.tmpDir, "pyproject.toml", "[tool.mypy]\nstrict = true\n");
+			createTempFile(
+				env.tmpDir,
+				"pyproject.toml",
+				"[tool.mypy]\nstrict = true\n",
+			);
 			const subDir = path.join(env.tmpDir, "src");
 			fs.mkdirSync(subDir, { recursive: true });
 			expect(hasMypyConfig(subDir)).toBe(true);
@@ -523,7 +548,11 @@ describe("tool-policy", () => {
 	it("hasBlackConfig detects [tool.black] in a parent directory pyproject.toml", () => {
 		const env = setupTestEnvironment("pi-lens-tool-policy-black-walkup-");
 		try {
-			createTempFile(env.tmpDir, "pyproject.toml", "[tool.black]\nline-length = 88\n");
+			createTempFile(
+				env.tmpDir,
+				"pyproject.toml",
+				"[tool.black]\nline-length = 88\n",
+			);
 			const subDir = path.join(env.tmpDir, "src");
 			fs.mkdirSync(subDir, { recursive: true });
 			expect(hasBlackConfig(subDir)).toBe(true);
@@ -545,9 +574,15 @@ describe("tool-policy", () => {
 	});
 
 	it("hasRuffConfig detects [tool.ruff] in a parent directory pyproject.toml", () => {
-		const env = setupTestEnvironment("pi-lens-tool-policy-ruff-walkup-pyproject-");
+		const env = setupTestEnvironment(
+			"pi-lens-tool-policy-ruff-walkup-pyproject-",
+		);
 		try {
-			createTempFile(env.tmpDir, "pyproject.toml", "[tool.ruff]\nline-length = 100\n");
+			createTempFile(
+				env.tmpDir,
+				"pyproject.toml",
+				"[tool.ruff]\nline-length = 100\n",
+			);
 			const subDir = path.join(env.tmpDir, "src");
 			fs.mkdirSync(subDir, { recursive: true });
 			expect(hasRuffConfig(subDir)).toBe(true);
