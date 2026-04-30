@@ -319,7 +319,11 @@ export function createLspNavigationTool(
 					failureKind: string;
 					resultCount: number;
 				},
-			) => {
+			): typeof payload & {
+				details: typeof payload.details & {
+					failureKind: string;
+				}
+			} => {
 				const normalizedFilePath = meta.filePath.replace(/\\/g, "/");
 				logLatency({
 					type: "phase",
