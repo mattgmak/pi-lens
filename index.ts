@@ -27,6 +27,7 @@ import { logReadGuardEvent } from "./clients/read-guard-logger.js";
 import {
 	countFileLines,
 	getTouchedLinesForGuard,
+	tryCorrectIndentationMismatch,
 } from "./clients/read-guard-tool-lines.js";
 import {
 	EXPANSION_BUDGET_MS,
@@ -985,6 +986,33 @@ export default function (pi: ExtensionAPI) {
 					return {
 						block: true,
 						reason: verdict.reason,
+					};
+				}
+			}
+		}
+
+		// --- Indentation mismatch correction ---
+		// Some models output spaces in oldText when the file uses tabs (or vice versa).
+		// Detect this before the edit executes and return the corrected oldText so the
+		// model can retry immediately rather than hitting a cryptic "not found" error.
+		if (isEditOnly && filePath) {
+			const editInput = (event as { input?: unknown }).input as {
+				oldText?: string;
+				edits?: Array<{ oldText?: string }>;
+			};
+			const oldTexts = editInput.oldText
+				? [editInput.oldText]
+				: (editInput.edits ?? []).map((e) => e.oldText).filter(Boolean) as string[];
+			for (const oldText of oldTexts) {
+				const corrected = tryCorrectIndentationMismatch(oldText, filePath);
+				if (corrected !== undefined) {
+					const preview = oldText.trimStart().slice(0, 60).replace(/\n/g, "↵");
+					return {
+						block: true,
+						reason:
+							`🔄 RETRYABLE — Indentation mismatch in oldText\n\n` +
+							`oldText ("${preview}…") uses different indentation than the file. ` +
+							`Corrected oldText (use this exactly):\n\n${corrected}`,
 					};
 				}
 			}

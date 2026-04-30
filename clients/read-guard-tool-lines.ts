@@ -156,6 +156,44 @@ function resolveOldTextEdits(
 	return { touchedLines };
 }
 
+/**
+ * Tries to fix a tab/space indentation mismatch between the model's oldText and the
+ * actual file. Returns the corrected oldText if a matching variant is found, or
+ * undefined if the text already matches or no indentation conversion fixes it.
+ */
+export function tryCorrectIndentationMismatch(
+	oldText: string,
+	filePath: string,
+): string | undefined {
+	let content: string;
+	try {
+		content = nodeFs.readFileSync(filePath, "utf-8").replace(/\r\n/g, "\n");
+	} catch {
+		return undefined;
+	}
+
+	const normalized = oldText.replace(/\r\n/g, "\n");
+	if (content.includes(normalized)) return undefined;
+
+	const conversions = [
+		// tabs → 2 spaces
+		(s: string) => s.split("\n").map((l) => l.replace(/^\t+/, (m) => "  ".repeat(m.length))).join("\n"),
+		// tabs → 4 spaces
+		(s: string) => s.split("\n").map((l) => l.replace(/^\t+/, (m) => "    ".repeat(m.length))).join("\n"),
+		// 2 spaces → tabs
+		(s: string) => s.split("\n").map((l) => l.replace(/^( {2})+/, (m) => "\t".repeat(m.length / 2))).join("\n"),
+		// 4 spaces → tabs
+		(s: string) => s.split("\n").map((l) => l.replace(/^( {4})+/, (m) => "\t".repeat(m.length / 4))).join("\n"),
+	];
+
+	for (const convert of conversions) {
+		const candidate = convert(normalized);
+		if (candidate !== normalized && content.includes(candidate)) return candidate;
+	}
+
+	return undefined;
+}
+
 export function getTouchedLinesForGuard(
 	event: unknown,
 	filePath?: string,

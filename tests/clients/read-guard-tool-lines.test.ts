@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
 	countFileLines,
 	getTouchedLinesForGuard,
+	tryCorrectIndentationMismatch,
 } from "../../clients/read-guard-tool-lines.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
@@ -107,6 +108,78 @@ describe("read-guard tool line helpers", () => {
 			expect(result.preflightError).toMatch(/2 times/);
 			expect(result.preflightError).toMatch(/Line 1/);
 			expect(result.preflightError).toMatch(/Line 5/);
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+describe("tryCorrectIndentationMismatch", () => {
+	it("returns undefined when oldText already matches the file", () => {
+		const env = setupTestEnvironment("pi-lens-indent-match-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "function foo() {\n\treturn 1;\n}\n");
+			expect(tryCorrectIndentationMismatch("function foo() {\n\treturn 1;\n}", filePath)).toBeUndefined();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("corrects 4-space indentation to tabs when file uses tabs", () => {
+		const env = setupTestEnvironment("pi-lens-indent-4to-tab-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "function foo() {\n\treturn 1;\n}\n");
+			const result = tryCorrectIndentationMismatch("function foo() {\n    return 1;\n}", filePath);
+			expect(result).toBe("function foo() {\n\treturn 1;\n}");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("corrects 2-space indentation to tabs when file uses tabs", () => {
+		const env = setupTestEnvironment("pi-lens-indent-2to-tab-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "function foo() {\n\treturn 1;\n}\n");
+			const result = tryCorrectIndentationMismatch("function foo() {\n  return 1;\n}", filePath);
+			expect(result).toBe("function foo() {\n\treturn 1;\n}");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("corrects tabs to 4-space indentation when file uses 4 spaces", () => {
+		const env = setupTestEnvironment("pi-lens-indent-tab-to-4-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "function foo() {\n    return 1;\n}\n");
+			const result = tryCorrectIndentationMismatch("function foo() {\n\treturn 1;\n}", filePath);
+			expect(result).toBe("function foo() {\n    return 1;\n}");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("corrects tabs to 2-space indentation when file uses 2 spaces", () => {
+		const env = setupTestEnvironment("pi-lens-indent-tab-to-2-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "function foo() {\n  return 1;\n}\n");
+			const result = tryCorrectIndentationMismatch("function foo() {\n\treturn 1;\n}", filePath);
+			expect(result).toBe("function foo() {\n  return 1;\n}");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("returns undefined when no indentation conversion fixes the mismatch", () => {
+		const env = setupTestEnvironment("pi-lens-indent-no-fix-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "function foo() {\n\treturn 1;\n}\n");
+			expect(tryCorrectIndentationMismatch("function bar() {\n\treturn 2;\n}", filePath)).toBeUndefined();
 		} finally {
 			env.cleanup();
 		}
