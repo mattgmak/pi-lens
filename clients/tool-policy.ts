@@ -1456,15 +1456,23 @@ export function hasNearestPackageJsonField(
 }
 
 export function hasEslintConfig(cwd: string): boolean {
-	for (const cfg of ESLINT_CONFIGS) {
-		if (fs.existsSync(path.join(cwd, cfg))) return true;
+	let dir = cwd;
+	const root = path.parse(dir).root;
+	while (true) {
+		for (const cfg of ESLINT_CONFIGS) {
+			if (fs.existsSync(path.join(dir, cfg))) return true;
+		}
+		const pkgPath = path.join(dir, "package.json");
+		if (fs.existsSync(pkgPath)) {
+			try {
+				if (JSON.parse(fs.readFileSync(pkgPath, "utf-8")).eslintConfig) return true;
+			} catch {}
+		}
+		if (dir === root) break;
+		const parent = path.dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
 	}
-	try {
-		const pkg = JSON.parse(
-			fs.readFileSync(path.join(cwd, "package.json"), "utf-8"),
-		);
-		if (pkg.eslintConfig) return true;
-	} catch {}
 	return false;
 }
 
@@ -1473,10 +1481,18 @@ export function hasBiomeConfig(cwd: string): boolean {
 }
 
 export function getBiomeConfigPath(cwd: string): string | undefined {
-	const jsoncPath = path.join(cwd, "biome.jsonc");
-	if (fs.existsSync(jsoncPath)) return jsoncPath;
-	const jsonPath = path.join(cwd, "biome.json");
-	if (fs.existsSync(jsonPath)) return jsonPath;
+	let dir = cwd;
+	const root = path.parse(dir).root;
+	while (true) {
+		const jsoncPath = path.join(dir, "biome.jsonc");
+		if (fs.existsSync(jsoncPath)) return jsoncPath;
+		const jsonPath = path.join(dir, "biome.json");
+		if (fs.existsSync(jsonPath)) return jsonPath;
+		if (dir === root) break;
+		const parent = path.dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
 	return undefined;
 }
 
@@ -1557,24 +1573,30 @@ export function hasRubocopConfig(cwd: string): boolean {
 }
 
 export function hasMypyConfig(cwd: string): boolean {
-	for (const cfg of MYPY_CONFIGS) {
-		const cfgPath = path.join(cwd, cfg);
-		if (!fs.existsSync(cfgPath)) continue;
-		if (cfg === "setup.cfg") {
-			try {
-				const content = fs.readFileSync(cfgPath, "utf-8");
-				if (content.includes("[mypy]")) return true;
-			} catch {}
-			continue;
+	let dir = cwd;
+	const root = path.parse(dir).root;
+	while (true) {
+		for (const cfg of MYPY_CONFIGS) {
+			const cfgPath = path.join(dir, cfg);
+			if (!fs.existsSync(cfgPath)) continue;
+			if (cfg === "setup.cfg") {
+				try {
+					if (fs.readFileSync(cfgPath, "utf-8").includes("[mypy]")) return true;
+				} catch {}
+				continue;
+			}
+			if (cfg === "pyproject.toml") {
+				try {
+					if (fs.readFileSync(cfgPath, "utf-8").includes("[tool.mypy]")) return true;
+				} catch {}
+				continue;
+			}
+			return true;
 		}
-		if (cfg === "pyproject.toml") {
-			try {
-				const content = fs.readFileSync(cfgPath, "utf-8");
-				if (content.includes("[tool.mypy]")) return true;
-			} catch {}
-			continue;
-		}
-		return true;
+		if (dir === root) break;
+		const parent = path.dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
 	}
 	return false;
 }
@@ -1729,7 +1751,16 @@ const DETEKT_CONFIGS = [
 ];
 
 export function hasDetektConfig(cwd: string): boolean {
-	return DETEKT_CONFIGS.some((cfg) => fs.existsSync(path.join(cwd, cfg)));
+	let dir = cwd;
+	const root = path.parse(dir).root;
+	while (true) {
+		if (DETEKT_CONFIGS.some((cfg) => fs.existsSync(path.join(dir, cfg)))) return true;
+		if (dir === root) break;
+		const parent = path.dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+	return false;
 }
 
 export function hasStandardrbConfig(cwd: string): boolean {
@@ -1759,10 +1790,19 @@ export function getRubocopCommand(cwd: string): {
 }
 
 export function hasOxlintConfig(cwd: string): boolean {
-	return (
-		fs.existsSync(path.join(cwd, ".oxlintrc.json")) ||
-		fs.existsSync(path.join(cwd, "oxlint.json"))
-	);
+	let dir = cwd;
+	const root = path.parse(dir).root;
+	while (true) {
+		if (
+			fs.existsSync(path.join(dir, ".oxlintrc.json")) ||
+			fs.existsSync(path.join(dir, "oxlint.json"))
+		) return true;
+		if (dir === root) break;
+		const parent = path.dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+	return false;
 }
 
 export function getPreferredJstsLintRunners(

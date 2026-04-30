@@ -17,13 +17,17 @@ import {
 	getToolCommandSpec,
 	getToolExecutionPolicy,
 	hasBlackConfig,
+	hasBiomeConfig,
 	hasClangFormatConfig,
+	hasDetektConfig,
+	hasEslintConfig,
 	hasGolangciConfig,
 	hasMarkdownlintConfig,
 	hasMypyConfig,
 	hasNearestPackageJsonDependency,
 	hasNearestPackageJsonField,
 	hasOcamlformatConfig,
+	hasOxlintConfig,
 	hasPhpCsFixerConfig,
 	hasPhpstanConfig,
 	hasPrettierConfig,
@@ -438,6 +442,79 @@ describe("tool-policy", () => {
 				JSON.stringify({ prettier: null }),
 			);
 			expect(hasPrettierConfig(env.tmpDir)).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("hasEslintConfig detects config file in a parent directory", () => {
+		const env = setupTestEnvironment("pi-lens-tool-policy-eslint-walkup-");
+		try {
+			createTempFile(env.tmpDir, "eslint.config.js", "export default [];\n");
+			const subDir = path.join(env.tmpDir, "src");
+			fs.mkdirSync(subDir, { recursive: true });
+			expect(hasEslintConfig(subDir)).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("hasEslintConfig detects eslintConfig field in parent package.json", () => {
+		const env = setupTestEnvironment("pi-lens-tool-policy-eslint-pkg-walkup-");
+		try {
+			createTempFile(env.tmpDir, "package.json", JSON.stringify({ eslintConfig: { rules: {} } }));
+			const subDir = path.join(env.tmpDir, "src");
+			fs.mkdirSync(subDir, { recursive: true });
+			expect(hasEslintConfig(subDir)).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("hasBiomeConfig / getBiomeConfigPath detects biome.json in a parent directory", () => {
+		const env = setupTestEnvironment("pi-lens-tool-policy-biome-walkup-");
+		try {
+			createTempFile(env.tmpDir, "biome.json", "{}\n");
+			const subDir = path.join(env.tmpDir, "src");
+			fs.mkdirSync(subDir, { recursive: true });
+			expect(hasBiomeConfig(subDir)).toBe(true);
+			expect(getBiomeConfigPath(subDir)).toMatch(/biome\.json$/);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("hasOxlintConfig detects .oxlintrc.json in a parent directory", () => {
+		const env = setupTestEnvironment("pi-lens-tool-policy-oxlint-walkup-");
+		try {
+			createTempFile(env.tmpDir, ".oxlintrc.json", "{}\n");
+			const subDir = path.join(env.tmpDir, "src");
+			fs.mkdirSync(subDir, { recursive: true });
+			expect(hasOxlintConfig(subDir)).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("hasMypyConfig detects [tool.mypy] in a parent directory pyproject.toml", () => {
+		const env = setupTestEnvironment("pi-lens-tool-policy-mypy-walkup-");
+		try {
+			createTempFile(env.tmpDir, "pyproject.toml", "[tool.mypy]\nstrict = true\n");
+			const subDir = path.join(env.tmpDir, "src");
+			fs.mkdirSync(subDir, { recursive: true });
+			expect(hasMypyConfig(subDir)).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("hasDetektConfig detects detekt.yml in a parent directory", () => {
+		const env = setupTestEnvironment("pi-lens-tool-policy-detekt-walkup-");
+		try {
+			createTempFile(env.tmpDir, "detekt.yml", "build:\n  maxIssues: 0\n");
+			const subDir = path.join(env.tmpDir, "src");
+			fs.mkdirSync(subDir, { recursive: true });
+			expect(hasDetektConfig(subDir)).toBe(true);
 		} finally {
 			env.cleanup();
 		}
