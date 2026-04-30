@@ -127,6 +127,29 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		return;
 	}
 
+	// Keep cachedExports in sync after each write/edit so the pre-write STOP
+	// check doesn't fire on names that were removed from this file this session.
+	if (runtime.cachedExports.size > 0 && nodeFs.existsSync(filePath)) {
+		const exportRe =
+			/export\s+(?:async\s+)?(?:function|class|const|let|type|interface)\s+(\w+)/g;
+		for (const [name, file] of runtime.cachedExports) {
+			if (path.resolve(file) === path.resolve(filePath)) {
+				runtime.cachedExports.delete(name);
+			}
+		}
+		try {
+			const freshContent = nodeFs.readFileSync(filePath, "utf-8");
+			for (const match of freshContent.matchAll(exportRe)) {
+				const name = match[1];
+				if (!runtime.cachedExports.has(name)) {
+					runtime.cachedExports.set(name, filePath);
+				}
+			}
+		} catch {
+			// Non-fatal — stale entry is worse than a missing one
+		}
+	}
+
 	const initialStateHash = getFileStateHash(filePath);
 	const pipelineDedupeKey = `${filePath}:${initialStateHash}`;
 
