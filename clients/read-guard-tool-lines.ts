@@ -2,6 +2,11 @@ import * as nodeFs from "node:fs";
 import { isToolCallEventType } from "@mariozechner/pi-coding-agent";
 import { logReadGuardEvent } from "./read-guard-logger.js";
 
+export interface GuardLineResult {
+	touchedLines: [number, number] | undefined;
+	preflightError?: string;
+}
+
 export function countFileLines(filePath: string): number {
 	try {
 		const content = nodeFs.readFileSync(filePath, "utf-8");
@@ -12,16 +17,157 @@ export function countFileLines(filePath: string): number {
 	}
 }
 
+function normalizeContent(text: string): string {
+	return text
+		.replace(/\r\n/g, "\n")
+		.split("\n")
+		.map((line) => line.trimEnd())
+		.join("\n");
+}
+
+function lineNumberAt(content: string, index: number): number {
+	return content.substring(0, index).split("\n").length;
+}
+
+function findOccurrenceLines(content: string, needle: string): number[] {
+	const lines: number[] = [];
+	let pos = 0;
+	while (pos < content.length) {
+		const idx = content.indexOf(needle, pos);
+		if (idx === -1) break;
+		lines.push(lineNumberAt(content, idx));
+		pos = idx + needle.length;
+	}
+	return lines;
+}
+
+function resolveOldTextEdits(
+	edits: Array<{ oldText?: string }>,
+	filePath: string,
+	sessionId: string | undefined,
+): GuardLineResult {
+	let rawContent: string;
+	try {
+		rawContent = nodeFs.readFileSync(filePath, "utf-8");
+	} catch {
+		logReadGuardEvent({
+			event: "touched_lines_missing",
+			sessionId,
+			filePath,
+			metadata: {
+				tool: "edit",
+				source: "edits_without_ranges",
+				editCount: edits.length,
+			},
+		});
+		return { touchedLines: undefined };
+	}
+
+	const content = normalizeContent(rawContent);
+	const errors: string[] = [];
+	const resolvedRanges: [number, number][] = [];
+
+	for (let i = 0; i < edits.length; i++) {
+		const oldText = edits[i].oldText;
+		if (!oldText) continue;
+
+		const needle = normalizeContent(oldText);
+		const occurrenceLines = findOccurrenceLines(content, needle);
+
+		if (occurrenceLines.length === 0) {
+			logReadGuardEvent({
+				event: "oldtext_not_found",
+				sessionId,
+				filePath,
+				metadata: { tool: "edit", source: "edits_without_ranges", editIndex: i },
+			});
+		} else if (occurrenceLines.length === 1) {
+			const startLine = occurrenceLines[0];
+			const endLine = startLine + needle.split("\n").length - 1;
+			resolvedRanges.push([startLine, endLine]);
+			logReadGuardEvent({
+				event: "oldtext_resolved",
+				sessionId,
+				filePath,
+				metadata: {
+					tool: "edit",
+					source: "edits_without_ranges",
+					editIndex: i,
+					touchedLines: [startLine, endLine],
+				},
+			});
+		} else {
+			const preview = oldText.trimStart().substring(0, 60).replace(/\n/g, "↵");
+			const lineList = occurrenceLines.map((l) => `  • Line ${l}`).join("\n");
+			errors.push(
+				`edits[${i}].oldText ("${preview}") appears ${occurrenceLines.length} times:\n${lineList}\nAdd more surrounding context to make it unique.`,
+			);
+			logReadGuardEvent({
+				event: "oldtext_duplicate",
+				sessionId,
+				filePath,
+				metadata: {
+					tool: "edit",
+					source: "edits_without_ranges",
+					editIndex: i,
+					occurrenceCount: occurrenceLines.length,
+					occurrenceLines,
+				},
+			});
+		}
+	}
+
+	if (errors.length > 0) {
+		return {
+			touchedLines: undefined,
+			preflightError: `🔴 BLOCKED — Ambiguous edit target\n\n${errors.join("\n\n")}`,
+		};
+	}
+
+	if (resolvedRanges.length === 0) {
+		logReadGuardEvent({
+			event: "touched_lines_missing",
+			sessionId,
+			filePath,
+			metadata: {
+				tool: "edit",
+				source: "edits_without_ranges",
+				editCount: edits.length,
+			},
+		});
+		return { touchedLines: undefined };
+	}
+
+	const starts = resolvedRanges.map(([s]) => s);
+	const ends = resolvedRanges.map(([, e]) => e);
+	const touchedLines: [number, number] = [Math.min(...starts), Math.max(...ends)];
+	logReadGuardEvent({
+		event: "touched_lines_detected",
+		sessionId,
+		filePath,
+		metadata: {
+			tool: "edit",
+			source: "oldtext_resolved",
+			touchedLines,
+			resolvedEditCount: resolvedRanges.length,
+			totalEditCount: edits.length,
+		},
+	});
+	return { touchedLines };
+}
+
 export function getTouchedLinesForGuard(
 	event: unknown,
 	filePath?: string,
 	sessionId?: string,
-): [number, number] | undefined {
+): GuardLineResult {
 	if (isToolCallEventType("edit", event as any)) {
 		const editInput = (event as { input?: unknown }).input as {
 			oldRange?: { start: { line: number }; end: { line: number } };
 			edits?: Array<{
 				range?: { start?: { line: number }; end?: { line: number } };
+				oldText?: string;
+				newText?: string;
 			}>;
 		};
 		if (editInput.oldRange) {
@@ -41,7 +187,7 @@ export function getTouchedLinesForGuard(
 					},
 				});
 			}
-			return touchedLines;
+			return { touchedLines };
 		}
 		if (editInput.edits?.length) {
 			const rangedEdits = editInput.edits
@@ -56,18 +202,9 @@ export function getTouchedLinesForGuard(
 				.filter((range): range is [number, number] => range !== null);
 			if (rangedEdits.length === 0) {
 				if (filePath) {
-					logReadGuardEvent({
-						event: "touched_lines_missing",
-						sessionId,
-						filePath,
-						metadata: {
-							tool: "edit",
-							source: "edits_without_ranges",
-							editCount: editInput.edits.length,
-						},
-					});
+					return resolveOldTextEdits(editInput.edits, filePath, sessionId);
 				}
-				return undefined;
+				return { touchedLines: undefined };
 			}
 			const starts = rangedEdits.map(([start]) => start);
 			const ends = rangedEdits.map(([, end]) => end);
@@ -89,7 +226,7 @@ export function getTouchedLinesForGuard(
 					},
 				});
 			}
-			return touchedLines;
+			return { touchedLines };
 		}
 		if (filePath) {
 			logReadGuardEvent({
@@ -102,7 +239,7 @@ export function getTouchedLinesForGuard(
 				},
 			});
 		}
-		return undefined;
+		return { touchedLines: undefined };
 	}
 
 	if (isToolCallEventType("write", event as any)) {
@@ -121,8 +258,8 @@ export function getTouchedLinesForGuard(
 				},
 			});
 		}
-		return touchedLines;
+		return { touchedLines };
 	}
 
-	return undefined;
+	return { touchedLines: undefined };
 }

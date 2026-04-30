@@ -959,11 +959,14 @@ export default function (pi: ExtensionAPI) {
 				typeof readGuard?.isNewFile !== "function" ||
 				!readGuard.isNewFile(filePath);
 			if (readGuard && isExistingFile) {
-				const touchedLines = getTouchedLinesForGuard(
+				const { touchedLines, preflightError } = getTouchedLinesForGuard(
 					event,
 					filePath,
 					runtime.telemetrySessionId,
 				);
+				if (preflightError) {
+					return { block: true, reason: preflightError };
+				}
 				logReadGuardEvent({
 					event: "edit_check_started",
 					sessionId: runtime.telemetrySessionId,

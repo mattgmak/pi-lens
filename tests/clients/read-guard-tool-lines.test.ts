@@ -8,7 +8,7 @@ import {
 import { setupTestEnvironment } from "./test-utils.js";
 
 describe("read-guard tool line helpers", () => {
-	it("returns undefined for text-replacement edits without explicit ranges", () => {
+	it("returns undefined touchedLines for text-replacement edits without explicit ranges and no filePath", () => {
 		const event = {
 			toolName: "edit",
 			input: {
@@ -17,7 +17,7 @@ describe("read-guard tool line helpers", () => {
 			},
 		};
 
-		expect(getTouchedLinesForGuard(event)).toBeUndefined();
+		expect(getTouchedLinesForGuard(event).touchedLines).toBeUndefined();
 	});
 
 	it("uses only edits that actually provide ranges", () => {
@@ -37,7 +37,7 @@ describe("read-guard tool line helpers", () => {
 			},
 		};
 
-		expect(getTouchedLinesForGuard(event)).toEqual([10, 12]);
+		expect(getTouchedLinesForGuard(event).touchedLines).toEqual([10, 12]);
 	});
 
 	it("uses actual on-disk line count for writes", () => {
@@ -51,8 +51,62 @@ describe("read-guard tool line helpers", () => {
 				getTouchedLinesForGuard(
 					{ toolName: "write", input: { path: filePath } },
 					filePath,
-				),
+				).touchedLines,
 			).toEqual([1, 4]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("resolves unique oldText to a line range", () => {
+		const env = setupTestEnvironment("read-guard-lines-resolve-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(
+				filePath,
+				"function foo() {\n  return 1;\n}\n\nfunction bar() {\n  return 2;\n}\n",
+			);
+
+			const event = {
+				toolName: "edit",
+				input: {
+					path: filePath,
+					edits: [{ oldText: "function bar() {\n  return 2;\n}", newText: "function bar() {\n  return 99;\n}" }],
+				},
+			};
+
+			const result = getTouchedLinesForGuard(event, filePath);
+			expect(result.touchedLines).toEqual([5, 7]);
+			expect(result.preflightError).toBeUndefined();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("returns preflightError with line numbers when oldText appears multiple times", () => {
+		const env = setupTestEnvironment("read-guard-lines-dup-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(
+				filePath,
+				"  return value;\n}\n\nfunction b() {\n  return value;\n}\n",
+			);
+
+			const event = {
+				toolName: "edit",
+				input: {
+					path: filePath,
+					edits: [{ oldText: "  return value;", newText: "  return 42;" }],
+				},
+			};
+
+			const result = getTouchedLinesForGuard(event, filePath);
+			expect(result.touchedLines).toBeUndefined();
+			expect(result.preflightError).toMatch(/BLOCKED/);
+			expect(result.preflightError).toMatch(/edits\[0\]/);
+			expect(result.preflightError).toMatch(/2 times/);
+			expect(result.preflightError).toMatch(/Line 1/);
+			expect(result.preflightError).toMatch(/Line 5/);
 		} finally {
 			env.cleanup();
 		}

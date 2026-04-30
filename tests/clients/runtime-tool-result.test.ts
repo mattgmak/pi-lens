@@ -50,6 +50,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 					reportedThisTurn: new Set<string>(),
 					formatPipelineCrashNotice: () => "",
 					lastCascadeOutput: "",
+					cachedExports: new Map(),
 				},
 				cacheManager: {
 					addModifiedRange: () => {},
@@ -115,6 +116,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 					reportedThisTurn: new Set<string>(),
 					formatPipelineCrashNotice: () => "",
 					lastCascadeOutput: "",
+					cachedExports: new Map(),
 				},
 				cacheManager: {
 					addModifiedRange: () => {},
@@ -177,6 +179,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 					reportedThisTurn: new Set<string>(),
 					formatPipelineCrashNotice: () => "",
 					lastCascadeOutput: "",
+					cachedExports: new Map(),
 				},
 				cacheManager: {
 					addModifiedRange: () => {},
@@ -259,6 +262,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 					reportedThisTurn: new Set<string>(),
 					formatPipelineCrashNotice: () => "",
 					lastCascadeOutput: "",
+					cachedExports: new Map(),
 				},
 				cacheManager: {
 					addModifiedRange: () => {},
@@ -337,6 +341,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 					reportedThisTurn: new Set<string>(),
 					formatPipelineCrashNotice: () => "",
 					lastCascadeOutput: "",
+					cachedExports: new Map(),
 				},
 				cacheManager: {
 					addModifiedRange: (
@@ -401,6 +406,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 					reportedThisTurn: new Set<string>(),
 					formatPipelineCrashNotice: () => "",
 					lastCascadeOutput: "",
+					cachedExports: new Map(),
 				},
 				cacheManager: {
 					addModifiedRange: () => {},
