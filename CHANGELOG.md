@@ -2,7 +2,7 @@
 
 All notable changes to pi-lens will be documented in this file.
 
-## [Unreleased]
+## [3.8.34] - 2026-05-01
 
 ### Added
 
