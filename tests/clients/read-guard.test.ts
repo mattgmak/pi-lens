@@ -10,6 +10,12 @@ import { describe, expect, it, vi } from "vitest";
 import { createReadGuard, type ReadRecord } from "../../clients/read-guard.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
+// Suppress log writes — tests care about verdicts, not log output
+vi.mock("../../clients/read-guard-logger.js", () => ({
+	logReadGuardEvent: vi.fn(),
+	getReadGuardLogPath: vi.fn(() => "/dev/null"),
+}));
+
 // Mock FileTime
 vi.mock("../../clients/file-time.js", () => ({
 	createFileTime: (_sessionId: string) => ({
