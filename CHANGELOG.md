@@ -19,6 +19,7 @@ All notable changes to pi-lens will be documented in this file.
 - **`/lens-booboo` language gates** — Knip (dead code), Madge (circular deps), and type coverage now skip on non-JS/TS projects. Compiler checks extended with Java (mvn/gradle), C# (dotnet build), Dart, Gleam, Zig, and Elixir alongside the existing TypeScript, Go, Rust, Ruby, and Python checks.
 - **`project-metadata` detects 8 new languages** — Java, Kotlin, C#, Dart, Gleam, Zig, Elixir, and C++ are now detected from their project markers (pom.xml, build.gradle.kts, *.sln, pubspec.yaml, gleam.toml, build.zig, mix.exs, CMakeLists.txt). All runners and booboo language gates now work correctly for these languages.
 - **4 new formatters** — `google-java-format` (config-gated via `.editorconfig` or `.google-java-format`), `cljfmt` (config-gated via `.cljfmt.edn`), `cmake-format` (config-gated via `.cmake-format`), and `PSScriptAnalyzer` formatter for PowerShell (smart-default when PSScriptAnalyzer module is available).
+- **Startup pre-install defaults for shell, Ruby, Kotlin, TOML** — `shellcheck`, `rubocop`, `ktlint`, and `taplo` are now pre-installed fire-and-forget at session start for matching projects, consistent with the existing pattern for `typescript-language-server`, `biome`, `pyright`, `ruff`, `yamllint`, and `sqlfluff`. No latency impact — all installs are fire-and-forget and no-ops when already cached.
 
 ### Improved
 

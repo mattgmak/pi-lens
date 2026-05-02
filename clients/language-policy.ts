@@ -36,7 +36,7 @@ export const LANGUAGE_POLICY: Record<FileKind, LanguagePolicy> = {
 	rust: { lspCapable: true },
 	cxx: { lspCapable: true },
 	cmake: { lspCapable: true },
-	shell: { lspCapable: true },
+	shell: { lspCapable: true, startup: { defaults: ["shellcheck"] } },
 	json: { lspCapable: true },
 	markdown: { lspCapable: false },
 	css: { lspCapable: true },
@@ -54,7 +54,7 @@ export const LANGUAGE_POLICY: Record<FileKind, LanguagePolicy> = {
 			heavyScansRequireConfig: true,
 		},
 	},
-	ruby: { lspCapable: true },
+	ruby: { lspCapable: true, startup: { defaults: ["rubocop"] } },
 	html: { lspCapable: true },
 	docker: { lspCapable: true },
 	php: { lspCapable: true },
@@ -63,7 +63,7 @@ export const LANGUAGE_POLICY: Record<FileKind, LanguagePolicy> = {
 	csharp: { lspCapable: true },
 	fsharp: { lspCapable: true },
 	java: { lspCapable: true },
-	kotlin: { lspCapable: true },
+	kotlin: { lspCapable: true, startup: { defaults: ["ktlint"] } },
 	swift: { lspCapable: true },
 	dart: { lspCapable: true },
 	lua: { lspCapable: true },
@@ -75,7 +75,7 @@ export const LANGUAGE_POLICY: Record<FileKind, LanguagePolicy> = {
 	clojure: { lspCapable: true },
 	terraform: { lspCapable: true },
 	nix: { lspCapable: true },
-	toml: { lspCapable: true },
+	toml: { lspCapable: true, startup: { defaults: ["taplo"] } },
 };
 
 const PRIMARY_DISPATCH_GROUPS: Partial<Record<FileKind, RunnerGroup>> = {
