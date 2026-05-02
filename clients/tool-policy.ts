@@ -561,6 +561,78 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 			gate: "smart-default",
 		},
 	],
+	[
+		".java",
+		{
+			formatterNames: ["google-java-format"],
+			defaultFormatter: "google-java-format",
+			defaultWhenUnconfigured: false,
+			gate: "config-first",
+		},
+	],
+	[
+		".clj",
+		{
+			formatterNames: ["cljfmt"],
+			defaultFormatter: "cljfmt",
+			defaultWhenUnconfigured: false,
+			gate: "config-first",
+		},
+	],
+	[
+		".cljc",
+		{
+			formatterNames: ["cljfmt"],
+			defaultFormatter: "cljfmt",
+			defaultWhenUnconfigured: false,
+			gate: "config-first",
+		},
+	],
+	[
+		".cljs",
+		{
+			formatterNames: ["cljfmt"],
+			defaultFormatter: "cljfmt",
+			defaultWhenUnconfigured: false,
+			gate: "config-first",
+		},
+	],
+	[
+		".cmake",
+		{
+			formatterNames: ["cmake-format"],
+			defaultFormatter: "cmake-format",
+			defaultWhenUnconfigured: false,
+			gate: "config-first",
+		},
+	],
+	[
+		".ps1",
+		{
+			formatterNames: ["psscriptanalyzer-format"],
+			defaultFormatter: "psscriptanalyzer-format",
+			defaultWhenUnconfigured: true,
+			gate: "smart-default",
+		},
+	],
+	[
+		".psm1",
+		{
+			formatterNames: ["psscriptanalyzer-format"],
+			defaultFormatter: "psscriptanalyzer-format",
+			defaultWhenUnconfigured: true,
+			gate: "smart-default",
+		},
+	],
+	[
+		".psd1",
+		{
+			formatterNames: ["psscriptanalyzer-format"],
+			defaultFormatter: "psscriptanalyzer-format",
+			defaultWhenUnconfigured: true,
+			gate: "smart-default",
+		},
+	],
 ]);
 
 const AUTO_INSTALLABLE_DEFAULT_FORMATTERS = new Map<string, string>([
@@ -1742,6 +1814,33 @@ export function hasStyluaConfig(cwd: string): boolean {
 
 export function hasOcamlformatConfig(cwd: string): boolean {
 	return fs.existsSync(path.join(cwd, ".ocamlformat"));
+}
+
+export function hasGoogleJavaFormatConfig(cwd: string): boolean {
+	// google-java-format has no standard config file — gate on .editorconfig
+	// with indent_size defined (common Java project signal) or explicit opt-in marker.
+	return (
+		fs.existsSync(path.join(cwd, ".google-java-format")) ||
+		fs.existsSync(path.join(cwd, ".editorconfig"))
+	);
+}
+
+export function hasCljfmtConfig(cwd: string): boolean {
+	return [".cljfmt.edn", "cljfmt.edn", ".cljfmt"].some((cfg) =>
+		fs.existsSync(path.join(cwd, cfg)),
+	);
+}
+
+export function hasCmakeFormatConfig(cwd: string): boolean {
+	return [
+		".cmake-format",
+		".cmake-format.yaml",
+		".cmake-format.yml",
+		".cmake-format.json",
+		".cmake-format.py",
+		"cmake-format.yaml",
+		"cmake-format.yml",
+	].some((cfg) => fs.existsSync(path.join(cwd, cfg)));
 }
 
 export function hasPhpstanConfig(cwd: string): boolean {

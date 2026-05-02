@@ -15,6 +15,10 @@ All notable changes to pi-lens will be documented in this file.
 - **`/lens-health` cascade summary** — shows session-total cascade runs, diagnostics surfaced, and cold-snapshot touches (the new active-touch fallback for TypeScript neighbors with no snapshot).
 - **`/lens-health` i18n** — localizes status labels with English fallback; es, fr, and pt-BR strings included (PR #45 by @jerryfan).
 
+- **`/lens-booboo` language gates** — Knip (dead code), Madge (circular deps), and type coverage now skip on non-JS/TS projects. Compiler checks extended with Java (mvn/gradle), C# (dotnet build), Dart, Gleam, Zig, and Elixir alongside the existing TypeScript, Go, Rust, Ruby, and Python checks.
+- **`project-metadata` detects 8 new languages** — Java, Kotlin, C#, Dart, Gleam, Zig, Elixir, and C++ are now detected from their project markers (pom.xml, build.gradle.kts, *.sln, pubspec.yaml, gleam.toml, build.zig, mix.exs, CMakeLists.txt). All runners and booboo language gates now work correctly for these languages.
+- **4 new formatters** — `google-java-format` (config-gated via `.editorconfig` or `.google-java-format`), `cljfmt` (config-gated via `.cljfmt.edn`), `cmake-format` (config-gated via `.cmake-format`), and `PSScriptAnalyzer` formatter for PowerShell (smart-default when PSScriptAnalyzer module is available).
+
 ### Improved
 
 - **`ast-grep` skill clarifies string literal behaviour** — exact string literals in patterns (e.g. `from "./utils"`) work correctly; only metavariables inside string literals (e.g. `from "$PATH"`) are not supported and should use grep instead. Previously the skill incorrectly implied import path matching was unsupported entirely, causing unnecessary grep fallbacks.

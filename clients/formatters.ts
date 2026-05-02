@@ -20,6 +20,9 @@ import {
 	hasBiomeConfig,
 	hasBlackConfig,
 	hasClangFormatConfig,
+	hasCljfmtConfig,
+	hasCmakeFormatConfig,
+	hasGoogleJavaFormatConfig,
 	hasNearestPackageJsonDependency,
 	hasNearestPackageJsonField,
 	hasOcamlformatConfig,
@@ -296,6 +299,12 @@ function hasExplicitFormatterConfig(
 			return hasStyluaConfig(cwd);
 		case "ocamlformat":
 			return hasOcamlformatConfig(cwd);
+		case "google-java-format":
+			return hasGoogleJavaFormatConfig(cwd);
+		case "cljfmt":
+			return hasCljfmtConfig(cwd);
+		case "cmake-format":
+			return hasCmakeFormatConfig(cwd);
 		default:
 			return false;
 	}
@@ -737,6 +746,63 @@ export const taploFormatter: FormatterInfo = {
 	},
 };
 
+export const googleJavaFormatFormatter: FormatterInfo = {
+	name: "google-java-format",
+	command: ["google-java-format", "--replace", "$FILE"],
+	extensions: [".java"],
+	async detect(cwd: string) {
+		if ((await which("google-java-format")) === null) return false;
+		return hasGoogleJavaFormatConfig(cwd);
+	},
+};
+
+export const cljfmtFormatter: FormatterInfo = {
+	name: "cljfmt",
+	command: ["cljfmt", "fix", "$FILE"],
+	extensions: [".clj", ".cljc", ".cljs"],
+	async detect(cwd: string) {
+		if ((await which("cljfmt")) === null) return false;
+		return hasCljfmtConfig(cwd);
+	},
+};
+
+export const cmakeFormatFormatter: FormatterInfo = {
+	name: "cmake-format",
+	command: ["cmake-format", "-i", "$FILE"],
+	extensions: [".cmake"],
+	async detect(cwd: string) {
+		if ((await which("cmake-format")) === null) return false;
+		return hasCmakeFormatConfig(cwd);
+	},
+};
+
+export const psscriptanalyzerFormatFormatter: FormatterInfo = {
+	name: "psscriptanalyzer-format",
+	command: ["pwsh", "-Command", "Invoke-Formatter -ScriptDefinition (Get-Content -Raw '$FILE') | Set-Content '$FILE'"],
+	extensions: [".ps1", ".psm1", ".psd1"],
+	async resolveCommand(filePath, _cwd) {
+		const pwsh = (await which("pwsh")) ?? (await which("powershell"));
+		if (!pwsh) return null;
+		return [
+			pwsh,
+			"-NoProfile",
+			"-Command",
+			`$content = Get-Content -Raw '${filePath}'; $formatted = Invoke-Formatter -ScriptDefinition $content; Set-Content -Path '${filePath}' -Value $formatted`,
+		];
+	},
+	async detect(_cwd: string) {
+		const pwsh = (await which("pwsh")) ?? (await which("powershell"));
+		if (!pwsh) return false;
+		// Check PSScriptAnalyzer module is available
+		const result = safeSpawn(pwsh, [
+			"-NoProfile",
+			"-Command",
+			"Get-Module -ListAvailable PSScriptAnalyzer | Select-Object -First 1 -ExpandProperty Name",
+		], { timeout: 5_000 });
+		return (result.stdout ?? "").includes("PSScriptAnalyzer");
+	},
+};
+
 // --- Registry ---
 
 const ALL_FORMATTERS: FormatterInfo[] = [
@@ -767,6 +833,10 @@ const ALL_FORMATTERS: FormatterInfo[] = [
 	standardrbFormatter,
 	gleamFormatter,
 	taploFormatter,
+	googleJavaFormatFormatter,
+	cljfmtFormatter,
+	cmakeFormatFormatter,
+	psscriptanalyzerFormatFormatter,
 ];
 
 // Cache for detection results - stores array of enabled formatter names per cwd+ext

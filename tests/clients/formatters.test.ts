@@ -555,6 +555,51 @@ describe("getFormattersForFile — policy selection", () => {
 		expect(formatters.map((f) => f.name)).toEqual(["prettier"]);
 	});
 
+	it("does not force google-java-format without config", async () => {
+		const filePath = fileIn(tmpDir, "Main.java");
+		const formatters = await getFormattersForFile(filePath, tmpDir);
+		expect(formatters).toEqual([]);
+	});
+
+	it("enables google-java-format when .editorconfig is present", async () => {
+		createTempFile(tmpDir, ".editorconfig", "[*.java]\nindent_size = 4\n");
+		await withPathShim("google-java-format", async () => {
+			const filePath = fileIn(tmpDir, "Main.java");
+			const formatters = await getFormattersForFile(filePath, tmpDir);
+			expect(formatters.map((f) => f.name)).toEqual(["google-java-format"]);
+		});
+	});
+
+	it("does not force cljfmt without config", async () => {
+		const filePath = fileIn(tmpDir, "core.clj");
+		const formatters = await getFormattersForFile(filePath, tmpDir);
+		expect(formatters).toEqual([]);
+	});
+
+	it("enables cljfmt when .cljfmt.edn is present", async () => {
+		createTempFile(tmpDir, ".cljfmt.edn", "{}\n");
+		await withPathShim("cljfmt", async () => {
+			const filePath = fileIn(tmpDir, "core.clj");
+			const formatters = await getFormattersForFile(filePath, tmpDir);
+			expect(formatters.map((f) => f.name)).toEqual(["cljfmt"]);
+		});
+	});
+
+	it("does not force cmake-format without config", async () => {
+		const filePath = fileIn(tmpDir, "CMakeLists.cmake");
+		const formatters = await getFormattersForFile(filePath, tmpDir);
+		expect(formatters).toEqual([]);
+	});
+
+	it("enables cmake-format when .cmake-format is present", async () => {
+		createTempFile(tmpDir, ".cmake-format", "# cmake-format config\n");
+		await withPathShim("cmake-format", async () => {
+			const filePath = fileIn(tmpDir, "CMakeLists.cmake");
+			const formatters = await getFormattersForFile(filePath, tmpDir);
+			expect(formatters.map((f) => f.name)).toEqual(["cmake-format"]);
+		});
+	});
+
 	it("taplo resolveCommand falls back to managed install when not on PATH", async () => {
 		const managedPath = isWin
 			? path.join(tmpDir, "managed", "taplo.exe")
