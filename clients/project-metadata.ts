@@ -15,7 +15,7 @@ import * as path from "node:path";
 
 // --- Types ---
 
-export type ProjectType = "node" | "python" | "rust" | "go" | "php" | "ruby" | "multi" | "unknown";
+export type ProjectType = "node" | "python" | "rust" | "go" | "php" | "ruby" | "java" | "kotlin" | "csharp" | "dart" | "gleam" | "zig" | "elixir" | "cpp" | "multi" | "unknown";
 
 export type PackageManager = "npm" | "yarn" | "pnpm" | "bun" | "pip" | "poetry" | "uv" | "cargo" | "gomod" | "composer" | "bundler";
 
@@ -104,11 +104,60 @@ export function detectProjectMetadata(targetPath: string): ProjectMetadata {
 		Object.assign(metadata, rubyMeta);
 	}
 
+	// Check for Java project
+	const javaMeta = detectJavaProject(targetPath);
+	if (javaMeta && metadata.type === "unknown") {
+		Object.assign(metadata, javaMeta);
+	}
+
+	// Check for Kotlin project
+	const kotlinMeta = detectKotlinProject(targetPath);
+	if (kotlinMeta && metadata.type === "unknown") {
+		Object.assign(metadata, kotlinMeta);
+	}
+
+	// Check for C# project
+	const csharpMeta = detectCsharpProject(targetPath);
+	if (csharpMeta && metadata.type === "unknown") {
+		Object.assign(metadata, csharpMeta);
+	}
+
+	// Check for Dart project
+	const dartMeta = detectDartProject(targetPath);
+	if (dartMeta && metadata.type === "unknown") {
+		Object.assign(metadata, dartMeta);
+	}
+
+	// Check for Gleam project
+	const gleamMeta = detectGleamProject(targetPath);
+	if (gleamMeta && metadata.type === "unknown") {
+		Object.assign(metadata, gleamMeta);
+	}
+
+	// Check for Zig project
+	const zigMeta = detectZigProject(targetPath);
+	if (zigMeta && metadata.type === "unknown") {
+		Object.assign(metadata, zigMeta);
+	}
+
+	// Check for Elixir project
+	const elixirMeta = detectElixirProject(targetPath);
+	if (elixirMeta && metadata.type === "unknown") {
+		Object.assign(metadata, elixirMeta);
+	}
+
+	// Check for C/C++ project
+	const cppMeta = detectCppProject(targetPath);
+	if (cppMeta && metadata.type === "unknown") {
+		Object.assign(metadata, cppMeta);
+	}
+
 	// Multi-project detection: if multiple types found
-	const types = [nodeMeta, pythonMeta, rustMeta, goMeta, phpMeta, rubyMeta]
+	const types = [nodeMeta, pythonMeta, rustMeta, goMeta, phpMeta, rubyMeta,
+		javaMeta, kotlinMeta, csharpMeta, dartMeta, gleamMeta, zigMeta, elixirMeta, cppMeta]
 		.filter(Boolean)
 		.map(m => m!.type);
-	
+
 	if (types.length > 1) {
 		metadata.type = "multi";
 		metadata.languages = [...new Set(types)];
@@ -507,6 +556,142 @@ function detectRubyProject(targetPath: string): ProjectMetadata | null {
 	}
 
 	return metadata;
+}
+
+function detectJavaProject(targetPath: string): ProjectMetadata | null {
+	const hasPom = fs.existsSync(path.join(targetPath, "pom.xml"));
+	const hasGradle = fs.existsSync(path.join(targetPath, "build.gradle")) ||
+		fs.existsSync(path.join(targetPath, "build.gradle.kts"));
+	if (!hasPom && !hasGradle) return null;
+	return {
+		type: "java",
+		packageManager: hasPom ? "maven" as PackageManager : "gradle" as PackageManager,
+		scripts: {},
+		languages: ["java"],
+		hasTests: true,
+		hasLinting: false,
+		hasFormatting: false,
+		hasTypeScript: false,
+		configFiles: hasPom ? ["pom.xml"] : ["build.gradle"],
+	};
+}
+
+function detectKotlinProject(targetPath: string): ProjectMetadata | null {
+	const hasGradleKts = fs.existsSync(path.join(targetPath, "build.gradle.kts"));
+	const hasKotlinSrc = fs.existsSync(path.join(targetPath, "src", "main", "kotlin"));
+	if (!hasGradleKts && !hasKotlinSrc) return null;
+	return {
+		type: "kotlin",
+		packageManager: "gradle" as PackageManager,
+		scripts: {},
+		languages: ["kotlin"],
+		hasTests: true,
+		hasLinting: false,
+		hasFormatting: false,
+		hasTypeScript: false,
+		configFiles: hasGradleKts ? ["build.gradle.kts"] : [],
+	};
+}
+
+function detectCsharpProject(targetPath: string): ProjectMetadata | null {
+	const entries = fs.readdirSync(targetPath);
+	const hasSln = entries.some(e => /\.(sln|slnx)$/i.test(e));
+	const hasCsproj = entries.some(e => /\.csproj$/i.test(e));
+	if (!hasSln && !hasCsproj) return null;
+	const configFile = entries.find(e => /\.(sln|slnx|csproj)$/i.test(e)) ?? "";
+	return {
+		type: "csharp",
+		packageManager: "dotnet" as PackageManager,
+		scripts: {},
+		languages: ["csharp"],
+		hasTests: true,
+		hasLinting: false,
+		hasFormatting: false,
+		hasTypeScript: false,
+		configFiles: [configFile],
+	};
+}
+
+function detectDartProject(targetPath: string): ProjectMetadata | null {
+	if (!fs.existsSync(path.join(targetPath, "pubspec.yaml"))) return null;
+	return {
+		type: "dart",
+		packageManager: "pub" as PackageManager,
+		scripts: {},
+		languages: ["dart"],
+		hasTests: true,
+		hasLinting: false,
+		hasFormatting: false,
+		hasTypeScript: false,
+		configFiles: ["pubspec.yaml"],
+	};
+}
+
+function detectGleamProject(targetPath: string): ProjectMetadata | null {
+	if (!fs.existsSync(path.join(targetPath, "gleam.toml"))) return null;
+	return {
+		type: "gleam",
+		packageManager: "gleam" as PackageManager,
+		scripts: {},
+		languages: ["gleam"],
+		hasTests: true,
+		hasLinting: false,
+		hasFormatting: false,
+		hasTypeScript: false,
+		configFiles: ["gleam.toml"],
+	};
+}
+
+function detectZigProject(targetPath: string): ProjectMetadata | null {
+	if (!fs.existsSync(path.join(targetPath, "build.zig"))) return null;
+	return {
+		type: "zig",
+		packageManager: "zig" as PackageManager,
+		scripts: {},
+		languages: ["zig"],
+		hasTests: true,
+		hasLinting: false,
+		hasFormatting: false,
+		hasTypeScript: false,
+		configFiles: ["build.zig"],
+	};
+}
+
+function detectElixirProject(targetPath: string): ProjectMetadata | null {
+	if (!fs.existsSync(path.join(targetPath, "mix.exs"))) return null;
+	return {
+		type: "elixir",
+		packageManager: "mix" as PackageManager,
+		scripts: {},
+		languages: ["elixir"],
+		hasTests: true,
+		hasLinting: false,
+		hasFormatting: false,
+		hasTypeScript: false,
+		configFiles: ["mix.exs"],
+	};
+}
+
+function detectCppProject(targetPath: string): ProjectMetadata | null {
+	const hasCmake = fs.existsSync(path.join(targetPath, "CMakeLists.txt"));
+	const hasMakefile = fs.existsSync(path.join(targetPath, "Makefile"));
+	// Also detect by source files if no build system marker
+	const hasCppFiles = fs.existsSync(targetPath) &&
+		fs.readdirSync(targetPath).some(f => /\.(cpp|cxx|cc|c\+\+)$/i.test(f));
+	if (!hasCmake && !hasMakefile && !hasCppFiles) return null;
+	const configFiles: string[] = [];
+	if (hasCmake) configFiles.push("CMakeLists.txt");
+	if (hasMakefile) configFiles.push("Makefile");
+	return {
+		type: "cpp",
+		scripts: {},
+		languages: ["cpp"],
+		hasTests: false,
+		hasLinting: false,
+		hasFormatting: false,
+		hasTypeScript: false,
+		configFiles,
+	};
 }
 
 // --- Formatting Utilities ---
