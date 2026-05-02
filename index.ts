@@ -1321,9 +1321,9 @@ export default function (pi: ExtensionAPI) {
 	// --- Inject turn-end findings into next agent turn ---
 	// jscpd, madge, and turn-end delta results are cached at turn_end and consumed here
 	// via the context event, which fires before each provider request.
-	// Important: context handlers must APPEND to the existing message list, not replace it.
-	// Replacing `event.messages` can drop the user's first prompt entirely, which causes
-	// OpenAI Responses requests to fail with: "One of input/previous_response_id/prompt/conversation_id must be provided."
+	// Important: keep the user's prompt as the trailing message. Some provider bridges
+	// treat the final message as the active user action, so pi-lens context must be
+	// prepended instead of appended.
 	// biome-ignore lint/suspicious/noExplicitAny: pi.on("context") overload has TS resolution bug
 	(pi as any).on(
 		"context",
@@ -1348,7 +1348,7 @@ export default function (pi: ExtensionAPI) {
 						?.messages ?? [];
 
 				return {
-					messages: [...existingMessages, ...injectedMessages],
+					messages: [...injectedMessages, ...existingMessages],
 				};
 			} catch (err) {
 				dbg(`context event error: ${err}`);
