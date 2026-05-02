@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CacheManager } from "../clients/cache-manager.js";
 
 // Mock read-guard for integration tests to avoid dynamic require issues
 vi.mock("../clients/read-guard.js", () => ({
@@ -179,6 +180,35 @@ describe("index.ts integration", () => {
 
 		expect(handleSessionStartMock).toHaveBeenCalledTimes(1);
 		expect(ensureToolMock).toHaveBeenCalledWith("typescript-language-server");
+	}, 15_000);
+
+	it("context handler prepends injected guidance before the user prompt", async () => {
+		const { default: registerExtension } = await import("../index.ts");
+		const { pi, handlers } = createMockPi();
+		registerExtension(pi as any);
+
+		const cacheManager = new CacheManager(false);
+		cacheManager.writeCache(
+			"session-start-guidance",
+			{ content: "Use pi-lens tools when useful." },
+			tmpDir,
+		);
+
+		const context = handlers.context?.[0];
+		expect(context).toBeTypeOf("function");
+
+		const userMessage = { role: "user", content: "Fix the bug" };
+		const result = await context?.({ messages: [userMessage] }, { cwd: tmpDir });
+
+		expect(result).toEqual({
+			messages: [
+				expect.objectContaining({
+					role: "user",
+					content: expect.stringContaining("[pi-lens] Session guidance"),
+				}),
+				userMessage,
+			],
+		});
 	}, 15_000);
 
 	it("tool_call handler executes captureSnapshot and similarity paths without crashing", async () => {

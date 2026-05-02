@@ -41,7 +41,7 @@ At `session_start`, pi-lens:
 - applies language-aware startup defaults for tool preinstall
 - warms caches and optional indexes (with overlap/session guardrails)
 - emits missing-tool install hints for detected languages when relevant
-- injects session guidance through internal context (non-user channel) to reduce acknowledgement-only first responses
+- prepends session guidance before the user's prompt so provider bridges keep the real prompt active
 - opens `warmFiles` (if configured in `.pi-lens/lsp.json`) to seed lazy-indexing language servers like clangd before the first symbol query
 
 For one-shot print sessions (for example `pi --print ...`), pi-lens auto-uses a quick startup path that skips heavy bootstrap work to reduce startup latency. Override with `PI_LENS_STARTUP_MODE=full|minimal|quick`.
