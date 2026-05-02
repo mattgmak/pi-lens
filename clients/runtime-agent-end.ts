@@ -159,8 +159,9 @@ export async function handleAgentEnd({
 			"warning",
 		);
 	} else if (summary.changed.length > 0) {
+		const names = summary.changed.map((f) => path.basename(f)).join(", ");
 		notify(
-			`pi-lens deferred format applied to ${summary.changed.length} file(s)`,
+			`pi-lens deferred format applied to ${summary.changed.length} file(s): ${names}`,
 			"info",
 		);
 	}

@@ -50,7 +50,7 @@ describe("runtime-agent-end deferred formatting", () => {
 			expect(runtime.pendingDeferredFormatCount).toBe(0);
 			expect(modifiedRanges.map((entry) => entry.filePath)).toEqual([filePath]);
 			expect(notify).toHaveBeenCalledWith(
-				"pi-lens deferred format applied to 1 file(s)",
+				"pi-lens deferred format applied to 1 file(s): app.ts",
 				"info",
 			);
 		} finally {
