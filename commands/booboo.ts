@@ -1260,7 +1260,7 @@ export async function handleBooboo(
 				timeout: 120_000,
 			});
 			const output = (result.stdout || "") + (result.stderr || "");
-			const mvnRe = /^\[ERROR\]\s+(.+?\.java):\[(\d+),(\d+)\]\s+(.+)$/gm;
+			const mvnRe = /^\[ERROR\]\s+([^\s[]+\.java):\[(\d+),(\d+)\]\s+(.+)$/gm;
 			for (const m of output.matchAll(mvnRe)) {
 				const [, file, line, col, msg] = m;
 				const absFile = path.isAbsolute(file) ? file : path.join(targetPath, file);
@@ -1272,7 +1272,7 @@ export async function handleBooboo(
 			const gradleCmd = nodeFs.existsSync(path.join(targetPath, "gradlew")) ? "./gradlew" : "gradle";
 			const result = safeSpawn(gradleCmd, ["compileJava", "--quiet"], { cwd: targetPath, timeout: 120_000 });
 			const output = (result.stdout || "") + (result.stderr || "");
-			const gradleRe = /^(.+?\.(?:java|kt)):\s*(\d+):\s*(?:error|warning):\s*(.+)$/gm;
+			const gradleRe = /^([^\s:]+\.(?:java|kt)):\s*(\d+):\s*(?:error|warning):\s*(.+)$/gm;
 			for (const m of output.matchAll(gradleRe)) {
 				const [, file, line, msg] = m;
 				const absFile = path.isAbsolute(file) ? file : path.join(targetPath, file);
@@ -1288,7 +1288,7 @@ export async function handleBooboo(
 			if (hasDotnet) {
 				const result = safeSpawn("dotnet", ["build", "--no-incremental", "-v", "minimal"], { cwd: targetPath, timeout: 120_000 });
 				const output = (result.stdout || "") + (result.stderr || "");
-				const csRe = /^(.*?\.cs)\((\d+),(\d+)\):\s+(error|warning)\s+([A-Z]+\d+):\s+(.+?)(?:\s+\[.+?\])?$/gm;
+				const csRe = /^([^\s(]+\.cs)\((\d+),(\d+)\):\s+(error|warning)\s+([A-Z]+\d+):\s+([^[]+?)(?:\s+\[[^\]]+\])?$/gm;
 				for (const m of output.matchAll(csRe)) {
 					const [, file, line, col, sev, code, msg] = m;
 					const absFile = path.isAbsolute(file) ? file : path.join(targetPath, file);
@@ -1340,7 +1340,7 @@ export async function handleBooboo(
 			if (hasZig) {
 				const result = safeSpawn("zig", ["build", "--summary", "none"], { cwd: targetPath, timeout: 120_000 });
 				const output = (result.stdout || "") + (result.stderr || "");
-				const zigRe = /^(.+?):(\d+):(\d+):\s*(error|warning|note):\s*(.+)$/gm;
+				const zigRe = /^([^:]+):(\d+):(\d+):\s*(error|warning|note):\s*(.+)$/gm;
 				for (const m of output.matchAll(zigRe)) {
 					const [, file, line, col, sev, msg] = m;
 					const absFile = path.isAbsolute(file) ? file : path.join(targetPath, file);
@@ -1357,7 +1357,7 @@ export async function handleBooboo(
 			if (hasMix) {
 				const result = safeSpawn("mix", ["compile", "--warnings-as-errors"], { cwd: targetPath, timeout: 60_000 });
 				const output = (result.stdout || "") + (result.stderr || "");
-				const elixirRe = /^(?:warning|error):\s+(.+)\n\s+(.+):(\d+)/gm;
+				const elixirRe = /^(?:warning|error):\s+([^\n]+)\n\s+([^:\n]+):(\d+)/gm;
 				for (const m of output.matchAll(elixirRe)) {
 					const [, msg, file, line] = m;
 					const absFile = path.isAbsolute(file) ? file : path.join(targetPath, file);
