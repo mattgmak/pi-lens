@@ -1255,45 +1255,98 @@ export async function handleBooboo(
 
 		// Java: mvn compile (preferred) or javac on discovered .java files
 		if (nodeFs.existsSync(path.join(targetPath, "pom.xml"))) {
-			const result = safeSpawn("mvn", ["compile", "-q", "-B", "--no-transfer-progress"], {
+			const result = safeSpawn(
+				"mvn",
+				["compile", "-q", "-B", "--no-transfer-progress"],
+				{
+					cwd: targetPath,
+					timeout: 120_000,
+				},
+			);
+			const output = (result.stdout || "") + (result.stderr || "");
+			const mvnRe = /^\[ERROR\]\s+([^\s[]+\.java):\[(\d+),(\d+)\]\s+([^\n]+)/gm;
+			for (const m of output.matchAll(mvnRe)) {
+				const [, file, line, col, msg] = m;
+				const absFile = path.isAbsolute(file)
+					? file
+					: path.join(targetPath, file);
+				if (shouldIncludeFile(absFile)) {
+					issues.push({
+						file: path.relative(targetPath, absFile),
+						line: parseInt(line, 10),
+						col: parseInt(col, 10),
+						severity: "error",
+						code: "javac",
+						message: msg.trim(),
+						compiler: "mvn compile",
+					});
+				}
+			}
+		} else if (
+			nodeFs.existsSync(path.join(targetPath, "build.gradle")) ||
+			nodeFs.existsSync(path.join(targetPath, "build.gradle.kts"))
+		) {
+			const gradleCmd = nodeFs.existsSync(path.join(targetPath, "gradlew"))
+				? "./gradlew"
+				: "gradle";
+			const result = safeSpawn(gradleCmd, ["compileJava", "--quiet"], {
 				cwd: targetPath,
 				timeout: 120_000,
 			});
 			const output = (result.stdout || "") + (result.stderr || "");
-			const mvnRe = /^\[ERROR\]\s+([^\s[]+\.java):\[(\d+),(\d+)\]\s+(.+)$/gm;
-			for (const m of output.matchAll(mvnRe)) {
-				const [, file, line, col, msg] = m;
-				const absFile = path.isAbsolute(file) ? file : path.join(targetPath, file);
-				if (shouldIncludeFile(absFile)) {
-					issues.push({ file: path.relative(targetPath, absFile), line: parseInt(line, 10), col: parseInt(col, 10), severity: "error", code: "javac", message: msg.trim(), compiler: "mvn compile" });
-				}
-			}
-		} else if (nodeFs.existsSync(path.join(targetPath, "build.gradle")) || nodeFs.existsSync(path.join(targetPath, "build.gradle.kts"))) {
-			const gradleCmd = nodeFs.existsSync(path.join(targetPath, "gradlew")) ? "./gradlew" : "gradle";
-			const result = safeSpawn(gradleCmd, ["compileJava", "--quiet"], { cwd: targetPath, timeout: 120_000 });
-			const output = (result.stdout || "") + (result.stderr || "");
-			const gradleRe = /^([^\s:]+\.(?:java|kt)):\s*(\d+):\s*(?:error|warning):\s*(.+)$/gm;
+			const gradleRe =
+				/^([^\s:]+\.(?:java|kt)):\s*(\d+):\s*(?:error|warning):\s+([^\n]+)/gm;
 			for (const m of output.matchAll(gradleRe)) {
 				const [, file, line, msg] = m;
-				const absFile = path.isAbsolute(file) ? file : path.join(targetPath, file);
+				const absFile = path.isAbsolute(file)
+					? file
+					: path.join(targetPath, file);
 				if (shouldIncludeFile(absFile)) {
-					issues.push({ file: path.relative(targetPath, absFile), line: parseInt(line, 10), col: 1, severity: "error", code: "gradle", message: msg.trim(), compiler: "gradle compileJava" });
+					issues.push({
+						file: path.relative(targetPath, absFile),
+						line: parseInt(line, 10),
+						col: 1,
+						severity: "error",
+						code: "gradle",
+						message: msg.trim(),
+						compiler: "gradle compileJava",
+					});
 				}
 			}
 		}
 
 		// C#: dotnet build
-		if (nodeFs.readdirSync(targetPath).some((e) => /\.(sln|slnx|csproj)$/i.test(e))) {
-			const hasDotnet = safeSpawn("dotnet", ["--version"], { timeout: 5_000 }).status === 0;
+		if (
+			nodeFs
+				.readdirSync(targetPath)
+				.some((e) => /\.(sln|slnx|csproj)$/i.test(e))
+		) {
+			const hasDotnet =
+				safeSpawn("dotnet", ["--version"], { timeout: 5_000 }).status === 0;
 			if (hasDotnet) {
-				const result = safeSpawn("dotnet", ["build", "--no-incremental", "-v", "minimal"], { cwd: targetPath, timeout: 120_000 });
+				const result = safeSpawn(
+					"dotnet",
+					["build", "--no-incremental", "-v", "minimal"],
+					{ cwd: targetPath, timeout: 120_000 },
+				);
 				const output = (result.stdout || "") + (result.stderr || "");
-				const csRe = /^([^\s(]+\.cs)\((\d+),(\d+)\):\s+(error|warning)\s+([A-Z]+\d+):\s+([^[]+?)(?:\s+\[[^\]]+\])?$/gm;
+				const csRe =
+					/^([^\s(]+\.cs)\((\d+),(\d+)\):\s+(error|warning)\s+([A-Z]+\d+):\s+([^[]+)(?:\s+\[[^\]]+\])?/gm;
 				for (const m of output.matchAll(csRe)) {
 					const [, file, line, col, sev, code, msg] = m;
-					const absFile = path.isAbsolute(file) ? file : path.join(targetPath, file);
+					const absFile = path.isAbsolute(file)
+						? file
+						: path.join(targetPath, file);
 					if (shouldIncludeFile(absFile)) {
-						issues.push({ file: path.relative(targetPath, absFile), line: parseInt(line, 10), col: parseInt(col, 10), severity: sev, code, message: msg.trim(), compiler: "dotnet build" });
+						issues.push({
+							file: path.relative(targetPath, absFile),
+							line: parseInt(line, 10),
+							col: parseInt(col, 10),
+							severity: sev,
+							code,
+							message: msg.trim(),
+							compiler: "dotnet build",
+						});
 					}
 				}
 			}
@@ -1301,34 +1354,63 @@ export async function handleBooboo(
 
 		// Dart: dart analyze
 		if (nodeFs.existsSync(path.join(targetPath, "pubspec.yaml"))) {
-			const hasDart = safeSpawn("dart", ["--version"], { timeout: 5_000 }).status === 0;
+			const hasDart =
+				safeSpawn("dart", ["--version"], { timeout: 5_000 }).status === 0;
 			if (hasDart) {
-				const result = safeSpawn("dart", ["analyze", "--format=machine"], { cwd: targetPath, timeout: 60_000 });
+				const result = safeSpawn("dart", ["analyze", "--format=machine"], {
+					cwd: targetPath,
+					timeout: 60_000,
+				});
 				const output = (result.stdout || "") + (result.stderr || "");
 				// severity|type|code|file|line|col|length|message
 				for (const line of output.split(/\r?\n/)) {
 					const parts = line.split("|");
 					if (parts.length < 8) continue;
 					const [sev, , code, file, lineNum, , , ...msgParts] = parts;
-					const absFile = path.isAbsolute(file) ? file : path.join(targetPath, file);
+					const absFile = path.isAbsolute(file)
+						? file
+						: path.join(targetPath, file);
 					if (!shouldIncludeFile(absFile)) continue;
-					issues.push({ file: path.relative(targetPath, absFile), line: parseInt(lineNum, 10), col: 1, severity: sev.toLowerCase() === "error" ? "error" : "warning", code: code.trim(), message: msgParts.join("|").trim(), compiler: "dart analyze" });
+					issues.push({
+						file: path.relative(targetPath, absFile),
+						line: parseInt(lineNum, 10),
+						col: 1,
+						severity: sev.toLowerCase() === "error" ? "error" : "warning",
+						code: code.trim(),
+						message: msgParts.join("|").trim(),
+						compiler: "dart analyze",
+					});
 				}
 			}
 		}
 
 		// Gleam: gleam check
 		if (nodeFs.existsSync(path.join(targetPath, "gleam.toml"))) {
-			const hasGleam = safeSpawn("gleam", ["--version"], { timeout: 5_000 }).status === 0;
+			const hasGleam =
+				safeSpawn("gleam", ["--version"], { timeout: 5_000 }).status === 0;
 			if (hasGleam) {
-				const result = safeSpawn("gleam", ["check"], { cwd: targetPath, timeout: 60_000 });
+				const result = safeSpawn("gleam", ["check"], {
+					cwd: targetPath,
+					timeout: 60_000,
+				});
 				const output = (result.stdout || "") + (result.stderr || "");
-				const gleamRe = /^(.+?):(\d+):(\d+)\s*(?:error|warning)[^\n]*\n([^\n]+)/gm;
+				const gleamRe =
+					/^([^:]+):(\d+):(\d+)\s*(?:error|warning)[^\n]*\n([^\n]+)/gm;
 				for (const m of output.matchAll(gleamRe)) {
 					const [, file, line, col, msg] = m;
-					const absFile = path.isAbsolute(file) ? file : path.join(targetPath, file);
+					const absFile = path.isAbsolute(file)
+						? file
+						: path.join(targetPath, file);
 					if (shouldIncludeFile(absFile)) {
-						issues.push({ file: path.relative(targetPath, absFile), line: parseInt(line, 10), col: parseInt(col, 10), severity: "error", code: "gleam", message: msg.trim(), compiler: "gleam check" });
+						issues.push({
+							file: path.relative(targetPath, absFile),
+							line: parseInt(line, 10),
+							col: parseInt(col, 10),
+							severity: "error",
+							code: "gleam",
+							message: msg.trim(),
+							compiler: "gleam check",
+						});
 					}
 				}
 			}
@@ -1336,16 +1418,30 @@ export async function handleBooboo(
 
 		// Zig: zig build (or zig check on entry files)
 		if (nodeFs.existsSync(path.join(targetPath, "build.zig"))) {
-			const hasZig = safeSpawn("zig", ["version"], { timeout: 5_000 }).status === 0;
+			const hasZig =
+				safeSpawn("zig", ["version"], { timeout: 5_000 }).status === 0;
 			if (hasZig) {
-				const result = safeSpawn("zig", ["build", "--summary", "none"], { cwd: targetPath, timeout: 120_000 });
+				const result = safeSpawn("zig", ["build", "--summary", "none"], {
+					cwd: targetPath,
+					timeout: 120_000,
+				});
 				const output = (result.stdout || "") + (result.stderr || "");
 				const zigRe = /^([^:]+):(\d+):(\d+):\s*(error|warning|note):\s*(.+)$/gm;
 				for (const m of output.matchAll(zigRe)) {
 					const [, file, line, col, sev, msg] = m;
-					const absFile = path.isAbsolute(file) ? file : path.join(targetPath, file);
+					const absFile = path.isAbsolute(file)
+						? file
+						: path.join(targetPath, file);
 					if (!absFile.includes("zig-cache") && shouldIncludeFile(absFile)) {
-						issues.push({ file: path.relative(targetPath, absFile), line: parseInt(line, 10), col: parseInt(col, 10), severity: sev === "error" ? "error" : "warning", code: "zig", message: msg.trim(), compiler: "zig build" });
+						issues.push({
+							file: path.relative(targetPath, absFile),
+							line: parseInt(line, 10),
+							col: parseInt(col, 10),
+							severity: sev === "error" ? "error" : "warning",
+							code: "zig",
+							message: msg.trim(),
+							compiler: "zig build",
+						});
 					}
 				}
 			}
@@ -1353,16 +1449,38 @@ export async function handleBooboo(
 
 		// Elixir: mix compile
 		if (nodeFs.existsSync(path.join(targetPath, "mix.exs"))) {
-			const hasMix = safeSpawn("mix", ["--version"], { timeout: 5_000 }).status === 0;
+			const hasMix =
+				safeSpawn("mix", ["--version"], { timeout: 5_000 }).status === 0;
 			if (hasMix) {
-				const result = safeSpawn("mix", ["compile", "--warnings-as-errors"], { cwd: targetPath, timeout: 60_000 });
+				const result = safeSpawn("mix", ["compile", "--warnings-as-errors"], {
+					cwd: targetPath,
+					timeout: 60_000,
+				});
 				const output = (result.stdout || "") + (result.stderr || "");
-				const elixirRe = /^(?:warning|error):\s+([^\n]+)\n\s+([^:\n]+):(\d+)/gm;
-				for (const m of output.matchAll(elixirRe)) {
-					const [, msg, file, line] = m;
-					const absFile = path.isAbsolute(file) ? file : path.join(targetPath, file);
+				const elixirLines = output.split(/\r?\n/);
+				for (let i = 0; i < elixirLines.length; i++) {
+					const line = elixirLines[i];
+					const prefixMatch = line.match(/^(?:warning|error):\s+/);
+					if (!prefixMatch) continue;
+					const msg = line.slice(prefixMatch[0].length);
+					const nextLine = elixirLines[i + 1];
+					if (!nextLine) continue;
+					const locMatch = nextLine.trim().match(/^([^:]+):(\d+)$/);
+					if (!locMatch) continue;
+					const [, file, lineNum] = locMatch;
+					const absFile = path.isAbsolute(file)
+						? file
+						: path.join(targetPath, file);
 					if (shouldIncludeFile(absFile)) {
-						issues.push({ file: path.relative(targetPath, absFile), line: parseInt(line, 10), col: 1, severity: "warning", code: "mix", message: msg.trim(), compiler: "mix compile" });
+						issues.push({
+							file: path.relative(targetPath, absFile),
+							line: parseInt(lineNum, 10),
+							col: 1,
+							severity: "warning",
+							code: "mix",
+							message: msg.trim(),
+							compiler: "mix compile",
+						});
 					}
 				}
 			}
