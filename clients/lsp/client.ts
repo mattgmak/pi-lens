@@ -725,7 +725,19 @@ async function clientShutdown(state: LSPClientState): Promise<void> {
 		/* ignore */
 	}
 	disposeClientConnection(state);
-	state.lspProcess.process.kill();
+	const pid = state.lspProcess.pid;
+	state.lspProcess.process.kill("SIGTERM");
+	// On Windows, SIGTERM only kills the direct child process — grandchildren
+	// (e.g. tsserver.js spawned by typescript-language-server) are orphaned.
+	// Use taskkill /F /T to kill the full process tree, matching the crash path.
+	if (process.platform === "win32" && pid > 0) {
+		try {
+			nodeSpawn("taskkill", ["/F", "/T", "/PID", String(pid)], {
+				shell: false,
+				windowsHide: true,
+			});
+		} catch {}
+	}
 }
 
 async function navRequest<T>(

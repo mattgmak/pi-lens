@@ -358,6 +358,8 @@ export function resetDispatchBaselines(): void {
 	primaryFilesThisTurn.clear();
 	cascadeDiagnosticBaselines.clear();
 	cascadeSessionStats = { runs: 0, diagnosticsSurfaced: 0, coldSnapshotTouches: 0 };
+	for (const timer of astGrepWarnDebounceTimers.values()) clearTimeout(timer);
+	astGrepWarnDebounceTimers.clear();
 }
 
 let cascadeSessionStats = { runs: 0, diagnosticsSurfaced: 0, coldSnapshotTouches: 0 };
