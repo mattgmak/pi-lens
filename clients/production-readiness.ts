@@ -256,9 +256,9 @@ function validateConfig(root: string): CategoryResult {
 
 	const found: string[] = [];
 
-	for (const { file, critical, dir } of checks) {
+	for (const { file, critical } of checks) {
 		const filePath = path.join(root, file);
-		const exists = dir ? fs.existsSync(filePath) : fs.existsSync(filePath);
+		const exists = fs.existsSync(filePath);
 		if (exists) {
 			found.push(file);
 		} else if (critical) {

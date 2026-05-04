@@ -244,7 +244,7 @@ export function sanitizeGoOutput(output: string): string {
 
 	return extractDiagnosticLines(output, (line) => {
 		const clean = stripAnsi(line);
-		return /^\.\/|\.go:/.test(clean) || isErrorLine(clean);
+		return /(?:^\.\/)|(?:\.go:)/.test(clean) || isErrorLine(clean);
 	});
 }
 

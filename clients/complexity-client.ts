@@ -386,7 +386,7 @@ export class ComplexityClient {
 		let count = 0;
 
 		const aiPatterns = [
-			/[🔍✅📝🔧🐛⚠️🚀💡🎯📌🏷️🔑🏗️🧪🗑️🔄♻️📋🔖📊💬🔥💎⭐🌟🎯🎨🔧🛠️]/u,
+			/(?:[🔍✅📝🔧🐛🚀💡🎯📌🏷️🔑🏗️🧪🗑️🔄♻️📋🔖📊💬🔥💎⭐🌟🎯🎨🔧🛠️]|⚠️)/u,
 			/\/\/\s*(Initialize|Setup|Clean up|Create|Define|Check if|Handle|Process|Validate|Return|Get|Set|Add|Remove|Update|Fetch)\b/i,
 			/\/\/\s*(This function|This method|This code|Here we|Now we)\b/i,
 			/\/\*\*?\s*(Overview|Summary|Description|Example|Usage)\s*\*?\//i,

@@ -148,14 +148,8 @@ const shellcheckRunner: RunnerDefinition = {
 		}
 		if (!cmd) return { status: "skipped", diagnostics: [], semantic: "none" };
 
-		// Determine shell dialect from file extension
-		const shellDialect = ctx.filePath.endsWith(".zsh")
-			? "bash"
-			: ctx.filePath.endsWith(".fish")
-				? "bash"
-				: ctx.filePath.endsWith(".sh")
-					? "bash"
-					: "bash"; // Default to bash for generic shell files
+		// Determine shell dialect from file extension (all map to bash for shellcheck)
+		const shellDialect = "bash";
 
 		// Build args
 		// --format json: JSON output

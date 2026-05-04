@@ -317,9 +317,7 @@ export class KnipClient {
 										? "unlisted"
 										: rawType === "bin" || rawType === "binaries"
 											? "bin"
-											: rawType === "file"
-												? "file"
-												: "file";
+											: "file";
 					addIssue({
 						type,
 						name: String(
