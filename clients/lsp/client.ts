@@ -21,6 +21,7 @@ import {
 
 import type { LSPProcess } from "./launch.js";
 import { normalizeMapKey, uriToPath } from "./path-utils.js";
+import { getStrategy } from "./server-strategies.js";
 
 // --- Types ---
 
@@ -228,10 +229,6 @@ export interface LSPClientInfo {
 
 // --- Constants ---
 
-const DIAGNOSTICS_DEBOUNCE_MS = positiveIntFromEnv(
-	"PI_LENS_LSP_DIAGNOSTICS_DEBOUNCE_MS",
-	150,
-); // ms — waits for follow-up semantic diagnostics
 const INITIALIZE_TIMEOUT_MS = positiveIntFromEnv(
 	"PI_LENS_LSP_INIT_TIMEOUT_MS",
 	15_000,
@@ -243,10 +240,6 @@ const NAV_REQUEST_TIMEOUT_MS = positiveIntFromEnv(
 const DIAGNOSTICS_WAIT_TIMEOUT_MS = positiveIntFromEnv(
 	"PI_LENS_LSP_DIAGNOSTICS_WAIT_MS",
 	10_000,
-);
-const PULL_DIAGNOSTICS_RETRY_BUDGET_MS = positiveIntFromEnv(
-	"PI_LENS_LSP_PULL_RETRY_BUDGET_MS",
-	1200,
 );
 const PULL_DIAGNOSTICS_RETRY_INTERVAL_MS = positiveIntFromEnv(
 	"PI_LENS_LSP_PULL_RETRY_INTERVAL_MS",
@@ -481,6 +474,19 @@ function setupIncomingHandlers(
 			const filePath = uriToPath(params.uri);
 			const normalizedPath = normalizeMapKey(filePath);
 			const newDiags: LSPDiagnostic[] = params.diagnostics || [];
+			const strategy = getStrategy(state.serverId);
+
+			// Seed on first push for servers whose first push is known complete.
+			// Bypasses the debounce timer entirely — resolves waiting promises immediately.
+			if (
+				strategy.seedFirstPush &&
+				!state.pushDiagnostics.has(normalizedPath)
+			) {
+				state.pushDiagnostics.set(normalizedPath, newDiags);
+				state.pushDiagnosticTimestamps.set(normalizedPath, Date.now());
+				state.diagnosticEmitter.emit("diagnostics", normalizedPath);
+				return;
+			}
 
 			const existingTimer = state.pendingDiagnostics.get(normalizedPath);
 			if (existingTimer) clearTimeout(existingTimer);
@@ -490,7 +496,7 @@ function setupIncomingHandlers(
 				state.pushDiagnosticTimestamps.set(normalizedPath, Date.now());
 				state.pendingDiagnostics.delete(normalizedPath);
 				state.diagnosticEmitter.emit("diagnostics", normalizedPath);
-			}, DIAGNOSTICS_DEBOUNCE_MS);
+			}, strategy.debounceMs);
 
 			state.pendingDiagnostics.set(normalizedPath, timer);
 		},
@@ -608,7 +614,11 @@ export async function clientWaitForDiagnostics(
 		const firstPullCount = await clientRequestPullDiagnostics(state, filePath);
 		if (firstPullCount > 0) return;
 
-		const retryBudgetMs = Math.min(timeoutMs, PULL_DIAGNOSTICS_RETRY_BUDGET_MS);
+		const strategy = getStrategy(state.serverId);
+		const retryBudgetMs =
+			strategy.pullRetryBudgetMs > 0
+				? Math.min(timeoutMs, strategy.pullRetryBudgetMs)
+				: 0;
 		const startedAt = Date.now();
 		let latestCount = firstPullCount;
 
@@ -629,11 +639,19 @@ export async function clientWaitForDiagnostics(
 		const onDiagnostics = (fp: string) => {
 			if (normalizeMapKey(fp) !== normalizedPath) return;
 			if (debounceTimer) clearTimeout(debounceTimer);
+
+			// Adaptive debounce: use time since last push to compute remaining
+			// wait instead of always waiting the full debounce window.
+			const strategy = getStrategy(state.serverId);
+			const hit = state.pushDiagnosticTimestamps.get(normalizedPath);
+			const timeSincePush = hit ? Date.now() - hit : Infinity;
+			const remaining = Math.max(0, strategy.debounceMs - timeSincePush);
+
 			debounceTimer = setTimeout(() => {
 				state.diagnosticEmitter.off("diagnostics", onDiagnostics);
 				clearTimeout(timeout);
 				resolve();
-			}, DIAGNOSTICS_DEBOUNCE_MS);
+			}, remaining);
 		};
 
 		state.diagnosticEmitter.on("diagnostics", onDiagnostics);

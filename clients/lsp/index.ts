@@ -20,6 +20,8 @@ import { createLSPClient } from "./client.js";
 import { getServersForFileWithConfig } from "./config.js";
 import { getLanguageId } from "./language.js";
 import type { LSPServerInfo } from "./server.js";
+import { getStrategy } from "./server-strategies.js";
+import { raceToCompletion } from "./aggregation.js";
 
 // --- Types ---
 
@@ -44,13 +46,6 @@ const TOUCH_DEBOUNCE_MS = Math.max(
 	0,
 	Number.parseInt(process.env.PI_LENS_LSP_TOUCH_DEBOUNCE_MS ?? "1500", 10) ||
 		1500,
-);
-const DIAGNOSTICS_AGGREGATE_WAIT_MS = Math.max(
-	0,
-	Number.parseInt(
-		process.env.PI_LENS_LSP_DIAGNOSTICS_AGGREGATE_WAIT_MS ?? "1500",
-		10,
-	) || 1500,
 );
 const DIAGNOSTICS_SEMANTIC_SETTLE_THRESHOLD_MS = Math.max(
 	0,
@@ -667,6 +662,7 @@ export class LSPService {
 	 */
 	async getDiagnostics(
 		filePath: string,
+		diagnosticsMode: LSPDiagnosticsMode = "full",
 	): Promise<import("./client.js").LSPDiagnostic[]> {
 		if (this.checkDestroyed()) return [];
 		const startedAt = Date.now();
@@ -691,82 +687,81 @@ export class LSPService {
 			return [];
 		}
 
-		// TypeScript LSP often pushes syntactic diagnostics first (sometimes empty)
-		// and semantic diagnostics shortly after. Keep the aggregate wait short for
-		// interactive edits, then do one brief settle pass only when the first
-		// response was empty and arrived quickly.
-		//
-		// Early-unblock: each client writes into pendingResults as it finishes. The
-		// outer race exits as soon as all clients are done OR the first client finishes
-		// and the grace window elapses, whichever is sooner. Remaining slots are left
-		// undefined and filled with zero-diagnostic defaults before merging.
+		// Per-server entries produced by client waits. Each promise resolves
+		// with a PerServerEntry; raceToCompletion collects them as they finish.
 		type PerServerEntry = {
 			serverId: string;
 			waitMs: number;
 			diagnosticCount: number;
 			diagnostics: import("./client.js").LSPDiagnostic[];
 		};
-		const pendingResults: (PerServerEntry | undefined)[] = new Array(
-			spawned.length,
-		).fill(undefined);
 
-		const clientWaits = spawned.map(async (entry, index) => {
-			const waitStart = Date.now();
-			await entry.client.waitForDiagnostics(
-				filePath,
-				DIAGNOSTICS_AGGREGATE_WAIT_MS,
-			);
-			let diagnostics = entry.client.getDiagnostics(filePath);
-			const firstWaitMs = Date.now() - waitStart;
-			if (
-				diagnostics.length === 0 &&
-				firstWaitMs < DIAGNOSTICS_SEMANTIC_SETTLE_THRESHOLD_MS
-			) {
+		const clientWaits: Promise<PerServerEntry>[] = spawned.map(
+			async (entry) => {
+				const waitStart = Date.now();
+				const strategy = getStrategy(entry.info.id);
 				await entry.client.waitForDiagnostics(
 					filePath,
-					DIAGNOSTICS_SEMANTIC_SETTLE_WAIT_MS,
+					strategy.aggregateWaitMs,
 				);
-				diagnostics = entry.client.getDiagnostics(filePath);
-			}
-			pendingResults[index] = {
-				serverId: entry.info.id,
-				waitMs: Date.now() - waitStart,
-				diagnosticCount: diagnostics.length,
-				diagnostics,
-			};
-			return pendingResults[index]!;
-		});
+				let diagnostics = entry.client.getDiagnostics(filePath);
+				const firstWaitMs = Date.now() - waitStart;
+				if (
+					strategy.expectSemanticSecondPush &&
+					diagnostics.length === 0 &&
+					firstWaitMs < DIAGNOSTICS_SEMANTIC_SETTLE_THRESHOLD_MS
+				) {
+					await entry.client.waitForDiagnostics(
+						filePath,
+						DIAGNOSTICS_SEMANTIC_SETTLE_WAIT_MS,
+					);
+					diagnostics = entry.client.getDiagnostics(filePath);
+				}
+				return {
+					serverId: entry.info.id,
+					waitMs: Date.now() - waitStart,
+					diagnosticCount: diagnostics.length,
+					diagnostics,
+				};
+			},
+		);
 
-		if (EARLY_UNBLOCK_GRACE_MS > 0 && spawned.length > 1) {
-			await Promise.race([
-				Promise.all(clientWaits),
-				Promise.race(clientWaits).then(
-					() =>
-						new Promise<void>((resolve) =>
-							setTimeout(resolve, EARLY_UNBLOCK_GRACE_MS),
-						),
+		// Document mode: 0ms grace — return as soon as any client has results.
+		// Full mode: 400ms grace — wait a bit for other clients to catch up.
+		const graceMs = diagnosticsMode === "document" ? 0 : EARLY_UNBLOCK_GRACE_MS;
+
+		// Result-aware racing: only trigger early-unblock when at least one
+		// client has returned non-empty diagnostics.
+		const perServer = await raceToCompletion(
+			clientWaits,
+			(results) => results.some((r) => r.diagnosticCount > 0),
+			{
+				timeoutMs: Math.max(
+					...spawned.map((entry) => getStrategy(entry.info.id).aggregateWaitMs),
 				),
-			]);
-		} else {
-			await Promise.all(clientWaits);
-		}
+				graceMs,
+			},
+		);
 
-		const earlyUnblockedCount = pendingResults.filter(
-			(r) => r === undefined,
-		).length;
-		const perServer: PerServerEntry[] = pendingResults.map(
-			(r, i) =>
-				r ?? {
-					serverId: spawned[i].info.id,
-					waitMs: DIAGNOSTICS_AGGREGATE_WAIT_MS,
+		// Fill in any slots that timed out before producing results.
+		const earlyUnblockedCount = spawned.length - perServer.length;
+		const perServerFull: PerServerEntry[] = spawned.map((entry) => {
+			const found = perServer.find((r) => r.serverId === entry.info.id);
+			return (
+				found ?? {
+					serverId: entry.info.id,
+					waitMs: getStrategy(entry.info.id).aggregateWaitMs,
 					diagnosticCount: 0,
 					diagnostics: [],
-				},
-		);
+				}
+			);
+		});
+
+		// Deduplicate across servers (same diagnostic reported by multiple tools).
 
 		const merged: import("./client.js").LSPDiagnostic[] = [];
 		const seen = new Set<string>();
-		for (const entry of perServer) {
+		for (const entry of perServerFull) {
 			for (const diagnostic of entry.diagnostics) {
 				const key = [
 					diagnostic.range.start.line,
@@ -779,11 +774,11 @@ export class LSPService {
 			}
 		}
 
-		const rawCount = perServer.reduce(
+		const rawCount = perServerFull.reduce(
 			(sum, entry) => sum + entry.diagnosticCount,
 			0,
 		);
-		const serversWithDiagnostics = perServer.filter(
+		const serversWithDiagnostics = perServerFull.filter(
 			(entry) => entry.diagnosticCount > 0,
 		).length;
 		const failureKind = merged.length === 0 ? "ok_empty" : "success";
@@ -795,14 +790,15 @@ export class LSPService {
 			durationMs: Date.now() - startedAt,
 			metadata: {
 				serverCountAttempted: getServersForFileWithConfig(filePath).length,
-				serverCountReady: perServer.length,
+				serverCountReady: perServerFull.length,
 				serverCountWithDiagnostics: serversWithDiagnostics,
 				mergedCount: merged.length,
 				dedupDroppedCount: rawCount - merged.length,
 				earlyUnblockedCount,
+				diagnosticsMode,
 				failureKind,
 				health: failureKind === "success" ? "ok" : "ok_empty",
-				servers: perServer.map((entry) => ({
+				servers: perServerFull.map((entry) => ({
 					id: entry.serverId,
 					waitMs: entry.waitMs,
 					diagnosticCount: entry.diagnosticCount,
