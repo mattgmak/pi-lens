@@ -338,7 +338,7 @@ export class LSPService {
 
 		const normalizedRoot = normalizeMapKey(root);
 		const key = `${server.id}:${normalizedRoot}`;
-		const isOptionalServer = OPTIONAL_LSP_SERVER_IDS.has(server.id);
+		const isOptionalServer = OPTIONAL_LSP_SERVER_IDS.has(server.id); // NOSONAR: set intentionally empty — no optional servers configured yet
 
 		if (isOptionalServer && this.optionalDisabled.has(key)) {
 			return undefined;
@@ -418,7 +418,7 @@ export class LSPService {
 		filePath: string,
 		allowInstall: boolean,
 	): Promise<SpawnedServer | undefined> {
-		const isOptionalServer = OPTIONAL_LSP_SERVER_IDS.has(server.id);
+		const isOptionalServer = OPTIONAL_LSP_SERVER_IDS.has(server.id); // NOSONAR: set intentionally empty — no optional servers configured yet
 		const startedAt = Date.now();
 		logSessionStart(
 			`lsp spawn ${server.id}: start root=${root} install=${allowInstall ? "enabled" : "disabled"} file=${filePath}`,
