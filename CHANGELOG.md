@@ -6,6 +6,8 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Fixed
 
+- **tree-sitter wasm abort loop and memory leak (fixes #56)** — when the emscripten wasm runtime aborts (OOM or assertion failure on large workspaces), the module-level heap is permanently corrupted. pi-lens was re-invoking the dead runtime on every subsequent file write, printing `Aborted()` to stderr on each query and leaking memory on each retry. Added a module-level `_wasmAborted` flag: the first abort detected in the query catch loop poisons the singleton and prevents any further tree-sitter calls for the session. The runner skips cleanly with `reason: wasm_aborted_fatal` logged to `tree-sitter.log`.
+- **`turn_end` phases now instrumented in latency log** — `handleTurnEnd` previously had no `logLatency` calls; all timing data was buried in plain-text `dbg()` lines in `sessionstart.log`. Added per-phase latency entries for `cascade_merge`, `jscpd`, `knip`, and `madge`, plus a `tool_result` total with `fileCount` and `blockerSections`. This gives a baseline for measuring the cost of future turn_end additions (e.g. LSP re-query).
 - **Cascade ran graph build on non-code files** — markdown, YAML, JSON, and other files without a dispatchable kind were reaching `buildOrUpdateGraph`, causing cold graph builds that took up to 3–4 seconds per write with zero useful output. `computeCascadeForFile` now exits immediately with `cascade_skip / non_code_file` when `detectFileKind` returns `undefined`, consistent with the existing `shouldDispatch` gate used by the lint pipeline.
 
 ### Added

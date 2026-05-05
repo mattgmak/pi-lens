@@ -11,6 +11,7 @@ import {
 import { getKnipIgnorePatterns } from "./file-utils.js";
 import type { JscpdClient } from "./jscpd-client.js";
 import type { KnipClient, KnipIssue } from "./knip-client.js";
+import { logLatency } from "./latency-logger.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
 import type { TestRunnerClient } from "./test-runner-client.js";
@@ -117,6 +118,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		return;
 	}
 
+	const turnEndStart = Date.now();
 	const blockerParts: string[] = [];
 
 	// Merge accumulated cascade results from all pipeline runs this turn.
@@ -124,6 +126,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	//   1. Primary-level: dedup by primary file (last writer wins).
 	//   2. Neighbor-level: each neighbor is claimed by the latest cascade result
 	//      that covers it — suppresses stale neighbor state from earlier writes.
+	const t0 = Date.now();
 	const cascadeResults = runtime.consumeCascadeResults();
 	if (cascadeResults.length > 0) {
 		const seen = new Map<string, (typeof cascadeResults)[number]>();
@@ -163,7 +166,16 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			},
 		});
 	}
+	logLatency({
+		type: "phase",
+		toolName: "turn_end",
+		filePath: cwd,
+		phase: "cascade_merge",
+		durationMs: Date.now() - t0,
+		metadata: { resultCount: cascadeResults.length },
+	});
 
+	const t1 = Date.now();
 	if (runtime.isStartupScanInFlight("jscpd")) {
 		dbg("turn_end: skipping jscpd (startup scan still in flight)");
 	} else if (await jscpdClient.ensureAvailable()) {
@@ -238,7 +250,15 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			cacheManager.writeCache("jscpd", result, cwd);
 		}
 	}
+	logLatency({
+		type: "phase",
+		toolName: "turn_end",
+		filePath: cwd,
+		phase: "jscpd",
+		durationMs: Date.now() - t1,
+	});
 
+	const t2 = Date.now();
 	if (runtime.isStartupScanInFlight("knip")) {
 		dbg("turn_end: skipping knip (startup scan still in flight)");
 	} else if (await knipClient.ensureAvailable()) {
@@ -283,7 +303,15 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			}
 		}
 	}
+	logLatency({
+		type: "phase",
+		toolName: "turn_end",
+		filePath: cwd,
+		phase: "knip",
+		durationMs: Date.now() - t2,
+	});
 
+	const t3 = Date.now();
 	if (await depChecker.ensureAvailable()) {
 		const madgeFiles = cacheManager.getFilesForMadge(cwd);
 		if (madgeFiles.length > 0) {
@@ -307,6 +335,14 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			}
 		}
 	}
+
+	logLatency({
+		type: "phase",
+		toolName: "turn_end",
+		filePath: cwd,
+		phase: "madge",
+		durationMs: Date.now() - t3,
+	});
 
 	// --- Test runner: fire once per turn after all edits are done ---
 	// Runs for each unique test target across modified files; results appear
@@ -407,5 +443,13 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	}
 
 	runtime.fixedThisTurn.clear();
+	logLatency({
+		type: "tool_result",
+		toolName: "turn_end",
+		filePath: cwd,
+		durationMs: Date.now() - turnEndStart,
+		result: blockerParts.length > 0 ? "blockers_found" : "clean",
+		metadata: { fileCount: files.length, blockerSections: blockerParts.length },
+	});
 	resetFormatService();
 }

@@ -32,6 +32,11 @@ import type {
 // Creating a new TreeSitterClient() on every write resets TRANSFER_BUFFER (a module-level
 // WASM pointer) — concurrent writes race on _ts_init() and corrupt shared WASM state → crash.
 let _sharedClient: TreeSitterClient | null = null;
+// Once the wasm runtime aborts, the entire module-level wasm heap is corrupted — no
+// recovery is possible within this process. Flag it and skip all further tree-sitter work
+// rather than re-invoking the dead runtime (which prints "Aborted()" on every call and
+// leaks memory on each retry).
+let _wasmAborted = false;
 const blastCooldownByFile = new Map<string, number>();
 const BLAST_COOLDOWN_MS = 5_000;
 
@@ -244,7 +249,8 @@ function isLineInModifiedRanges(
 	return ranges.some((r) => line >= r.start && line <= r.end);
 }
 
-function getSharedClient(): TreeSitterClient {
+function getSharedClient(): TreeSitterClient | null {
+	if (_wasmAborted) return null;
 	if (!_sharedClient) {
 		_sharedClient = new TreeSitterClient();
 	}
@@ -276,11 +282,11 @@ const treeSitterRunner: RunnerDefinition = {
 		// Use singleton client — WASM must never be re-initialized after first call
 		const client = getSharedClient();
 		logTreeSitter({ phase: "runner_start", filePath: ctx.filePath });
-		if (!client.isAvailable()) {
+		if (!client || !client.isAvailable()) {
 			logTreeSitter({
 				phase: "runner_skip",
 				filePath: ctx.filePath,
-				reason: "client_unavailable",
+				reason: _wasmAborted ? "wasm_aborted" : "client_unavailable",
 				status: "skipped",
 			});
 			return { status: "skipped", diagnostics: [], semantic: "none" };
@@ -506,14 +512,29 @@ const treeSitterRunner: RunnerDefinition = {
 						}
 					} catch (err) {
 						// pi-lens-ignore: missing-error-propagation — per-query resilience loop, intentional
-						console.error(`[tree-sitter] Query ${query.id} failed:`, err);
-						logTreeSitter({
-							phase: "query_error",
-							filePath,
-							languageId,
-							queryId: query.id,
-							error: err instanceof Error ? err.message : String(err),
-						});
+						const msg = err instanceof Error ? err.message : String(err);
+						// Emscripten abort() corrupts the entire module-level wasm heap.
+						// Poison the singleton so no further queries attempt to use the dead runtime.
+						if (msg.includes("Aborted") || msg.includes("abort()")) {
+							_wasmAborted = true;
+							_sharedClient = null;
+							logTreeSitter({
+								phase: "query_error",
+								filePath,
+								languageId,
+								queryId: query.id,
+								error: "wasm_aborted_fatal",
+							});
+						} else {
+							console.error(`[tree-sitter] Query ${query.id} failed:`, err);
+							logTreeSitter({
+								phase: "query_error",
+								filePath,
+								languageId,
+								queryId: query.id,
+								error: msg,
+							});
+						}
 					}
 					return queryDiagnostics;
 				}),
