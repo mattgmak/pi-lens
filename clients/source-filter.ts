@@ -19,7 +19,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { isExcludedDirName } from "./file-utils.js";
+import { isExcludedDirName, readGitignoreDirs } from "./file-utils.js";
 
 /**
  * Mapping of file extension to the extensions it shadows (build artifacts).
@@ -141,7 +141,8 @@ export function collectSourceFiles(
 		followSymlinks?: boolean;
 	},
 ): string[] {
-	const extraExcludePatterns = options?.excludeDirs ?? [];
+	const gitignoreDirs = readGitignoreDirs(path.resolve(dir));
+	const extraExcludePatterns = [...(options?.excludeDirs ?? []), ...gitignoreDirs];
 
 	const extensions = new Set(options?.extensions || ALL_SCANNABLE_EXTENSIONS);
 

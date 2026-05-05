@@ -82,7 +82,39 @@ export const EXCLUDED_DIRS = [
 	".tox",
 	".pytest_cache",
 	"*.dSYM",
+	// Vendored upstream source conventions — universally too large to scan
+	"vendor",   // Go modules, PHP Composer, Ruby Bundler
+	"third_party", // Chromium/Google convention (llama.cpp, sherpa-onnx, gRPC, TF)
+	"third-party",
+	"vendors",
 ];
+
+/**
+ * Read simple directory-name entries from a root .gitignore.
+ * Only extracts bare names and names with a trailing slash — no wildcards,
+ * no negations, no paths with internal slashes. This covers the common case
+ * of large vendored trees (third_party/, vendor/, custom-build/) without
+ * requiring full gitignore-spec compliance.
+ */
+export function readGitignoreDirs(rootDir: string): string[] {
+	const gitignorePath = path.join(rootDir, ".gitignore");
+	try {
+		const content = fs.readFileSync(gitignorePath, "utf-8");
+		const dirs: string[] = [];
+		for (const rawLine of content.split(/\r?\n/)) {
+			const line = rawLine.trim();
+			if (!line || line.startsWith("#") || line.startsWith("!")) continue;
+			if (line.includes("*") || line.includes("?") || line.includes("[")) continue;
+			const name = line.endsWith("/") ? line.slice(0, -1) : line;
+			// Must be a simple name — no path separators
+			if (!name || name.includes("/") || name.includes("\\")) continue;
+			dirs.push(name);
+		}
+		return dirs;
+	} catch {
+		return [];
+	}
+}
 
 function globToRegExp(glob: string): RegExp {
 	const escaped = glob

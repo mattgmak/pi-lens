@@ -11,7 +11,7 @@ import { createDispatchContext } from "../clients/dispatch/dispatcher.js";
 import { evaluateRules } from "../clients/dispatch/fact-rule-runner.js";
 import { runProviders } from "../clients/dispatch/fact-runner.js";
 import { FactStore } from "../clients/dispatch/fact-store.js";
-import { getKnipIgnorePatterns, isTestFile } from "../clients/file-utils.js";
+import { getKnipIgnorePatterns, isTestFile, readGitignoreDirs } from "../clients/file-utils.js";
 import type { JscpdClient } from "../clients/jscpd-client.js";
 import type { KnipClient } from "../clients/knip-client.js";
 import { validateProductionReadiness } from "../clients/production-readiness.js";
@@ -125,6 +125,11 @@ export async function handleBooboo(
 	const requestedPath = args.trim() || ctx.cwd || process.cwd();
 	const targetPath = resolveProjectRoot(path.resolve(requestedPath));
 	const reviewRoot = targetPath;
+
+	// Dirs to exclude from all scanners — EXCLUDED_DIRS baseline + root .gitignore entries
+	const gitignoreDirs = readGitignoreDirs(targetPath);
+	// Build --globs exclusion args for sg scan
+	const sgExcludeGlobs = gitignoreDirs.flatMap((d) => ["--globs", `!**/${d}/**`]);
 
 	const categoryKey = (name: string) => name.toLowerCase().replace(/\s+/g, "-");
 
@@ -262,9 +267,16 @@ export async function handleBooboo(
 					"--globs",
 					"!**/node_modules/**",
 					"--globs",
+					"!**/vendor/**",
+					"--globs",
+					"!**/third_party/**",
+					"--globs",
+					"!**/third-party/**",
+					"--globs",
 					"!**/.git/**",
 					"--globs",
 					"!**/.ruff_cache/**",
+					...sgExcludeGlobs,
 					targetPath,
 				],
 				{
