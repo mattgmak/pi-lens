@@ -4,6 +4,10 @@ All notable changes to pi-lens will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Cascade ran graph build on non-code files** — markdown, YAML, JSON, and other files without a dispatchable kind were reaching `buildOrUpdateGraph`, causing cold graph builds that took up to 3–4 seconds per write with zero useful output. `computeCascadeForFile` now exits immediately with `cascade_skip / non_code_file` when `detectFileKind` returns `undefined`, consistent with the existing `shouldDispatch` gate used by the lint pipeline.
+
 ### Added
 
 - **Per-server LSP diagnostic strategies** — new `clients/lsp/server-strategies.ts` codifies known server behavior (TypeScript, rust-analyzer, pyright, ESLint) so timing decisions are automatic rather than one-size-fits-all. Strategies control first-push seeding, debounce window, pull retry budget, aggregate wait timeout, and whether a server benefits from a semantic second pull pass. Env var overrides (`PI_LENS_LSP_*`) take precedence. Unknown servers get a conservative default.

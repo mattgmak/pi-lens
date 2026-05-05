@@ -477,6 +477,11 @@ export async function computeCascadeForFile(
 		return undefined;
 	}
 
+	if (!detectFileKind(filePath)) {
+		logCascade({ phase: "cascade_skip", filePath, reason: "non_code_file" });
+		return undefined;
+	}
+
 	const normalizedFile = resolveRunnerPath(cwd, filePath);
 	const normalizedFileKey = normalizeMapKey(normalizedFile);
 
