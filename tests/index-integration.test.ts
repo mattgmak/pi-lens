@@ -204,7 +204,7 @@ describe("index.ts integration", () => {
 			messages: [
 				expect.objectContaining({
 					role: "user",
-					content: expect.stringContaining("[pi-lens] Session guidance"),
+					content: expect.stringContaining("[pi-lens automated context — not a user request]"),
 				}),
 				userMessage,
 			],
