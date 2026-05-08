@@ -4,6 +4,12 @@ All notable changes to pi-lens will be documented in this file.
 
 ## [Unreleased]
 
+## [3.8.43] - 2026-05-08
+
+### Added
+
+- **Unresolved inline blocker re-surfacing at turn_end** — when the agent ignores a blocking diagnostic shown during a write/edit and moves to the next turn without fixing it, the blocker now reappears in the turn_end injection framed as `"Unresolved from this turn — <file>: 🔴 STOP…"`. Previously, unresolved inline blockers were silently lost until cascade happened to re-touch the same file via an importer. `RuntimeCoordinator` tracks the last-seen blocking output per file (`_pendingInlineBlockers`); a subsequent write that produces no blockers clears the entry, so only genuinely unresolved issues resurface. The map is cleared at `beginTurn` to prevent cross-turn contamination.
+
 ## [3.8.42] - 2026-05-08
 
 ### Added
