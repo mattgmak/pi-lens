@@ -129,8 +129,10 @@ export const noMagicNumbersRule: FactRule = {
 
 // ---------- QR-002: no-boolean-params ----------
 
-// Names prefixed with is/has/should/can/was/did are clearly boolean — skip them
-const BOOLEAN_PREFIX_OK = /^(is|has|should|can|was|did|will|are|use)[A-Z_]/;
+// Names that unambiguously communicate boolean intent — skip them
+const BOOLEAN_PREFIX_OK = /^(is|has|should|can|was|did|will|are|use|allow|skip|needs|wait|want|auto|show|hide|keep|ignore|include|exclude)[A-Z_]/;
+const BOOLEAN_SUFFIX_OK = /(Only|Enabled|Disabled|Allowed|Changed|Available|Active|Silent|Strict|Required|Blocking|Verbose|Force|Lazy|Auto)$/;
+const BOOLEAN_WHOLE_OK = /^(enabled|disabled|silent|verbose|blocking|strict|force|lazy|allow|allowed|required|active)$/i;
 
 export const noBooleanParamsRule: FactRule = {
 	id: "no-boolean-params",
@@ -147,7 +149,12 @@ export const noBooleanParamsRule: FactRule = {
 				if (!param.type) continue;
 				const name =
 					ts.isIdentifier(param.name) ? param.name.text : "";
-				if (BOOLEAN_PREFIX_OK.test(name)) continue;
+				if (
+				BOOLEAN_PREFIX_OK.test(name) ||
+				BOOLEAN_SUFFIX_OK.test(name) ||
+				BOOLEAN_WHOLE_OK.test(name) ||
+				name.startsWith("_")
+			) continue;
 
 				const isBoolean =
 					param.type.kind === ts.SyntaxKind.BooleanKeyword ||
@@ -192,13 +199,16 @@ export const noBooleanParamsRule: FactRule = {
 
 // ---------- QR-003: high-import-coupling ----------
 
-const IMPORT_COUPLING_THRESHOLD = 10;
+const IMPORT_COUPLING_THRESHOLD = 15;
+// Registry/hub files are intentionally wide — they import everything by design
+const IMPORT_COUPLING_EXEMPT = /[/\\](index|integration)\.[cm]?tsx?$/;
 
 export const highImportCouplingRule: FactRule = {
 	id: "high-import-coupling",
 	requires: ["file.imports"],
 	appliesTo: tsFile,
 	evaluate(ctx, store) {
+		if (IMPORT_COUPLING_EXEMPT.test(ctx.filePath)) return [];
 		const imports = store.getFileFact<ImportEntry[]>(ctx.filePath, "file.imports") ?? [];
 		// Count distinct module sources
 		const sources = new Set(imports.map((i) => i.source));

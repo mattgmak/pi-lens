@@ -178,6 +178,25 @@ const SKIP_STRINGS = new Set([
 	"tests",
 	"install",
 	"ignore",
+	// Dispatch plan / policy DSL discriminators — these naturally repeat as structural values
+	"types",
+	"fallback",
+	"direct",
+	"primary",
+	"all",
+	"mode",
+	"filter",
+	"source",
+	"latest",
+	"stable",
+	// Tool names, registry sources, and platform/arch identifiers naturally repeat in installer code
+	"github",
+	"rubocop",
+	"allow",
+	"deny",
+	"arm64",
+	"x86_64",
+	"aarch64",
 ]);
 
 export const duplicateStringLiteralRule: FactRule = {
@@ -419,7 +438,7 @@ export const dynamicRegexpRule: FactRule = {
 
 // ---------- SN-007: max switch cases ----------
 
-const MAX_SWITCH_CASES = 30;
+const MAX_SWITCH_CASES = 40;
 
 export const maxSwitchCasesRule: FactRule = {
 	id: "max-switch-cases",
@@ -465,11 +484,16 @@ const CREDENTIAL_PATTERNS = [
 	/(?:aws|gcp|azure)[_-]?(?:key|secret|token)\s*[:=]\s*["'][^"']{6,}/i,
 ];
 
+// Files that define credential patterns as code (scanners, test fixtures, etc.) —
+// their own regex literals would otherwise self-trigger this rule.
+const CREDENTIALS_EXEMPT = /[/\\](secrets?[-_]?(scanner|detect|check)|scanner|fixture|mock)[^/\\]*\.(tsx?|ya?ml|json|env)$/i;
+
 export const commentedCredentialsRule: FactRule = {
 	id: "no-commented-credentials",
 	requires: ["file.content"],
 	appliesTo(ctx) {
-		return /\.(tsx?|ya?ml|json|env)$/.test(ctx.filePath);
+		return /\.(tsx?|ya?ml|json|env)$/.test(ctx.filePath) &&
+			!CREDENTIALS_EXEMPT.test(ctx.filePath);
 	},
 	evaluate(ctx, store) {
 		const content = store.getFileFact<string>(ctx.filePath, "file.content");
