@@ -124,25 +124,45 @@ Supported: TypeScript, TSX, JavaScript, JSX, Python, Go, Rust, Ruby.
 
 ### Fact Rules Pipeline
 
-Covers JavaScript/TypeScript, Python, Go, Rust, Ruby, Shell, and CMake. Dispatch includes a fact-rule engine that extracts function-level metrics (cyclomatic complexity, nesting depth, outgoing calls) and evaluates quality rules inline:
+Covers JavaScript/TypeScript, Python, Go, Rust, Ruby, Shell, and CMake. A TypeScript AST-based fact-rule engine extracts function-level metrics and evaluates quality and security rules inline. Blocking rules surface immediately at write time; advisory rules are available via `/lens-booboo`.
 
-- **high-complexity** — flags functions exceeding configurable CC thresholds
-- **unsafe-boundary** — detects dangerous boundary crossings (unvalidated user input → trusted context)
-- **high-fan-out** — flags excessive outgoing call count (default threshold: 20)
-- **comment-facts** — classifies comment quality (TODO density, doc coverage)
-- **try-catch-facts** — flags empty/obscuring catch blocks
-- **import-facts** — detects circular/star/unused imports
-- **file-role** — classifies files as source/test/config/vendor and adjusts severity
+**Blocking (surface inline at write time):**
+- **cors-wildcard** — `Access-Control-Allow-Origin: *` in server-side code
+- **error-swallowing** — empty catch block (skips documented local fallbacks and fs-boundary catches)
+- **no-commented-credentials** — password/token/secret in commented-out code
+- **high-entropy-string** — string literals with suspiciously high Shannon entropy (possible hardcoded secret)
+
+**Advisory (accessible via `/lens-booboo`):**
+- **high-complexity** / **no-complex-conditionals** — cyclomatic complexity and deeply nested conditions
+- **high-fan-out** — function calls too many distinct functions (coordination smell)
+- **unsafe-boundary** — dangerous `any` casts at API boundaries
+- **async-noise** / **async-unnecessary-wrapper** — async functions with no await; wrappers that add no value
+- **pass-through-wrappers** — trivial wrapper functions
+- **dynamic-regexp** — `new RegExp(variable)` (potential ReDoS; complements tree-sitter `unsafe-regex`)
+- **jwt-without-verify** — `jwt.sign()` without `jwt.verify()` in the same file
+- **missing-error-propagation** — catch blocks that log but don't rethrow
+- **error-obscuring** — catch blocks that wrap errors in a different type
+- **duplicate-string-literal** / **no-boolean-params** / **high-import-coupling** — code-quality signals
 
 ### Tree-sitter Rules
 
-Structural rules are organized by language in `rules/tree-sitter-queries/`:
+Structural rules organized by language in `rules/tree-sitter-queries/`. Rules marked **🔴** block the agent inline at write time (only for lines in the current edit); others are advisory.
 
-- **TypeScript** (18 rules): console-statement, debugger, deep-nesting, eval, sql-injection, ssrf, weak-hash, unsafe-regex, variable-shadowing, and more
-- **Python** (26 rules): debug statements, hardcoded secrets, mutable class attrs, unsafe regex, empty except, and more
-- **Go** (17 rules): defer-in-loop, hardcoded secrets, unchecked errors, and more
-- **Rust** (6 rules): unsafe blocks, unwrap outside tests, and more
-- **Ruby** (15 rules): empty rescue, rescue Exception, debugger, hardcoded secrets, and more
+**TypeScript (23 rules):**
+🔴 `eval`, `sql-injection`, `ts-command-injection`, `ts-ssrf`, `ts-xss-dom-sink`, `ts-dynamic-require`, `ts-open-redirect`, `ts-nosql-injection`, `ts-weak-hash`, `ts-hallucinated-react-import`, `unsafe-regex`, `debugger`, `default-not-last`, `duplicate-function-arg`, `empty-switch-case`, `infinite-loop`, `self-assignment`, `switch-case-termination`  
+⚠️ `console-statement`, `deep-promise-chain`, `mixed-async-styles`, `ts-insecure-random`, `ts-detached-async-call`, `ts-react-antipatterns`, `ts-weak-hash`, `variable-shadowing`
+
+**Python:** 🔴 `python-command-injection`, `python-sql-injection`, `python-insecure-deserialization`, `python-weak-hash`, `python-hallucinated-import` + 20 advisory rules
+
+**Go:** 🔴 `go-command-injection`, `go-sql-injection`, `go-shared-map-write-goroutine`, `go-weak-hash` + 13 advisory rules
+
+**Rust:** 🔴 `rust-lock-held-across-await` + 3 advisory rules (`rust-unsafe-block`, `rust-expect`, `rust-clone-in-loop`)
+
+**Ruby:** 🔴 `ruby-weak-hash` + 14 advisory rules
+
+**Suppressing a finding:** add `// pi-lens-ignore: rule-id` on the flagged line or the line above (JS/TS), or `# pi-lens-ignore: rule-id` for Python/Ruby/Shell. This suppresses that specific rule at that location only.
+
+**Project-wide disabling** is not currently supported through config — there is no `.pi-lens/disabled-rules` file. Use inline suppression for per-occurrence overrides. When editing pi-lens itself, move a rule file to the `<language>-disabled/` directory to prevent it from running.
 
 ### Ast-Grep Rules
 

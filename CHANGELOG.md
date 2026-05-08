@@ -6,6 +6,17 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Added
 
+- **Fact-rules wired into all language dispatch plans** — the `fact-rules` runner was registered but never listed in any `RunnerGroup`; 20 TypeScript FactRule instances (`corsWildcardRule`, `jwtWithoutVerifyRule`, `dynamicRegexpRule`, `errorObscuringRule`, `highComplexityRule`, etc.) were never executing. Added `mode:all fact-rules` group to jsts, python, go, rust, ruby, cmake, and shell write plans.
+- **3 fact-rules promoted to blocking (inline at write time):** `cors-wildcard` (CORS `*` origin — no ast-grep/tree-sitter equivalent), `error-swallowing` (empty catch — smarter than the disabled tree-sitter `empty-catch`, skips fs-boundary and documented fallbacks), `no-commented-credentials` (credentials in commented code — complementary to ast-grep which covers live code). `high-entropy-string` was already blocking.
+- **Fact-rule false-positive reductions:** `no-boolean-params` now exempts names with `*Only`/`*Enabled`/`*Disabled` suffixes, `allow*`/`skip*`/`needs*`/`auto*` prefixes, and `_`-prefixed params. `duplicate-string-literal` SKIP_STRINGS expanded with DSL discriminators (`types`, `fallback`, `direct`, `all`, `mode`, `source`) and infrastructure strings (`github`, `rubocop`, `arm64`). `high-import-coupling` threshold raised 10→15 and exempts `index.ts`/`integration.ts` registry/hub files. `no-commented-credentials` exempts scanner/fixture files.
+- **Severity alignment for 3 existing TS tree-sitter blocking rules** — `ts-command-injection`, `ts-ssrf`, `unsafe-regex` had `inline_tier: blocking` but `severity: warning`, producing `semantic: "warning"` which is never shown inline. Fixed to `severity: error` → `semantic: "blocking"` → actually surfaces to the agent.
+- **Fixed `inline_tier: error` typo** on `ts-hallucinated-react-import` and `python-hallucinated-import` (→ `blocking`).
+- **13 new high-confidence blocking promotions across 5 languages** (all `severity: error`, `inline_tier: blocking`):
+  - *TypeScript:* `ts-weak-hash` (`createHash("md5"/"sha1")` — confidence: high)
+  - *Python:* `python-command-injection`, `python-sql-injection`, `python-insecure-deserialization`, `python-weak-hash`
+  - *Go:* `go-command-injection`, `go-sql-injection`, `go-shared-map-write-goroutine`, `go-weak-hash`
+  - *Ruby:* `ruby-weak-hash`
+  - *Rust:* `rust-lock-held-across-await`
 - **4 new blocking tree-sitter rules (SonarCloud BLOCKER equivalents)**:
   - `ts-xss-dom-sink` (S5696) — flags dynamic values assigned to `innerHTML`/`outerHTML` or passed to `document.write()` / `document.writeln()`
   - `ts-dynamic-require` (S5335) — flags `require()` called with a non-string-literal argument (arbitrary module loading)
@@ -13,8 +24,13 @@ All notable changes to pi-lens will be documented in this file.
   - `ts-nosql-injection` (S5147) — flags any MongoDB `$where` key (JS-execution sink, dangerous regardless of value)
 - **2 existing security rules promoted to `inline_tier: blocking`** — `ts-command-injection` (maps to SonarCloud S2076) and `ts-ssrf` (maps to S5146) were previously `warning`; now block the agent turn on detection.
 
+### Fixed
+
+- **`fact-rules` `RuleCache` blind to built-in rule changes** — the cache hash only covered project-local rule files; for any project with no local `rules/` directory the hash was a constant, so new pi-lens built-in rules were silently ignored after the first run. Fixed by including both project-local files and `resolvePackagePath()`-resolved built-in files in the hash, with a `Set` to deduplicate when pi-lens analyzes itself.
+
 ### Changed
 
+- **`max-switch-cases` threshold raised 30→40** — `applyPostFilter` dispatch table now has 31 cases and is expected to grow; the old threshold triggered a false positive on pi-lens itself.
 - **Package scope migration** — all `@mariozechner/*` import references updated to `@earendil-works/*` following the repo move to `earendil-works/pi-mono`. `@earendil-works/pi-tui` dependency bumped to `^0.74.0`.
 - **Startup: `lsp-config` phase is now fully fire-and-forget** — `loadLSPConfig` and `igniteWarmFiles` no longer block the interactive path, removing ~1s from session start on Windows (previously dominated by sequential ENOENT `readFile` calls walking the directory tree to find a config file).
 - **Startup: persistent tool probe cache** — `ensureTool` now checks `~/.pi-lens/probe-cache.json` before falling back to the full `verifyToolBinary` process spawn. Cache entries are validated with `fs.access` + mtime check and expire after 24 h; stale or missing entries fall through to the full probe and update the cache on success.
