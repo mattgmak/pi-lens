@@ -2,7 +2,7 @@
 # Detects dynamic regex construction that can lead to ReDoS
 id: unsafe-regex
 name: Dynamic Regex Construction
-severity: warning
+severity: error
 category: security
 defect_class: injection
 inline_tier: blocking

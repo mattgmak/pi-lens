@@ -2,10 +2,10 @@
 # Detects lock guards obtained via lock().await and additional await in same block.
 id: rust-lock-held-across-await
 name: Lock Held Across Await
-severity: warning
+severity: error
 category: concurrency
 defect_class: async-misuse
-inline_tier: warning
+inline_tier: blocking
 language: rust
 
 message: "Lock guard may be held across await — release lock before awaiting other work"

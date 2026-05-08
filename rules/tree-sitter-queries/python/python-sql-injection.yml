@@ -2,10 +2,10 @@
 # Detects dynamic SQL passed into execute-like APIs.
 id: python-sql-injection
 name: SQL Injection Risk
-severity: warning
+severity: error
 category: security
 defect_class: injection
-inline_tier: warning
+inline_tier: blocking
 language: python
 
 message: "Potential SQL injection sink — use parameterized queries"

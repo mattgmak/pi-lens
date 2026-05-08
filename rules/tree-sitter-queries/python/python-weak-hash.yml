@@ -2,10 +2,10 @@
 # Detects weak cryptographic hash primitives.
 id: python-weak-hash
 name: Weak Hash Primitive
-severity: warning
+severity: error
 category: security
 defect_class: injection
-inline_tier: warning
+inline_tier: blocking
 language: python
 
 message: "Weak hash primitive detected (MD5/SHA1) — use SHA-256+ for security-sensitive contexts"

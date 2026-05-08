@@ -2,7 +2,7 @@
 # Detects outbound HTTP sinks invoked with dynamic URL expressions.
 id: ts-ssrf
 name: SSRF Risk
-severity: warning
+severity: error
 category: security
 defect_class: injection
 inline_tier: blocking

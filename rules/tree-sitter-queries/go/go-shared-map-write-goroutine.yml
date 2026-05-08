@@ -2,10 +2,10 @@
 # Detects map writes inside goroutines, often indicating unsafe shared mutation.
 id: go-shared-map-write-goroutine
 name: Shared Map Write in Goroutine
-severity: warning
+severity: error
 category: concurrency
 defect_class: async-misuse
-inline_tier: warning
+inline_tier: blocking
 language: go
 
 message: "Map write inside goroutine may race — guard with synchronization or ownership boundaries"

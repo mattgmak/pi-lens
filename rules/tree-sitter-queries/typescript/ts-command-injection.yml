@@ -2,7 +2,7 @@
 # Detects command execution sinks via child_process APIs.
 id: ts-command-injection
 name: Command Injection Sink
-severity: warning
+severity: error
 category: security
 defect_class: injection
 inline_tier: blocking

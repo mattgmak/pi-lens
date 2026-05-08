@@ -2,10 +2,10 @@
 # Detects unsafe deserialization APIs.
 id: python-insecure-deserialization
 name: Insecure Deserialization
-severity: warning
+severity: error
 category: security
 defect_class: injection
-inline_tier: warning
+inline_tier: blocking
 language: python
 
 message: "Potential insecure deserialization sink — avoid unsafe loaders"

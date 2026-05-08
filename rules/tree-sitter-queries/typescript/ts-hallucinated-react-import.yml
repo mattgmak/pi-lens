@@ -6,7 +6,7 @@ name: Hallucinated React Import
 severity: error
 category: correctness
 defect_class: hallucination
-inline_tier: error
+inline_tier: blocking
 language: typescript
 
 message: "'{NAME}' is a Next.js API, not from 'react' — import from 'next/{CORRECT}' instead"

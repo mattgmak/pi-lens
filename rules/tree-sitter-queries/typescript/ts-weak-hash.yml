@@ -2,10 +2,10 @@
 # Detects weak hash algorithm selection in crypto hashing APIs.
 id: ts-weak-hash
 name: Weak Hash Primitive
-severity: warning
+severity: error
 category: security
 defect_class: injection
-inline_tier: warning
+inline_tier: blocking
 language: typescript
 
 message: "Weak hash primitive selected (md5/sha1) — use sha256+ for security-sensitive contexts"

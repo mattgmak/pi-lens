@@ -2,10 +2,10 @@
 # Detects shell command execution sinks that commonly lead to command injection.
 id: python-command-injection
 name: Command Injection Sink
-severity: warning
+severity: error
 category: security
 defect_class: injection
-inline_tier: warning
+inline_tier: blocking
 language: python
 
 message: "Potential command injection sink — avoid shell execution with dynamic input"

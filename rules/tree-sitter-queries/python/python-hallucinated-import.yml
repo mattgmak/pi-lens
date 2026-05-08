@@ -6,7 +6,7 @@ name: Hallucinated Import
 severity: warning
 category: correctness
 defect_class: hallucination
-inline_tier: error
+inline_tier: blocking
 language: python
 
 message: "Hallucinated import — '{NAME}' does not exist in '{MODULE}'"
