@@ -969,9 +969,9 @@ export const PythonServer: LSPServerInfo = {
 	},
 };
 
-export const PythonPylspServer: LSPServerInfo = {
-	id: "python-pylsp",
-	name: "Python LSP Server (pylsp)",
+export const PythonJediServer: LSPServerInfo = {
+	id: "python-jedi",
+	name: "Jedi Language Server",
 	extensions: KIND_EXTENSIONS["python"],
 	root: RootWithFallback(
 		createRootDetector([
@@ -986,10 +986,10 @@ export const PythonPylspServer: LSPServerInfo = {
 	),
 	async spawn(root) {
 		try {
-			const proc = await launchLSP("pylsp", [], { cwd: root });
+			const proc = await launchLSP("jedi-language-server", [], { cwd: root });
 			const pythonPath = await detectPythonVenv(root);
 			const initialization: Record<string, unknown> = pythonPath
-				? { pylsp: { plugins: { jedi: { environment: pythonPath } } } }
+				? { workspace: { environmentPath: pythonPath } }
 				: {};
 			return { process: proc, source: "direct", initialization };
 		} catch {
@@ -1703,8 +1703,7 @@ export const CssServer: LSPServerInfo = {
 export const LSP_SERVERS: LSPServerInfo[] = [
 	TypeScriptServer,
 	DenoServer,
-	PythonServer,
-	PythonPylspServer,
+	PythonJediServer,
 	GoServer,
 	RustServer,
 	RubyServer,

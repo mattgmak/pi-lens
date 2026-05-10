@@ -579,7 +579,7 @@ describe("lsp server policy", () => {
 	});
 
 	it("falls back to the file directory for standalone python files", async () => {
-		const { PythonServer, PythonPylspServer } = await import(
+		const { PythonJediServer } = await import(
 			"../../../clients/lsp/server.js"
 		);
 		const tmp = fs.mkdtempSync(
@@ -591,10 +591,7 @@ describe("lsp server policy", () => {
 		fs.mkdirSync(path.dirname(file), { recursive: true });
 		fs.writeFileSync(file, "print('ok')\n");
 
-		await expect(PythonServer.root(file)).resolves.toBe(path.dirname(file));
-		await expect(PythonPylspServer.root(file)).resolves.toBe(
-			path.dirname(file),
-		);
+		await expect(PythonJediServer.root(file)).resolves.toBe(path.dirname(file));
 	});
 
 	it("launches taplo LSP from managed taplo install", async () => {
@@ -829,12 +826,12 @@ describe("lsp server policy", () => {
 		}
 	});
 
-	it("PythonPylspServer passes jedi environment when venv is detected", async () => {
-		const { PythonPylspServer } = await import(
+	it("PythonJediServer passes workspace environmentPath when venv is detected", async () => {
+		const { PythonJediServer } = await import(
 			"../../../clients/lsp/server.js"
 		);
 		const tmp = fs.mkdtempSync(
-			path.join(os.tmpdir(), "pi-lens-pylsp-venv-"),
+			path.join(os.tmpdir(), "pi-lens-jedi-venv-"),
 		);
 		dirs.push(tmp);
 
@@ -859,10 +856,10 @@ describe("lsp server policy", () => {
 		});
 
 		try {
-			const spawned = await PythonPylspServer.spawn(tmp);
+			const spawned = await PythonJediServer.spawn(tmp);
 			expect(spawned).toBeDefined();
 			expect(spawned?.initialization).toMatchObject({
-				pylsp: { plugins: { jedi: { environment: pythonPath } } },
+				workspace: { environmentPath: pythonPath },
 			});
 		} finally {
 			if (origVENV !== undefined) process.env.VIRTUAL_ENV = origVENV;

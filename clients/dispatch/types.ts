@@ -84,6 +84,10 @@ export interface Diagnostic {
 	fixKind?: "pipeline" | "manual" | "suggestion";
 	/** Auto-fix command/suggestion */
 	fixSuggestion?: string;
+	/** Exact matched text from tree-sitter (more precise than the full source line) */
+	matchedText?: string;
+	/** Tree-sitter AST node type of the match (e.g. "call_expression", "template_string") */
+	astNodeType?: string;
 }
 
 export interface DispatchResult {

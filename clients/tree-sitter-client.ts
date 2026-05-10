@@ -43,6 +43,7 @@ interface TreeSitterNode {
 	type: string;
 	text: string;
 	children: TreeSitterNode[];
+	parent?: TreeSitterNode | null;
 	isNamed: boolean;
 	childCount: number;
 	startPosition: { row: number; column: number };
@@ -80,6 +81,8 @@ export interface StructuralMatch {
 	line: number;
 	column: number;
 	matchedText: string;
+	/** Tree-sitter node type of the first capture (e.g. "call_expression") */
+	nodeType?: string;
 	captures: Record<string, string>;
 }
 
@@ -973,6 +976,61 @@ export class TreeSitterClient {
 			}
 			case "ts_detached_async_call":
 				return /(Async$|fetch$|request$)/.test(captures.FN?.text ?? "");
+			case "incomplete_assertion": {
+				const expectNode = captures.EXPECT;
+				if (!expectNode) return false;
+				const CHAI_PROPERTY_ASSERTIONS = new Set([
+					"true",
+					"false",
+					"null",
+					"undefined",
+					"empty",
+					"NaN",
+					"finite",
+					"exist",
+					"arguments",
+					"extensible",
+					"sealed",
+					"frozen",
+					"locked",
+				]);
+				// The expect identifier is inside a call_expression. Walk up past that
+				// call_expression to the container that determines if it's a complete
+				// assertion or an incomplete one.
+				let current: TreeSitterNode | null | undefined = expectNode.parent;
+				if (!current) return false;
+				current = current.parent; // skip the expect(...) call_expression
+				if (!current) return false;
+				// Bare expect(foo); or return expect(foo);
+				if (
+					current.type === "expression_statement" ||
+					current.type === "return_statement"
+				)
+					return true;
+				let lastPropertyName: string | null = null;
+				while (current && current.type === "member_expression") {
+					const propNode = current.children?.find(
+						(c: any) => c.type === "property_identifier",
+					);
+					if (propNode) lastPropertyName = propNode.text;
+					const parent: TreeSitterNode | null | undefined = current.parent;
+					if (!parent) return false;
+					if (
+						parent.type === "expression_statement" ||
+						parent.type === "return_statement"
+					) {
+						if (
+							lastPropertyName &&
+							CHAI_PROPERTY_ASSERTIONS.has(lastPropertyName)
+						)
+							return false;
+						return true;
+					}
+					if (parent.type === "call_expression") return false;
+					current = parent;
+				}
+				return false;
+			}
 			case "py_command_injection_sink": {
 				const mod = captures.MOD?.text ?? "";
 				const fn = captures.FN?.text ?? "";
@@ -1119,6 +1177,7 @@ export class TreeSitterClient {
 						line: firstNode.startPosition.row + 1,
 						column: firstNode.startPosition.column + 1,
 						matchedText: firstNode.text,
+						nodeType: firstNode.type as string | undefined,
 						captures: textCaptures,
 					});
 				}

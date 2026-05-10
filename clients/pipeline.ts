@@ -28,7 +28,7 @@ import {
 	resolveToolCommand,
 	resolveToolCommandWithInstallFallback,
 } from "./dispatch/runners/utils/runner-helpers.js";
-import type { PiAgentAPI } from "./dispatch/types.js";
+import type { Diagnostic, PiAgentAPI } from "./dispatch/types.js";
 import { detectFileKind, getFileKindLabel } from "./file-kinds.js";
 import {
 	detectFileChangedAfterCommand,
@@ -767,6 +767,45 @@ export async function runFormatPhase(
 	return { formatChanged, formattersUsed, formatFailures, fileContent };
 }
 
+/**
+ * Build the 🔴 STOP blocker output with an inline code snippet for each
+ * diagnostic so the agent can see the exact line it wrote without re-reading
+ * the file.
+ *
+ * Example:
+ *   L4: 'randomInt' is declared but its value is never read.
+ *       → const randomInt = Math.floor(result);
+ */
+function buildEnrichedBlockerOutput(
+	blockers: Diagnostic[],
+	fileContent: string,
+): string {
+	const fileLines = fileContent.split("\n");
+	const MAX_SNIPPET = 120; // chars — keep it tight in context
+
+	let out = `\n\n🔴 STOP — ${blockers.length} issue(s) must be fixed:\n`;
+	const shown = blockers.slice(0, 10);
+
+	for (const d of shown) {
+		const lineNo = d.line ?? 1;
+		const nodeCtx = d.astNodeType ? ` (${d.astNodeType})` : "";
+		out += `  L${lineNo}: ${d.message}${nodeCtx}\n`;
+		// Prefer the exact matched node text (tree-sitter); fall back to the
+		// full source line (LSP / other runners).
+		const snippet = d.matchedText
+			? d.matchedText.trim().split("\n")[0]?.slice(0, MAX_SNIPPET)
+			: fileLines[lineNo - 1]?.trim().slice(0, MAX_SNIPPET);
+		if (snippet) out += `      → ${snippet}\n`;
+		if (d.fixSuggestion) out += `      💡 ${d.fixSuggestion}\n`;
+	}
+
+	if (blockers.length > 10) {
+		out += `  ... and ${blockers.length - 10} more\n`;
+	}
+
+	return out;
+}
+
 // --- Main Pipeline ---
 
 export async function runPipeline(
@@ -944,7 +983,17 @@ export async function runPipeline(
 		getDiagnosticTracker().trackAgentFixed(dispatchResult.resolvedCount);
 
 	let output = "";
-	if (dispatchResult.output) output += `\n\n${dispatchResult.output}`;
+	if (dispatchResult.hasBlockers && fileContent) {
+		// Enrich blocker output with a code snippet so the agent can see the
+		// exact line it wrote that caused each violation — no re-read needed.
+		output += buildEnrichedBlockerOutput(dispatchResult.blockers, fileContent);
+		// Append fixed/coverage parts from the original output (slice off the
+		// blocker section we're replacing).
+		const rest = dispatchResult.output.slice(dispatchResult.blockerOutput.length);
+		if (rest) output += rest;
+	} else if (dispatchResult.output) {
+		output += `\n\n${dispatchResult.output}`;
+	}
 	if (fixedCount > 0) {
 		const detail =
 			autofixTools.length > 0 ? ` (${autofixTools.join(", ")})` : "";

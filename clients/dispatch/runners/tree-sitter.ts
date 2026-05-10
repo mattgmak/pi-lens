@@ -524,6 +524,8 @@ const treeSitterRunner: RunnerDefinition = {
 								autoFixAvailable: false,
 								fixKind: hasSuggestedFix ? "suggestion" : undefined,
 								fixSuggestion: suggestion,
+								matchedText: match.matchedText || undefined,
+								astNodeType: match.nodeType || undefined,
 							});
 						}
 					} catch (err) {

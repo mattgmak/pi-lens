@@ -174,6 +174,59 @@ function rebuildIndexes(graph: ReviewGraph): void {
 	}
 }
 
+const GRAPH_CACHE_REL = path.join(".pi-lens", "cache", "review-graph.json");
+
+interface PersistedGraphData {
+	version: string;
+	builtAt: string;
+	signature: string;
+	nodes: Array<[string, ReviewGraphNode]>;
+	edges: ReviewGraphEdge[];
+}
+
+function loadPersistedGraph(
+	cwd: string,
+): { signature: string; graph: ReviewGraph } | null {
+	const cachePath = path.join(cwd, GRAPH_CACHE_REL);
+	try {
+		const raw = fs.readFileSync(cachePath, "utf-8");
+		const data = JSON.parse(raw) as PersistedGraphData;
+		if (data.version !== REVIEW_GRAPH_VERSION) return null;
+		const graph: ReviewGraph = {
+			version: data.version,
+			builtAt: data.builtAt,
+			nodes: new Map(data.nodes),
+			edges: data.edges,
+			edgesByFrom: new Map(),
+			edgesByTo: new Map(),
+			fileNodes: new Map(),
+			symbolNodesByFile: new Map(),
+			changedSymbolsByFile: new Map(),
+		};
+		rebuildIndexes(graph);
+		return { signature: data.signature, graph };
+	} catch {
+		return null;
+	}
+}
+
+function persistGraph(cwd: string, signature: string, graph: ReviewGraph): void {
+	const cacheDir = path.join(cwd, ".pi-lens", "cache");
+	const cachePath = path.join(cwd, GRAPH_CACHE_REL);
+	const data: PersistedGraphData = {
+		version: graph.version,
+		builtAt: graph.builtAt,
+		signature,
+		nodes: Array.from(graph.nodes.entries()),
+		edges: graph.edges,
+	};
+	const json = JSON.stringify(data);
+	fs.mkdir(cacheDir, { recursive: true }, (mkdirErr) => {
+		if (mkdirErr) return;
+		fs.writeFile(cachePath, json, "utf-8", () => {});
+	});
+}
+
 function localImportToFile(
 	cwd: string,
 	filePath: string,
@@ -456,9 +509,11 @@ async function _doBuildGraph(
 	const normalizedChanged = changedFiles.map((file) => normalizeMapKey(file));
 	const filesToBuild = getGraphSourceFiles(cwd);
 	const signature = sourceSignature(filesToBuild);
-	const cached = _workspaceGraphCache.get(normalizedCwd);
-	if (cached?.signature === signature) {
-		const graph = cloneGraph(cached.graph);
+
+	// Tier 1: in-memory cache (hot path — same process, already built this session)
+	const memCached = _workspaceGraphCache.get(normalizedCwd);
+	if (memCached?.signature === signature) {
+		const graph = cloneGraph(memCached.graph);
 		rebuildIndexes(graph);
 		graph.changedSymbolsByFile.clear();
 		for (const file of normalizedChanged) {
@@ -469,6 +524,25 @@ async function _doBuildGraph(
 		return graph;
 	}
 
+	// Tier 2: disk cache (cold start — files unchanged since last persist)
+	const diskCached = loadPersistedGraph(cwd);
+	if (diskCached?.signature === signature) {
+		const graph = cloneGraph(diskCached.graph);
+		rebuildIndexes(graph);
+		graph.changedSymbolsByFile.clear();
+		for (const file of normalizedChanged) {
+			upsertChangedSymbols(graph, facts, file);
+		}
+		_workspaceGraphCache.set(normalizedCwd, {
+			signature,
+			graph: cloneGraph(diskCached.graph),
+		});
+		_lastGraphBuildInfo = { reused: true, mode: "cached" };
+		facts.setSessionFact("session.reviewGraph", graph);
+		return graph;
+	}
+
+	// Tier 3: full build
 	const graph = createEmptyGraph();
 	for (const file of filesToBuild) {
 		const kind = detectFileKind(file);
@@ -490,10 +564,9 @@ async function _doBuildGraph(
 	resolveDeferredSymbolEdges(graph);
 	graph.version = REVIEW_GRAPH_VERSION;
 	graph.builtAt = new Date().toISOString();
-	_workspaceGraphCache.set(normalizedCwd, {
-		signature,
-		graph: cloneGraph(graph),
-	});
+	const graphSnapshot = cloneGraph(graph);
+	_workspaceGraphCache.set(normalizedCwd, { signature, graph: graphSnapshot });
+	persistGraph(cwd, signature, graphSnapshot); // fire-and-forget
 	_lastGraphBuildInfo = { reused: false, mode: "full" };
 	facts.setSessionFact("session.reviewGraph", graph);
 	return graph;

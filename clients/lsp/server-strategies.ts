@@ -48,6 +48,13 @@ export const SERVER_DIAGNOSTIC_STRATEGIES: Record<string, DiagnosticStrategy> =
 			aggregateWaitMs: 1500,
 			expectSemanticSecondPush: false,
 		},
+		"python-jedi": {
+			seedFirstPush: true,
+			pullRetryBudgetMs: 0,
+			debounceMs: 100,
+			aggregateWaitMs: 1000,
+			expectSemanticSecondPush: false,
+		},
 		eslint: {
 			seedFirstPush: true,
 			pullRetryBudgetMs: 0,
