@@ -3,11 +3,11 @@
  */
 
 export const LANGUAGES = [
+	"bash",
 	"c",
 	"cpp",
 	"csharp",
 	"css",
-	"dart",
 	"elixir",
 	"go",
 	"haskell",
@@ -17,12 +17,13 @@ export const LANGUAGES = [
 	"json",
 	"kotlin",
 	"lua",
+	"nix",
 	"php",
 	"python",
 	"ruby",
 	"rust",
 	"scala",
-	"sql",
+	"solidity",
 	"swift",
 	"tsx",
 	"typescript",

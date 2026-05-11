@@ -71,6 +71,7 @@ import { handleBooboo } from "./commands/booboo.js";
 import { initI18n, t } from "./i18n.js";
 import { createAstGrepReplaceTool } from "./tools/ast-grep-replace.js";
 import { createAstGrepSearchTool } from "./tools/ast-grep-search.js";
+import { createLspDiagnosticsTool } from "./tools/lsp-diagnostics.js";
 import { createLspNavigationTool } from "./tools/lsp-navigation.js";
 
 const DEBUG_LOG_DIR = path.join(os.homedir(), ".pi-lens");
@@ -921,6 +922,7 @@ export default function (pi: ExtensionAPI) {
 	// --- Tools (extracted to tools/) ---
 	pi.registerTool(createAstGrepSearchTool(astGrepClient) as any);
 	pi.registerTool(createAstGrepReplaceTool(astGrepClient) as any);
+	pi.registerTool(createLspDiagnosticsTool() as any);
 	pi.registerTool(createLspNavigationTool((name) => pi.getFlag(name)) as any);
 
 	// REMOVED: ~450 lines of inline tool definitions moved to tools/

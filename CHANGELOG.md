@@ -4,6 +4,26 @@ All notable changes to pi-lens will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`lsp_diagnostics` tool** — proactive LSP error checking for files and directories. The agent can now run `lsp_diagnostics({ filePath: "src/" })` before builds to catch issues without making edits. Directory mode walks the tree (skipping node_modules/.git/target), auto-detects the language extension, opens each file in the LSP client, and aggregates diagnostics. Supports severity filtering (`error`/`warning`/`information`/`hint`/`all`), caps at 50 files and 200 diagnostics. Returns structured details with `totalDiagnostics`, `truncated`, and per-diagnostic `file`/`line`/`severity`/`message`/`source`/`code`. Adapted from `code-yeongyu/pi-lsp-client`.
+- **LSP process stderr capture and health check** — the LSP client now maintains a rolling 100-line stderr buffer from server startup through shutdown. Three new client methods exposed: `processExited()` (true if the server process died), `recentStderr(n)` (last N lines for diagnostics), and `checkAlive()` (pre-request health check returning error string with exit code + stderr tail if dead). Previously, stderr was only captured during initialization and discarded afterward.
+- **SIGTERM → 1.5s → SIGKILL escalation in `killProcessTree`** — on Unix, process cleanup now sends SIGTERM first, waits 1.5 seconds, then sends SIGKILL if the process is still alive. Prevents zombie server processes that survive a standard kill. Windows already uses `taskkill /F /T` (force kill tree).
+- **LSP force-reinstall when PATH-resolved tool is broken** — when an LSP server's PATH candidate fails to launch (e.g. broken symlink, missing runtime, corrupted binary) AND the managed install returns the same broken PATH entry, pi-lens now clears the probe cache, downloads a managed copy from the registry (npm/GitHub/pip), and retries the launch. Previously, broken PATH tools triggered exponential backoff and were permanently disabled after 5 failures. The retry only fires when the `ensureTool` path is a bare command name (no `/` or `\` separators) — absolute paths from prior managed installs are not force-reinstalled to avoid redundant download loops. `ensureTool` gained an optional `forceReinstall` flag that bypasses both the in-memory `resolvedPathCache` and the persistent probe cache.
+- **`getToolPath` prefers managed installs over PATH for github-strategy tools** — github-strategy tools (`rust-analyzer`, `shellcheck`, `shfmt`, `golangci-lint`) now check `~/.pi-lens/bin/` before falling through to PATH lookup. This ensures force-reinstall flows find the newly downloaded binary, and pi-lens-managed copies take priority over potentially stale or broken PATH entries. Non-github tools (npm, pip) are unaffected.
+- **Pattern hints for `ast_grep_search` zero-match results** — when a search returns no matches, the tool now appends a hint suggesting likely pattern mistakes: regex misuse (`\w`, `\d`, `[a-z]`, `.*`, `.+`, `|` alternation), language-specific mistakes (Python trailing colons, incomplete JS/Go/Rust function patterns). Adapted from `code-yeongyu/pi-ast-grep`.
+- **Truncation metadata in ast-grep tool results** — `SgResult` now carries `totalMatches` and `truncated` fields, threaded through `SgRunner` → `AstGrepClient` → both `ast_grep_search` and `ast_grep_replace` tool `details`. The agent can now distinguish "50 shown of 500 total" from "50 total".
+
+### Changed
+
+- **`isCommandAvailable` replaced `which`/`where` spawn with PATH walk + `statSync` size validation** — instead of spawning `which`/`where` (~50 ms + timeout risk), the installer now walks `$PATH` entries synchronously and checks `statSync(path).isFile() && stat.size > 0` for each candidate. This catches broken symlinks (stat throws `ENOENT` or returns size 0) at ~μs per candidate with zero process spawns. On Windows, `.exe`, `.cmd`, and `.bat` extensions are probed.
+
+### Fixed
+
+- **ast-grep tool language list aligned with ast-grep CLI** — dropped phantom `dart` and `sql` (not supported by ast-grep binary), added missing `bash`, `nix`, `solidity`. The `LANGUAGES` constant in `tools/shared.ts` now matches ast-grep v0.41's official 25-language list.
+- **Graph-cache test: disk cache leaked across test runs** — `buildOrUpdateGraph` persists to `cwd/.pi-lens/cache/review-graph.json`. All tests used hardcoded `"/cwd"`, causing the first test run's disk cache to contaminate subsequent runs. Switched to `fs.mkdtempSync` temp directories with `afterEach` cleanup.
+- **Disabled tree-sitter rules leaked into production** — `parseQueryFile` uses the YAML's `language:` field over the directory name, so rules in `typescript-disabled/` with `language: typescript` were loaded as active TypeScript rules and appeared in the diagnostics widget. Added `!d.name.endsWith("-disabled")` filter to `loadQueries` directory enumeration.
+
 ## [3.8.43] - 2026-05-10
 
 ### Added
@@ -33,11 +53,11 @@ All notable changes to pi-lens will be documented in this file.
 - **Severity alignment for 3 existing TS tree-sitter blocking rules** — `ts-command-injection`, `ts-ssrf`, `unsafe-regex` had `inline_tier: blocking` but `severity: warning`, producing `semantic: "warning"` which is never shown inline. Fixed to `severity: error` → `semantic: "blocking"` → actually surfaces to the agent.
 - **Fixed `inline_tier: error` typo** on `ts-hallucinated-react-import` and `python-hallucinated-import` (→ `blocking`).
 - **13 new high-confidence blocking promotions across 5 languages** (all `severity: error`, `inline_tier: blocking`):
-  - *TypeScript:* `ts-weak-hash` (`createHash("md5"/"sha1")` — confidence: high)
-  - *Python:* `python-command-injection`, `python-sql-injection`, `python-insecure-deserialization`, `python-weak-hash`
-  - *Go:* `go-command-injection`, `go-sql-injection`, `go-shared-map-write-goroutine`, `go-weak-hash`
-  - *Ruby:* `ruby-weak-hash`
-  - *Rust:* `rust-lock-held-across-await`
+  - _TypeScript:_ `ts-weak-hash` (`createHash("md5"/"sha1")` — confidence: high)
+  - _Python:_ `python-command-injection`, `python-sql-injection`, `python-insecure-deserialization`, `python-weak-hash`
+  - _Go:_ `go-command-injection`, `go-sql-injection`, `go-shared-map-write-goroutine`, `go-weak-hash`
+  - _Ruby:_ `ruby-weak-hash`
+  - _Rust:_ `rust-lock-held-across-await`
 - **4 new blocking tree-sitter rules (SonarCloud BLOCKER equivalents)**:
   - `ts-xss-dom-sink` (S5696) — flags dynamic values assigned to `innerHTML`/`outerHTML` or passed to `document.write()` / `document.writeln()`
   - `ts-dynamic-require` (S5335) — flags `require()` called with a non-string-literal argument (arbitrary module loading)
@@ -59,8 +79,6 @@ All notable changes to pi-lens will be documented in this file.
 ### Added
 
 - **Startup observability** — `checkProbeCache` now logs the reason for each cache miss (`ttl expired`, `gone`, `mtime changed`); the lsp-config fire-and-forget callback logs how many warm files were configured once the config resolves asynchronously.
-
-
 
 ### Added
 

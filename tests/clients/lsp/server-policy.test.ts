@@ -268,7 +268,9 @@ describe("lsp server policy", () => {
 
 	it("deduplicates concurrent in-flight walks for the same directory", async () => {
 		const { NearestRoot } = await import("../../../clients/lsp/server.js");
-		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-root-inflight-"));
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-root-inflight-"),
+		);
 		dirs.push(tmp);
 
 		const src = path.join(tmp, "extractors");
@@ -579,9 +581,7 @@ describe("lsp server policy", () => {
 	});
 
 	it("falls back to the file directory for standalone python files", async () => {
-		const { PythonJediServer } = await import(
-			"../../../clients/lsp/server.js"
-		);
+		const { PythonJediServer } = await import("../../../clients/lsp/server.js");
 		const tmp = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-python-filedir-"),
 		);
@@ -719,9 +719,7 @@ describe("lsp server policy", () => {
 	// --- Python venv detection ---
 
 	it("detectPythonVenv finds .venv at project root", async () => {
-		const { detectPythonVenv } = await import(
-			"../../../clients/lsp/server.js"
-		);
+		const { detectPythonVenv } = await import("../../../clients/lsp/server.js");
 		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-venv-dot-"));
 		dirs.push(tmp);
 
@@ -745,9 +743,7 @@ describe("lsp server policy", () => {
 	});
 
 	it("detectPythonVenv picks up CONDA_PREFIX when VIRTUAL_ENV is absent", async () => {
-		const { detectPythonVenv } = await import(
-			"../../../clients/lsp/server.js"
-		);
+		const { detectPythonVenv } = await import("../../../clients/lsp/server.js");
 		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-conda-"));
 		dirs.push(tmp);
 
@@ -773,9 +769,7 @@ describe("lsp server policy", () => {
 	});
 
 	it("detectPythonVenv prefers VIRTUAL_ENV over .venv at project root", async () => {
-		const { detectPythonVenv } = await import(
-			"../../../clients/lsp/server.js"
-		);
+		const { detectPythonVenv } = await import("../../../clients/lsp/server.js");
 		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-venv-prio-"));
 		dirs.push(tmp);
 
@@ -808,9 +802,7 @@ describe("lsp server policy", () => {
 	});
 
 	it("detectPythonVenv returns undefined when no venv exists", async () => {
-		const { detectPythonVenv } = await import(
-			"../../../clients/lsp/server.js"
-		);
+		const { detectPythonVenv } = await import("../../../clients/lsp/server.js");
 		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-no-venv-"));
 		dirs.push(tmp);
 
@@ -827,12 +819,8 @@ describe("lsp server policy", () => {
 	});
 
 	it("PythonJediServer passes workspace environmentPath when venv is detected", async () => {
-		const { PythonJediServer } = await import(
-			"../../../clients/lsp/server.js"
-		);
-		const tmp = fs.mkdtempSync(
-			path.join(os.tmpdir(), "pi-lens-jedi-venv-"),
-		);
+		const { PythonJediServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-jedi-venv-"));
 		dirs.push(tmp);
 
 		const pythonPath =
@@ -865,5 +853,96 @@ describe("lsp server policy", () => {
 			if (origVENV !== undefined) process.env.VIRTUAL_ENV = origVENV;
 			if (origCONDA !== undefined) process.env.CONDA_PREFIX = origCONDA;
 		}
+	});
+
+	describe("rust-analyzer force-reinstall", () => {
+		const MANAGED =
+			process.platform === "win32"
+				? String.raw`C:\Users\test\.pi-lens\bin\rust-analyzer.exe`
+				: "/home/test/.pi-lens/bin/rust-analyzer";
+
+		it("triggers force-reinstall after two PATH-resolved launch failures", async () => {
+			const { RustServer } = await import("../../../clients/lsp/server.js");
+			const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-rust-force-"));
+			dirs.push(tmp);
+
+			const calls: string[] = [];
+
+			launchLSP.mockImplementation(async (command: string) => {
+				calls.push(`launch(${command})`);
+				if (calls.length <= 2) {
+					throw new Error("BROKEN");
+				}
+				if (command === MANAGED) {
+					return {
+						process: { killed: false } as never,
+						stdin: {} as never,
+						stdout: {} as never,
+						stderr: {} as never,
+						pid: 9999,
+					};
+				}
+				throw new Error(`unexpected: ${command} (call #${calls.length})`);
+			});
+
+			ensureTool.mockImplementation(
+				async (_id: string, opts?: { forceReinstall?: boolean }) => {
+					calls.push(`ensure(${opts?.forceReinstall ? "force" : "normal"})`);
+					if (opts?.forceReinstall) return MANAGED;
+					return "rust-analyzer";
+				},
+			);
+
+			try {
+				const spawned = await RustServer.spawn(tmp, {
+					allowInstall: true,
+				});
+
+				expect(spawned).toBeDefined();
+				expect(ensureTool).toHaveBeenCalledWith("rust-analyzer", {
+					forceReinstall: true,
+				});
+				expect(launchLSP).toHaveBeenCalledWith(
+					MANAGED,
+					expect.any(Array),
+					expect.objectContaining({ cwd: tmp }),
+				);
+			} catch (err) {
+				// eslint-disable-next-line no-console
+				console.error("Calls:", JSON.stringify(calls, null, 2));
+				throw err;
+			}
+		});
+
+		it("does not force-reinstall when path is already absolute", async () => {
+			const { RustServer } = await import("../../../clients/lsp/server.js");
+			const tmp = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-rust-no-force-"),
+			);
+			dirs.push(tmp);
+
+			// Step 1: PATH candidate fails
+			// Step 3: absolute path launch also fails → throws (no force-reinstall)
+			launchLSP.mockImplementation(async () => {
+				throw new Error("exit code 1");
+			});
+
+			// ensureTool returns an absolute path (simulates already-managed binary)
+			ensureTool.mockResolvedValue(MANAGED);
+
+			// resolveAndLaunch throws when all methods fail, including absolute-path
+			// managed installs. That propagates through RustServer.spawn.
+			await expect(
+				RustServer.spawn(tmp, { allowInstall: true }),
+			).rejects.toThrow("exit code 1");
+
+			// ensureTool should NOT have been called with forceReinstall
+			const forceCalls = ensureTool.mock.calls.filter(
+				([, opts]) =>
+					(opts as { forceReinstall?: boolean } | undefined)?.forceReinstall ===
+					true,
+			);
+			expect(forceCalls).toHaveLength(0);
+		});
 	});
 });

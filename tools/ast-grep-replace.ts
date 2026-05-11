@@ -100,7 +100,12 @@ export function createAstGrepReplaceTool(astGrepClient: AstGrepClient) {
 
 			return {
 				content: [{ type: "text" as const, text: output }],
-				details: { matchCount: result.matches.length, applied: apply ?? false },
+				details: {
+					matchCount: result.matches.length,
+					totalMatches: result.totalMatches,
+					truncated: result.truncated,
+					applied: apply ?? false,
+				},
 			};
 		},
 	};

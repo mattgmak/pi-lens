@@ -136,6 +136,12 @@ export interface LSPClientInfo {
 	connection: MessageConnection;
 	/** Check if the connection is still alive */
 	isAlive: () => boolean;
+	/** True if the server process has exited or been killed */
+	processExited: () => boolean;
+	/** Last N lines of server stderr for diagnostics */
+	recentStderr: (lines?: number) => string;
+	/** Pre-request health check — returns error string if process is dead */
+	checkAlive: () => string | undefined;
 	notify: {
 		open(
 			filePath: string,
@@ -362,7 +368,19 @@ async function killProcessTree(
 
 	try {
 		proc.kill("SIGTERM");
-	} catch {}
+		// SIGTERM → 1.5s → SIGKILL escalation.
+		// SIGTERM alone can leave zombie processes if the server hangs.
+		await new Promise<void>((resolve) => setTimeout(resolve, 1500));
+		try {
+			if (!(proc as { killed?: boolean }).killed) {
+				proc.kill("SIGKILL");
+			}
+		} catch {
+			// best-effort
+		}
+	} catch {
+		// ignore
+	}
 }
 
 function mergeDiagnosticLists(
@@ -846,10 +864,36 @@ export async function createLSPClient(options: {
 		stderr: "",
 	};
 
-	const onStartupStderr = (chunk: Buffer | string): void => {
-		if (startupState.stderr.length >= 4096) return;
-		startupState.stderr += chunk.toString();
+	// Persistent stderr ring buffer — captures last ~100 lines for diagnostics.
+	// Used in error messages to show what the server said before dying.
+	const stderrRing: string[] = [];
+	const MAX_STDERR_LINES = 100;
+
+	const onStderr = (chunk: Buffer | string): void => {
+		stderrRing.push(chunk.toString());
+		if (stderrRing.length > MAX_STDERR_LINES) stderrRing.shift();
+		// Also capture startup stderr for the initialized-failed error path
+		if (startupState.stderr.length < 4096) {
+			startupState.stderr += chunk.toString();
+		}
 	};
+
+	const recentStderr = (lines = 10): string =>
+		stderrRing.slice(-lines).join("").trim();
+
+	// Pre-request health check — returns error string if process is dead.
+	const checkProcessAlive = (): string | undefined => {
+		const exited = lspProcess.process.exitCode;
+		if (exited !== null) {
+			const tail = recentStderr(20);
+			return `LSP server ${serverId} exited with code ${exited}${tail ? `. stderr: ${tail}` : ""}`;
+		}
+		if ((lspProcess.process as { killed?: boolean }).killed) {
+			return `LSP server ${serverId} was killed`;
+		}
+		return undefined;
+	};
+
 	const onProcessExit = (
 		code: number | null,
 		signal: NodeJS.Signals | null,
@@ -865,7 +909,7 @@ export async function createLSPClient(options: {
 		startupState.closeSignal = signal;
 	};
 
-	(lspProcess.stderr as NodeJS.ReadableStream).on("data", onStartupStderr);
+	(lspProcess.stderr as NodeJS.ReadableStream).on("data", onStderr);
 	lspProcess.process.on("exit", onProcessExit);
 	lspProcess.process.on("close", onProcessClose);
 
@@ -978,7 +1022,7 @@ export async function createLSPClient(options: {
 		}, 2000);
 		throw err;
 	} finally {
-		(lspProcess.stderr as NodeJS.ReadableStream).off("data", onStartupStderr);
+		(lspProcess.stderr as NodeJS.ReadableStream).off("data", onStderr);
 	}
 
 	if (initResult === undefined) {
@@ -1019,6 +1063,17 @@ export async function createLSPClient(options: {
 		root,
 		connection,
 		isAlive: () => isClientAlive(state),
+
+		/** True if the server process has exited or been killed. */
+		processExited: () =>
+			lspProcess.process.exitCode !== null ||
+			(lspProcess.process as { killed?: boolean }).killed === true,
+
+		/** Last N lines of server stderr for diagnostics. */
+		recentStderr: (lines?: number) => recentStderr(lines),
+
+		/** Pre-request health check — returns error string if dead. */
+		checkAlive: () => checkProcessAlive(),
 
 		notify: {
 			async open(filePath, content, languageId, preserveDiagnostics, silent) {

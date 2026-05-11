@@ -289,6 +289,46 @@ async function resolveAndLaunch(
 					},
 				});
 				trackRuntimeFailure(err);
+
+				// force-reinstall: when a PATH-resolved tool (bare command name)
+				// fails to launch (e.g. broken symlink, missing .dll), nuke the
+				// caches and download a managed copy from the registry.
+				const looksPathResolved =
+					!installed.includes("/") && !installed.includes("\\");
+				if (looksPathResolved) {
+					logSessionStart(
+						`lsp launch managed retry force-reinstall tool=${spec.managedToolId}`,
+					);
+					const reinstalled = await ensureTool(spec.managedToolId, {
+						forceReinstall: true,
+					});
+					if (reinstalled) {
+						try {
+							const proc = await launchLSP(reinstalled, spec.args, {
+								cwd: spec.cwd,
+								env: spec.env,
+							});
+							logSessionStart(
+								`lsp launch managed force-reinstall success tool=${spec.managedToolId} command=${reinstalled}`,
+							);
+							logLatency({
+								type: "phase",
+								phase: "lsp_launch_managed_force_reinstall_success",
+								filePath: spec.cwd,
+								durationMs: 0,
+								metadata: {
+									tool: spec.managedToolId,
+									command: reinstalled,
+								},
+							});
+							return { process: proc, source: "managed" };
+						} catch (retryErr) {
+							logSessionStart(
+								`lsp launch managed force-reinstall failed tool=${spec.managedToolId} error=${retryErr instanceof Error ? retryErr.message : String(retryErr)}`,
+							);
+						}
+					}
+				}
 				// fall through
 			}
 		}

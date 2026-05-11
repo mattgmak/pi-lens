@@ -39,6 +39,8 @@ export interface SgMatch {
 
 export interface SgResult {
 	matches: SgMatch[];
+	totalMatches: number;
+	truncated: boolean;
 	error?: string;
 }
 
@@ -156,38 +158,35 @@ export class SgRunner {
 			proc.stdout.on("data", (data: Buffer) => (stdout += data.toString()));
 			proc.stderr.on("data", (data: Buffer) => (stderr += data.toString()));
 
+			const empty = (): SgResult => ({
+				matches: [],
+				totalMatches: 0,
+				truncated: false,
+			});
+
 			proc.on("error", (err: Error) => {
 				if (err.message.includes("ENOENT")) {
 					resolve({
-						matches: [],
+						...empty(),
 						error: "ast-grep CLI not found. Install: npm i -D @ast-grep/cli",
 					});
 				} else {
-					resolve({ matches: [], error: err.message });
+					resolve({ ...empty(), error: err.message });
 				}
 			});
 
 			proc.on("close", (code: number | null) => {
-				// ast-grep exit codes:
-				// 0 = matches found
-				// 1 = no matches found (NOT an error, just empty result)
-				// 2+ or non-zero with stderr = actual error
-
 				if (code !== 0 && !stdout.trim()) {
-					// No stdout - check if this is a real error or just "no matches"
 					const stderrMsg = stderr.trim();
 
-					// Exit code 1 with no stderr typically means "no matches" in ast-grep
-					// This is normal behavior, not an error
 					if (code === 1 && !stderrMsg) {
-						resolve({ matches: [] });
+						resolve(empty());
 						return;
 					}
 
-					// Check stderr for specific error patterns
 					if (stderrMsg.includes("Multiple AST nodes are detected")) {
 						resolve({
-							matches: [],
+							...empty(),
 							error:
 								`Invalid AST pattern: The pattern appears to contain multiple AST nodes or is malformed.\n` +
 								`Common causes:\n` +
@@ -201,7 +200,7 @@ export class SgRunner {
 
 					if (stderrMsg.includes("Cannot parse query")) {
 						resolve({
-							matches: [],
+							...empty(),
 							error:
 								`Pattern syntax error: The pattern could not be parsed as valid code.\n` +
 								`Tips:\n` +
@@ -213,23 +212,26 @@ export class SgRunner {
 						return;
 					}
 
-					// Unknown error - include what we have
 					resolve({
-						matches: [],
+						...empty(),
 						error: stderrMsg || `Command failed with exit code ${code}`,
 					});
 					return;
 				}
 				if (!stdout.trim()) {
-					resolve({ matches: [] });
+					resolve(empty());
 					return;
 				}
 				try {
 					const parsed = JSON.parse(stdout);
 					const matches = Array.isArray(parsed) ? parsed : [parsed];
-					resolve({ matches });
+					resolve({
+						matches,
+						totalMatches: matches.length,
+						truncated: false,
+					});
 				} catch {
-					resolve({ matches: [], error: "Failed to parse output" });
+					resolve({ ...empty(), error: "Failed to parse output" });
 				}
 			});
 		});

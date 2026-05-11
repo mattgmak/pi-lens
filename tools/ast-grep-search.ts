@@ -31,11 +31,63 @@ function looksLikeRuleYamlOrPlainText(pattern: string): boolean {
 
 	if (/^[-*]\s+/.test(text)) return true;
 
-	const hasAstSignals = /[$(){}\[\].;:'"`]/.test(text);
+	const hasAstSignals = /[$(){}[\].;:'"`]/.test(text);
 	const hasWhitespace = /\s/.test(text);
 	if (hasWhitespace && !hasAstSignals) return true;
 
 	return false;
+}
+
+/**
+ * Detect common mistakes in ast-grep patterns and return a hint.
+ * Helps the LLM self-correct when a search returns zero matches.
+ */
+function getPatternHint(pattern: string, lang: string): string | null {
+	const src = pattern.trim();
+
+	// --- regex misuse ---
+	if (/\\[wWdDsSbB]/.test(src)) {
+		return 'Hint: "\\w", "\\d", "\\s", "\\b" are regex escapes. ast-grep matches AST nodes, not text — use $VAR for identifiers, $$$ for node lists, or switch to grep for text search.';
+	}
+	if (/\[[a-zA-Z0-9]-[a-zA-Z0-9]\]/.test(src)) {
+		return 'Hint: "[a-z]" and similar character classes are regex, not AST. Use $VAR to match any identifier, or switch to grep for text search.';
+	}
+	if (!src.includes("$") && /\w\.[*+]/.test(src)) {
+		return 'Hint: ".*" and ".+" are regex wildcards. In ast-grep use $$$ for multiple AST nodes and $VAR for a single node. For text patterns, switch to grep.';
+	}
+	if (/^[-\w.*]+\|[-\w.*|]+$/.test(src)) {
+		return 'Hint: "|" is regex alternation and does NOT work in ast-grep patterns. Options: (a) fire one ast_grep_search per alternative, or (b) switch to grep with a regex pattern like "foo|bar".';
+	}
+
+	// --- language-specific mistakes ---
+	if (lang === "python") {
+		if (
+			(src.startsWith("def ") || src.startsWith("async def ")) &&
+			src.endsWith(":")
+		) {
+			return `Hint: Remove trailing colon from Python patterns. Try: "${src.slice(0, -1)}"`;
+		}
+		if (src.startsWith("class ") && src.endsWith(":")) {
+			return `Hint: Remove trailing colon from class patterns. Try: "${src.slice(0, -1)}"`;
+		}
+	}
+	if (["javascript", "typescript", "tsx"].includes(lang)) {
+		if (/^(export\s+)?(async\s+)?function\s+\$[A-Z_]+\s*$/i.test(src)) {
+			return 'Hint: Function patterns need params and body. Try "function $NAME($$$) { $$$ }"';
+		}
+	}
+	if (lang === "go") {
+		if (/^func\s+\$[A-Z_]+\s*$/i.test(src)) {
+			return 'Hint: Go function patterns need params and body. Try "func $NAME($$$) { $$$ }"';
+		}
+	}
+	if (lang === "rust") {
+		if (/^fn\s+\$[A-Z_]+\s*$/i.test(src)) {
+			return 'Hint: Rust fn patterns need params and body. Try "fn $NAME($$$) { $$$ }"';
+		}
+	}
+
+	return null;
 }
 
 export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
@@ -121,8 +173,7 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 					content: [
 						{
 							type: "text" as const,
-							text:
-								"Error: ast_grep_search expects a valid AST code pattern, not plain text/rule YAML. Use patterns like `function $NAME($$$ARGS) { $$$BODY }` or use grep/read for plain text diagnostics.",
+							text: "Error: ast_grep_search expects a valid AST code pattern, not plain text/rule YAML. Use patterns like `function $NAME($$$ARGS) { $$$BODY }` or use grep/read for plain text diagnostics.",
 						},
 					],
 					isError: true,
@@ -145,9 +196,18 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 			}
 
 			const output = astGrepClient.formatMatches(result.matches);
+			const hint =
+				result.matches.length === 0 && !result.error
+					? getPatternHint(pattern, lang)
+					: undefined;
+			const finalOutput = hint ? `${output}\n\n${hint}` : output;
 			return {
-				content: [{ type: "text" as const, text: output }],
-				details: { matchCount: result.matches.length },
+				content: [{ type: "text" as const, text: finalOutput }],
+				details: {
+					matchCount: result.matches.length,
+					totalMatches: result.totalMatches,
+					truncated: result.truncated,
+				},
 			};
 		},
 	};

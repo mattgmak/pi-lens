@@ -73,7 +73,12 @@ export class AstGrepClient {
 		lang: string,
 		paths: string[],
 		options?: { selector?: string; context?: number },
-	): Promise<{ matches: AstGrepMatch[]; error?: string }> {
+	): Promise<{
+		matches: AstGrepMatch[];
+		totalMatches: number;
+		truncated: boolean;
+		error?: string;
+	}> {
 		const args = ["run", "-p", pattern, "--lang", lang, "--json=compact"];
 		if (options?.selector) {
 			args.push("--selector", options.selector);
@@ -82,7 +87,13 @@ export class AstGrepClient {
 			args.push("--context", String(options.context));
 		}
 		args.push(...paths);
-		return this.runner.exec(args);
+		const result = await this.runner.exec(args);
+		return {
+			matches: result.matches,
+			totalMatches: result.totalMatches,
+			truncated: result.truncated,
+			error: result.error,
+		};
 	}
 
 	/**
@@ -94,7 +105,13 @@ export class AstGrepClient {
 		lang: string,
 		paths: string[],
 		apply = false,
-	): Promise<{ matches: AstGrepMatch[]; applied: boolean; error?: string }> {
+	): Promise<{
+		matches: AstGrepMatch[];
+		totalMatches: number;
+		truncated: boolean;
+		applied: boolean;
+		error?: string;
+	}> {
 		const baseArgs = ["run", "-p", pattern, "-r", rewrite, "--lang", lang];
 
 		if (!apply) {
@@ -104,7 +121,13 @@ export class AstGrepClient {
 				"--json=compact",
 				...paths,
 			]);
-			return { matches: result.matches, applied: false, error: result.error };
+			return {
+				matches: result.matches,
+				totalMatches: result.totalMatches,
+				truncated: result.truncated,
+				applied: false,
+				error: result.error,
+			};
 		}
 
 		// Apply: --update-all and --json are MUTUALLY EXCLUSIVE in sg.
@@ -117,7 +140,13 @@ export class AstGrepClient {
 			...paths,
 		]);
 		if (applyResult.error) {
-			return { matches: [], applied: false, error: applyResult.error };
+			return {
+				matches: [],
+				totalMatches: 0,
+				truncated: false,
+				applied: false,
+				error: applyResult.error,
+			};
 		}
 
 		// Search for what was changed (pattern no longer matches after rewrite,
@@ -131,7 +160,13 @@ export class AstGrepClient {
 			"--json=compact",
 			...paths,
 		]);
-		return { matches: searchResult.matches, applied: true, error: undefined };
+		return {
+			matches: searchResult.matches,
+			totalMatches: searchResult.totalMatches,
+			truncated: searchResult.truncated,
+			applied: true,
+			error: undefined,
+		};
 	}
 
 	/**

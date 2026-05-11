@@ -47,6 +47,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { statSync } from "node:fs";
 import fs from "node:fs/promises";
 import https from "node:https";
 import os from "node:os";
@@ -628,7 +629,11 @@ interface ProbeCacheEntry {
 
 type ProbeCache = Record<string, ProbeCacheEntry>;
 
-const PROBE_CACHE_PATH = path.join(os.homedir(), ".pi-lens", "probe-cache.json");
+const PROBE_CACHE_PATH = path.join(
+	os.homedir(),
+	".pi-lens",
+	"probe-cache.json",
+);
 const PROBE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 let _probeCache: ProbeCache | null = null;
@@ -731,41 +736,43 @@ export function resetProbeCacheStateForTesting(): void {
 // --- Check Functions ---
 
 /**
- * Check if a command is available in PATH.
- * Uses where/which so .cmd wrappers resolve without shell: true.
+ * Check if a command is available in PATH by walking PATH entries and
+ * verifying each candidate is a real file with non-zero size.
+ * Catches broken symlinks (stat throws ENOENT or returns size 0) without
+ * spawning a process — ~μs per candidate vs ~50ms for which/where.
  */
 async function isCommandAvailable(
 	command: string,
-	_args: string[] = ["--version"],
+	_args?: string[],
 ): Promise<boolean> {
-	const finder = process.platform === "win32" ? "where" : "which";
-	return new Promise((resolve) => {
-		const proc = spawn(finder, [command], { stdio: "ignore" });
+	const isWindows = process.platform === "win32";
+	const pathEnv =
+		process.env.PATH || process.env.Path || process.env.path || "";
+	const dirs = pathEnv.split(path.delimiter);
 
-		let resolved = false;
-		const timeoutId = setTimeout(() => {
-			if (!resolved) {
-				resolved = true;
-				proc.kill();
-				resolve(false);
-			}
-		}, 5000);
+	// On Windows, probe .exe, .cmd, and .bat extensions in addition to bare name.
+	// On Unix, probe bare name and extensionless (scripts, symlinks).
+	const names = isWindows
+		? [command, `${command}.exe`, `${command}.cmd`, `${command}.bat`]
+		: [command];
 
-		proc.on("exit", (code) => {
-			if (!resolved) {
-				resolved = true;
-				clearTimeout(timeoutId);
-				resolve(code === 0);
+	for (const dir of dirs) {
+		if (!dir) continue;
+		for (const name of names) {
+			const candidate = path.join(dir, name);
+			try {
+				const stat = statSync(candidate);
+				// isFile() returns false for broken symlinks (target missing)
+				if (stat.isFile() && stat.size > 0) {
+					return true;
+				}
+			} catch {
+				// ENOENT or permission denied — skip this candidate
 			}
-		});
-		proc.on("error", () => {
-			if (!resolved) {
-				resolved = true;
-				clearTimeout(timeoutId);
-				resolve(false);
-			}
-		});
-	});
+		}
+	}
+
+	return false;
 }
 
 // --- Verification Functions
@@ -1025,6 +1032,15 @@ export async function getToolPath(toolId: string): Promise<string | undefined> {
 		// fall through to global checks
 	}
 
+	// For github-strategy tools, prefer managed install (~/.pi-lens/bin/) over PATH.
+	// Managed installs are known-good binaries that pi-lens downloaded as a fallback
+	// when a PATH-resolved tool was broken or missing. Checking before PATH ensures
+	// force-reinstall flows find the newly downloaded binary.
+	if (tool.installStrategy === "github") {
+		const githubPath = await findGitHubToolPath(tool.binaryName || tool.id);
+		if (githubPath) return githubPath;
+	}
+
 	// Check if global
 	if (await isCommandAvailable(tool.checkCommand, tool.checkArgs)) {
 		return tool.checkCommand;
@@ -1043,13 +1059,6 @@ export async function getToolPath(toolId: string): Promise<string | undefined> {
 		if (pipPath) {
 			return pipPath;
 		}
-	}
-
-	// For github-strategy tools, probe ~/.pi-lens/bin/
-	if (tool.installStrategy === "github") {
-		const githubPath = await findGitHubToolPath(tool.binaryName || tool.id);
-		if (githubPath) return githubPath;
-		return undefined;
 	}
 
 	return undefined;
@@ -1961,7 +1970,52 @@ export async function installTool(toolId: string): Promise<boolean> {
 /**
  * Ensure a tool is installed (check first, install if missing)
  */
-export async function ensureTool(toolId: string): Promise<string | undefined> {
+export async function ensureTool(
+	toolId: string,
+	opts?: { forceReinstall?: boolean },
+): Promise<string | undefined> {
+	// forceReinstall: nuke caches, download from managed source, skip PATH entirely.
+	// Used when a PATH-resolved tool proves broken at launch (e.g. broken symlink).
+	if (opts?.forceReinstall) {
+		const ensureStartMs = Date.now();
+		logSessionStart(
+			`auto-install ensure ${toolId}: force reinstall — clearing caches`,
+		);
+
+		// Clear in-memory session cache
+		resolvedPathCache.delete(toolId);
+
+		// Clear persistent probe cache entry so getToolPath won't return stale PATH result
+		try {
+			const probeCache = await readProbeCache();
+			delete probeCache[toolId];
+			_probeCacheDirty = true;
+			scheduleProbeFlush();
+		} catch {
+			// best-effort
+		}
+
+		// Force download
+		const installed = await installTool(toolId);
+		if (!installed) {
+			logSessionStart(
+				`auto-install ensure ${toolId}: force reinstall failed (${Date.now() - ensureStartMs}ms)`,
+			);
+			return undefined;
+		}
+
+		// Find the newly installed binary (github-local check now comes before PATH)
+		const result = await getToolPath(toolId);
+		if (result) {
+			resolvedPathCache.set(toolId, result);
+			void updateProbeCache(toolId, result);
+			logSessionStart(
+				`auto-install ensure ${toolId}: force reinstall success at ${result} (${Date.now() - ensureStartMs}ms)`,
+			);
+		}
+		return result;
+	}
+
 	// Fast path 1: in-memory session cache — no I/O.
 	const cached = resolvedPathCache.get(toolId);
 	if (cached) return cached;
