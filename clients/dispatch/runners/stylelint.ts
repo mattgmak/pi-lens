@@ -77,7 +77,9 @@ const stylelintRunner: RunnerDefinition = {
 		}
 
 		let cmd: string | null = null;
-		if (stylelint.isAvailable(cwd)) {
+		if (
+			await (stylelint.isAvailableAsync?.(cwd) ?? stylelint.isAvailable(cwd))
+		) {
 			cmd = stylelint.getCommand(cwd);
 		} else {
 			cmd = await resolveToolCommandWithInstallFallback(cwd, "stylelint");

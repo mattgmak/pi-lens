@@ -23,7 +23,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { ensureTool } from "../../installer/index.js";
-import { safeSpawn } from "../../safe-spawn.js";
+import { safeSpawnAsync } from "../../safe-spawn.js";
 import { PRIORITY } from "../priorities.js";
 import type {
 	Diagnostic,
@@ -140,7 +140,7 @@ const shellcheckRunner: RunnerDefinition = {
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		const cwd = ctx.cwd || process.cwd();
 		let cmd: string | null = null;
-		if (shellcheck.isAvailable(cwd)) {
+		if (await (shellcheck.isAvailableAsync?.(cwd) ?? shellcheck.isAvailable(cwd))) {
 			cmd = shellcheck.getCommand(cwd);
 		} else {
 			const managed = await ensureTool("shellcheck");
@@ -167,7 +167,7 @@ const shellcheckRunner: RunnerDefinition = {
 
 		args.push(ctx.filePath);
 
-		const result = safeSpawn(cmd, args, { timeout: 15000 });
+		const result = await safeSpawnAsync(cmd, args, { timeout: 15000 });
 
 		// shellcheck exits with code 1 if issues found, 0 if clean
 		if (result.status === 0 && !result.stdout?.trim()) {

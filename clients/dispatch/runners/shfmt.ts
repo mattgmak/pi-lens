@@ -1,5 +1,5 @@
 import { ensureTool } from "../../installer/index.js";
-import { safeSpawn } from "../../safe-spawn.js";
+import { safeSpawnAsync } from "../../safe-spawn.js";
 import { PRIORITY } from "../priorities.js";
 import type {
 	Diagnostic,
@@ -27,7 +27,7 @@ const shfmtRunner: RunnerDefinition = {
 		const cwd = ctx.cwd || process.cwd();
 
 		let cmd: string | null = null;
-		if (shfmt.isAvailable(cwd)) {
+		if (await (shfmt.isAvailableAsync?.(cwd) ?? shfmt.isAvailable(cwd))) {
 			cmd = shfmt.getCommand(cwd);
 		} else {
 			const installed = await ensureTool("shfmt");
@@ -40,7 +40,7 @@ const shfmtRunner: RunnerDefinition = {
 		if (!cmd) return { status: "skipped", diagnostics: [], semantic: "none" };
 
 		// --diff exits 1 and prints a unified diff if the file needs formatting
-		const result = safeSpawn(cmd, ["--diff", ctx.filePath], {
+		const result = await safeSpawnAsync(cmd, ["--diff", ctx.filePath], {
 			timeout: 10000,
 			cwd,
 		});

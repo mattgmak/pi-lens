@@ -1,4 +1,4 @@
-import { safeSpawn } from "../../safe-spawn.js";
+import { safeSpawnAsync } from "../../safe-spawn.js";
 import {
 	getLinterPolicyForCwd,
 	hasMarkdownlintConfig,
@@ -61,7 +61,7 @@ const markdownlintRunner: RunnerDefinition = {
 		}
 
 		let cmd: string | null = null;
-		if (markdownlint.isAvailable(cwd)) {
+		if (await (markdownlint.isAvailableAsync?.(cwd) ?? markdownlint.isAvailable(cwd))) {
 			cmd = markdownlint.getCommand(cwd);
 		} else {
 			cmd = await resolveToolCommandWithInstallFallback(cwd, "markdownlint");
@@ -70,7 +70,7 @@ const markdownlintRunner: RunnerDefinition = {
 		if (!cmd) return { status: "skipped", diagnostics: [], semantic: "none" };
 
 		const configArgs = hasConfig ? [] : ["--disable", "MD013"];
-		const result = safeSpawn(cmd, [...configArgs, ctx.filePath], {
+		const result = await safeSpawnAsync(cmd, [...configArgs, ctx.filePath], {
 			timeout: 15000,
 			cwd,
 		});

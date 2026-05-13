@@ -1,4 +1,4 @@
-import { safeSpawn } from "../../safe-spawn.js";
+import { safeSpawnAsync } from "../../safe-spawn.js";
 import { getLinterPolicyForCwd, hasYamllintConfig } from "../../tool-policy.js";
 import { PRIORITY } from "../priorities.js";
 import type {
@@ -60,7 +60,7 @@ const yamllintRunner: RunnerDefinition = {
 		}
 
 		let cmd: string | null = null;
-		if (yamllint.isAvailable(cwd)) {
+		if (await (yamllint.isAvailableAsync?.(cwd) ?? yamllint.isAvailable(cwd))) {
 			cmd = yamllint.getCommand(cwd);
 		} else {
 			cmd = await resolveToolCommandWithInstallFallback(cwd, "yamllint");
@@ -68,7 +68,7 @@ const yamllintRunner: RunnerDefinition = {
 
 		if (!cmd) return { status: "skipped", diagnostics: [], semantic: "none" };
 
-		const result = safeSpawn(cmd, ["-f", "parsable", ctx.filePath], {
+		const result = await safeSpawnAsync(cmd, ["-f", "parsable", ctx.filePath], {
 			timeout: 15000,
 		});
 

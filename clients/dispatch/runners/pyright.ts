@@ -43,7 +43,7 @@ const pyrightRunner: RunnerDefinition = {
 		let cmd: string | null = null;
 
 		// Strategy 1: Check cached availability (fast path)
-		if (pyright.isAvailable(cwd)) {
+		if (await (pyright.isAvailableAsync?.(cwd) ?? pyright.isAvailable(cwd))) {
 			cmd = pyright.getCommand(cwd);
 		}
 

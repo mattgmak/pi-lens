@@ -10,7 +10,7 @@
  * Based on slop-code-bench: https://github.com/SprocketLab/slop-code-bench
  */
 
-import { safeSpawn } from "../../safe-spawn.js";
+import { safeSpawnAsync } from "../../safe-spawn.js";
 import { PRIORITY } from "../priorities.js";
 import type {
 	Diagnostic,
@@ -57,7 +57,7 @@ const pythonSlopRunner: RunnerDefinition = {
 			ctx.filePath,
 		];
 
-		const result = safeSpawn(sgCmd, args, {
+		const result = await safeSpawnAsync(sgCmd, args, {
 			timeout: 30000,
 		});
 

@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { safeSpawn } from "../../safe-spawn.js";
+import { safeSpawnAsync } from "../../safe-spawn.js";
 import { PRIORITY } from "../priorities.js";
 import type {
 	Diagnostic,
@@ -7,9 +7,12 @@ import type {
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
-import { resolveLocalFirst } from "./utils/runner-helpers.js";
+import { resolveLocalFirstAsync } from "./utils/runner-helpers.js";
 
-function parsePrismaValidateOutput(raw: string, filePath: string): Diagnostic[] {
+function parsePrismaValidateOutput(
+	raw: string,
+	filePath: string,
+): Diagnostic[] {
 	const output = raw
 		.split("\n")
 		.map((line) => line.trim())
@@ -51,9 +54,9 @@ const prismaValidateRunner: RunnerDefinition = {
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		const cwd = ctx.cwd || process.cwd();
-		const resolved = resolveLocalFirst("prisma", cwd);
+		const resolved = await resolveLocalFirstAsync("prisma", cwd);
 		const absPath = path.resolve(cwd, ctx.filePath);
-		const result = safeSpawn(
+		const result = await safeSpawnAsync(
 			resolved.cmd,
 			[...resolved.args, "validate", "--schema", absPath],
 			{ timeout: 20000, cwd },

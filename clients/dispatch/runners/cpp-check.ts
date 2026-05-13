@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { safeSpawn } from "../../safe-spawn.js";
+import { safeSpawnAsync } from "../../safe-spawn.js";
 import { PRIORITY } from "../priorities.js";
 import type {
 	Diagnostic,
@@ -12,20 +12,22 @@ type CompilerSpec =
 	| { command: string; args: string[]; flavor: "gcc" | "msvc" }
 	| undefined;
 
-function resolveCompiler(absPath: string): CompilerSpec {
+async function resolveCompiler(absPath: string): Promise<CompilerSpec> {
 	const gccLike: Array<{ command: string; args: string[] }> = [
 		{ command: "clang++", args: ["-fsyntax-only", absPath] },
 		{ command: "g++", args: ["-fsyntax-only", absPath] },
 		{ command: "c++", args: ["-fsyntax-only", absPath] },
 	];
 	for (const candidate of gccLike) {
-		const probe = safeSpawn(candidate.command, ["--version"], { timeout: 5000 });
+		const probe = await safeSpawnAsync(candidate.command, ["--version"], {
+			timeout: 5000,
+		});
 		if (!probe.error && probe.status === 0) {
 			return { ...candidate, flavor: "gcc" };
 		}
 	}
 
-	const clProbe = safeSpawn("cl", [], { timeout: 5000 });
+	const clProbe = await safeSpawnAsync("cl", [], { timeout: 5000 });
 	if (!clProbe.error && clProbe.status !== null) {
 		return {
 			command: "cl",
@@ -49,8 +51,9 @@ function parseGccLikeOutput(raw: string, filePath: string): Diagnostic[] {
 		const resolvedTarget = path.resolve(filePath);
 		if (resolvedSource !== resolvedTarget) continue;
 
-		const severity =
-			severityLabel.toLowerCase().includes("error") ? "error" : "warning";
+		const severity = severityLabel.toLowerCase().includes("error")
+			? "error"
+			: "warning";
 		diagnostics.push({
 			id: `cpp-check-${severityLabel}-${lineStr}-${colStr || "1"}`,
 			message: message.trim(),
@@ -79,8 +82,9 @@ function parseMsvcOutput(raw: string, filePath: string): Diagnostic[] {
 		const resolvedTarget = path.resolve(filePath);
 		if (resolvedSource !== resolvedTarget) continue;
 
-		const severity =
-			severityLabel.toLowerCase().includes("error") ? "error" : "warning";
+		const severity = severityLabel.toLowerCase().includes("error")
+			? "error"
+			: "warning";
 		diagnostics.push({
 			id: `cpp-check-${rule}-${lineStr}-${colStr || "1"}`,
 			message: `[${rule}] ${message.trim()}`,
@@ -111,12 +115,12 @@ const cppCheckRunner: RunnerDefinition = {
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		const cwd = ctx.cwd || process.cwd();
 		const absPath = path.resolve(cwd, ctx.filePath);
-		const compiler = resolveCompiler(absPath);
+		const compiler = await resolveCompiler(absPath);
 		if (!compiler) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
-		const result = safeSpawn(compiler.command, compiler.args, {
+		const result = await safeSpawnAsync(compiler.command, compiler.args, {
 			cwd,
 			timeout: 30000,
 		});
@@ -148,7 +152,12 @@ const cppCheckRunner: RunnerDefinition = {
 					rawOutput: raw,
 				};
 			}
-			return { status: "succeeded", diagnostics: [], semantic: "none", rawOutput: raw };
+			return {
+				status: "succeeded",
+				diagnostics: [],
+				semantic: "none",
+				rawOutput: raw,
+			};
 		}
 
 		const hasErrors = diagnostics.some((d) => d.severity === "error");

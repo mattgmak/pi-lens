@@ -4,18 +4,25 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { FactStore } from "../../../../clients/dispatch/fact-store.js";
 import { setupTestEnvironment } from "../../test-utils.js";
 
+const safeSpawn = vi.fn((..._args: unknown[]) => ({
+	error: null,
+	status: 0,
+	stdout: "",
+	stderr: "",
+}));
+const safeSpawnAsync = vi.fn((...args: Parameters<typeof safeSpawn>) =>
+	Promise.resolve(safeSpawn(...args)),
+);
+
 vi.mock("../../../../clients/safe-spawn.js", () => ({
-	safeSpawn: vi.fn(() => ({
-		error: null,
-		status: 0,
-		stdout: "",
-		stderr: "",
-	})),
+	safeSpawn,
+	safeSpawnAsync,
 }));
 
 vi.mock("../../../../clients/dispatch/runners/utils/runner-helpers.js", () => ({
 	createAvailabilityChecker: () => ({
 		isAvailable: () => true,
+		isAvailableAsync: async () => true,
 		getCommand: () => "shellcheck",
 	}),
 }));
@@ -35,103 +42,110 @@ function createShellCtx(filePath: string, cwd: string) {
 }
 
 describe("shellcheck runner", () => {
-	beforeEach(async () => {
-		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
-		vi.mocked(safeSpawnMod.safeSpawn).mockReset();
+	beforeEach(() => {
+		vi.resetModules();
+		safeSpawn.mockReset();
+		safeSpawnAsync.mockReset();
+		safeSpawnAsync.mockImplementation((...args: Parameters<typeof safeSpawn>) =>
+			Promise.resolve(safeSpawn(...args)),
+		);
 	});
 
 	it("adds --severity warning when no .shellcheckrc exists", async () => {
-		const shellcheckRunner = (await import(
-			"../../../../clients/dispatch/runners/shellcheck.js"
-		)).default;
-		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
-
-		vi.mocked(safeSpawnMod.safeSpawn).mockReturnValue({
-			error: undefined,
-			status: 0,
-			stdout: "",
-			stderr: "",
-		});
-
-		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-shell-");
+		const env = setupTestEnvironment("pi-lens-shellcheck-");
 		try {
-			const filePath = path.join(tmpDir, "script.sh");
-			fs.writeFileSync(filePath, "#!/bin/bash\necho ok\n");
+			const filePath = path.join(env.tmpDir, "script.sh");
+			fs.writeFileSync(filePath, "echo $x\n");
+			safeSpawn.mockReturnValue({
+				error: null,
+				status: 0,
+				stdout: "",
+				stderr: "",
+			});
 
-			await shellcheckRunner.run(createShellCtx(filePath, tmpDir) as never);
+			const runner = (
+				await import("../../../../clients/dispatch/runners/shellcheck.js")
+			).default;
+			await runner.run(createShellCtx(filePath, env.tmpDir) as never);
 
-			const args = vi.mocked(safeSpawnMod.safeSpawn).mock.calls[0]?.[1] ?? [];
+			const args = safeSpawn.mock.calls[0]?.[1] ?? [];
 			expect(args).toContain("--severity");
 			expect(args).toContain("warning");
 		} finally {
-			cleanup();
+			env.cleanup();
 		}
 	});
 
 	it("finds parent .shellcheckrc and does not force --severity", async () => {
-		const shellcheckRunner = (await import(
-			"../../../../clients/dispatch/runners/shellcheck.js"
-		)).default;
-		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
-
-		vi.mocked(safeSpawnMod.safeSpawn).mockReturnValue({
-			error: undefined,
-			status: 0,
-			stdout: "",
-			stderr: "",
-		});
-
-		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-shell-");
+		const env = setupTestEnvironment("pi-lens-shellcheck-");
 		try {
-			fs.writeFileSync(path.join(tmpDir, ".shellcheckrc"), "disable=SC1090\n");
-			const subdir = path.join(tmpDir, "scripts", "ci");
-			fs.mkdirSync(subdir, { recursive: true });
-			const filePath = path.join(subdir, "script.sh");
-			fs.writeFileSync(filePath, "#!/bin/bash\necho ok\n");
+			fs.writeFileSync(
+				path.join(env.tmpDir, ".shellcheckrc"),
+				"disable=SC2034\n",
+			);
+			const filePath = path.join(env.tmpDir, "scripts", "script.sh");
+			fs.mkdirSync(path.dirname(filePath), { recursive: true });
+			fs.writeFileSync(filePath, "echo $x\n");
+			safeSpawn.mockReturnValue({
+				error: null,
+				status: 0,
+				stdout: "",
+				stderr: "",
+			});
 
-			await shellcheckRunner.run(createShellCtx(filePath, subdir) as never);
+			const runner = (
+				await import("../../../../clients/dispatch/runners/shellcheck.js")
+			).default;
+			await runner.run(createShellCtx(filePath, env.tmpDir) as never);
 
-			const args = vi.mocked(safeSpawnMod.safeSpawn).mock.calls[0]?.[1] ?? [];
+			const args = safeSpawn.mock.calls[0]?.[1] ?? [];
 			expect(args).not.toContain("--severity");
 		} finally {
-			cleanup();
+			env.cleanup();
 		}
 	});
 
+	it("appliesTo shell but not fish (so dispatch skips .fish files)", async () => {
+		const runner = (
+			await import("../../../../clients/dispatch/runners/shellcheck.js")
+		).default;
+		expect(runner.appliesTo).toContain("shell");
+		expect(runner.appliesTo).not.toContain("fish");
+	});
+
 	it("returns failed/blocking when shellcheck reports error severity", async () => {
-		const shellcheckRunner = (await import(
-			"../../../../clients/dispatch/runners/shellcheck.js"
-		)).default;
-		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
-
-		vi.mocked(safeSpawnMod.safeSpawn).mockReturnValue({
-			error: undefined,
-			status: 1,
-			stdout: JSON.stringify([
-				{
-					line: 3,
-					column: 1,
-					level: "error",
-					code: 1000,
-					message: "syntax error",
-				},
-			]),
-			stderr: "",
-		});
-
-		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-shell-");
+		const env = setupTestEnvironment("pi-lens-shellcheck-");
 		try {
-			const filePath = path.join(tmpDir, "script.sh");
-			fs.writeFileSync(filePath, "#!/bin/bash\nif then\n");
+			const filePath = path.join(env.tmpDir, "script.sh");
+			fs.writeFileSync(filePath, "echo $x\n");
+			safeSpawn.mockReturnValue({
+				error: null,
+				status: 1,
+				stdout: JSON.stringify([
+					{
+						file: filePath,
+						line: 1,
+						column: 1,
+						level: "error",
+						code: 2086,
+						message: "Double quote to prevent globbing",
+					},
+				]),
+				stderr: "",
+			});
 
-			const result = await shellcheckRunner.run(
-				createShellCtx(filePath, tmpDir) as never,
+			const runner = (
+				await import("../../../../clients/dispatch/runners/shellcheck.js")
+			).default;
+			const result = await runner.run(
+				createShellCtx(filePath, env.tmpDir) as never,
 			);
 
 			expect(result.status).toBe("failed");
 			expect(result.semantic).toBe("blocking");
+			expect(result.diagnostics[0]?.semantic).toBe("blocking");
 		} finally {
-			cleanup();
+			env.cleanup();
 		}
 	});
 });

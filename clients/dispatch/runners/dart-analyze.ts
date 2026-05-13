@@ -21,19 +21,24 @@ function parseDartMachineOutput(raw: string, filePath: string): Diagnostic[] {
 		const parts = line.split("|");
 		if (parts.length < 8) continue;
 
-		const [severityStr, , code, file, lineStr, colStr, , ...messageParts] = parts;
+		const [severityStr, , code, file, lineStr, colStr, , ...messageParts] =
+			parts;
 		const message = messageParts.join("|").trim();
 		const lineNum = parseInt(lineStr, 10);
 		const colNum = parseInt(colStr, 10);
 
 		// Only include diagnostics for the target file
-		if (file && !path.resolve(file).endsWith(path.resolve(filePath).replace(/\\/g, "/"))) {
+		if (
+			file &&
+			!path.resolve(file).endsWith(path.resolve(filePath).replace(/\\/g, "/"))
+		) {
 			const resolvedFile = path.resolve(file.trim());
 			const resolvedTarget = path.resolve(filePath);
 			if (resolvedFile !== resolvedTarget) continue;
 		}
 
-		const severity = severityStr?.trim().toLowerCase() === "error" ? "error" : "warning";
+		const severity =
+			severityStr?.trim().toLowerCase() === "error" ? "error" : "warning";
 		diagnostics.push({
 			id: `dart-${code?.trim()}-${lineNum}-${colNum}`,
 			message: `[${code?.trim()}] ${message}`,
@@ -67,21 +72,22 @@ const dartAnalyzeRunner: RunnerDefinition = {
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		const cwd = ctx.cwd || process.cwd();
 		const absPath = path.resolve(cwd, ctx.filePath);
-		const dartAvailable = dart.isAvailable(cwd);
-		const flutterAvailable = !dartAvailable && flutter.isAvailable(cwd);
+		const dartAvailable = await (dart.isAvailableAsync?.(cwd) ??
+			dart.isAvailable(cwd));
+		const flutterAvailable =
+			!dartAvailable &&
+			(await (flutter.isAvailableAsync?.(cwd) ?? flutter.isAvailable(cwd)));
 		if (!dartAvailable && !flutterAvailable) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
-		const cmd = dartAvailable ? dart.getCommand(cwd)! : flutter.getCommand(cwd)!;
+		const cmd = dartAvailable
+			? dart.getCommand(cwd)!
+			: flutter.getCommand(cwd)!;
 		const args = dartAvailable
 			? ["analyze", "--format=machine", absPath]
 			: ["analyze", "--machine", absPath];
 
-		const result = await safeSpawnAsync(
-			cmd,
-			args,
-			{ cwd, timeout: 30000 },
-		);
+		const result = await safeSpawnAsync(cmd, args, { cwd, timeout: 30000 });
 
 		if (result.error && !result.stdout && !result.stderr) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };

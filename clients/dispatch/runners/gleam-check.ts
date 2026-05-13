@@ -17,7 +17,9 @@ function parseGleamOutput(raw: string, filePath: string): Diagnostic[] {
 		const location = lines[i].match(/^(.+?):(\d+):(\d+)$/);
 		if (!location) continue;
 		const [, sourcePath, lineStr, colStr] = location;
-		if (!sourcePath.replace(/\\/g, "/").endsWith(filePath.replace(/\\/g, "/"))) {
+		if (
+			!sourcePath.replace(/\\/g, "/").endsWith(filePath.replace(/\\/g, "/"))
+		) {
 			continue;
 		}
 		const message = lines.slice(i + 1).find((line) => line.trim().length > 0);
@@ -53,7 +55,7 @@ const gleamCheckRunner: RunnerDefinition = {
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		const cwd = ctx.cwd || process.cwd();
-		if (!gleam.isAvailable(cwd)) {
+		if (!(await (gleam.isAvailableAsync?.(cwd) ?? gleam.isAvailable(cwd)))) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
