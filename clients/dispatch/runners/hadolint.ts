@@ -64,7 +64,7 @@ const hadolintRunner: RunnerDefinition = {
 		}
 
 		let cmd: string | null = null;
-		if (hadolint.isAvailable(cwd)) {
+		if (await (hadolint.isAvailableAsync?.(cwd) ?? hadolint.isAvailable(cwd))) {
 			cmd = hadolint.getCommand(cwd);
 		} else {
 			cmd = await resolveToolCommandWithInstallFallback(cwd, "hadolint");

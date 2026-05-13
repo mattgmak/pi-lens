@@ -82,7 +82,7 @@ describe("runner status/semantic edge cases", () => {
 			);
 			fs.writeFileSync(filePath, "package main\n");
 
-			safeSpawn.mockReturnValueOnce({
+			safeSpawnAsync.mockResolvedValueOnce({
 				error: null,
 				status: 0,
 				stdout: "ok",

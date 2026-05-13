@@ -237,7 +237,9 @@ const semgrepRunner: RunnerDefinition = {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
-		if (!semgrep.isAvailable(cwd)) {
+		if (
+			!(await (semgrep.isAvailableAsync?.(cwd) ?? semgrep.isAvailable(cwd)))
+		) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 		const cmd = semgrep.getCommand(cwd) ?? "semgrep";

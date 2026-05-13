@@ -57,7 +57,7 @@ const zigCheckRunner: RunnerDefinition = {
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		const cwd = ctx.cwd || process.cwd();
-		if (!zig.isAvailable(cwd)) {
+		if (!(await (zig.isAvailableAsync?.(cwd) ?? zig.isAvailable(cwd)))) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 

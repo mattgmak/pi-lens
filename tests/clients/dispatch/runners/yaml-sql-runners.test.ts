@@ -4,18 +4,25 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { FactStore } from "../../../../clients/dispatch/fact-store.js";
 import { setupTestEnvironment } from "../../test-utils.js";
 
+const safeSpawn = vi.fn((..._args: unknown[]) => ({
+	error: undefined,
+	status: 0,
+	stdout: "",
+	stderr: "",
+}));
+const safeSpawnAsync = vi.fn((...args: Parameters<typeof safeSpawn>) =>
+	Promise.resolve(safeSpawn(...args)),
+);
+
 vi.mock("../../../../clients/safe-spawn.js", () => ({
-	safeSpawn: vi.fn(() => ({
-		error: undefined,
-		status: 0,
-		stdout: "",
-		stderr: "",
-	})),
+	safeSpawn,
+	safeSpawnAsync,
 }));
 
 vi.mock("../../../../clients/dispatch/runners/utils/runner-helpers.js", () => ({
 	createAvailabilityChecker: (command: string) => ({
 		isAvailable: () => true,
+		isAvailableAsync: async () => true,
 		getCommand: () => command,
 	}),
 	resolveToolCommandWithInstallFallback: vi.fn(
@@ -45,6 +52,11 @@ describe("yaml/sql runners", () => {
 	beforeEach(async () => {
 		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
 		vi.mocked(safeSpawnMod.safeSpawn).mockReset();
+		vi.mocked(safeSpawnMod.safeSpawnAsync).mockReset();
+		vi.mocked(safeSpawnMod.safeSpawnAsync).mockImplementation(
+			(...args: Parameters<typeof safeSpawn>) =>
+				Promise.resolve(safeSpawn(...args)),
+		);
 	});
 
 	it("yamllint runner maps error severity to blocking", async () => {

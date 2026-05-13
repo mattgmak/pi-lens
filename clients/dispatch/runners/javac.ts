@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { safeSpawn } from "../../safe-spawn.js";
+import { safeSpawnAsync } from "../../safe-spawn.js";
 import { PRIORITY } from "../priorities.js";
 import type {
 	Diagnostic,
@@ -24,7 +24,8 @@ function parseJavacOutput(raw: string, filePath: string): Diagnostic[] {
 		const resolvedTarget = path.resolve(filePath);
 		if (resolvedReported !== resolvedTarget) continue;
 
-		const severity = severityLabel.toLowerCase() === "error" ? "error" : "warning";
+		const severity =
+			severityLabel.toLowerCase() === "error" ? "error" : "warning";
 		const lineNum = Number.parseInt(lineStr, 10) || 1;
 		diagnostics.push({
 			id: `javac-${severity}-${lineNum}-${message}`,
@@ -52,7 +53,7 @@ const javacRunner: RunnerDefinition = {
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		const cwd = ctx.cwd || process.cwd();
-		if (!javac.isAvailable(cwd)) {
+		if (!(await (javac.isAvailableAsync?.(cwd) ?? javac.isAvailable(cwd)))) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
@@ -62,10 +63,14 @@ const javacRunner: RunnerDefinition = {
 		}
 
 		const absPath = path.resolve(cwd, ctx.filePath);
-		const result = safeSpawn(cmd, ["-Xlint:none", "-proc:none", absPath], {
-			cwd,
-			timeout: 30000,
-		});
+		const result = await safeSpawnAsync(
+			cmd,
+			["-Xlint:none", "-proc:none", absPath],
+			{
+				cwd,
+				timeout: 30000,
+			},
+		);
 		const raw = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.trim();
 
 		if (result.status === 0 && !raw) {

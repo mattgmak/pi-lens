@@ -9,7 +9,7 @@ import { clearAllSessions as clearFileTimeSessions } from "./file-time.js";
 import { getKnipIgnorePatterns } from "./file-utils.js";
 import type { GoClient } from "./go-client.js";
 import type { JscpdClient } from "./jscpd-client.js";
-import type { KnipClient } from "./knip-client.js";
+import type { KnipClient, KnipResult } from "./knip-client.js";
 import { canRunStartupHeavyScans } from "./language-policy.js";
 import {
 	detectProjectLanguageProfile,
@@ -258,10 +258,7 @@ function scheduleStartupScans(
 	runTask("knip", async () => {
 		if (await knipClient.ensureAvailable()) {
 			if (!runtime.isCurrentSession(sessionGeneration)) return;
-			const cached = cacheManager.readCache<ReturnType<KnipClient["analyze"]>>(
-				"knip",
-				analysisRoot,
-			);
+			const cached = cacheManager.readCache<KnipResult>("knip", analysisRoot);
 			if (cached) {
 				if (!runtime.isCurrentSession(sessionGeneration)) return;
 				dbg(
@@ -269,7 +266,7 @@ function scheduleStartupScans(
 				);
 			} else {
 				const startMs = Date.now();
-				const knipResult = knipClient.analyze(
+				const knipResult = await knipClient.analyze(
 					analysisRoot,
 					getKnipIgnorePatterns(),
 				);
@@ -289,16 +286,15 @@ function scheduleStartupScans(
 	runTask("jscpd", async () => {
 		if (await jscpdClient.ensureAvailable()) {
 			if (!runtime.isCurrentSession(sessionGeneration)) return;
-			const cached = cacheManager.readCache<ReturnType<JscpdClient["scan"]>>(
-				"jscpd",
-				analysisRoot,
-			);
+			const cached = cacheManager.readCache<
+				Awaited<ReturnType<JscpdClient["scan"]>>
+			>("jscpd", analysisRoot);
 			if (cached) {
 				if (!runtime.isCurrentSession(sessionGeneration)) return;
 				dbg("session_start jscpd: cache hit");
 			} else {
 				const startMs = Date.now();
-				const jscpdResult = jscpdClient.scan(analysisRoot);
+				const jscpdResult = await jscpdClient.scan(analysisRoot);
 				if (!runtime.isCurrentSession(sessionGeneration)) return;
 				cacheManager.writeCache("jscpd", jscpdResult, analysisRoot, {
 					scanDurationMs: Date.now() - startMs,
@@ -638,8 +634,14 @@ export async function handleSessionStart(
 					`session_start lsp-config: loaded (${warmFiles.length} warm file(s) configured)`,
 				);
 				if (warmFiles.length > 0) {
-					igniteWarmFiles(cwd, warmFiles, runtime, sessionGeneration, dbg).catch(
-						(err) => dbg(`session_start lsp-warm: unhandled error: ${err}`),
+					igniteWarmFiles(
+						cwd,
+						warmFiles,
+						runtime,
+						sessionGeneration,
+						dbg,
+					).catch((err) =>
+						dbg(`session_start lsp-warm: unhandled error: ${err}`),
 					);
 				}
 			});

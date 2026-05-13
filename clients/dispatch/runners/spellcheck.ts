@@ -19,7 +19,7 @@
  * Or: npm install -g typos-cli (if wrapped)
  */
 
-import { safeSpawn } from "../../safe-spawn.js";
+import { safeSpawnAsync } from "../../safe-spawn.js";
 import { PRIORITY } from "../priorities.js";
 import type {
 	Diagnostic,
@@ -85,7 +85,9 @@ function parseTyposOutput(raw: string, filePath: string): Diagnostic[] {
 				fixKind: parsed.corrections?.length ? "suggestion" : undefined,
 				fixSuggestion: parsed.corrections?.[0],
 			});
-		} catch {}
+		} catch (err) {
+			void err;
+		}
 	}
 
 	return diagnostics;
@@ -100,7 +102,7 @@ const spellcheckRunner: RunnerDefinition = {
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		// Skip if typos-cli is not installed
-		if (!typos.isAvailable(ctx.cwd || process.cwd())) {
+		if (!(await (typos.isAvailableAsync?.(ctx.cwd || process.cwd()) ?? typos.isAvailable(ctx.cwd || process.cwd())))) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
@@ -109,7 +111,7 @@ const spellcheckRunner: RunnerDefinition = {
 		// --exclude <pattern>: Could be used to exclude code blocks if needed
 		const args = ["--format", "json", ctx.filePath];
 
-		const result = safeSpawn(
+		const result = await safeSpawnAsync(
 			typos.getCommand(ctx.cwd || process.cwd())!,
 			args,
 			{

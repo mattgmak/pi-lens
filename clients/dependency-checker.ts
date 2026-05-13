@@ -11,7 +11,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { safeSpawn, safeSpawnAsync } from "./safe-spawn.js";
+import { safeSpawnAsync } from "./safe-spawn.js";
 
 // --- Types ---
 
@@ -38,6 +38,12 @@ interface FileImports {
 
 export class DependencyChecker {
 	private available: boolean | null = null;
+	private ensureInFlight: Promise<boolean> | null = null;
+	private checkInFlight = new Map<string, Promise<DepCheckResult>>();
+	private scanInFlight = new Map<
+		string,
+		Promise<{ circular: CircularDep[]; count: number }>
+	>();
 	private log: (msg: string) => void;
 
 	// Cache: file path -> its imports
@@ -61,7 +67,17 @@ export class DependencyChecker {
 	async ensureAvailable(): Promise<boolean> {
 		// Fast path: already checked
 		if (this.available !== null) return this.available;
+		if (this.ensureInFlight) return this.ensureInFlight;
 
+		this.ensureInFlight = this.doEnsureAvailable();
+		try {
+			return await this.ensureInFlight;
+		} finally {
+			this.ensureInFlight = null;
+		}
+	}
+
+	private async doEnsureAvailable(): Promise<boolean> {
 		// Check if available in PATH
 		const result = await safeSpawnAsync("madge", ["--version"], {
 			timeout: 5000,
@@ -84,27 +100,9 @@ export class DependencyChecker {
 			return true;
 		}
 
+		this.available = false;
 		this.log("Madge auto-install failed");
 		return false;
-	}
-
-	/**
-	 * Check if madge is available (legacy sync method)
-	 * Prefer ensureAvailable() for auto-install behavior
-	 */
-	isAvailable(): boolean {
-		if (this.available !== null) return this.available;
-
-		const result = safeSpawn("npx", ["madge", "--version"], {
-			timeout: 5000,
-		});
-
-		this.available = !result.error && result.status === 0;
-		if (this.available) {
-			this.log("Madge available for dependency checking");
-		}
-
-		return this.available;
 	}
 
 	/**
@@ -210,7 +208,7 @@ export class DependencyChecker {
 	 * Quick circular dependency check using DFS on cached graph.
 	 * Only re-runs full madge check when imports change.
 	 */
-	checkFile(filePath: string, cwd?: string): DepCheckResult {
+	async checkFile(filePath: string, cwd?: string): Promise<DepCheckResult> {
 		const normalized = path.resolve(filePath);
 
 		// Return early for non-existent files without running availability check
@@ -223,18 +221,9 @@ export class DependencyChecker {
 			};
 		}
 
-		if (!this.isAvailable()) {
-			return {
-				hasCircular: false,
-				circular: [],
-				checked: false,
-				cacheHit: false,
-			};
-		}
+		const projectRoot = path.resolve(cwd || process.cwd());
 
-		const projectRoot = cwd || process.cwd();
-
-		// Check if imports changed
+		// Check if imports changed before probing/installing madge.
 		const importsChanged = this.importsChanged(normalized);
 
 		if (!importsChanged) {
@@ -249,13 +238,37 @@ export class DependencyChecker {
 			};
 		}
 
+		if (!(await this.ensureAvailable())) {
+			return {
+				hasCircular: false,
+				circular: [],
+				checked: false,
+				cacheHit: false,
+			};
+		}
+
+		const key = `${projectRoot}:${normalized}`;
+		const existing = this.checkInFlight.get(key);
+		if (existing) return existing;
+
+		const promise = this.runCheckFile(normalized, projectRoot).finally(() => {
+			this.checkInFlight.delete(key);
+		});
+		this.checkInFlight.set(key, promise);
+		return promise;
+	}
+
+	private async runCheckFile(
+		normalized: string,
+		projectRoot: string,
+	): Promise<DepCheckResult> {
 		this.log(
-			`Imports changed for ${path.basename(filePath)}, checking dependencies...`,
+			`Imports changed for ${path.basename(normalized)}, checking dependencies...`,
 		);
 
 		// Run madge on the specific file (fast)
 		try {
-			const result = safeSpawn(
+			const result = await safeSpawnAsync(
 				"npx",
 				[
 					"madge",
@@ -270,6 +283,16 @@ export class DependencyChecker {
 					cwd: projectRoot,
 				},
 			);
+
+			if (result.error) {
+				this.log(`Check error: ${result.error.message}`);
+				return {
+					hasCircular: false,
+					circular: [],
+					checked: false,
+					cacheHit: false,
+				};
+			}
 
 			const output = result.stdout || "[]";
 			const parsed = JSON.parse(output);
@@ -333,10 +356,12 @@ export class DependencyChecker {
 	/**
 	 * Full project scan (for /check-deps command)
 	 */
-	scanProject(cwd?: string): { circular: CircularDep[]; count: number } {
-		const projectRoot = cwd || process.cwd();
+	async scanProject(
+		cwd?: string,
+	): Promise<{ circular: CircularDep[]; count: number }> {
+		const projectRoot = path.resolve(cwd || process.cwd());
 
-		// Return early for non-existent or empty directories
+		// Return early for non-existent or empty directories before probing/installing.
 		if (!fs.existsSync(projectRoot)) {
 			return { circular: [], count: 0 };
 		}
@@ -348,12 +373,25 @@ export class DependencyChecker {
 			return { circular: [], count: 0 };
 		}
 
-		if (!this.isAvailable()) {
+		if (!(await this.ensureAvailable())) {
 			return { circular: [], count: 0 };
 		}
 
+		const existing = this.scanInFlight.get(projectRoot);
+		if (existing) return existing;
+
+		const promise = this.runScanProject(projectRoot).finally(() => {
+			this.scanInFlight.delete(projectRoot);
+		});
+		this.scanInFlight.set(projectRoot, promise);
+		return promise;
+	}
+
+	private async runScanProject(
+		projectRoot: string,
+	): Promise<{ circular: CircularDep[]; count: number }> {
 		try {
-			const result = safeSpawn(
+			const result = await safeSpawnAsync(
 				"npx",
 				[
 					"madge",
@@ -368,6 +406,11 @@ export class DependencyChecker {
 					cwd: projectRoot,
 				},
 			);
+
+			if (result.error) {
+				this.log(`Scan error: ${result.error.message}`);
+				return { circular: [], count: 0 };
+			}
 
 			const output = result.stdout || "{}";
 			const data = JSON.parse(output);

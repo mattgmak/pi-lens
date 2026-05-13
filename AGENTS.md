@@ -1,7 +1,7 @@
 # pi-lens — agent context
 
 ## What it is
-A pi coding-agent extension that runs automated checks on every file write/edit. Dispatches parallel runners (LSP, biome, ruff, ast-grep, tree-sitter, type coverage, jscpd, knip) and injects findings as context injections at turn-end and session-start.
+A pi coding-agent extension that runs automated checks on every file write/edit. Dispatches async parallel runners (LSP, biome, ruff, ast-grep, tree-sitter, type coverage, jscpd, knip, Madge, and language-specific linters/build checks) and injects findings as context injections at turn-end and session-start.
 
 ## Key source layout
 ```
@@ -37,16 +37,16 @@ npm run lint          # same as type-check
 Four hooks in `index.ts` drive everything:
 
 **`session_start`** → `handleSessionStart` (`clients/runtime-session.ts`)
-Resets `RuntimeCoordinator`. Fires tool preinstall (typescript-language-server, biome, etc.) and background scans (knip, jscpd, ast-grep exports, project index) as fire-and-forget tasks. LSP config walk is deferred via `setImmediate`. Returns in ~150ms; background tasks finish asynchronously.
+Resets `RuntimeCoordinator`. Fires tool preinstall (typescript-language-server, biome, etc.) and background scans (knip, jscpd, ast-grep exports, project index) as fire-and-forget tasks. LSP config walk is deferred via `setImmediate`. Returns in ~150ms; background tasks finish asynchronously. Knip/jscpd startup scans are async and guarded against duplicate in-flight scans.
 
 **`tool_call`** (write/edit events) → inline handler in `index.ts`
-Warms the LSP for the file, records read-guard lines. If the tool is a write/edit, triggers the dispatch pipeline: format → autofix → LSP diagnostics sync → parallel runner dispatch → dedup/merge → findings stored on `RuntimeCoordinator`.
+Warms the LSP for the file and records read-guard lines. For write/edit tools, records read-guard preflight data before the later `tool_result` dispatch.
 
 **`tool_result`** → `handleToolResult` (`clients/runtime-tool-result.ts`)
-Tracks modified file ranges per turn for turn_end targeting. Triggers the test runner when a relevant source file changed.
+Tracks modified file ranges per turn for turn_end targeting. For write/edit events, runs the dispatch pipeline: format → autofix → LSP diagnostics sync → parallel async runner dispatch → dedup/merge → findings stored on `RuntimeCoordinator`.
 
 **`turn_end`** → `handleTurnEnd` (`clients/runtime-turn.ts`)
-Runs jscpd (duplicate code), madge (circular deps), and the test runner against files modified this turn. Deduplicates findings against the previous turn's output, then injects blockers (🔴) and advisories into the agent's context.
+Merges unresolved inline blockers and cascade findings, runs Knip delta analysis when the startup scan is not in flight, runs Madge circular-dependency checks for files whose imports changed, and fires related/failed tests asynchronously for the next context injection. Deduplicates findings against previous turn state and injects blockers (🔴) and advisories into the agent's context.
 
 ## Key abstractions
 
@@ -54,14 +54,28 @@ Runs jscpd (duplicate code), madge (circular deps), and the test runner against 
 Key fields: `projectRoot`, `sessionGeneration` (incremented on each `session_start`), `cachedExports` (symbol→file map from ast-grep startup scan), `cachedProjectIndex` (structural similarity index), `complexityBaselines` (per-file complexity for regression detection), `projectRulesScan` (custom ast-grep rules found in the project).
 
 **`DispatchContext`** — built per dispatch by `createDispatchContext()` in `clients/dispatch/dispatcher.ts`.
-Holds: `filePath`, `cwd`, `kind` (`FileKind` — ts/js/py/go/rust/css/etc.), `runtime` (the coordinator), `lspService`, `facts` (FactStore), and a `checkToolAvailability(cmd)` helper that caches availability per session.
+Holds: `filePath`, language-root `cwd`, `kind` (`FileKind` — `jsts`, `python`, `go`, `rust`, `css`, etc.), `pi` flags, `facts` (FactStore), `blockingOnly`, `modifiedRanges`, and `hasTool(cmd)` / `log()` helpers.
 
 **`FactStore`** — session+turn-scoped key-value store. Runners use it to cache tool availability checks (e.g., "is biome installed?") so subsequent dispatches within the same session skip the spawn. Set/get via `facts.setSessionFact` / `facts.getSessionFact`.
 
-**`FileKind`** — union type (`"typescript"` | `"javascript"` | `"python"` | `"go"` | `"rust"` | …) detected from the file path. Controls which of the 48 runners are eligible for a given dispatch. Runners declare `appliesTo: FileKind[]`; an empty array means "all kinds".
+**`FileKind`** — union type (`"jsts"` | `"python"` | `"go"` | `"rust"` | …) detected from the file path. Controls which runners are eligible for a given dispatch. Runners declare `appliesTo: FileKind[]`; an empty array means "all kinds".
 
 ## Session-start critical path
 `lsp-config` is deferred via `setImmediate` (not awaited). Tool availability probes use the probe cache before spawning binaries. Interactive path target: ~150ms on warm runs.
+
+## Runner process model
+- Prefer `safeSpawnAsync()` for all subprocess work in hook paths (`session_start`, write/edit `tool_result`, `turn_end`, formatter pipeline, and dispatch runners). `safeSpawn()` is deprecated and blocks the Node event loop.
+- Expensive project scans have in-flight guards: Knip by project root, jscpd by project root + scan params, Madge by project root/file or project root scan.
+- Check cheap filesystem/root preconditions before availability probes or auto-install. Example: Knip/jscpd/Madge skip non-project or empty roots before probing/installing tools.
+- `createAvailabilityChecker()` now exposes `isAvailableAsync()`; use it in runners. The sync `isAvailable()` remains only for legacy/test compatibility.
+- Formatter execution (`clients/formatters.ts::formatFile`) uses `safeSpawnAsync()` so timeout wrappers are meaningful.
+
+## Legacy async-cleanup TODO
+- Migrate remaining `runner-helpers.ts` sync compatibility paths (`isAvailable()`, `isSgAvailable()`, `resolveLocalFirst()`) to async callers, then remove or clearly quarantine the sync APIs.
+- Add async `sg` availability/command resolution and migrate `python-slop`/other sg CLI consumers away from sync `isSgAvailable()` probes.
+- Convert remaining formatter detection/install helper probes in `clients/formatters.ts` (e.g. rubocop gem install, rustfmt install, Go env checks, csharpier probes) from `safeSpawn()` to `safeSpawnAsync()` or installer-managed async helpers.
+- Audit explicit command flows such as `/lens-booboo` for remaining full-project `safeSpawn()` calls; they are lower priority than hook paths but should not freeze the TUI.
+- Keep tests mocking both `safeSpawn` and `safeSpawnAsync` where legacy compatibility remains; prefer async mocks for new runner tests.
 
 ## Tree-sitter rules
 
@@ -85,7 +99,7 @@ Mixing different capture names in one `[...]` block causes tree-sitter to silent
 **Post-filters** (`post_filter` in YAML, `applyPostFilter` in `clients/tree-sitter-client.ts`): evaluated after query matching to reject false positives. Key ones: `count_params` (long-param-list: excludes optional/defaulted params), `ts_ssrf_sink` (requires URL to look like external input), `check_secret_pattern` (variable name must match secret-sounding pattern).
 
 ## Current version / state
-v3.8.41 published. Master has scope migration + startup optimizations + blocking rule additions (unreleased). CI runs `npm ci` + tsc lint + vitest.
+v3.8.43 is the package version. Master includes unreleased async runner consistency work after the Knip freeze fix: jscpd/Madge/formatters/dispatch runners now use async subprocess execution in hook paths, with in-flight guards for expensive scans. CI runs `npm ci` + tsc lint + vitest.
 
 ## Conventions
 - TypeScript ESM throughout (`"type": "module"`)

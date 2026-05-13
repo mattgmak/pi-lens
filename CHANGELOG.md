@@ -6,6 +6,13 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Added
 
+- **`fish` FileKind with `fish_indent` formatter runner** — `.fish` files are now a first-class `"fish"` kind rather than being bucketed under `"shell"`. A new `fish-indent` runner wraps `fish_indent --check` (fish ≥ 3.6), reporting a formatting warning with a `fish_indent -w` fix hint on exit 1 and a blocking parse-error diagnostic when stderr is non-empty. Formatter and linter policy entries added for `.fish` in `tool-policy.ts`; fish dispatch group `[lsp, fish-indent]` wired in `language-policy.ts`. Closes #74.
+
+### Fixed
+
+- **`fish` missing from `LANGUAGE_CAPABILITY_MATRIX` and `LintRunnerName`** — adding the `"fish"` FileKind required two exhaustiveness fixes: a `fish` entry in `plan.ts`'s `Record<FileKind, CapabilityMatrixEntry>` and `"fish-indent"` in the `LintRunnerName` union in `tool-policy.ts`; both caused build/type-check failures on CI.
+- **shellcheck and shfmt no longer fire on `.fish` files** — `.fish` was classified as `"shell"`, causing both runners (which use `appliesTo: ["shell"]`) to process fish scripts with `--shell bash`, producing false-positive SC1073/SC1064 parse errors. Moving `.fish` to the new `"fish"` kind fixes the routing with no special-case logic in either runner. Closes #74.
+
 - **`lsp_diagnostics` tool** — proactive LSP error checking for files and directories. The agent can now run `lsp_diagnostics({ filePath: "src/" })` before builds to catch issues without making edits. Directory mode walks the tree (skipping node_modules/.git/target), auto-detects the language extension, opens each file in the LSP client, and aggregates diagnostics. Supports severity filtering (`error`/`warning`/`information`/`hint`/`all`), caps at 50 files and 200 diagnostics. Returns structured details with `totalDiagnostics`, `truncated`, and per-diagnostic `file`/`line`/`severity`/`message`/`source`/`code`. Adapted from `code-yeongyu/pi-lsp-client`.
 - **LSP process stderr capture and health check** — the LSP client now maintains a rolling 100-line stderr buffer from server startup through shutdown. Three new client methods exposed: `processExited()` (true if the server process died), `recentStderr(n)` (last N lines for diagnostics), and `checkAlive()` (pre-request health check returning error string with exit code + stderr tail if dead). Previously, stderr was only captured during initialization and discarded afterward.
 - **SIGTERM → 1.5s → SIGKILL escalation in `killProcessTree`** — on Unix, process cleanup now sends SIGTERM first, waits 1.5 seconds, then sends SIGKILL if the process is still alive. Prevents zombie server processes that survive a standard kill. Windows already uses `taskkill /F /T` (force kill tree).
@@ -16,10 +23,12 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Changed
 
+- **Runner process execution is async/non-blocking across hook paths** — jscpd scans, Madge dependency checks, formatter execution, and dispatch runners that previously used sync `safeSpawn()` now use `safeSpawnAsync()` in write/session/turn hooks. Added in-flight guards for jscpd and Madge project/file scans, async availability checks in runner helpers, and Knip availability dedupe + project-root bail before install/probe.
 - **`isCommandAvailable` replaced `which`/`where` spawn with PATH walk + `statSync` size validation** — instead of spawning `which`/`where` (~50 ms + timeout risk), the installer now walks `$PATH` entries synchronously and checks `statSync(path).isFile() && stat.size > 0` for each candidate. This catches broken symlinks (stat throws `ENOENT` or returns size 0) at ~μs per candidate with zero process spawns. On Windows, `.exe`, `.cmd`, and `.bat` extensions are probed.
 
 ### Fixed
 
+- **SonarCloud security hotspots resolved** — replaced the .NET build diagnostic regex with a linear manual parser to avoid ReDoS risk (S5852), and switched jscpd temporary directory creation from a `Math.random()` suffix to `fs.mkdtempSync()` to avoid weak PRNG use (S2245).
 - **ast-grep tool language list aligned with ast-grep CLI** — dropped phantom `dart` and `sql` (not supported by ast-grep binary), added missing `bash`, `nix`, `solidity`. The `LANGUAGES` constant in `tools/shared.ts` now matches ast-grep v0.41's official 25-language list.
 - **Graph-cache test: disk cache leaked across test runs** — `buildOrUpdateGraph` persists to `cwd/.pi-lens/cache/review-graph.json`. All tests used hardcoded `"/cwd"`, causing the first test run's disk cache to contaminate subsequent runs. Switched to `fs.mkdtempSync` temp directories with `afterEach` cleanup.
 - **Disabled tree-sitter rules leaked into production** — `parseQueryFile` uses the YAML's `language:` field over the directory name, so rules in `typescript-disabled/` with `language: typescript` were loaded as active TypeScript rules and appeared in the diagnostics widget. Added `!d.name.endsWith("-disabled")` filter to `loadQueries` directory enumeration.

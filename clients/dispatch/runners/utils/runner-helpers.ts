@@ -103,9 +103,11 @@ export function createAvailabilityChecker(
 	windowsExt = "",
 ): {
 	isAvailable: (cwd?: string) => boolean;
+	isAvailableAsync: (cwd?: string) => Promise<boolean>;
 	getCommand: (cwd?: string) => string | null;
 } {
 	const cacheByCwd = new Map<string, AvailabilityCache>();
+	const inFlightByCwd = new Map<string, Promise<boolean>>();
 
 	const findCommand = createVenvFinder(command, windowsExt, true);
 
@@ -135,12 +137,39 @@ export function createAvailabilityChecker(
 		return cache.available;
 	}
 
+	async function isAvailableAsync(cwd?: string): Promise<boolean> {
+		const resolvedCwd = cwd || process.cwd();
+		const cache = getCache(resolvedCwd);
+		if (cache.available !== null) return cache.available;
+
+		const key = path.resolve(resolvedCwd);
+		const existing = inFlightByCwd.get(key);
+		if (existing) return existing;
+
+		const promise = (async () => {
+			const cmd = findCommand(resolvedCwd);
+			const result = await safeSpawnAsync(cmd, ["--version"], {
+				timeout: 5000,
+			});
+
+			cache.available = !result.error && result.status === 0;
+			if (cache.available) {
+				cache.command = cmd;
+			}
+			return cache.available;
+		})().finally(() => {
+			inFlightByCwd.delete(key);
+		});
+		inFlightByCwd.set(key, promise);
+		return promise;
+	}
+
 	function getCommand(cwd?: string): string | null {
 		const cache = getCache(cwd || process.cwd());
 		return cache.command;
 	}
 
-	return { isAvailable, getCommand };
+	return { isAvailable, isAvailableAsync, getCommand };
 }
 
 export function resolveNodeToolCommand(
@@ -277,12 +306,16 @@ export async function resolveCommandWithInstallFallback(
 export async function resolveAvailableOrInstall(
 	checker: {
 		isAvailable: (cwd?: string) => boolean;
+		isAvailableAsync?: (cwd?: string) => Promise<boolean>;
 		getCommand: (cwd?: string) => string | null;
 	},
 	toolId: string,
 	cwd: string,
 ): Promise<string | null> {
-	if (checker.isAvailable(cwd)) {
+	const available = checker.isAvailableAsync
+		? await checker.isAvailableAsync(cwd)
+		: checker.isAvailable(cwd);
+	if (available) {
 		return checker.getCommand(cwd);
 	}
 	if (!shouldAutoInstallTool(toolId)) {
@@ -428,6 +461,30 @@ export function resolveLocalFirst(
 
 	// 2. Global PATH (already installed system-wide)
 	const globalCheck = safeSpawn(toolName, ["--version"], { timeout: 3000 });
+	if (!globalCheck.error && globalCheck.status === 0) {
+		return { cmd: toolName, args: [] };
+	}
+
+	// 3. npx fallback — only for already-cached packages (no silent download)
+	return { cmd: "npx", args: ["--no", toolName] };
+}
+
+export async function resolveLocalFirstAsync(
+	toolName: string,
+	cwd: string,
+	windowsExt = ".cmd",
+): Promise<{ cmd: string; args: string[] }> {
+	const isWin = process.platform === "win32";
+	const binName = isWin ? `${toolName}${windowsExt}` : toolName;
+
+	// 1. Local node_modules/.bin (project-installed)
+	const local = path.join(cwd, "node_modules", ".bin", binName);
+	if (fs.existsSync(local)) return { cmd: local, args: [] };
+
+	// 2. Global PATH (already installed system-wide)
+	const globalCheck = await safeSpawnAsync(toolName, ["--version"], {
+		timeout: 3000,
+	});
 	if (!globalCheck.error && globalCheck.status === 0) {
 		return { cmd: toolName, args: [] };
 	}

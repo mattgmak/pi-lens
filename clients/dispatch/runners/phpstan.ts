@@ -58,8 +58,9 @@ function parsePhpstanJson(raw: string, filePath: string): Diagnostic[] {
 	}
 }
 
-function resolvePhpstan(cwd: string): string | null {
-	if (phpstan.isAvailable(cwd)) return phpstan.getCommand(cwd);
+async function resolvePhpstan(cwd: string): Promise<string | null> {
+	if (await (phpstan.isAvailableAsync?.(cwd) ?? phpstan.isAvailable(cwd)))
+		return phpstan.getCommand(cwd);
 	return resolveVendorToolCommand(cwd, "phpstan", ".bat");
 }
 
@@ -82,7 +83,7 @@ const phpstanRunner: RunnerDefinition = {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
-		const cmd = resolvePhpstan(cwd);
+		const cmd = await resolvePhpstan(cwd);
 		if (!cmd) return { status: "skipped", diagnostics: [], semantic: "none" };
 
 		const absPath = path.resolve(cwd, ctx.filePath);

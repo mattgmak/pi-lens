@@ -4,7 +4,7 @@
  * Runs `go vet` for Go files to catch common mistakes.
  */
 
-import { safeSpawn } from "../../safe-spawn.js";
+import { safeSpawnAsync } from "../../safe-spawn.js";
 import { stripAnsi } from "../../sanitize.js";
 import { parseGoVetOutput } from "./utils/diagnostic-parsers.js";
 import type {
@@ -22,7 +22,7 @@ const goVetRunner: RunnerDefinition = {
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		// Check if go is available
-		const check = safeSpawn("go", ["version"], {
+		const check = await safeSpawnAsync("go", ["version"], {
 			timeout: 5000,
 		});
 
@@ -31,7 +31,7 @@ const goVetRunner: RunnerDefinition = {
 		}
 
 		// Run go vet on the file
-		const result = safeSpawn("go", ["vet", ctx.filePath], {
+		const result = await safeSpawnAsync("go", ["vet", ctx.filePath], {
 			timeout: 30000,
 		});
 

@@ -1,4 +1,4 @@
-import { safeSpawn } from "../../safe-spawn.js";
+import { safeSpawnAsync } from "../../safe-spawn.js";
 import { getLinterPolicyForCwd, hasSqlfluffConfig } from "../../tool-policy.js";
 import { PRIORITY } from "../priorities.js";
 import type {
@@ -75,7 +75,7 @@ const sqlfluffRunner: RunnerDefinition = {
 		}
 
 		let cmd: string | null = null;
-		if (sqlfluff.isAvailable(cwd)) {
+		if (await (sqlfluff.isAvailableAsync?.(cwd) ?? sqlfluff.isAvailable(cwd))) {
 			cmd = sqlfluff.getCommand(cwd);
 		} else {
 			cmd = await resolveToolCommandWithInstallFallback(cwd, "sqlfluff");
@@ -88,7 +88,7 @@ const sqlfluffRunner: RunnerDefinition = {
 			args.splice(2, 0, "--dialect", "ansi");
 		}
 
-		const result = safeSpawn(cmd, args, {
+		const result = await safeSpawnAsync(cmd, args, {
 			timeout: 20000,
 		});
 

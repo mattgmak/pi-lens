@@ -50,16 +50,23 @@ describe("ruff runner", () => {
 			const filePath = path.join(env.tmpDir, "sample.py");
 			fs.writeFileSync(filePath, "import os\n");
 
-			safeSpawnAsync.mockResolvedValueOnce({
-				error: null,
-				status: 1,
-				stdout: "[]",
-				stderr: "",
-			});
+			safeSpawnAsync
+				.mockResolvedValueOnce({
+					error: new Error("not found"),
+					status: 1,
+					stdout: "",
+					stderr: "",
+				})
+				.mockResolvedValueOnce({
+					error: null,
+					status: 1,
+					stdout: "[]",
+					stderr: "",
+				});
 
-			const runner = (await import(
-				"../../../../clients/dispatch/runners/ruff.ts"
-			)).default;
+			const runner = (
+				await import("../../../../clients/dispatch/runners/ruff.ts")
+			).default;
 
 			await runner.run(createCtx(filePath, env.tmpDir) as never);
 

@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { safeSpawn } from "../../safe-spawn.js";
+import { safeSpawnAsync } from "../../safe-spawn.js";
 import { PRIORITY } from "../priorities.js";
 import type {
 	Diagnostic,
@@ -45,7 +45,7 @@ const phpLintRunner: RunnerDefinition = {
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		const cwd = ctx.cwd || process.cwd();
-		if (!php.isAvailable(cwd)) {
+		if (!(await (php.isAvailableAsync?.(cwd) ?? php.isAvailable(cwd)))) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
@@ -55,7 +55,10 @@ const phpLintRunner: RunnerDefinition = {
 		}
 
 		const absPath = path.resolve(cwd, ctx.filePath);
-		const result = safeSpawn(cmd, ["-l", absPath], { timeout: 15000, cwd });
+		const result = await safeSpawnAsync(cmd, ["-l", absPath], {
+			timeout: 15000,
+			cwd,
+		});
 		if (result.status === 0) {
 			return { status: "succeeded", diagnostics: [], semantic: "none" };
 		}

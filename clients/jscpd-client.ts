@@ -9,10 +9,11 @@
  */
 
 import * as fs from "node:fs";
+import { mkdtempSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getExcludedDirGlobs, isExcludedDirName } from "./file-utils.js";
-import { safeSpawn, safeSpawnAsync } from "./safe-spawn.js";
+import { safeSpawnAsync } from "./safe-spawn.js";
 
 // --- Types ---
 
@@ -33,11 +34,22 @@ export interface JscpdResult {
 	percentage: number;
 }
 
+const EMPTY_RESULT: JscpdResult = {
+	success: false,
+	clones: [],
+	duplicatedLines: 0,
+	totalLines: 0,
+	percentage: 0,
+};
+
+const SCAN_TIMEOUT_MS = 30_000;
+
 // --- Client ---
 
 export class JscpdClient {
 	private available: boolean | null = null;
 	private ensureInFlight: Promise<boolean> | null = null;
+	private inFlight = new Map<string, Promise<JscpdResult>>();
 	private log: (msg: string) => void;
 
 	constructor(verbose = false) {
@@ -149,62 +161,56 @@ export class JscpdClient {
 	}
 
 	/**
-	 * Check if jscpd is available (legacy sync method)
-	 * Prefer ensureAvailable() for auto-install behavior
-	 */
-	isAvailable(): boolean {
-		if (this.available !== null) return this.available;
-		const result = safeSpawn("npx", ["jscpd", "--version"], {
-			timeout: 5000,
-		});
-		this.available = !result.error && result.status === 0;
-		return this.available;
-	}
-
-	/**
 	 * Scan a directory for duplicate code blocks.
 	 * Uses a temp output dir to capture JSON report.
 	 * @param isTsProject - If true, excludes .js files (they're compiled artifacts in TS projects)
 	 */
-	scan(
+	async scan(
 		cwd: string,
 		minLines = 5,
 		minTokens = 50,
 		isTsProject = false,
-	): JscpdResult {
-		// Return early for non-existent or empty directories
-		if (!fs.existsSync(cwd)) {
-			return {
-				success: false,
-				clones: [],
-				duplicatedLines: 0,
-				totalLines: 0,
-				percentage: 0,
-			};
+	): Promise<JscpdResult> {
+		const targetDir = path.resolve(cwd);
+
+		// Return early for non-existent or empty directories before probing/installing.
+		if (!fs.existsSync(targetDir)) {
+			return { ...EMPTY_RESULT };
 		}
-		const hasSourceFiles = this.hasSourceFilesRecursive(cwd);
-		if (!hasSourceFiles) {
-			return {
-				success: true,
-				clones: [],
-				duplicatedLines: 0,
-				totalLines: 0,
-				percentage: 0,
-			};
+		if (!this.hasSourceFilesRecursive(targetDir)) {
+			return { ...EMPTY_RESULT, success: true };
 		}
 
-		if (!this.isAvailable()) {
-			return {
-				success: false,
-				clones: [],
-				duplicatedLines: 0,
-				totalLines: 0,
-				percentage: 0,
-			};
+		if (!(await this.ensureAvailable())) {
+			return { ...EMPTY_RESULT };
 		}
 
-		const outDir = path.join(os.tmpdir(), `pi-lens-jscpd-${Date.now()}`);
-		fs.mkdirSync(outDir, { recursive: true });
+		const key = `${targetDir}:${minLines}:${minTokens}:${isTsProject}`;
+		const existing = this.inFlight.get(key);
+		if (existing) {
+			this.log(`Scan already in flight for ${targetDir}; sharing result`);
+			return existing;
+		}
+
+		const promise = this.runScan(
+			targetDir,
+			minLines,
+			minTokens,
+			isTsProject,
+		).finally(() => {
+			this.inFlight.delete(key);
+		});
+		this.inFlight.set(key, promise);
+		return promise;
+	}
+
+	private async runScan(
+		cwd: string,
+		minLines: number,
+		minTokens: number,
+		isTsProject: boolean,
+	): Promise<JscpdResult> {
+		const outDir = mkdtempSync(`${os.tmpdir()}${path.sep}pi-lens-jscpd-`);
 
 		// Build ignore pattern from shared exclusions + scanner-specific patterns.
 		const baseIgnores = [
@@ -228,7 +234,7 @@ export class JscpdClient {
 		const ignorePattern = baseIgnores.join(",");
 
 		try {
-			safeSpawn(
+			const result = await safeSpawnAsync(
 				"npx",
 				[
 					"jscpd",
@@ -245,32 +251,25 @@ export class JscpdClient {
 					ignorePattern,
 				],
 				{
-					timeout: 30000,
+					timeout: SCAN_TIMEOUT_MS,
 					cwd,
 				},
 			);
 
+			if (result.error) {
+				this.log(`Scan error: ${result.error.message}`);
+				return { ...EMPTY_RESULT };
+			}
+
 			const reportPath = path.join(outDir, "jscpd-report.json");
 			if (!fs.existsSync(reportPath)) {
-				return {
-					success: true,
-					clones: [],
-					duplicatedLines: 0,
-					totalLines: 0,
-					percentage: 0,
-				};
+				return { ...EMPTY_RESULT, success: true };
 			}
 
 			return this.parseReport(reportPath);
 		} catch (err: any) {
 			this.log(`Scan error: ${err.message}`);
-			return {
-				success: false,
-				clones: [],
-				duplicatedLines: 0,
-				totalLines: 0,
-				percentage: 0,
-			};
+			return { ...EMPTY_RESULT };
 		} finally {
 			try {
 				fs.rmSync(outDir, { recursive: true, force: true });

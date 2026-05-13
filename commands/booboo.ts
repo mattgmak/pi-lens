@@ -11,7 +11,11 @@ import { createDispatchContext } from "../clients/dispatch/dispatcher.js";
 import { evaluateRules } from "../clients/dispatch/fact-rule-runner.js";
 import { runProviders } from "../clients/dispatch/fact-runner.js";
 import { FactStore } from "../clients/dispatch/fact-store.js";
-import { getKnipIgnorePatterns, isTestFile, readGitignoreDirs } from "../clients/file-utils.js";
+import {
+	getKnipIgnorePatterns,
+	isTestFile,
+	readGitignoreDirs,
+} from "../clients/file-utils.js";
 import type { JscpdClient } from "../clients/jscpd-client.js";
 import type { KnipClient } from "../clients/knip-client.js";
 import { validateProductionReadiness } from "../clients/production-readiness.js";
@@ -37,7 +41,14 @@ import type { TypeCoverageClient } from "../clients/type-coverage-client.js";
 // Side-effect import: registers all fact providers and fact rules
 import "../clients/dispatch/integration.js";
 
-const ROOT_MARKERS = ["package.json", "tsconfig.json", ".git", "Cargo.toml", "go.mod", "pyproject.toml"];
+const ROOT_MARKERS = [
+	"package.json",
+	"tsconfig.json",
+	".git",
+	"Cargo.toml",
+	"go.mod",
+	"pyproject.toml",
+];
 
 function hasRootMarker(dir: string): boolean {
 	return ROOT_MARKERS.some((m) => nodeFs.existsSync(path.join(dir, m)));
@@ -129,7 +140,10 @@ export async function handleBooboo(
 	// Dirs to exclude from all scanners — EXCLUDED_DIRS baseline + root .gitignore entries
 	const gitignoreDirs = readGitignoreDirs(targetPath);
 	// Build --globs exclusion args for sg scan
-	const sgExcludeGlobs = gitignoreDirs.flatMap((d) => ["--globs", `!**/${d}/**`]);
+	const sgExcludeGlobs = gitignoreDirs.flatMap((d) => [
+		"--globs",
+		`!**/${d}/**`,
+	]);
 
 	const categoryKey = (name: string) => name.toLowerCase().replace(/\s+/g, "-");
 
@@ -848,7 +862,7 @@ export async function handleBooboo(
 			return { findings: 0, status: "skipped" };
 		}
 
-		const knipResult = clients.knip.analyze(
+		const knipResult = await clients.knip.analyze(
 			targetPath,
 			getKnipIgnorePatterns(),
 		);
@@ -886,7 +900,12 @@ export async function handleBooboo(
 		}
 
 		// In TS projects, exclude .js files (they're compiled artifacts)
-		const jscpdResult = clients.jscpd.scan(targetPath, 5, 50, isTsProject);
+		const jscpdResult = await clients.jscpd.scan(
+			targetPath,
+			5,
+			50,
+			isTsProject,
+		);
 
 		// Filter out test file duplicates using centralized exclusion
 		const filteredClones = jscpdResult.clones.filter(
@@ -984,7 +1003,7 @@ export async function handleBooboo(
 			return { findings: 0, status: "skipped" };
 		}
 
-		const { circular } = clients.depChecker.scanProject(targetPath);
+		const { circular } = await clients.depChecker.scanProject(targetPath);
 
 		// Filter out circular deps involving only test files using centralized exclusion
 		const filteredCircular = circular.filter((dep) => {
@@ -1193,7 +1212,9 @@ export async function handleBooboo(
 						inner.spans?.[0];
 					if (!span) continue;
 					const absFile = span.file_name
-						? (path.isAbsolute(span.file_name) ? span.file_name : path.join(targetPath, span.file_name))
+						? path.isAbsolute(span.file_name)
+							? span.file_name
+							: path.join(targetPath, span.file_name)
 						: targetPath;
 					issues.push({
 						file: path.relative(targetPath, absFile),
@@ -1225,7 +1246,9 @@ export async function handleBooboo(
 					for (const diag of json?.generalDiagnostics ?? []) {
 						if (!["error", "warning"].includes(diag.severity)) continue;
 						const absFile = diag.file
-							? (path.isAbsolute(diag.file) ? diag.file : path.join(targetPath, diag.file))
+							? path.isAbsolute(diag.file)
+								? diag.file
+								: path.join(targetPath, diag.file)
 							: targetPath;
 						if (shouldIncludeFile(absFile)) {
 							issues.push({
@@ -1469,7 +1492,8 @@ export async function handleBooboo(
 					timeout: 120_000,
 				});
 				const output = (result.stdout || "") + (result.stderr || "");
-				const zigLineRe = /^([^:]+):(\d+):(\d+):[ \t]*(error|warning|note):[ \t]*(.+)/;
+				const zigLineRe =
+					/^([^:]+):(\d+):(\d+):[ \t]*(error|warning|note):[ \t]*(.+)/;
 				for (const zigLine of output.split("\n")) {
 					const m = zigLineRe.exec(zigLine);
 					if (!m) continue;
@@ -1795,7 +1819,9 @@ function findTopSimilarPairs(
 
 			if (similarity >= SEMANTIC_SIMILARITY_THRESHOLD) {
 				// Canonical pair key (sorted to avoid duplicates)
-				const pairKey = [entry1.id, entry2.id].sort((a, b) => a.localeCompare(b)).join("::");
+				const pairKey = [entry1.id, entry2.id]
+					.sort((a, b) => a.localeCompare(b))
+					.join("::");
 				if (seenPairs.has(pairKey)) continue;
 				seenPairs.add(pairKey);
 

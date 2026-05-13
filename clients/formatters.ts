@@ -12,7 +12,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { logLatency } from "./latency-logger.js";
-import { safeSpawn } from "./safe-spawn.js";
+import { safeSpawn, safeSpawnAsync } from "./safe-spawn.js";
 import {
 	getAutoInstallToolIdForFormatter,
 	getFormatterPolicyForFile,
@@ -992,8 +992,11 @@ export async function formatFile(
 			resolved ??
 			formatter.command.map((c) => c.replace("$FILE", absolutePath));
 
-		// Run formatter
-		const result = safeSpawn(cmd[0], cmd.slice(1), { timeout: 15000, cwd });
+		// Run formatter without blocking the event loop.
+		const result = await safeSpawnAsync(cmd[0], cmd.slice(1), {
+			timeout: 15000,
+			cwd,
+		});
 
 		if (result.error) {
 			return {

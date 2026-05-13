@@ -78,7 +78,10 @@ const detektRunner: RunnerDefinition = {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
-		const cmd = detekt.isAvailable(cwd) ? detekt.getCommand(cwd) : null;
+		const cmd = (await (detekt.isAvailableAsync?.(cwd) ??
+			detekt.isAvailable(cwd)))
+			? detekt.getCommand(cwd)
+			: null;
 		if (!cmd) return { status: "skipped", diagnostics: [], semantic: "none" };
 
 		const absPath = path.resolve(cwd, ctx.filePath);

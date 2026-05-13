@@ -5,14 +5,19 @@ import { FactStore } from "../../../../clients/dispatch/fact-store.js";
 import { setupTestEnvironment } from "../../test-utils.js";
 
 const safeSpawn = vi.fn();
+const safeSpawnAsync = vi.fn((...args: Parameters<typeof safeSpawn>) =>
+	Promise.resolve(safeSpawn(...args)),
+);
 
 vi.mock("../../../../clients/safe-spawn.js", () => ({
 	safeSpawn,
+	safeSpawnAsync,
 }));
 
 vi.mock("../../../../clients/dispatch/runners/utils/runner-helpers.js", () => ({
 	createAvailabilityChecker: (command: string) => ({
 		isAvailable: () => true,
+		isAvailableAsync: async () => true,
 		getCommand: () => command,
 	}),
 }));
@@ -35,6 +40,10 @@ describe("java/csharp fallback runners", () => {
 	beforeEach(() => {
 		vi.resetModules();
 		safeSpawn.mockReset();
+		safeSpawnAsync.mockReset();
+		safeSpawnAsync.mockImplementation((...args: Parameters<typeof safeSpawn>) =>
+			Promise.resolve(safeSpawn(...args)),
+		);
 	});
 
 	it("parses javac blocking diagnostics for the edited file", async () => {
@@ -48,10 +57,12 @@ describe("java/csharp fallback runners", () => {
 				stderr: `${filePath}:7: error: cannot find symbol`,
 			});
 
-			const runner = (await import(
-				"../../../../clients/dispatch/runners/javac.js"
-			)).default;
-			const result = await runner.run(createCtx("java", filePath, env.tmpDir) as never);
+			const runner = (
+				await import("../../../../clients/dispatch/runners/javac.js")
+			).default;
+			const result = await runner.run(
+				createCtx("java", filePath, env.tmpDir) as never,
+			);
 
 			expect(result.status).toBe("failed");
 			expect(result.semantic).toBe("blocking");
@@ -67,7 +78,7 @@ describe("java/csharp fallback runners", () => {
 		try {
 			const projectPath = path.join(env.tmpDir, "LensTool.csproj");
 			const filePath = path.join(env.tmpDir, "Program.cs");
-			fs.writeFileSync(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\" />\n");
+			fs.writeFileSync(projectPath, '<Project Sdk="Microsoft.NET.Sdk" />\n');
 			safeSpawn.mockImplementation((command: string, args?: string[]) => {
 				if (command === "dotnet" && args?.[0] === "--version") {
 					return { error: null, status: 0, stdout: "9.0.0", stderr: "" };
@@ -80,9 +91,9 @@ describe("java/csharp fallback runners", () => {
 				};
 			});
 
-			const runner = (await import(
-				"../../../../clients/dispatch/runners/dotnet-build.js"
-			)).default;
+			const runner = (
+				await import("../../../../clients/dispatch/runners/dotnet-build.js")
+			).default;
 			const result = await runner.run(
 				createCtx("csharp", filePath, env.tmpDir) as never,
 			);
@@ -106,7 +117,12 @@ describe("java/csharp fallback runners", () => {
 
 			safeSpawn.mockImplementation((command: string, args?: string[]) => {
 				if (command === "clang++" && args?.[0] === "--version") {
-					return { error: null, status: 0, stdout: "clang version 17", stderr: "" };
+					return {
+						error: null,
+						status: 0,
+						stdout: "clang version 17",
+						stderr: "",
+					};
 				}
 				return {
 					error: null,
@@ -116,15 +132,13 @@ describe("java/csharp fallback runners", () => {
 				};
 			});
 
-			const runner = (await import(
-				"../../../../clients/dispatch/runners/cpp-check.js"
-			)).default;
-			const result = await runner.run(
-				{
-					...createCtx("java", filePath, env.tmpDir),
-					kind: "cxx",
-				} as never,
-			);
+			const runner = (
+				await import("../../../../clients/dispatch/runners/cpp-check.js")
+			).default;
+			const result = await runner.run({
+				...createCtx("java", filePath, env.tmpDir),
+				kind: "cxx",
+			} as never);
 
 			expect(result.status).toBe("failed");
 			expect(result.semantic).toBe("blocking");

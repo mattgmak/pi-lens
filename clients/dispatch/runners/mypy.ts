@@ -1,4 +1,4 @@
-import { safeSpawn } from "../../safe-spawn.js";
+import { safeSpawnAsync } from "../../safe-spawn.js";
 import { hasMypyConfig } from "../../tool-policy.js";
 import { PRIORITY } from "../priorities.js";
 import type {
@@ -56,7 +56,7 @@ const mypyRunner: RunnerDefinition = {
 		}
 
 		let cmd: string | null = null;
-		if (mypy.isAvailable(cwd)) {
+		if (await (mypy.isAvailableAsync?.(cwd) ?? mypy.isAvailable(cwd))) {
 			cmd = mypy.getCommand(cwd);
 		} else {
 			cmd = await resolveToolCommandWithInstallFallback(cwd, "mypy");
@@ -64,7 +64,7 @@ const mypyRunner: RunnerDefinition = {
 
 		if (!cmd) return { status: "skipped", diagnostics: [], semantic: "none" };
 
-		const result = safeSpawn(
+		const result = await safeSpawnAsync(
 			cmd,
 			["--no-error-summary", "--show-column-numbers", ctx.filePath],
 			{ timeout: 30000, cwd },

@@ -72,7 +72,7 @@ const htmlhintRunner: RunnerDefinition = {
 		}
 
 		let cmd: string | null = null;
-		if (htmlhint.isAvailable(cwd)) {
+		if (await (htmlhint.isAvailableAsync?.(cwd) ?? htmlhint.isAvailable(cwd))) {
 			cmd = htmlhint.getCommand(cwd);
 		} else {
 			cmd = await resolveToolCommandWithInstallFallback(cwd, "htmlhint");
