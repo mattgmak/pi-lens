@@ -736,6 +736,7 @@ export type LintRunnerName =
 	| "taplo"
 	| "rust-clippy"
 	| "shellcheck"
+	| "fish-indent"
 	| "tflint"
 	| "credo"
 	| "cpp-check"
