@@ -32,6 +32,22 @@ describe("language-profile roots", () => {
 		expect(root).toBe(pkg);
 	});
 
+	it("resolves C/C++ file root to nearest C/C++ marker", () => {
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lang-root-"));
+		dirs.push(tmp);
+
+		const workspace = path.join(tmp, "repo");
+		const projectRoot = path.join(workspace, "qwenfire");
+		const file = path.join(projectRoot, "src", "main.c");
+
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(path.join(projectRoot, "compile_commands.json"), "[]\n");
+		fs.writeFileSync(file, "int main(void) { return 0; }\n");
+
+		const root = resolveLanguageRootForFile(file, workspace);
+		expect(root).toBe(projectRoot);
+	});
+
 	it("falls back to workspace root for files outside workspace", () => {
 		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lang-root-"));
 		dirs.push(tmp);
@@ -55,7 +71,10 @@ describe("language-profile roots", () => {
 		const file = path.join(projectRoot, "src", "main", "kotlin", "main.kt");
 
 		fs.mkdirSync(path.dirname(file), { recursive: true });
-		fs.writeFileSync(path.join(projectRoot, "build.gradle.kts"), "plugins {}\n");
+		fs.writeFileSync(
+			path.join(projectRoot, "build.gradle.kts"),
+			"plugins {}\n",
+		);
 		fs.writeFileSync(file, "fun main() = greet(123)\n");
 
 		const ctx = createDispatchContext(

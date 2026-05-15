@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { PRIORITY } from "../priorities.js";
@@ -12,13 +13,79 @@ type CompilerSpec =
 	| { command: string; args: string[]; flavor: "gcc" | "msvc" }
 	| undefined;
 
+const C_SOURCE_EXTENSIONS = new Set([".c"]);
+const C_HEADER_EXTENSIONS = new Set([".h"]);
+const CPP_SOURCE_EXTENSIONS = new Set([
+	".c++",
+	".cc",
+	".cp",
+	".cpp",
+	".cxx",
+	".c++m",
+	".cppm",
+	".cxxm",
+	".ixx",
+	".cu",
+	".hip",
+	".mm",
+	".clcpp",
+]);
+const CPP_HEADER_EXTENSIONS = new Set([
+	".hh",
+	".hpp",
+	".hxx",
+	".inl",
+	".ipp",
+	".tpp",
+	".txx",
+]);
+
+function headerLooksLikeCpp(absPath: string): boolean {
+	try {
+		const content = fs.readFileSync(absPath, "utf-8");
+		return /\b(namespace|template|class|constexpr|concept|using)\b|std::|\b(public|private|protected)\s*:/.test(
+			content,
+		);
+	} catch {
+		return false;
+	}
+}
+
+function getGccLikeCandidates(absPath: string): Array<{
+	command: string;
+	args: string[];
+}> {
+	const ext = path.extname(absPath).toLowerCase();
+	const cMode =
+		C_SOURCE_EXTENSIONS.has(ext) ||
+		(C_HEADER_EXTENSIONS.has(ext) && !headerLooksLikeCpp(absPath));
+	const cppMode =
+		CPP_SOURCE_EXTENSIONS.has(ext) || CPP_HEADER_EXTENSIONS.has(ext);
+
+	if (cMode) {
+		const cArgs = C_HEADER_EXTENSIONS.has(ext)
+			? ["-x", "c-header", "-fsyntax-only", absPath]
+			: ["-x", "c", "-fsyntax-only", absPath];
+		return [
+			{ command: "clang", args: cArgs },
+			{ command: "gcc", args: cArgs },
+			{ command: "cc", args: cArgs },
+		];
+	}
+
+	if (cppMode || ext) {
+		return [
+			{ command: "clang++", args: ["-fsyntax-only", absPath] },
+			{ command: "g++", args: ["-fsyntax-only", absPath] },
+			{ command: "c++", args: ["-fsyntax-only", absPath] },
+		];
+	}
+
+	return [];
+}
+
 async function resolveCompiler(absPath: string): Promise<CompilerSpec> {
-	const gccLike: Array<{ command: string; args: string[] }> = [
-		{ command: "clang++", args: ["-fsyntax-only", absPath] },
-		{ command: "g++", args: ["-fsyntax-only", absPath] },
-		{ command: "c++", args: ["-fsyntax-only", absPath] },
-	];
-	for (const candidate of gccLike) {
+	for (const candidate of getGccLikeCandidates(absPath)) {
 		const probe = await safeSpawnAsync(candidate.command, ["--version"], {
 			timeout: 5000,
 		});

@@ -470,7 +470,14 @@ function ensureCascadeTurnScope(turnSeq: number): void {
 const CASCADE_TTL_MS = 240_000;
 const MAX_PER_FILE = RUNTIME_CONFIG.pipeline.cascadeMaxDiagnosticsPerFile;
 const MAX_FILES = RUNTIME_CONFIG.pipeline.cascadeMaxFiles;
-const CASCADE_GRAPH_KINDS = new Set(["jsts", "python", "go", "rust", "ruby"]);
+const CASCADE_GRAPH_KINDS = new Set([
+	"jsts",
+	"python",
+	"go",
+	"rust",
+	"ruby",
+	"cxx",
+]);
 
 /**
  * Unified cascade orchestration — builds graph, discovers neighbors, and

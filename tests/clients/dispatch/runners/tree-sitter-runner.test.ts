@@ -36,10 +36,18 @@ async function loadRunnerWithClient(isAvailable: boolean, initResult: boolean) {
 		recordEntitySnapshotDiff: vi.fn(),
 	}));
 	vi.doMock("../../../../clients/tree-sitter-query-loader.js", () => ({
-		queryLoader: { loadQueries: vi.fn().mockResolvedValue([]), getAllQueries: vi.fn().mockReturnValue([]) },
+		queryLoader: {
+			loadQueries: vi.fn().mockResolvedValue([]),
+			getAllQueries: vi.fn().mockReturnValue([]),
+		},
 	}));
 	vi.doMock("../../../../clients/cache/rule-cache.js", () => ({
-		RuleCache: function () { return { get: () => null, set: () => {} }; },
+		RuleCache: class {
+			get() {
+				return null;
+			}
+			set() {}
+		},
 	}));
 	vi.doMock("../../../../clients/tree-sitter-client.js", () => {
 		function MockTreeSitterClient() {
@@ -53,7 +61,9 @@ async function loadRunnerWithClient(isAvailable: boolean, initResult: boolean) {
 		return { TreeSitterClient: MockTreeSitterClient };
 	});
 
-	const mod = await import("../../../../clients/dispatch/runners/tree-sitter.js");
+	const mod = await import(
+		"../../../../clients/dispatch/runners/tree-sitter.js"
+	);
 	return mod.default;
 }
 
@@ -62,16 +72,39 @@ describe("tree-sitter runner — metadata", () => {
 
 	it("has expected id and appliesTo languages", async () => {
 		vi.doMock("../../../../clients/tree-sitter-client.js", () => ({
-			TreeSitterClient: function () {
-				return { isAvailable: () => false, init: () => Promise.resolve(false), parseFile: () => Promise.resolve(null), query: () => [] };
+			TreeSitterClient: () => ({
+				isAvailable: () => false,
+				init: () => Promise.resolve(false),
+				parseFile: () => Promise.resolve(null),
+				query: () => [],
+			}),
+		}));
+		vi.doMock("../../../../clients/tree-sitter-logger.js", () => ({
+			logTreeSitter: vi.fn(),
+		}));
+		vi.doMock("../../../../clients/review-graph/service.js", () => ({
+			buildOrUpdateGraph: vi.fn(),
+			computeImpactCascade: vi.fn(),
+			recordEntitySnapshotDiff: vi.fn(),
+		}));
+		vi.doMock("../../../../clients/tree-sitter-query-loader.js", () => ({
+			queryLoader: {
+				loadQueries: vi.fn().mockResolvedValue([]),
+				getAllQueries: vi.fn().mockReturnValue([]),
 			},
 		}));
-		vi.doMock("../../../../clients/tree-sitter-logger.js", () => ({ logTreeSitter: vi.fn() }));
-		vi.doMock("../../../../clients/review-graph/service.js", () => ({ buildOrUpdateGraph: vi.fn(), computeImpactCascade: vi.fn(), recordEntitySnapshotDiff: vi.fn() }));
-		vi.doMock("../../../../clients/tree-sitter-query-loader.js", () => ({ queryLoader: { loadQueries: vi.fn().mockResolvedValue([]), getAllQueries: vi.fn().mockReturnValue([]) } }));
-		vi.doMock("../../../../clients/cache/rule-cache.js", () => ({ RuleCache: function () { return { get: () => null, set: () => {} }; } }));
+		vi.doMock("../../../../clients/cache/rule-cache.js", () => ({
+			RuleCache: class {
+				get() {
+					return null;
+				}
+				set() {}
+			},
+		}));
 
-		const mod = await import("../../../../clients/dispatch/runners/tree-sitter.js");
+		const mod = await import(
+			"../../../../clients/dispatch/runners/tree-sitter.js"
+		);
 		const runner = mod.default;
 		expect(runner.id).toBe("tree-sitter");
 		expect(runner.appliesTo).toContain("jsts");
@@ -79,6 +112,7 @@ describe("tree-sitter runner — metadata", () => {
 		expect(runner.appliesTo).toContain("go");
 		expect(runner.appliesTo).toContain("rust");
 		expect(runner.appliesTo).toContain("ruby");
+		expect(runner.appliesTo).toContain("cxx");
 		expect(runner.enabledByDefault).toBe(true);
 	});
 });

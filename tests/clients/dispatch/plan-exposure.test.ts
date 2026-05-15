@@ -123,7 +123,11 @@ describe("dispatch plan exposure", () => {
 	});
 
 	it("routes cxx and elixir through fallback compiler coverage", () => {
-		expect(flattenRunnerIds(TOOL_PLANS.cxx)).toEqual(["lsp", "cpp-check"]);
+		expect(flattenRunnerIds(TOOL_PLANS.cxx)).toEqual([
+			"lsp",
+			"cpp-check",
+			"tree-sitter",
+		]);
 		expect(flattenRunnerIds(TOOL_PLANS.elixir)).toEqual([
 			"lsp",
 			"elixir-check",

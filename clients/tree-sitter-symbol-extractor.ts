@@ -161,6 +161,60 @@ const SYMBOL_QUERIES: Record<string, { defs: string; refs: string }> = {
         method: (constant) @typeIdent) @typeRef
     `,
 	},
+	c: {
+		defs: `
+      (function_definition
+        declarator: (function_declarator
+          declarator: (identifier) @funcName
+          parameters: (parameter_list) @funcParams)) @funcDef
+
+      (type_definition
+        declarator: (type_identifier) @typeName) @typeDef
+
+      (struct_specifier
+        name: (type_identifier) @typeName) @typeDef
+
+      (enum_specifier
+        name: (type_identifier) @typeName) @typeDef
+    `,
+		refs: `
+      (call_expression
+        function: (identifier) @callIdent) @callRef
+
+      (call_expression
+        function: (field_expression
+          field: (field_identifier) @callField)) @callFieldRef
+
+      (type_identifier) @typeIdent
+    `,
+	},
+	cpp: {
+		defs: `
+      (function_definition
+        declarator: (function_declarator
+          declarator: (identifier) @funcName
+          parameters: (parameter_list) @funcParams)) @funcDef
+
+      (class_specifier
+        name: (type_identifier) @className) @classDef
+
+      (struct_specifier
+        name: (type_identifier) @className) @classDef
+
+      (type_definition
+        declarator: (type_identifier) @typeName) @typeDef
+    `,
+		refs: `
+      (call_expression
+        function: (identifier) @callIdent) @callRef
+
+      (call_expression
+        function: (field_expression
+          field: (field_identifier) @callField)) @callFieldRef
+
+      (type_identifier) @typeIdent
+    `,
+	},
 };
 
 export interface ExtractedSymbols {

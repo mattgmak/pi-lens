@@ -99,8 +99,11 @@ export const LANGUAGE_CAPABILITY_MATRIX: Record<
 	},
 	cxx: {
 		name: "C/C++ Linting",
-		capabilities: ["types", "lint"],
-		writeGroups: [primary("cxx")],
+		capabilities: ["types", "lint", "smells"],
+		writeGroups: [
+			primary("cxx"),
+			{ mode: "all", runnerIds: ["tree-sitter"], filterKinds: ["cxx"] },
+		],
 	},
 	cmake: {
 		name: "CMake Processing",

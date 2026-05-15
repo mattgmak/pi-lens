@@ -22,7 +22,7 @@ import {
 import type { ReviewGraph, ReviewGraphEdge, ReviewGraphNode } from "./types.js";
 
 const REVIEW_GRAPH_VERSION = "v1";
-const MAIN_KINDS = new Set(["jsts", "python", "go", "rust", "ruby"]);
+const MAIN_KINDS = new Set(["jsts", "python", "go", "rust", "ruby", "cxx"]);
 const CHANGED_SYMBOLS_PREFIX = "session.reviewGraph.changedSymbols:";
 const treeSitterClient = new TreeSitterClient();
 const extractorCache = new Map<string, TreeSitterSymbolExtractor>();
@@ -210,7 +210,11 @@ function loadPersistedGraph(
 	}
 }
 
-function persistGraph(cwd: string, signature: string, graph: ReviewGraph): void {
+function persistGraph(
+	cwd: string,
+	signature: string,
+	graph: ReviewGraph,
+): void {
 	const cacheDir = path.join(cwd, ".pi-lens", "cache");
 	const cachePath = path.join(cwd, GRAPH_CACHE_REL);
 	const data: PersistedGraphData = {
@@ -223,7 +227,10 @@ function persistGraph(cwd: string, signature: string, graph: ReviewGraph): void 
 	const json = JSON.stringify(data);
 	fs.mkdir(cacheDir, { recursive: true }, (mkdirErr) => {
 		if (mkdirErr) {
-			console.error("[review-graph] cache dir creation failed:", mkdirErr.message);
+			console.error(
+				"[review-graph] cache dir creation failed:",
+				mkdirErr.message,
+			);
 			return;
 		}
 		fs.writeFile(cachePath, json, "utf-8", (writeErr) => {
@@ -389,6 +396,7 @@ function addJsTsFile(
 
 function mapKindToTreeSitterLanguage(
 	kind: string | undefined,
+	filePath?: string,
 ): string | undefined {
 	switch (kind) {
 		case "python":
@@ -399,6 +407,10 @@ function mapKindToTreeSitterLanguage(
 			return "rust";
 		case "ruby":
 			return "ruby";
+		case "cxx": {
+			const ext = filePath ? path.extname(filePath).toLowerCase() : "";
+			return ext === ".c" || ext === ".h" ? "c" : "cpp";
+		}
 		default:
 			return undefined;
 	}
@@ -485,6 +497,93 @@ function addTreeSitterFile(
 	}
 }
 
+function ensureFileNode(
+	graph: ReviewGraph,
+	filePath: string,
+	languageId: string,
+): string {
+	const normalized = normalizeMapKey(filePath);
+	const existing = graph.fileNodes.get(normalized);
+	if (existing) return existing;
+	const fileNodeId = `file:${normalized}`;
+	addNode(graph, {
+		id: fileNodeId,
+		kind: "file",
+		language: languageId,
+		filePath: normalized,
+	});
+	return fileNodeId;
+}
+
+function resolveCxxInclude(
+	cwd: string,
+	filePath: string,
+	source: string,
+): string | undefined {
+	const candidates = [
+		path.resolve(path.dirname(filePath), source),
+		path.resolve(cwd, source),
+		path.resolve(cwd, "include", source),
+		path.resolve(cwd, "src", source),
+	];
+	const root = path.resolve(cwd);
+	for (const candidate of candidates) {
+		if (!candidate.startsWith(root + path.sep) && candidate !== root) continue;
+		if (fs.existsSync(candidate) && detectFileKind(candidate) === "cxx") {
+			return normalizeMapKey(candidate);
+		}
+	}
+	return undefined;
+}
+
+function parseLocalCxxInclude(line: string): string | undefined {
+	let i = 0;
+	while (i < line.length && (line[i] === " " || line[i] === "\t")) i += 1;
+	if (line[i] !== "#") return undefined;
+	i += 1;
+	while (i < line.length && (line[i] === " " || line[i] === "\t")) i += 1;
+	if (!line.startsWith("include", i)) return undefined;
+	i += "include".length;
+	if (i >= line.length || (line[i] !== " " && line[i] !== "\t")) {
+		return undefined;
+	}
+	while (i < line.length && (line[i] === " " || line[i] === "\t")) i += 1;
+	if (line[i] !== '"') return undefined;
+	i += 1;
+	const start = i;
+	while (i < line.length && line[i] !== '"') i += 1;
+	if (i >= line.length || i === start) return undefined;
+	return line.slice(start, i);
+}
+
+function addCxxIncludeEdges(
+	graph: ReviewGraph,
+	cwd: string,
+	filePath: string,
+): void {
+	let content = "";
+	try {
+		content = fs.readFileSync(filePath, "utf-8");
+	} catch {
+		return;
+	}
+	const fromNode = ensureFileNode(graph, filePath, "cpp");
+	for (const line of content.split(/\r?\n/)) {
+		const source = parseLocalCxxInclude(line);
+		if (!source) continue;
+		const target = resolveCxxInclude(cwd, filePath, source);
+		if (!target) continue;
+		const languageId = mapKindToTreeSitterLanguage("cxx", target) ?? "cpp";
+		const toNode = ensureFileNode(graph, target, languageId);
+		addEdge(graph, {
+			from: fromNode,
+			to: toNode,
+			kind: "imports",
+			metadata: { source },
+		});
+	}
+}
+
 function resolveDeferredSymbolEdges(graph: ReviewGraph): void {
 	const symbolNameToIds = new Map<string, string[]>();
 	for (const node of graph.nodes.values()) {
@@ -558,10 +657,11 @@ async function _doBuildGraph(
 			await ensureTsFacts(file, cwd, facts);
 			addJsTsFile(graph, cwd, file, facts);
 		} else {
-			const languageId = mapKindToTreeSitterLanguage(kind);
+			const languageId = mapKindToTreeSitterLanguage(kind, file);
 			if (!languageId) continue;
 			const extracted = await extractTreeSitterSymbols(file, languageId);
 			addTreeSitterFile(graph, file, languageId, extracted);
+			if (kind === "cxx") addCxxIncludeEdges(graph, cwd, file);
 		}
 		if (normalizedChanged.includes(file)) {
 			upsertChangedSymbols(graph, facts, file);
