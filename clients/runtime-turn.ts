@@ -208,67 +208,87 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	if (runtime.isStartupScanInFlight("knip")) {
 		dbg("turn_end: skipping knip (startup scan still in flight)");
 		knipMeta = { skipped: true };
-	} else if (await knipClient.ensureAvailable()) {
-		const knipResult = await knipClient.analyze(cwd, getKnipIgnorePatterns());
+	} else {
+		// Let KnipClient resolve/validate a real JS project root before probing or
+		// auto-installing knip. Non-JS repos (for example Unity projects) should not
+		// run tool checks every turn. Also back off after a timeout/kill so every
+		// agent turn does not spend 30s launching another heavyweight knip process.
 		const prevKnip = cacheManager.readCache<KnipResult>("knip", cwd);
-		cacheManager.writeCache("knip", knipResult, cwd);
-		knipMeta = {
-			success: knipResult.success,
-			totalIssues: knipResult.issues.length,
-			newIssues: 0,
-			blockerIssues: 0,
-			...(!knipResult.success && { reason: knipResult.summary }),
-		};
-
-		if (knipResult.success && knipResult.issues.length > 0) {
-			const issueKey = (i: KnipIssue) =>
-				`${i.type}:${i.file ?? ""}:${i.name}:${i.line ?? 0}:${i.package ?? ""}`;
-			const prevKeys = new Set((prevKnip?.data?.issues ?? []).map(issueKey));
-			const modifiedSet = new Set(files.map((f) => resolveRunnerPath(cwd, f)));
-
-			const newIssues = knipResult.issues.filter((issue) => {
-				if (prevKeys.has(issueKey(issue))) return false;
-				if (!issue.file) return false;
-				const abs = resolveRunnerPath(cwd, issue.file);
-				return modifiedSet.has(abs);
-			});
-			knipMeta.newIssues = newIssues.length;
-
-			const blockerIssues = newIssues.filter(
-				(i) => i.type === "unlisted" || i.type === "bin",
+		const previousFailedHard =
+			prevKnip &&
+			!prevKnip.data.success &&
+			/(timed out|killed|SIGTERM|SIGKILL|SIGABRT)/i.test(
+				prevKnip.data.summary,
 			);
-			knipMeta.blockerIssues = blockerIssues.length;
-			if (blockerIssues.length > 0) {
-				let report =
-					"🔴 New unresolved imports/deps in modified code (Knip):\n";
-				let firstPath: string | null = null;
-				for (const issue of blockerIssues.slice(0, 5)) {
-					const display = issue.file
-						? toRunnerDisplayPath(cwd, issue.file)
-						: "(unknown)";
-					if (!firstPath && display !== "(unknown)") firstPath = display;
-					report += `  ${display}${issue.line ? `:${issue.line}` : ""} — ${issue.type}: ${issue.name}\n`;
-				}
-				if (firstPath) {
-					report += `  First location: ${firstPath}\n`;
-				}
-				blockerParts.push(report);
-			}
 
-			// Newly-unused exports in modified files: symbol was clean before this turn
-			// (not in prevKnip issues) but is now flagged — likely a caller was removed or
-			// an interface changed. Advisory only — the agent may be mid-task.
-			const unusedExportIssues = newIssues.filter((i) => i.type === "export");
-			if (unusedExportIssues.length > 0) {
-				let report =
-					"⚠️ Newly unused exports in modified files — check if callers need updating (Knip):\n";
-				for (const issue of unusedExportIssues.slice(0, 5)) {
-					const display = issue.file
-						? toRunnerDisplayPath(cwd, issue.file)
-						: "(unknown)";
-					report += `  ${display}${issue.line ? `:${issue.line}` : ""} — ${issue.name}\n`;
+		if (previousFailedHard) {
+			dbg(
+				`turn_end: skipping knip after recent failure: ${prevKnip.data.summary}`,
+			);
+			knipMeta = { skipped: true, reason: prevKnip.data.summary };
+		} else {
+			const knipResult = await knipClient.analyze(cwd, getKnipIgnorePatterns());
+			cacheManager.writeCache("knip", knipResult, cwd);
+			knipMeta = {
+				success: knipResult.success,
+				totalIssues: knipResult.issues.length,
+				newIssues: 0,
+				blockerIssues: 0,
+				...(!knipResult.success && { reason: knipResult.summary }),
+			};
+
+			if (knipResult.success && knipResult.issues.length > 0) {
+				const issueKey = (i: KnipIssue) =>
+					`${i.type}:${i.file ?? ""}:${i.name}:${i.line ?? 0}:${i.package ?? ""}`;
+				const prevKeys = new Set((prevKnip?.data?.issues ?? []).map(issueKey));
+				const modifiedSet = new Set(
+					files.map((f) => resolveRunnerPath(cwd, f)),
+				);
+
+				const newIssues = knipResult.issues.filter((issue) => {
+					if (prevKeys.has(issueKey(issue))) return false;
+					if (!issue.file) return false;
+					const abs = resolveRunnerPath(cwd, issue.file);
+					return modifiedSet.has(abs);
+				});
+				knipMeta.newIssues = newIssues.length;
+
+				const blockerIssues = newIssues.filter(
+					(i) => i.type === "unlisted" || i.type === "bin",
+				);
+				knipMeta.blockerIssues = blockerIssues.length;
+				if (blockerIssues.length > 0) {
+					let report =
+						"🔴 New unresolved imports/deps in modified code (Knip):\n";
+					let firstPath: string | null = null;
+					for (const issue of blockerIssues.slice(0, 5)) {
+						const display = issue.file
+							? toRunnerDisplayPath(cwd, issue.file)
+							: "(unknown)";
+						if (!firstPath && display !== "(unknown)") firstPath = display;
+						report += `  ${display}${issue.line ? `:${issue.line}` : ""} — ${issue.type}: ${issue.name}\n`;
+					}
+					if (firstPath) {
+						report += `  First location: ${firstPath}\n`;
+					}
+					blockerParts.push(report);
 				}
-				advisoryParts.push(report);
+
+				// Newly-unused exports in modified files: symbol was clean before this turn
+				// (not in prevKnip issues) but is now flagged — likely a caller was removed or
+				// an interface changed. Advisory only — the agent may be mid-task.
+				const unusedExportIssues = newIssues.filter((i) => i.type === "export");
+				if (unusedExportIssues.length > 0) {
+					let report =
+						"⚠️ Newly unused exports in modified files — check if callers need updating (Knip):\n";
+					for (const issue of unusedExportIssues.slice(0, 5)) {
+						const display = issue.file
+							? toRunnerDisplayPath(cwd, issue.file)
+							: "(unknown)";
+						report += `  ${display}${issue.line ? `:${issue.line}` : ""} — ${issue.name}\n`;
+					}
+					advisoryParts.push(report);
+				}
 			}
 		}
 	}

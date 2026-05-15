@@ -10,6 +10,7 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { safeSpawnAsync } from "./safe-spawn.js";
 
@@ -56,7 +57,7 @@ export class KnipClient {
 	 *
 	 * Without this guard, two back-to-back turn_end events (or a turn_end
 	 * firing while the session_start scan is still in flight) can each spawn
-	 * a fresh `npx knip` process over the same tree. Two concurrent knip
+	 * a fresh `knip` process over the same tree. Two concurrent knip
 	 * runs are CPU-bound and cause the exact pathology we're fixing: load
 	 * averages >5, TUI freezes, and zombie processes reparented to init
 	 * after pi exits mid-scan.
@@ -89,13 +90,32 @@ export class KnipClient {
 			"knip.config.js",
 			"knip.config.ts",
 		];
-		let current = path.resolve(startDir);
+		const boundaries = [".git", ".hg", ".svn"];
+		const homeDir = path.resolve(os.homedir());
+		const initialDir = path.resolve(startDir);
+		let current = initialDir;
 		// Safety bound: in practice depths are ~10. This cap just prevents a
 		// pathological symlink loop from hanging the search.
 		for (let depth = 0; depth < 64; depth++) {
 			if (markers.some((m) => fs.existsSync(path.join(current, m)))) {
 				return current;
 			}
+
+			// Do not escape the current repository just to find an unrelated parent
+			// package.json. Unity/non-JS repos often have no package.json at their
+			// root; walking past their .git boundary can accidentally pick up
+			// ~/package.json and make knip scan the entire home directory.
+			if (boundaries.some((m) => fs.existsSync(path.join(current, m)))) {
+				return null;
+			}
+
+			// Likewise, never treat the user's home-level package.json as the project
+			// for a nested cwd. It is almost always tool/config noise, and scanning
+			// HOME is both slow and crash-prone.
+			if (current === homeDir && initialDir !== homeDir) {
+				return null;
+			}
+
 			const parent = path.dirname(current);
 			if (parent === current) return null;
 			current = parent;
@@ -195,15 +215,15 @@ export class KnipClient {
 
 	private async runAnalyze(targetDir: string): Promise<KnipResult> {
 		const args = [
-			"knip",
 			"--reporter=json",
 			"--include",
 			"files,exports,types,dependencies,unlisted",
 		];
 
-		const result = await safeSpawnAsync("npx", args, {
+		const result = await safeSpawnAsync("knip", args, {
 			timeout: ANALYSIS_TIMEOUT_MS,
 			cwd: targetDir,
+			env: await this.getKnipEnvironment(targetDir),
 		});
 
 		if (result.error) {
@@ -229,6 +249,21 @@ export class KnipClient {
 		}
 
 		return this.parseOutput(output);
+	}
+
+	private async getKnipEnvironment(targetDir: string): Promise<NodeJS.ProcessEnv> {
+		const { getToolEnvironment } = await import("./installer/index.js");
+		const env = await getToolEnvironment();
+		const separator = process.platform === "win32" ? ";" : ":";
+		const currentPath = env.PATH || env.Path || process.env.PATH || "";
+		const localBin = path.join(targetDir, "node_modules", ".bin");
+		const augmentedPath = `${localBin}${separator}${currentPath}`;
+
+		return {
+			...env,
+			PATH: augmentedPath,
+			...(process.platform === "win32" ? { Path: augmentedPath } : {}),
+		};
 	}
 
 	/**

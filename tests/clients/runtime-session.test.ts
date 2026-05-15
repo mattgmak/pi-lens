@@ -2,6 +2,16 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { handleSessionStart } from "../../clients/runtime-session.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
+const EMPTY_KNIP_RESULT = {
+	success: true,
+	issues: [],
+	unusedExports: [],
+	unusedFiles: [],
+	unusedDeps: [],
+	unlistedDeps: [],
+	summary: "skipped",
+};
+
 function setStartupMode(mode: "full" | "quick"): () => void {
 	const prev = process.env.PI_LENS_STARTUP_MODE;
 	process.env.PI_LENS_STARTUP_MODE = mode;
@@ -24,6 +34,7 @@ async function runSessionStart(
 	const biomeEnsure = vi.fn(async () => false);
 	const ruffEnsure = vi.fn(async () => false);
 	const knipEnsure = vi.fn(async () => false);
+	const knipAnalyze = vi.fn(async () => EMPTY_KNIP_RESULT);
 	const jscpdEnsure = vi.fn(async () => false);
 	const depEnsure = vi.fn(async () => false);
 	const restoreStartupMode = setStartupMode(mode);
@@ -81,6 +92,7 @@ async function runSessionStart(
 			knipClient: {
 				isAvailable: () => false,
 				ensureAvailable: knipEnsure,
+				analyze: knipAnalyze,
 			},
 			jscpdClient: {
 				isAvailable: () => false,
@@ -112,6 +124,7 @@ async function runSessionStart(
 			biomeEnsure,
 			ruffEnsure,
 			knipEnsure,
+			knipAnalyze,
 			jscpdEnsure,
 			depEnsure,
 		};
@@ -190,6 +203,7 @@ describe("runtime-session notifications", () => {
 			depEnsure,
 			astGrepEnsure,
 			knipEnsure,
+			knipAnalyze,
 			jscpdEnsure,
 		} = await runSessionStart("full", (tmpDir) => {
 			createTempFile(
@@ -208,7 +222,8 @@ describe("runtime-session notifications", () => {
 			expect(biomeEnsure).not.toHaveBeenCalled();
 			expect(ruffEnsure).not.toHaveBeenCalled();
 			expect(astGrepEnsure).toHaveBeenCalledTimes(1);
-			expect(knipEnsure).toHaveBeenCalledTimes(1);
+			expect(knipEnsure).not.toHaveBeenCalled();
+			expect(knipAnalyze).toHaveBeenCalledTimes(1);
 			expect(jscpdEnsure).toHaveBeenCalledTimes(1);
 		} finally {
 			env.cleanup();

@@ -9,6 +9,16 @@ import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleTurnEnd } from "../../clients/runtime-turn.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
+const EMPTY_KNIP_RESULT = {
+	success: true,
+	issues: [],
+	unusedExports: [],
+	unusedFiles: [],
+	unusedDeps: [],
+	unlistedDeps: [],
+	summary: "skipped",
+};
+
 function diagnostic(filePath: string, message: string, line = 1): Diagnostic {
 	return {
 		id: `lsp:test:${line}`,
@@ -90,7 +100,10 @@ describe("cascade turn-end merge", () => {
 				dbg: () => {},
 				runtime,
 				cacheManager,
-				knipClient: { ensureAvailable: async () => false },
+				knipClient: {
+					ensureAvailable: async () => false,
+					analyze: async () => EMPTY_KNIP_RESULT,
+				},
 				depChecker: { ensureAvailable: async () => false },
 				testRunnerClient: { getTestRunTarget: () => null },
 				resetLSPService: () => {},

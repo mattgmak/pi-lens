@@ -9,6 +9,16 @@ import { handleToolResult } from "../../clients/runtime-tool-result.js";
 import { handleTurnEnd } from "../../clients/runtime-turn.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
+const EMPTY_KNIP_RESULT = {
+	success: true,
+	issues: [],
+	unusedExports: [],
+	unusedFiles: [],
+	unusedDeps: [],
+	unlistedDeps: [],
+	summary: "skipped",
+};
+
 vi.mock("../../clients/pipeline.js", () => ({
 	runPipeline: vi.fn(async () => ({
 		output: "no blockers",
@@ -57,6 +67,7 @@ describe("runtime event flow", () => {
 				knipClient: {
 					isAvailable: () => false,
 					ensureAvailable: async () => false,
+					analyze: async () => EMPTY_KNIP_RESULT,
 				},
 				jscpdClient: {
 					isAvailable: () => false,
@@ -112,7 +123,10 @@ describe("runtime event flow", () => {
 				dbg: () => {},
 				runtime,
 				cacheManager,
-				knipClient: { ensureAvailable: async () => false },
+				knipClient: {
+					ensureAvailable: async () => false,
+					analyze: async () => EMPTY_KNIP_RESULT,
+				},
 				depChecker: { ensureAvailable: async () => false },
 				testRunnerClient: { getTestRunTarget: () => null },
 				resetLSPService: () => {},

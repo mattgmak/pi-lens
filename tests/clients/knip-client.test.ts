@@ -23,6 +23,25 @@ describe("knip-client", () => {
 		}
 	});
 
+	it("does not walk past a VCS boundary to a parent package.json", () => {
+		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-knip-boundary-");
+		try {
+			fs.writeFileSync(path.join(tmpDir, "package.json"), '{"name":"parent"}');
+			const repoRoot = path.join(tmpDir, "unity-repo");
+			const nested = path.join(repoRoot, "Assets", "Scripts");
+			fs.mkdirSync(path.join(repoRoot, ".git"), { recursive: true });
+			fs.mkdirSync(nested, { recursive: true });
+
+			const client = new KnipClient(false) as unknown as {
+				resolveProjectRoot: (startDir: string) => string | null;
+			};
+
+			expect(client.resolveProjectRoot(nested)).toBeNull();
+		} finally {
+			cleanup();
+		}
+	});
+
 	it("returns null when no project markers exist up the tree", () => {
 		// Regression: previously fell back to startDir, causing knip to scan
 		// arbitrary directories like $HOME when run from a bare cwd.
@@ -82,6 +101,41 @@ describe("knip-client", () => {
 		}
 	});
 
+	it("analyze() skips before probing knip when stopped by repo boundary", async () => {
+		const { tmpDir, cleanup } = setupTestEnvironment(
+			"pi-lens-knip-boundary-skip-",
+		);
+		try {
+			fs.writeFileSync(path.join(tmpDir, "package.json"), '{"name":"parent"}');
+			const repoRoot = path.join(tmpDir, "unity-repo");
+			const nested = path.join(repoRoot, "Assets", "Scripts");
+			fs.mkdirSync(path.join(repoRoot, ".git"), { recursive: true });
+			fs.mkdirSync(nested, { recursive: true });
+
+			const client = new KnipClient(false) as unknown as {
+				ensureAvailable: () => Promise<boolean>;
+				runAnalyze: (d: string) => Promise<unknown>;
+				analyze: (cwd?: string) => Promise<{
+					success: boolean;
+					issues: unknown[];
+					summary: string;
+				}>;
+			};
+
+			const ensureSpy = vi.spyOn(client, "ensureAvailable");
+			const runSpy = vi.spyOn(client, "runAnalyze");
+			const result = await client.analyze(nested);
+
+			expect(result.success).toBe(true);
+			expect(result.summary).toMatch(/skipped|no project/i);
+			expect(ensureSpy).not.toHaveBeenCalled();
+			expect(runSpy).not.toHaveBeenCalled();
+		} finally {
+			cleanup();
+			vi.restoreAllMocks();
+		}
+	});
+
 	it("analyze() returns a Promise (non-blocking)", async () => {
 		// Regression: analyze() used to be sync (spawnSync), blocking the event
 		// loop. The TypeScript signature alone doesn't enforce this at runtime,
@@ -95,7 +149,7 @@ describe("knip-client", () => {
 
 	it("de-dupes concurrent analyze() calls for the same project root", async () => {
 		// Regression: back-to-back turn_end events (or turn_end during a
-		// session_start scan) could spawn two `npx knip` processes against
+		// session_start scan) could spawn two `knip` processes against
 		// the same tree. Two concurrent knip runs pegged both CPU cores to
 		// 100% and caused the TUI freezes this PR is fixing.
 		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-knip-dedupe-");

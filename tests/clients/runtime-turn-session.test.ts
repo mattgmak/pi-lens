@@ -11,6 +11,16 @@ import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleTurnEnd } from "../../clients/runtime-turn.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
+const EMPTY_KNIP_RESULT = {
+	success: true,
+	issues: [],
+	unusedExports: [],
+	unusedFiles: [],
+	unusedDeps: [],
+	unlistedDeps: [],
+	summary: "skipped",
+};
+
 // Minimal turn_end deps — no real tool clients needed for these scenarios.
 function makeTurnEndDeps(
 	runtime: RuntimeCoordinator,
@@ -23,7 +33,10 @@ function makeTurnEndDeps(
 		dbg: () => {},
 		runtime,
 		cacheManager,
-		knipClient: { ensureAvailable: async () => false },
+		knipClient: {
+			ensureAvailable: async () => false,
+			analyze: async () => EMPTY_KNIP_RESULT,
+		},
 		depChecker: { ensureAvailable: async () => false },
 		testRunnerClient: { getTestRunTarget: () => null },
 		resetLSPService: () => {},
@@ -185,6 +198,51 @@ describe("stale turn state eviction", () => {
 		expect(Object.keys(afterState.files)).toHaveLength(0);
 
 		env.cleanup();
+	});
+});
+
+// ── Knip timeout backoff ─────────────────────────────────────────────────────
+
+describe("knip turn-end backoff", () => {
+	it("skips knip after a recent timeout failure", async () => {
+		const env = setupTestEnvironment("pi-lens-knip-backoff-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			const cacheManager = new CacheManager(false);
+			const filePath = path.join(env.tmpDir, "src/current.ts");
+			fs.mkdirSync(path.dirname(filePath), { recursive: true });
+			fs.writeFileSync(filePath, "export const x = 1;\n");
+			cacheManager.addModifiedRange(
+				filePath,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+			);
+			cacheManager.writeCache(
+				"knip",
+				{
+					...EMPTY_KNIP_RESULT,
+					success: false,
+					summary: "Error: Process timed out after 30000ms (killed with SIGTERM)",
+				},
+				env.tmpDir,
+			);
+			const analyze = vi.fn(async () => EMPTY_KNIP_RESULT);
+
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, {
+					ctxCwd: env.tmpDir,
+					knipClient: {
+						ensureAvailable: async () => true,
+						analyze,
+					},
+				}),
+			);
+
+			expect(analyze).not.toHaveBeenCalled();
+		} finally {
+			env.cleanup();
+		}
 	});
 });
 
