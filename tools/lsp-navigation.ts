@@ -18,6 +18,7 @@ const VALID_OPERATIONS = [
 	"hover",
 	"signatureHelp",
 	"documentSymbol",
+	"findSymbol",
 	"workspaceSymbol",
 	"codeAction",
 	"rename",
@@ -48,7 +49,8 @@ function operationSupportStatus(
 	if (operation === "references") return support.references;
 	if (operation === "hover") return support.hover;
 	if (operation === "signatureHelp") return support.signatureHelp;
-	if (operation === "documentSymbol") return support.documentSymbol;
+	if (operation === "documentSymbol" || operation === "findSymbol")
+		return support.documentSymbol;
 	if (operation === "workspaceSymbol") return support.workspaceSymbol;
 	if (operation === "codeAction") return support.codeAction;
 	if (operation === "rename") return support.rename;
@@ -67,6 +69,7 @@ function emptyReasonForOperation(operation: LspNavigationOperation): string {
 		return "position-sensitive-or-no-signature";
 	if (operation === "codeAction") return "no-applicable-actions";
 	if (operation === "rename") return "no-rename-edits-or-symbol-not-renamable";
+	if (operation === "findSymbol") return "no-matching-symbols";
 	if (operation === "workspaceSymbol")
 		return "no-matching-symbols-or-server-index-unavailable";
 	if (operation === "incomingCalls" || operation === "outgoingCalls")
@@ -103,10 +106,128 @@ function tokenAtPosition(
 
 type SymbolNode = {
 	name?: string;
+	kind?: number;
+	detail?: string;
 	location?: { uri: string; range: Record<string, unknown> };
 	range?: Record<string, unknown>;
+	selectionRange?: Record<string, unknown>;
 	children?: SymbolNode[];
 };
+
+type SymbolMatch = {
+	name: string;
+	kind: string;
+	kindCode?: number;
+	detail?: string;
+	line?: number;
+	character?: number;
+	depth: number;
+	location?: { uri: string; range: Record<string, unknown> };
+	range?: Record<string, unknown>;
+};
+
+const SYMBOL_KIND_LABELS: Record<number, string> = {
+	2: "module",
+	3: "namespace",
+	4: "package",
+	5: "class",
+	6: "method",
+	7: "property",
+	8: "field",
+	9: "constructor",
+	10: "enum",
+	11: "interface",
+	12: "function",
+	13: "variable",
+	14: "constant",
+	15: "string",
+	16: "number",
+	17: "boolean",
+	18: "array",
+	19: "object",
+	20: "key",
+	21: "null",
+	22: "enumMember",
+	23: "struct",
+	24: "event",
+	25: "operator",
+	26: "typeParameter",
+};
+
+function symbolKindLabel(kind: number | undefined): string {
+	return kind == null ? "symbol" : (SYMBOL_KIND_LABELS[kind] ?? "symbol");
+}
+
+function rangeStart(range: Record<string, unknown> | undefined): {
+	line?: number;
+	character?: number;
+} {
+	const start = range?.start as
+		| { line?: unknown; character?: unknown }
+		| undefined;
+	return {
+		line: typeof start?.line === "number" ? start.line + 1 : undefined,
+		character:
+			typeof start?.character === "number" ? start.character + 1 : undefined,
+	};
+}
+
+function findSymbolMatches(
+	symbols: SymbolNode[],
+	query: string,
+	options: {
+		maxResults: number;
+		topLevelOnly: boolean;
+		exactMatch: boolean;
+		kinds: Set<string>;
+	},
+): SymbolMatch[] {
+	const normalizedQuery = query.trim().toLowerCase();
+	if (!normalizedQuery) return [];
+	const matches: SymbolMatch[] = [];
+
+	const matchesText = (symbol: SymbolNode): boolean => {
+		const values = [symbol.name, symbol.detail]
+			.filter((value): value is string => Boolean(value))
+			.map((value) => value.trim().toLowerCase());
+		return options.exactMatch
+			? values.some((value) => value === normalizedQuery)
+			: values.some((value) => value.includes(normalizedQuery));
+	};
+
+	const matchesKind = (symbol: SymbolNode): boolean => {
+		if (options.kinds.size === 0) return true;
+		return options.kinds.has(symbolKindLabel(symbol.kind).toLowerCase());
+	};
+
+	const visit = (entries: SymbolNode[], depth: number): void => {
+		for (const symbol of entries) {
+			if (symbol.name && matchesText(symbol) && matchesKind(symbol)) {
+				const preferredRange = symbol.selectionRange ?? symbol.range;
+				const start = rangeStart(preferredRange);
+				matches.push({
+					name: symbol.name,
+					kind: symbolKindLabel(symbol.kind),
+					kindCode: symbol.kind,
+					detail: symbol.detail,
+					line: start.line,
+					character: start.character,
+					depth,
+					location: symbol.location,
+					range: preferredRange,
+				});
+				if (matches.length >= options.maxResults) return;
+			}
+			if (!options.topLevelOnly && symbol.children?.length) {
+				visit(symbol.children, depth + 1);
+				if (matches.length >= options.maxResults) return;
+			}
+		}
+	};
+
+	visit(symbols, 1);
+	return matches;
+}
 
 function flattenSymbols(symbols: SymbolNode[]): SymbolNode[] {
 	const all: SymbolNode[] = [];
@@ -204,6 +325,7 @@ export function createLspNavigationTool(
 			"- hover: Get type/doc info at a position\n" +
 			"- signatureHelp: Show callable signatures at cursor\n" +
 			"- documentSymbol: List all symbols (functions/classes/vars) in a file\n" +
+			"- findSymbol: Search document symbols in a file by name/detail with optional kind/top-level/exact filters\n" +
 			"- workspaceSymbol: Search symbols across the whole project (best with filePath context)\n" +
 			"- codeAction: Find available quick fixes/refactors at a range\n" +
 			"- rename: Compute workspace edits for renaming a symbol\n" +
@@ -259,7 +381,30 @@ export function createLspNavigationTool(
 			query: Type.Optional(
 				Type.String({
 					description:
-						"Symbol name to search. Used by workspaceSymbol (best with filePath for active project context).",
+						"Symbol name to search. Used by workspaceSymbol and findSymbol.",
+				}),
+			),
+			kinds: Type.Optional(
+				Type.Array(Type.String(), {
+					description:
+						"findSymbol only: restrict matches to symbol kind labels such as function, class, method, variable, interface.",
+				}),
+			),
+			exactMatch: Type.Optional(
+				Type.Boolean({
+					description:
+						"findSymbol only: match whole symbol names/details exactly instead of substring matching.",
+				}),
+			),
+			topLevelOnly: Type.Optional(
+				Type.Boolean({
+					description: "findSymbol only: do not search nested child symbols.",
+				}),
+			),
+			maxResults: Type.Optional(
+				Type.Number({
+					description:
+						"findSymbol only: maximum matches to return. Default 20.",
 				}),
 			),
 			callHierarchyItem: Type.Optional(
@@ -322,7 +467,7 @@ export function createLspNavigationTool(
 			): typeof payload & {
 				details: typeof payload.details & {
 					failureKind: string;
-				}
+				};
 			} => {
 				const normalizedFilePath = meta.filePath.replace(/\\/g, "/");
 				logLatency({
@@ -377,6 +522,10 @@ export function createLspNavigationTool(
 				endCharacter,
 				newName,
 				query,
+				kinds,
+				exactMatch,
+				topLevelOnly,
+				maxResults,
 			} = params as {
 				operation: string;
 				filePath?: string;
@@ -386,6 +535,10 @@ export function createLspNavigationTool(
 				endCharacter?: number;
 				newName?: string;
 				query?: string;
+				kinds?: string[];
+				exactMatch?: boolean;
+				topLevelOnly?: boolean;
+				maxResults?: number;
 			};
 			const normalizedOperation = normalizeOperation(rawOperation);
 			if (!isValidOperation(normalizedOperation)) {
@@ -496,10 +649,13 @@ export function createLspNavigationTool(
 						},
 					];
 					const noteMap: Record<string, string> = {
-						"pull": "Note: filePath mode requests pull diagnostics for this file and returns the aggregated result.",
-						"push-only": "Note: server is push-only; result depends on published diagnostics for this file.",
+						pull: "Note: filePath mode requests pull diagnostics for this file and returns the aggregated result.",
+						"push-only":
+							"Note: server is push-only; result depends on published diagnostics for this file.",
 					};
-					const note = noteMap[diagnosticsMode] ?? "Note: workspace diagnostics mode unknown (no active capability snapshot).";
+					const note =
+						noteMap[diagnosticsMode] ??
+						"Note: workspace diagnostics mode unknown (no active capability snapshot).";
 					const resultCount = diagnostics.length;
 					return finalize(
 						{
@@ -534,10 +690,13 @@ export function createLspNavigationTool(
 					}),
 				);
 				const noteMap2: Record<string, string> = {
-					"push-only": "Note: push-only tracked diagnostics snapshot (not full workspace pull diagnostics).",
-					"pull": "Note: tracked diagnostics snapshot from active clients. Provide filePath to force file-level diagnostics collection.",
+					"push-only":
+						"Note: push-only tracked diagnostics snapshot (not full workspace pull diagnostics).",
+					pull: "Note: tracked diagnostics snapshot from active clients. Provide filePath to force file-level diagnostics collection.",
 				};
-				const note = noteMap2[diagnosticsMode] ?? "Note: workspace diagnostics mode unknown (no active capability snapshot).";
+				const note =
+					noteMap2[diagnosticsMode] ??
+					"Note: workspace diagnostics mode unknown (no active capability snapshot).";
 				return finalize(
 					{
 						content: [
@@ -648,6 +807,26 @@ export function createLspNavigationTool(
 						return lspService.signatureHelp(filePath, lspLine, lspChar);
 					case "documentSymbol":
 						return lspService.documentSymbol(filePath);
+					case "findSymbol": {
+						if (!query || query.trim().length === 0) {
+							throw new Error(
+								"__BADINPUT__ query parameter required for findSymbol",
+							);
+						}
+						const symbols = (await lspService.documentSymbol(
+							filePath,
+						)) as SymbolNode[];
+						return findSymbolMatches(symbols, query, {
+							maxResults: Math.max(1, Math.min(100, maxResults ?? 20)),
+							topLevelOnly: topLevelOnly ?? false,
+							exactMatch: exactMatch ?? false,
+							kinds: new Set(
+								(kinds ?? [])
+									.map((kind) => kind.trim().toLowerCase())
+									.filter(Boolean),
+							),
+						});
+					}
 					case "workspaceSymbol":
 						supported = operationSupportStatus(
 							operation,
@@ -876,7 +1055,11 @@ export function createLspNavigationTool(
 				}
 			}
 
-			const resultCount = Array.isArray(result) ? result.length : (result ? 1 : 0);
+			const resultCount = Array.isArray(result)
+				? result.length
+				: result
+					? 1
+					: 0;
 			return finalize(
 				{
 					content: [{ type: "text" as const, text: output }],

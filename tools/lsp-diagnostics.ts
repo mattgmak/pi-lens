@@ -59,7 +59,10 @@ const LANG_EXTENSIONS: Record<string, string[]> = {
 };
 
 const MAX_FILES = 50;
+const MAX_BATCH_FILES = 100;
 const MAX_DIAGNOSTICS = 200;
+const DEFAULT_BATCH_CONCURRENCY = 8;
+const MAX_BATCH_CONCURRENCY = 16;
 
 // LSP severities: 1=Error, 2=Warning, 3=Information, 4=Hint
 const SEVERITY_NAMES: Record<number, string> = {
@@ -75,6 +78,28 @@ type LspHealthLike = {
 	serverCountReady?: number;
 	candidateServerIds?: string[];
 	mergedCount?: number;
+};
+
+type BatchOptions = {
+	concurrency: number;
+	waitMs?: number;
+};
+
+type FileDiag = {
+	file: string;
+	line?: number;
+	character?: number;
+	severity: number;
+	message: string;
+	source?: string;
+	code?: string | number;
+};
+
+type FileDiagnosticResult = {
+	file: string;
+	diagnostics: FileDiag[];
+	unavailable?: string;
+	error?: string;
 };
 
 function lspUnavailableMessage(
@@ -96,6 +121,38 @@ function lspUnavailableMessage(
 			? " Showing stale last-known diagnostics below."
 			: " No diagnostics were collected.";
 	return `LSP unavailable for ${filePath}: ${reason}; ready=${health.serverCountReady ?? 0}/${health.serverCountAttempted ?? 0}.${candidates}.${stale}`;
+}
+
+function boundedPositiveInt(
+	value: unknown,
+	fallback: number,
+	min: number,
+	max: number,
+): number {
+	const parsed = typeof value === "number" ? Math.floor(value) : Number.NaN;
+	if (!Number.isFinite(parsed)) return fallback;
+	return Math.max(min, Math.min(max, parsed));
+}
+
+async function mapWithConcurrency<T, R>(
+	items: T[],
+	concurrency: number,
+	mapper: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+	const results: R[] = [];
+	let nextIndex = 0;
+	const workers = Math.min(Math.max(1, concurrency), items.length);
+	await Promise.all(
+		Array.from({ length: workers }, async () => {
+			while (true) {
+				const index = nextIndex;
+				nextIndex += 1;
+				if (index >= items.length) return;
+				results[index] = await mapper(items[index]!, index);
+			}
+		}),
+	);
+	return results;
 }
 
 function collectFiles(
@@ -138,14 +195,36 @@ export function createLspDiagnosticsTool() {
 		promptSnippet:
 			"Get LSP diagnostics for a file or directory (use before builds)",
 		parameters: Type.Object({
-			filePath: Type.String({
-				description:
-					"File or directory path to check. For directories, all matching source files are scanned.",
-			}),
+			filePath: Type.Optional(
+				Type.String({
+					description:
+						"File or directory path to check. For directories, all matching source files are scanned.",
+				}),
+			),
+			filePaths: Type.Optional(
+				Type.Array(Type.String(), {
+					minItems: 1,
+					maxItems: MAX_BATCH_FILES,
+					description:
+						"Explicit files to check as a bounded-concurrency batch. When provided, filePath is ignored.",
+				}),
+			),
 			severity: Type.Optional(
 				Type.String({
 					enum: ["error", "warning", "information", "hint", "all"],
 					description: "Filter by severity level (default: all)",
+				}),
+			),
+			concurrency: Type.Optional(
+				Type.Number({
+					description:
+						"Batch/directory concurrency for opening files and collecting diagnostics. Default 8, max 16.",
+				}),
+			),
+			waitMs: Type.Optional(
+				Type.Number({
+					description:
+						"Optional per-file LSP wait budget for batch diagnostics. Uses server defaults when omitted.",
 				}),
 			),
 		}),
@@ -156,13 +235,25 @@ export function createLspDiagnosticsTool() {
 			_onUpdate: unknown,
 			ctx: { cwd?: string },
 		) {
-			const rawPath = (params as { filePath: string }).filePath;
-			const severity = ((params as { severity?: string }).severity ??
-				"all") as string;
+			const typedParams = params as {
+				filePath?: string;
+				filePaths?: string[];
+				severity?: string;
+				concurrency?: number;
+				waitMs?: number;
+			};
+			const severity = (typedParams.severity ?? "all") as string;
 			const cwd = ctx.cwd ?? process.cwd();
-			const absPath = path.isAbsolute(rawPath)
-				? rawPath
-				: path.resolve(cwd, rawPath);
+			const concurrency = boundedPositiveInt(
+				typedParams.concurrency,
+				DEFAULT_BATCH_CONCURRENCY,
+				1,
+				MAX_BATCH_CONCURRENCY,
+			);
+			const waitMs =
+				typeof typedParams.waitMs === "number" && typedParams.waitMs >= 0
+					? Math.floor(typedParams.waitMs)
+					: undefined;
 
 			const lspService = getLSPService();
 			if (!lspService) {
@@ -174,6 +265,42 @@ export function createLspDiagnosticsTool() {
 					details: {},
 				};
 			}
+
+			if (
+				Array.isArray(typedParams.filePaths) &&
+				typedParams.filePaths.length > 0
+			) {
+				const absPaths = typedParams.filePaths
+					.filter(
+						(entry): entry is string =>
+							typeof entry === "string" && entry.trim().length > 0,
+					)
+					.slice(0, MAX_BATCH_FILES)
+					.map((entry) =>
+						path.isAbsolute(entry) ? entry : path.resolve(cwd, entry),
+					);
+				return runBatchFileDiagnostics(absPaths, severity, lspService, {
+					concurrency,
+					waitMs,
+				});
+			}
+
+			const rawPath = typedParams.filePath;
+			if (!rawPath || rawPath.trim().length === 0) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: "filePath or filePaths is required.",
+						},
+					],
+					isError: true,
+					details: {},
+				};
+			}
+			const absPath = path.isAbsolute(rawPath)
+				? rawPath
+				: path.resolve(cwd, rawPath);
 
 			let stat: fs.Stats;
 			try {
@@ -189,10 +316,105 @@ export function createLspDiagnosticsTool() {
 			}
 
 			if (stat.isDirectory()) {
-				return runDirectoryDiagnostics(absPath, severity, lspService);
+				return runDirectoryDiagnostics(absPath, severity, lspService, {
+					concurrency,
+					waitMs,
+				});
 			}
-			return runFileDiagnostics(absPath, severity, lspService);
+			return runFileDiagnostics(absPath, severity, lspService, waitMs);
 		},
+	};
+}
+
+async function collectDiagnosticsForFile(
+	absPath: string,
+	lspService: NonNullable<ReturnType<typeof getLSPService>>,
+	waitMs?: number,
+): Promise<LSPDiagnostic[]> {
+	try {
+		const content = fs.readFileSync(absPath, "utf-8");
+		const serviceWithTouch = lspService as NonNullable<
+			ReturnType<typeof getLSPService>
+		> & {
+			touchFile?: (
+				filePath: string,
+				content: string,
+				options: {
+					diagnostics: "document";
+					collectDiagnostics: true;
+					maxClientWaitMs?: number;
+					source: string;
+					clientScope: "all";
+				},
+			) => Promise<LSPDiagnostic[] | undefined>;
+		};
+		if (
+			waitMs !== undefined &&
+			typeof serviceWithTouch.touchFile === "function"
+		) {
+			await serviceWithTouch.touchFile(absPath, content, {
+				diagnostics: "document",
+				collectDiagnostics: true,
+				maxClientWaitMs: waitMs,
+				source: "lsp_diagnostics",
+				clientScope: "all",
+			});
+		} else {
+			await lspService.openFile(absPath, content, {
+				preserveDiagnostics: false,
+			});
+		}
+	} catch {
+		// Non-fatal: getDiagnostics may still have stale/health information.
+	}
+
+	return lspService.getDiagnostics(
+		absPath,
+		waitMs !== undefined ? "document" : "full",
+	);
+}
+
+function diagnosticsToFileDiags(
+	file: string,
+	diagnostics: LSPDiagnostic[],
+): FileDiag[] {
+	return diagnostics.map((d) => ({
+		file,
+		line: d.range?.start?.line,
+		character: d.range?.start?.character,
+		severity: d.severity,
+		message: d.message,
+		source: d.source,
+		code: d.code,
+	}));
+}
+
+async function collectFileDiagnosticResult(
+	file: string,
+	severity: string,
+	lspService: NonNullable<ReturnType<typeof getLSPService>>,
+	waitMs?: number,
+): Promise<FileDiagnosticResult> {
+	try {
+		const stat = fs.statSync(file);
+		if (!stat.isFile()) {
+			return { file, diagnostics: [], error: `${file}: not a file` };
+		}
+	} catch {
+		return { file, diagnostics: [], error: `${file}: path not found` };
+	}
+
+	const rawDiags = await collectDiagnosticsForFile(file, lspService, waitMs);
+	const health = lspService.getDiagnosticsHealth?.(file) as
+		| LspHealthLike
+		| undefined;
+	return {
+		file,
+		diagnostics: diagnosticsToFileDiags(
+			file,
+			applySeverityFilter(rawDiags, severity),
+		),
+		unavailable: lspUnavailableMessage(file, health),
 	};
 }
 
@@ -200,17 +422,9 @@ async function runFileDiagnostics(
 	absPath: string,
 	severity: string,
 	lspService: NonNullable<ReturnType<typeof getLSPService>>,
+	waitMs?: number,
 ) {
-	try {
-		const content = fs.readFileSync(absPath, "utf-8");
-		await lspService.openFile(absPath, content, {
-			preserveDiagnostics: false,
-		});
-	} catch {
-		// Non-fatal
-	}
-
-	const rawDiags: LSPDiagnostic[] = await lspService.getDiagnostics(absPath);
+	const rawDiags = await collectDiagnosticsForFile(absPath, lspService, waitMs);
 	const lspHealth = lspService.getDiagnosticsHealth?.(absPath) as
 		| LspHealthLike
 		| undefined;
@@ -251,6 +465,89 @@ async function runFileDiagnostics(
 			totalDiagnostics: total,
 			truncated,
 			lspHealth,
+			waitMs,
+		},
+	};
+}
+
+async function runBatchFileDiagnostics(
+	absPaths: string[],
+	severity: string,
+	lspService: NonNullable<ReturnType<typeof getLSPService>>,
+	options: BatchOptions,
+) {
+	if (absPaths.length === 0) {
+		return {
+			content: [{ type: "text" as const, text: "No file paths provided." }],
+			isError: true,
+			details: { mode: "batch", severity, filesChecked: 0 },
+		};
+	}
+
+	const results = await mapWithConcurrency(
+		absPaths,
+		options.concurrency,
+		(file) =>
+			collectFileDiagnosticResult(file, severity, lspService, options.waitMs),
+	);
+	const fileErrors = results.flatMap((result) =>
+		result.error ? [result.error] : [],
+	);
+	const lspHealthWarnings = results.flatMap((result) =>
+		result.unavailable ? [result.unavailable] : [],
+	);
+	const allDiags = results.flatMap((result) => result.diagnostics);
+	const total = allDiags.length;
+	const truncated = total > MAX_DIAGNOSTICS;
+	const display = truncated ? allDiags.slice(0, MAX_DIAGNOSTICS) : allDiags;
+
+	const lines: string[] = [
+		`Files checked: ${results.length}`,
+		`Total diagnostics: ${total}`,
+		`Concurrency: ${options.concurrency}`,
+	];
+	if (options.waitMs !== undefined)
+		lines.push(`Wait budget: ${options.waitMs}ms`);
+	if (fileErrors.length > 0) lines.push("", "File errors:", ...fileErrors);
+	if (lspHealthWarnings.length > 0) {
+		lines.push("", "LSP health warnings:", ...lspHealthWarnings.slice(0, 10));
+	}
+	if (display.length === 0) {
+		lines.push("", "No diagnostics found.");
+	} else {
+		lines.push("");
+		for (const d of display) {
+			const sevName = SEVERITY_NAMES[d.severity] ?? "unknown";
+			const loc =
+				d.line !== undefined
+					? `${d.file}:${d.line + 1}:${(d.character ?? 0) + 1}`
+					: d.file;
+			const src = d.source ? `[${d.source}]` : "";
+			const code = d.code ? ` (${d.code})` : "";
+			lines.push(`${loc}: ${sevName}${src}${code}: ${d.message}`);
+		}
+		if (truncated) {
+			lines.push(
+				"",
+				`... (${total - MAX_DIAGNOSTICS} more diagnostics not shown)`,
+			);
+		}
+	}
+
+	return {
+		content: [{ type: "text" as const, text: lines.join("\n") }],
+		details: {
+			mode: "batch",
+			severity,
+			filesChecked: results.length,
+			concurrency: options.concurrency,
+			waitMs: options.waitMs,
+			diagnostics: display,
+			totalDiagnostics: total,
+			truncated,
+			fileErrors: fileErrors.length > 0 ? fileErrors : undefined,
+			lspHealthWarnings:
+				lspHealthWarnings.length > 0 ? lspHealthWarnings : undefined,
 		},
 	};
 }
@@ -259,6 +556,7 @@ async function runDirectoryDiagnostics(
 	absPath: string,
 	severity: string,
 	lspService: NonNullable<ReturnType<typeof getLSPService>>,
+	options: BatchOptions,
 ) {
 	let extension: string | undefined;
 	let collectedFiles: string[] = [];
@@ -290,55 +588,22 @@ async function runDirectoryDiagnostics(
 
 	const wasCapped = collectedFiles.length > MAX_FILES;
 	const filesToProcess = collectedFiles.slice(0, MAX_FILES);
-
-	type FileDiag = {
-		file: string;
-		line?: number;
-		character?: number;
-		severity: number;
-		message: string;
-		source?: string;
-		code?: string | number;
-	};
-
-	const allDiags: FileDiag[] = [];
-	const fileErrors: string[] = [];
-	const lspHealthWarnings: string[] = [];
-
-	for (const file of filesToProcess) {
-		try {
-			const content = fs.readFileSync(file, "utf-8");
-			await lspService.openFile(file, content, {
-				preserveDiagnostics: false,
-			});
-		} catch {
-			fileErrors.push(`${file}: could not read`);
-			continue;
-		}
-
-		const rawDiags: LSPDiagnostic[] = await lspService.getDiagnostics(file);
-		const health = lspService.getDiagnosticsHealth?.(file) as
-			| LspHealthLike
-			| undefined;
-		const unavailable = lspUnavailableMessage(file, health);
-		if (unavailable) lspHealthWarnings.push(unavailable);
-		for (const d of rawDiags) {
-			allDiags.push({
-				file,
-				line: d.range?.start?.line,
-				character: d.range?.start?.character,
-				severity: d.severity,
-				message: d.message,
-				source: d.source,
-				code: d.code,
-			});
-		}
-	}
-
-	const filtered = applySeverityFilter(allDiags, severity);
-	const total = filtered.length;
+	const results = await mapWithConcurrency(
+		filesToProcess,
+		options.concurrency,
+		(file) =>
+			collectFileDiagnosticResult(file, severity, lspService, options.waitMs),
+	);
+	const fileErrors = results.flatMap((result) =>
+		result.error ? [result.error] : [],
+	);
+	const lspHealthWarnings = results.flatMap((result) =>
+		result.unavailable ? [result.unavailable] : [],
+	);
+	const allDiags = results.flatMap((result) => result.diagnostics);
+	const total = allDiags.length;
 	const truncated = total > MAX_DIAGNOSTICS;
-	const display = truncated ? filtered.slice(0, MAX_DIAGNOSTICS) : filtered;
+	const display = truncated ? allDiags.slice(0, MAX_DIAGNOSTICS) : allDiags;
 
 	let text: string;
 	if (total === 0) {
@@ -405,6 +670,8 @@ async function runDirectoryDiagnostics(
 			fileErrors: fileErrors.length > 0 ? fileErrors : undefined,
 			lspHealthWarnings:
 				lspHealthWarnings.length > 0 ? lspHealthWarnings : undefined,
+			concurrency: options.concurrency,
+			waitMs: options.waitMs,
 		},
 	};
 }

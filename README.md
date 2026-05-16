@@ -83,6 +83,8 @@ pi-lens includes **37 language server definitions**. LSP is **enabled by default
 { "warmFiles": ["src/main.cpp", "src/lib.cpp"] }
 ```
 
+**Agent LSP tools:** `lsp_diagnostics` can check one file, a directory, or an explicit `filePaths` batch with bounded concurrency. `lsp_navigation` provides definitions, references, hover, workspace symbols, call hierarchy, rename edits, and `findSymbol` for filtered document-symbol lookup.
+
 LSP servers for: TypeScript, Deno, Python (pyright + pylsp), Go, Rust, Ruby (ruby-lsp + solargraph), PHP, C# (omnisharp), F#, Java, Kotlin, Swift, Dart, Lua, C/C++, Zig, Haskell, Elixir, Gleam, OCaml, Clojure, Terraform, Nix, Bash, Docker, YAML, JSON, HTML, TOML, Prisma, Vue, Svelte, ESLint, CSS.
 
 ### Formatters

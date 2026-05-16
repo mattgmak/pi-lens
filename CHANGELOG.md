@@ -6,6 +6,7 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Added
 
+- **LSP batch diagnostics and document symbol search** — `lsp_diagnostics` now accepts explicit `filePaths` batches with bounded concurrency (`concurrency`, default 8/max 16) and optional `waitMs`, so agents can validate exactly the files they touched without scanning a directory. `lsp_navigation` adds `operation: "findSymbol"` for filtered document-symbol lookup by `query`, `kinds`, `exactMatch`, `topLevelOnly`, and `maxResults`.
 - **Global user config at `~/.pi-lens/config.json`** — pi-lens now reads persistent user preferences from the same global directory used for logs/probe state. Initial settings cover `widget.visible` (hide the diagnostics widget by default; fixes #84) and `format.enabled` / `format.mode` (`"immediate"` to format after each write/edit instead of waiting for `agent_end`; fixes #61). CLI flags still override global config.
 - **10 new C blocker tree-sitter rules** — implements SonarCloud C blocker rules via AST queries:
   - `memset-sensitive-data` (S5798) — `memset` on passwords/secrets (optimized away by compilers)

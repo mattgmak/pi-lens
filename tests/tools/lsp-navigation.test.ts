@@ -36,6 +36,7 @@ describe("lsp_navigation tool", () => {
 				},
 			]),
 			workspaceSymbol: vi.fn().mockResolvedValue([]),
+			documentSymbol: vi.fn().mockResolvedValue([]),
 			incomingCalls: vi.fn().mockResolvedValue([]),
 			outgoingCalls: vi.fn().mockResolvedValue([]),
 			getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
@@ -162,6 +163,60 @@ describe("lsp_navigation tool", () => {
 				(mocked.service as { workspaceSymbol: ReturnType<typeof vi.fn> })
 					.workspaceSymbol,
 			).toHaveBeenCalledTimes(2);
+		} finally {
+			fs.rmSync(tmpDir, { recursive: true, force: true });
+		}
+	});
+
+	it("filters document symbols with findSymbol", async () => {
+		const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
+		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-nav-"));
+		const filePath = path.join(tmpDir, "symbols.ts");
+		fs.writeFileSync(
+			filePath,
+			"class ReportProcessor { normalizeReport() { return 1; } }\n",
+		);
+		(
+			mocked.service as { documentSymbol: ReturnType<typeof vi.fn> }
+		).documentSymbol = vi.fn().mockResolvedValue([
+			{
+				name: "ReportProcessor",
+				kind: 5,
+				range: {
+					start: { line: 0, character: 0 },
+					end: { line: 0, character: 55 },
+				},
+				children: [
+					{
+						name: "normalizeReport",
+						kind: 6,
+						range: {
+							start: { line: 0, character: 24 },
+							end: { line: 0, character: 39 },
+						},
+					},
+				],
+			},
+		]);
+
+		try {
+			const result = await tool.execute(
+				"find-symbol",
+				{
+					operation: "findSymbol",
+					filePath,
+					query: "normalize",
+					kinds: ["method"],
+				},
+				new AbortController().signal,
+				null,
+				{ cwd: "." },
+			);
+
+			expect(result.isError).toBeUndefined();
+			expect(result.details?.resultCount).toBe(1);
+			expect(String(result.content[0]?.text)).toContain("normalizeReport");
+			expect(String(result.content[0]?.text)).toContain('"kind": "method"');
 		} finally {
 			fs.rmSync(tmpDir, { recursive: true, force: true });
 		}
