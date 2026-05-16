@@ -27,6 +27,7 @@ function createCtx(filePath: string, overrides: Partial<Record<string, unknown>>
 		filePath,
 		cwd: path.dirname(filePath),
 		kind: "jsts",
+		fileRole: "source",
 		pi: { getFlag: () => undefined },
 		autofix: false,
 		deltaMode: true,

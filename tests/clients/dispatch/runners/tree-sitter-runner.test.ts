@@ -7,6 +7,7 @@ function createCtx(filePath: string, cwdOverride?: string) {
 		filePath,
 		cwd: cwdOverride ?? path.dirname(filePath),
 		kind: "jsts",
+		fileRole: "source",
 		pi: { getFlag: () => undefined },
 		autofix: false,
 		deltaMode: true,

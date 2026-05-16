@@ -171,6 +171,44 @@ describe("Dispatch Flow", () => {
 			expect(result.blockers).toHaveLength(0);
 		});
 
+		it("skips all runners for generated files", async () => {
+			let runCount = 0;
+			registerRunner(
+				createMockRunner({
+					id: "generated-runner",
+					appliesTo: ["jsts"],
+					runResult: {
+						status: "succeeded",
+						diagnostics: [
+							{
+								id: "generated-warning",
+								message: "should not run",
+								filePath: "test.generated.ts",
+								severity: "warning",
+								semantic: "warning",
+								tool: "generated-runner",
+							},
+						],
+						semantic: "warning",
+					},
+					when: () => {
+						runCount += 1;
+						return true;
+					},
+				}),
+			);
+
+			const ctx = createMockContext("test.generated.ts");
+			const result = await dispatchForFile(ctx, [
+				{ mode: "all", runnerIds: ["generated-runner"] },
+			]);
+
+			expect(ctx.fileRole).toBe("generated");
+			expect(result.diagnostics).toEqual([]);
+			expect(result.output).toBe("");
+			expect(runCount).toBe(0);
+		});
+
 		it("shows non-blocking analysis-unavailable notice when semantic tools are missing", async () => {
 			registerRunner({
 				id: "lsp",

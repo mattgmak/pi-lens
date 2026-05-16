@@ -21,6 +21,7 @@ function makeCtx(filePath: string, facts: FactStore): DispatchContext {
     filePath,
     cwd: "/tmp",
     kind: "jsts" as FileKind,
+		fileRole: "source",
 		pi: { getFlag: () => undefined },
 		autofix: false,
 		deltaMode: false,

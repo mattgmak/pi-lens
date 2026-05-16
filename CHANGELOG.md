@@ -7,6 +7,7 @@ All notable changes to pi-lens will be documented in this file.
 ### Added
 
 - **LSP batch diagnostics and document symbol search** — `lsp_diagnostics` now accepts explicit `filePaths` batches with bounded concurrency (`concurrency`, default 8/max 16) and optional `waitMs`, so agents can validate exactly the files they touched without scanning a directory. `lsp_navigation` adds `operation: "findSymbol"` for filtered document-symbol lookup by `query`, `kinds`, `exactMatch`, `topLevelOnly`, and `maxResults`.
+- **Review-graph feature hints and source grouping helpers** — review graph file/symbol metadata now includes deterministic `featureKind` and `trustBoundaries` hints derived from names/paths, and `source-groups.ts` can partition large source sets into stable labeled groups for context planning.
 - **Global user config at `~/.pi-lens/config.json`** — pi-lens now reads persistent user preferences from the same global directory used for logs/probe state. Initial settings cover `widget.visible` (hide the diagnostics widget by default; fixes #84) and `format.enabled` / `format.mode` (`"immediate"` to format after each write/edit instead of waiting for `agent_end`; fixes #61). CLI flags still override global config.
 - **10 new C blocker tree-sitter rules** — implements SonarCloud C blocker rules via AST queries:
   - `memset-sensitive-data` (S5798) — `memset` on passwords/secrets (optimized away by compilers)
@@ -25,6 +26,7 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Fixed
 
+- **Generated files are skipped by dispatch** — dispatch context now classifies file roles from path/content prefixes and bypasses runners for generated files, avoiding noisy lint/security findings on protobuf/sqlc/generated artifacts. Generated-file detection covers common Go/Python outputs such as `.pb.go`, `_sqlc.go`, `_pb2.py`, and `_pb2_grpc.py`.
 - **Disabled tree-sitter rules leaked into production dispatch/cache** — disabled query directories are now keyed under their base language for test access but filtered from production dispatch with cross-platform path-segment checks. Rule-cache entries now preserve `filePath`, cached disabled rules are defensively filtered, and the tree-sitter rule-cache version was bumped to invalidate stale `ts-path-traversal` cache entries from `typescript-disabled/`.
 - **Knip scans bounded to real project roots** — Knip was running against arbitrary working directories (including `/tmp` or parent dirs without `package.json`), producing nonsensical unused-export reports or crashing on missing configs. `KnipClient` now validates the project root with `findProjectRoot()` before scanning, and `turn_end` Knip delta analysis bails early when the root lacks a recognizable package manifest. Prevents false-positive unused-export noise and config-not-found errors.
 - **ReDoS in C/C++ include parsing** — `review-graph/builder.ts` used a regex with `[^>]*` to parse `#include <...>` directives, which SonarCloud flagged as S5852 (polynomial backtracking on malicious input). Replaced with a linear manual parser that scans character-by-character.

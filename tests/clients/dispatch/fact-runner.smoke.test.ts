@@ -12,6 +12,7 @@ function makeCtx(filePath: string, facts: FactStore): DispatchContext {
     filePath,
     cwd: path.dirname(filePath),
     kind: undefined,
+		fileRole: "source",
 		pi: { getFlag: () => undefined },
 		autofix: false,
 		deltaMode: false,

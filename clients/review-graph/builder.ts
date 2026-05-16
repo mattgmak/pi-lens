@@ -11,7 +11,9 @@ import {
 	importFactProvider,
 } from "../dispatch/facts/import-facts.js";
 import type { DispatchContext } from "../dispatch/types.js";
+import { featureHintMetadata } from "../feature-hints.js";
 import { detectFileKind } from "../file-kinds.js";
+import { detectFileRole } from "../file-role.js";
 import { normalizeMapKey } from "../path-utils.js";
 import { getSourceFiles } from "../scan-utils.js";
 import { TreeSitterClient } from "../tree-sitter-client.js";
@@ -21,7 +23,7 @@ import {
 } from "../tree-sitter-symbol-extractor.js";
 import type { ReviewGraph, ReviewGraphEdge, ReviewGraphNode } from "./types.js";
 
-const REVIEW_GRAPH_VERSION = "v1";
+const REVIEW_GRAPH_VERSION = "v2";
 const MAIN_KINDS = new Set(["jsts", "python", "go", "rust", "ruby", "cxx"]);
 const CHANGED_SYMBOLS_PREFIX = "session.reviewGraph.changedSymbols:";
 const treeSitterClient = new TreeSitterClient();
@@ -67,6 +69,7 @@ function makeCtx(
 		filePath,
 		cwd,
 		kind: detectFileKind(filePath),
+		fileRole: detectFileRole(filePath),
 		pi: { getFlag: () => undefined },
 		autofix: false,
 		deltaMode: false,
@@ -310,6 +313,7 @@ function addJsTsFile(
 		filePath: normalized,
 		metadata: {
 			lineCount: content.split("\n").length,
+			...featureHintMetadata(normalized),
 		},
 	});
 
@@ -367,6 +371,7 @@ function addJsTsFile(
 				maxNestingDepth: fn.maxNestingDepth,
 				isBoundaryWrapper: fn.isBoundaryWrapper,
 				isPassThroughWrapper: fn.isPassThroughWrapper,
+				...featureHintMetadata(`${fn.name} ${normalized}`),
 			},
 		});
 		addEdge(graph, { from: fileNodeId, to: symbolId, kind: "contains" });
@@ -455,6 +460,7 @@ function addTreeSitterFile(
 		kind: "file",
 		language: languageId,
 		filePath: normalized,
+		metadata: featureHintMetadata(normalized),
 	});
 
 	for (const symbol of extracted.symbols) {
@@ -471,6 +477,7 @@ function addTreeSitterFile(
 				line: symbol.line,
 				column: symbol.column,
 				signature: symbol.signature,
+				...featureHintMetadata(`${symbol.name} ${normalized}`),
 			},
 		});
 		addEdge(graph, { from: fileNodeId, to: symbolId, kind: "contains" });
@@ -511,6 +518,7 @@ function ensureFileNode(
 		kind: "file",
 		language: languageId,
 		filePath: normalized,
+		metadata: featureHintMetadata(normalized),
 	});
 	return fileNodeId;
 }

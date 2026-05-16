@@ -12,6 +12,7 @@
  */
 
 import type { FileKind } from "../file-kinds.js";
+import type { FileRole } from "../file-role.js";
 
 export type DefectClass =
 	| "silent-error"
@@ -22,8 +23,7 @@ export type DefectClass =
 	| "safety"
 	| "style"
 	| "unknown"
-	| "unused-value"
-	;
+	| "unused-value";
 
 export interface ModifiedRange {
 	start: number;
@@ -144,6 +144,7 @@ export interface DispatchContext {
 	readonly filePath: string;
 	readonly cwd: string;
 	readonly kind: FileKind | undefined;
+	readonly fileRole: FileRole;
 	readonly pi: PiAgentAPI;
 	readonly autofix: boolean;
 	readonly deltaMode: boolean;

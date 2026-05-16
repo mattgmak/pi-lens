@@ -103,6 +103,13 @@ export function detectFileRole(filePath: string, content?: string): FileRole {
 	if (
 		base.includes(".generated.") ||
 		base.includes(".gen.") ||
+		base.endsWith("_generated.go") ||
+		base.endsWith("_gen.go") ||
+		base.endsWith(".pb.go") ||
+		base.endsWith(".sql.go") ||
+		base.endsWith("_sqlc.go") ||
+		base.endsWith("_pb2.py") ||
+		base.endsWith("_pb2_grpc.py") ||
 		dir.includes("/generated/") ||
 		dir.includes("/__generated__/") ||
 		dir.includes("/codegen/")

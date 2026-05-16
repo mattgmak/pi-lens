@@ -43,6 +43,7 @@ function ctx(filePath: string, cwd: string) {
 		filePath,
 		cwd,
 		kind: "jsts",
+		fileRole: "source",
 		pi: {
 			getFlag: (name: string) => name === "lens-lsp",
 		},

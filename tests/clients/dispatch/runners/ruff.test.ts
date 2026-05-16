@@ -22,6 +22,7 @@ function createCtx(filePath: string, cwd: string) {
 		filePath,
 		cwd,
 		kind: "python",
+		fileRole: "source",
 		pi: {
 			getFlag: () => undefined,
 		},

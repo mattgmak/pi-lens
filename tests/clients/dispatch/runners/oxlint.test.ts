@@ -30,6 +30,7 @@ function createCtx(filePath: string, cwd: string) {
 		filePath,
 		cwd,
 		kind: "jsts",
+		fileRole: "source",
 		pi: {
 			getFlag: () => undefined,
 		},

@@ -14,10 +14,12 @@
  * - BaselineStore: Track pre-existing issues for delta mode
  */
 
+import * as fs from "node:fs";
 import * as path from "node:path";
 import type { FileKind } from "../file-kinds.js";
 import { recordRunner } from "../widget-state.js";
 import { detectFileKind } from "../file-kinds.js";
+import { detectFileRole } from "../file-role.js";
 import { isTestFile } from "../file-utils.js";
 import { getPrimaryDispatchGroup } from "../language-policy.js";
 import { resolveLanguageRootForFile } from "../language-profile.js";
@@ -116,6 +118,26 @@ async function checkToolAvailability(
 
 // --- Dispatch Context Factory ---
 
+function readFilePrefix(filePath: string, maxBytes = 4096): string | undefined {
+	let fd: number | undefined;
+	try {
+		fd = fs.openSync(filePath, "r");
+		const buffer = Buffer.alloc(maxBytes);
+		const bytesRead = fs.readSync(fd, buffer, 0, maxBytes, 0);
+		return buffer.subarray(0, bytesRead).toString("utf8");
+	} catch {
+		return undefined;
+	} finally {
+		if (fd !== undefined) {
+			try {
+				fs.closeSync(fd);
+			} catch {
+				// ignore close errors
+			}
+		}
+	}
+}
+
 export function createDispatchContext(
 	filePath: string,
 	cwd: string,
@@ -130,11 +152,16 @@ export function createDispatchContext(
 	);
 	const normalizedFilePath = normalizeMapKey(absoluteFilePath);
 	const kind = detectFileKind(normalizedFilePath);
+	const fileRole = detectFileRole(
+		normalizedFilePath,
+		readFilePrefix(normalizedFilePath),
+	);
 
 	return {
 		filePath: normalizedFilePath,
 		cwd: normalizedCwd,
 		kind,
+		fileRole,
 		pi,
 		autofix: false,
 		deltaMode: !pi.getFlag("no-delta"),
@@ -598,14 +625,15 @@ async function runGroup(
 			status: result.status,
 			diagnosticCount: result.diagnostics.length,
 			semantic: result.semantic ?? semantic,
-			diagnostics: result.diagnostics.length > 0
-				? result.diagnostics.map((d) => ({
-						rule: d.rule,
-						message: d.message.slice(0, 120),
-						line: d.line,
-						semantic: d.semantic,
-					}))
-				: undefined,
+			diagnostics:
+				result.diagnostics.length > 0
+					? result.diagnostics.map((d) => ({
+							rule: d.rule,
+							message: d.message.slice(0, 120),
+							line: d.line,
+							semantic: d.semantic,
+						}))
+					: undefined,
 		});
 		recordRunner(
 			ctx.filePath,
@@ -642,6 +670,19 @@ export async function dispatchForFile(
 	registry: RunnerRegistryContract,
 ): Promise<DispatchResult> {
 	const _overallStart = Date.now();
+	if (ctx.fileRole === "generated") {
+		return {
+			diagnostics: [],
+			blockers: [],
+			warnings: [],
+			baselineWarningCount: 0,
+			fixed: [],
+			resolvedCount: 0,
+			output: "",
+			blockerOutput: "",
+			hasBlockers: false,
+		};
+	}
 	const allDiagnostics: Diagnostic[] = [];
 	let stopped = false;
 	const runnerLatencies: RunnerLatency[] = [];
