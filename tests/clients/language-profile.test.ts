@@ -4,7 +4,11 @@ import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createDispatchContext } from "../../clients/dispatch/dispatcher.js";
 import { FactStore } from "../../clients/dispatch/fact-store.js";
-import { resolveLanguageRootForFile } from "../../clients/language-profile.js";
+import {
+	detectProjectLanguageProfile,
+	getDefaultStartupTools,
+	resolveLanguageRootForFile,
+} from "../../clients/language-profile.js";
 import { normalizeMapKey } from "../../clients/path-utils.js";
 
 const dirs: string[] = [];
@@ -16,6 +20,46 @@ afterEach(() => {
 });
 
 describe("language-profile roots", () => {
+	it("does not treat a plain git repository as configured C/C++", () => {
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lang-root-"));
+		dirs.push(tmp);
+
+		const workspace = path.join(tmp, "repo");
+		fs.mkdirSync(path.join(workspace, ".git"), { recursive: true });
+		fs.writeFileSync(path.join(workspace, "package.json"), "{}\n");
+		fs.writeFileSync(
+			path.join(workspace, "index.ts"),
+			"export const ok = true;\n",
+		);
+
+		const profile = detectProjectLanguageProfile(workspace);
+		expect(profile.present.cxx).toBe(false);
+		expect(profile.configured.cxx).toBeUndefined();
+	});
+
+	it("preinstalls Ruby tooling only for configured Ruby projects", () => {
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lang-root-"));
+		dirs.push(tmp);
+
+		const fixturesOnly = path.join(tmp, "fixtures-only");
+		fs.mkdirSync(fixturesOnly, { recursive: true });
+		fs.writeFileSync(path.join(fixturesOnly, "sample.rb"), "puts :ok\n");
+
+		const configured = path.join(tmp, "configured-ruby");
+		fs.mkdirSync(configured, { recursive: true });
+		fs.writeFileSync(
+			path.join(configured, "Gemfile"),
+			"source 'https://rubygems.org'\n",
+		);
+		fs.writeFileSync(path.join(configured, "app.rb"), "puts :ok\n");
+
+		expect(
+			getDefaultStartupTools(detectProjectLanguageProfile(fixturesOnly)),
+		).not.toContain("rubocop");
+		expect(
+			getDefaultStartupTools(detectProjectLanguageProfile(configured)),
+		).toContain("rubocop");
+	});
 	it("resolves python file root to nearest pyproject in monorepo", () => {
 		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lang-root-"));
 		dirs.push(tmp);

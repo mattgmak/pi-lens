@@ -59,7 +59,6 @@ const PROJECT_MARKERS_BY_KIND: Partial<Record<FileKind, readonly string[]>> = {
 		"makefile",
 		"meson.build",
 		"build.ninja",
-		".git",
 	],
 	ruby: ["Gemfile", "Rakefile"],
 	yaml: [".yamllint", "yamllint.yaml", "yamllint.yml", "pyproject.toml"],

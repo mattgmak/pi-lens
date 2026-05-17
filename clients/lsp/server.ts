@@ -31,6 +31,8 @@ export interface LSPServerInfo {
 	name: string;
 	extensions: readonly string[];
 	root: RootFunction;
+	/** Simple command name whose absence disables spawn attempts briefly across roots. */
+	availabilityKey?: string;
 	/**
 	 * Optional per-server initialize timeout.
 	 * Useful for servers like Ruby LSP that do real project bootstrap work
@@ -76,6 +78,51 @@ function isCommandNotFoundError(error: unknown): boolean {
 		msg.includes("ENOENT") ||
 		msg.includes("not recognized")
 	);
+}
+
+const DIRECT_LSP_NEGATIVE_TTL_MS = Math.max(
+	30_000,
+	Number.parseInt(
+		process.env.PI_LENS_DIRECT_LSP_NEGATIVE_TTL_MS ?? "600000",
+		10,
+	) || 600_000,
+);
+const directLspCommandUnavailableUntil = new Map<string, number>();
+const directLspCommandSkipLoggedUntil = new Map<string, number>();
+
+function isSimpleCommand(command: string): boolean {
+	return (
+		!path.isAbsolute(command) &&
+		!command.includes("/") &&
+		!command.includes("\\")
+	);
+}
+
+export function isDirectLspCommandTemporarilyUnavailable(
+	command: string,
+): boolean {
+	const until = directLspCommandUnavailableUntil.get(command);
+	if (!until || until <= Date.now()) {
+		directLspCommandUnavailableUntil.delete(command);
+		return false;
+	}
+	const loggedUntil = directLspCommandSkipLoggedUntil.get(command) ?? 0;
+	if (loggedUntil <= Date.now()) {
+		logSessionStart(
+			`lsp direct command ${command}: skipped by negative availability cache (${Math.max(0, until - Date.now())}ms remaining)`,
+		);
+		directLspCommandSkipLoggedUntil.set(command, until);
+	}
+	return true;
+}
+
+function markDirectLspCommandUnavailable(command: string): void {
+	if (!isSimpleCommand(command)) return;
+	directLspCommandUnavailableUntil.set(
+		command,
+		Date.now() + DIRECT_LSP_NEGATIVE_TTL_MS,
+	);
+	directLspCommandSkipLoggedUntil.delete(command);
 }
 
 const SESSIONSTART_LOG_DIR = path.join(os.homedir(), ".pi-lens");
@@ -450,6 +497,10 @@ function createInteractiveServer(spec: InteractiveServerSpec): LSPServerInfo {
 		name: spec.name,
 		extensions: spec.extensions,
 		root: spec.root,
+		availabilityKey:
+			typeof spec.command === "string" && isSimpleCommand(spec.command)
+				? spec.command
+				: undefined,
 		async spawn(root) {
 			const command =
 				typeof spec.command === "function" ? spec.command(root) : spec.command;
@@ -457,6 +508,12 @@ function createInteractiveServer(spec: InteractiveServerSpec): LSPServerInfo {
 				typeof spec.args === "function" ? spec.args(root) : spec.args || [];
 			// Try to launch directly — no auto-install for language-runtime tools
 			// (C#, Java, Swift, etc. require their SDK; cannot npm/pip install them)
+			if (
+				isSimpleCommand(command) &&
+				isDirectLspCommandTemporarilyUnavailable(command)
+			) {
+				return undefined;
+			}
 			try {
 				const proc = await launchLSP(command, args, { cwd: root });
 				const initialization =
@@ -464,7 +521,10 @@ function createInteractiveServer(spec: InteractiveServerSpec): LSPServerInfo {
 						? spec.initialization(root)
 						: spec.initialization;
 				return { process: proc, source: "direct", initialization };
-			} catch {
+			} catch (err) {
+				if (isCommandNotFoundError(err)) {
+					markDirectLspCommandUnavailable(command);
+				}
 				return undefined;
 			}
 		},
@@ -1757,7 +1817,7 @@ export const CssServer: LSPServerInfo = {
 export const LSP_SERVERS: LSPServerInfo[] = [
 	TypeScriptServer,
 	DenoServer,
-	PythonServer,     // pyright / basedpyright — preferred; openFilesOnly avoids cold-start
+	PythonServer, // pyright / basedpyright — preferred; openFilesOnly avoids cold-start
 	PythonJediServer, // fallback when neither pyright nor basedpyright is available
 	GoServer,
 	RustServer,

@@ -36,9 +36,12 @@ const extractorCache = new Map<string, TreeSitterSymbolExtractor>();
 const _buildCache = new Map<string, Promise<ReviewGraph>>();
 const _workspaceGraphCache = new Map<
 	string,
-	{ signature: string; graph: ReviewGraph }
+	{ signature: string; fileSignatures: Map<string, string>; graph: ReviewGraph }
 >();
-let _lastGraphBuildInfo: { reused: boolean; mode: "full" | "cached" } = {
+let _lastGraphBuildInfo: {
+	reused: boolean;
+	mode: "full" | "cached" | "incremental";
+} = {
 	reused: false,
 	mode: "full",
 };
@@ -55,7 +58,7 @@ export function clearReviewGraphWorkspaceCache(): void {
 
 export function getLastGraphBuildInfo(): {
 	reused: boolean;
-	mode: "full" | "cached";
+	mode: "full" | "cached" | "incremental";
 } {
 	return _lastGraphBuildInfo;
 }
@@ -113,17 +116,42 @@ function cloneGraph(graph: ReviewGraph): ReviewGraph {
 	};
 }
 
-function sourceSignature(files: string[]): string {
-	return files
-		.map((file) => {
-			try {
-				const stat = fs.statSync(file);
-				return `${file}:${stat.size}:${stat.mtimeMs}`;
-			} catch {
-				return `${file}:missing`;
-			}
-		})
+function sourceSignatureEntry(file: string): string {
+	try {
+		const stat = fs.statSync(file);
+		return `${stat.size}:${stat.mtimeMs}`;
+	} catch {
+		return "missing";
+	}
+}
+
+function sourceSignatureMap(files: string[]): Map<string, string> {
+	const signatures = new Map<string, string>();
+	for (const file of files) {
+		signatures.set(file, sourceSignatureEntry(file));
+	}
+	return signatures;
+}
+
+function sourceSignatureFromMap(signatures: Map<string, string>): string {
+	return [...signatures.entries()]
+		.sort(([a], [b]) => a.localeCompare(b))
+		.map(([file, signature]) => `${file}:${signature}`)
 		.join("|");
+}
+
+function changedSignatureFiles(
+	previous: Map<string, string>,
+	next: Map<string, string>,
+): string[] | undefined {
+	if (previous.size !== next.size) return undefined;
+	const changed: string[] = [];
+	for (const [file, signature] of next) {
+		const oldSignature = previous.get(file);
+		if (oldSignature === undefined) return undefined;
+		if (oldSignature !== signature) changed.push(file);
+	}
+	return changed;
 }
 
 function getGraphSourceFiles(cwd: string): string[] {
@@ -183,13 +211,16 @@ interface PersistedGraphData {
 	version: string;
 	builtAt: string;
 	signature: string;
+	fileSignatures?: Array<[string, string]>;
 	nodes: Array<[string, ReviewGraphNode]>;
 	edges: ReviewGraphEdge[];
 }
 
-function loadPersistedGraph(
-	cwd: string,
-): { signature: string; graph: ReviewGraph } | null {
+function loadPersistedGraph(cwd: string): {
+	signature: string;
+	fileSignatures: Map<string, string>;
+	graph: ReviewGraph;
+} | null {
 	const cachePath = path.join(cwd, GRAPH_CACHE_REL);
 	try {
 		const raw = fs.readFileSync(cachePath, "utf-8");
@@ -207,7 +238,11 @@ function loadPersistedGraph(
 			changedSymbolsByFile: new Map(),
 		};
 		rebuildIndexes(graph);
-		return { signature: data.signature, graph };
+		return {
+			signature: data.signature,
+			fileSignatures: new Map(data.fileSignatures ?? []),
+			graph,
+		};
 	} catch {
 		return null;
 	}
@@ -216,6 +251,7 @@ function loadPersistedGraph(
 function persistGraph(
 	cwd: string,
 	signature: string,
+	fileSignatures: Map<string, string>,
 	graph: ReviewGraph,
 ): void {
 	const cacheDir = path.join(cwd, ".pi-lens", "cache");
@@ -224,6 +260,7 @@ function persistGraph(
 		version: graph.version,
 		builtAt: graph.builtAt,
 		signature,
+		fileSignatures: Array.from(fileSignatures.entries()),
 		nodes: Array.from(graph.nodes.entries()),
 		edges: graph.edges,
 	};
@@ -592,6 +629,98 @@ function addCxxIncludeEdges(
 	}
 }
 
+function removeFileOwnedGraphData(
+	graph: ReviewGraph,
+	filePath: string,
+): ReviewGraphEdge[] {
+	const normalized = normalizeMapKey(filePath);
+	const fileNodeId = `file:${normalized}`;
+	const removedIds = new Set<string>();
+	const removedSymbolIds = new Set<string>();
+	for (const [id, node] of graph.nodes) {
+		if (node.filePath !== normalized) continue;
+		removedIds.add(id);
+		if (node.kind === "symbol") removedSymbolIds.add(id);
+	}
+	if (graph.nodes.has(fileNodeId)) removedIds.add(fileNodeId);
+
+	const preservedIncomingSymbolEdges: ReviewGraphEdge[] = [];
+	graph.edges = graph.edges.filter((edge) => {
+		const fromRemoved = removedIds.has(edge.from);
+		const toRemoved = removedIds.has(edge.to);
+		if (fromRemoved) return false;
+		if (removedSymbolIds.has(edge.to)) {
+			preservedIncomingSymbolEdges.push({ ...edge });
+			return false;
+		}
+		// Preserve importer edges to the stable file node id; the node is re-added below.
+		if (toRemoved && edge.to === fileNodeId) return true;
+		return !toRemoved;
+	});
+	for (const id of removedIds) graph.nodes.delete(id);
+	rebuildIndexes(graph);
+	return preservedIncomingSymbolEdges;
+}
+
+async function addFileToGraph(
+	graph: ReviewGraph,
+	cwd: string,
+	file: string,
+	facts: FactStore,
+): Promise<void> {
+	const kind = detectFileKind(file);
+	if (!kind || !MAIN_KINDS.has(kind)) return;
+	if (kind === "jsts") {
+		await ensureTsFacts(file, cwd, facts);
+		addJsTsFile(graph, cwd, file, facts);
+		return;
+	}
+	const languageId = mapKindToTreeSitterLanguage(kind, file);
+	if (!languageId) return;
+	const extracted = await extractTreeSitterSymbols(file, languageId);
+	addTreeSitterFile(graph, file, languageId, extracted);
+	if (kind === "cxx") addCxxIncludeEdges(graph, cwd, file);
+}
+
+function restoreValidIncomingEdges(
+	graph: ReviewGraph,
+	edges: ReviewGraphEdge[],
+): void {
+	const existing = new Set(
+		graph.edges.map(
+			(edge) =>
+				`${edge.from}\u0000${edge.to}\u0000${edge.kind}\u0000${JSON.stringify(edge.metadata ?? {})}`,
+		),
+	);
+	for (const edge of edges) {
+		if (!graph.nodes.has(edge.from) || !graph.nodes.has(edge.to)) continue;
+		const key = `${edge.from}\u0000${edge.to}\u0000${edge.kind}\u0000${JSON.stringify(edge.metadata ?? {})}`;
+		if (existing.has(key)) continue;
+		graph.edges.push(edge);
+		existing.add(key);
+	}
+	rebuildIndexes(graph);
+}
+
+async function updateGraphFiles(
+	graph: ReviewGraph,
+	cwd: string,
+	files: string[],
+	facts: FactStore,
+): Promise<void> {
+	const preservedIncoming: ReviewGraphEdge[] = [];
+	for (const file of files) {
+		preservedIncoming.push(...removeFileOwnedGraphData(graph, file));
+		await addFileToGraph(graph, cwd, file, facts);
+	}
+	restoreValidIncomingEdges(graph, preservedIncoming);
+	resolveDeferredSymbolEdges(graph);
+	graph.changedSymbolsByFile.clear();
+	for (const file of files) {
+		upsertChangedSymbols(graph, facts, file);
+	}
+}
+
 function resolveDeferredSymbolEdges(graph: ReviewGraph): void {
 	const symbolNameToIds = new Map<string, string[]>();
 	for (const node of graph.nodes.values()) {
@@ -621,8 +750,10 @@ async function _doBuildGraph(
 ): Promise<ReviewGraph> {
 	const normalizedCwd = normalizeMapKey(cwd);
 	const normalizedChanged = changedFiles.map((file) => normalizeMapKey(file));
+	const normalizedChangedSet = new Set(normalizedChanged);
 	const filesToBuild = getGraphSourceFiles(cwd);
-	const signature = sourceSignature(filesToBuild);
+	const fileSignatures = sourceSignatureMap(filesToBuild);
+	const signature = sourceSignatureFromMap(fileSignatures);
 
 	// Tier 1: in-memory cache (hot path — same process, already built this session)
 	const memCached = _workspaceGraphCache.get(normalizedCwd);
@@ -634,6 +765,28 @@ async function _doBuildGraph(
 			upsertChangedSymbols(graph, facts, file);
 		}
 		_lastGraphBuildInfo = { reused: true, mode: "cached" };
+		facts.setSessionFact("session.reviewGraph", graph);
+		return graph;
+	}
+	const memChanged = memCached
+		? changedSignatureFiles(memCached.fileSignatures, fileSignatures)
+		: undefined;
+	if (
+		memCached &&
+		memChanged !== undefined &&
+		memChanged.length > 0 &&
+		memChanged.every((file) => normalizedChangedSet.has(file))
+	) {
+		const graph = cloneGraph(memCached.graph);
+		await updateGraphFiles(graph, cwd, memChanged, facts);
+		const graphSnapshot = cloneGraph(graph);
+		_workspaceGraphCache.set(normalizedCwd, {
+			signature,
+			fileSignatures: new Map(fileSignatures),
+			graph: graphSnapshot,
+		});
+		persistGraph(cwd, signature, fileSignatures, graphSnapshot);
+		_lastGraphBuildInfo = { reused: true, mode: "incremental" };
 		facts.setSessionFact("session.reviewGraph", graph);
 		return graph;
 	}
@@ -649,9 +802,33 @@ async function _doBuildGraph(
 		}
 		_workspaceGraphCache.set(normalizedCwd, {
 			signature,
+			fileSignatures: new Map(fileSignatures),
 			graph: cloneGraph(diskCached.graph),
 		});
 		_lastGraphBuildInfo = { reused: true, mode: "cached" };
+		facts.setSessionFact("session.reviewGraph", graph);
+		return graph;
+	}
+	const diskChanged =
+		diskCached && diskCached.fileSignatures.size > 0
+			? changedSignatureFiles(diskCached.fileSignatures, fileSignatures)
+			: undefined;
+	if (
+		diskCached &&
+		diskChanged !== undefined &&
+		diskChanged.length > 0 &&
+		diskChanged.every((file) => normalizedChangedSet.has(file))
+	) {
+		const graph = cloneGraph(diskCached.graph);
+		await updateGraphFiles(graph, cwd, diskChanged, facts);
+		const graphSnapshot = cloneGraph(graph);
+		_workspaceGraphCache.set(normalizedCwd, {
+			signature,
+			fileSignatures: new Map(fileSignatures),
+			graph: graphSnapshot,
+		});
+		persistGraph(cwd, signature, fileSignatures, graphSnapshot);
+		_lastGraphBuildInfo = { reused: true, mode: "incremental" };
 		facts.setSessionFact("session.reviewGraph", graph);
 		return graph;
 	}
@@ -659,19 +836,8 @@ async function _doBuildGraph(
 	// Tier 3: full build
 	const graph = createEmptyGraph();
 	for (const file of filesToBuild) {
-		const kind = detectFileKind(file);
-		if (!kind || !MAIN_KINDS.has(kind)) continue;
-		if (kind === "jsts") {
-			await ensureTsFacts(file, cwd, facts);
-			addJsTsFile(graph, cwd, file, facts);
-		} else {
-			const languageId = mapKindToTreeSitterLanguage(kind, file);
-			if (!languageId) continue;
-			const extracted = await extractTreeSitterSymbols(file, languageId);
-			addTreeSitterFile(graph, file, languageId, extracted);
-			if (kind === "cxx") addCxxIncludeEdges(graph, cwd, file);
-		}
-		if (normalizedChanged.includes(file)) {
+		await addFileToGraph(graph, cwd, file, facts);
+		if (normalizedChangedSet.has(file)) {
 			upsertChangedSymbols(graph, facts, file);
 		}
 	}
@@ -680,8 +846,12 @@ async function _doBuildGraph(
 	graph.version = REVIEW_GRAPH_VERSION;
 	graph.builtAt = new Date().toISOString();
 	const graphSnapshot = cloneGraph(graph);
-	_workspaceGraphCache.set(normalizedCwd, { signature, graph: graphSnapshot });
-	persistGraph(cwd, signature, graphSnapshot); // fire-and-forget
+	_workspaceGraphCache.set(normalizedCwd, {
+		signature,
+		fileSignatures: new Map(fileSignatures),
+		graph: graphSnapshot,
+	});
+	persistGraph(cwd, signature, fileSignatures, graphSnapshot); // fire-and-forget
 	_lastGraphBuildInfo = { reused: false, mode: "full" };
 	facts.setSessionFact("session.reviewGraph", graph);
 	return graph;

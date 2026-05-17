@@ -55,7 +55,13 @@ export const LANGUAGE_POLICY: Record<FileKind, LanguagePolicy> = {
 			heavyScansRequireConfig: true,
 		},
 	},
-	ruby: { lspCapable: true, startup: { defaults: ["rubocop"] } },
+	ruby: {
+		lspCapable: true,
+		startup: {
+			defaults: ["rubocop"],
+			heavyScansRequireConfig: true,
+		},
+	},
 	html: { lspCapable: true },
 	docker: { lspCapable: true },
 	php: { lspCapable: true },

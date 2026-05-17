@@ -20,6 +20,7 @@ import { createLSPClient } from "./client.js";
 import { getServersForFileWithConfig } from "./config.js";
 import { getLanguageId } from "./language.js";
 import type { LSPServerInfo } from "./server.js";
+import { isDirectLspCommandTemporarilyUnavailable } from "./server.js";
 import { getStrategy } from "./server-strategies.js";
 import { raceToCompletion } from "./aggregation.js";
 
@@ -402,6 +403,23 @@ export class LSPService {
 		const normalizedRoot = normalizeMapKey(root);
 		const key = `${server.id}:${normalizedRoot}`;
 		const isOptionalServer = OPTIONAL_LSP_SERVER_IDS.has(server.id); // NOSONAR: set intentionally empty — no optional servers configured yet
+
+		if (
+			server.availabilityKey &&
+			isDirectLspCommandTemporarilyUnavailable(server.availabilityKey)
+		) {
+			logLatency({
+				type: "phase",
+				phase: "lsp_client_skipped_unavailable_command",
+				filePath,
+				durationMs: 0,
+				metadata: {
+					serverId: server.id,
+					command: server.availabilityKey,
+				},
+			});
+			return undefined;
+		}
 
 		if (isOptionalServer && this.optionalDisabled.has(key)) {
 			return undefined;

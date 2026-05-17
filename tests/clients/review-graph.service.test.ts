@@ -6,6 +6,10 @@ import {
 	computeImpactCascade,
 	formatImpactCascade,
 } from "../../clients/review-graph/service.js";
+import {
+	clearGraphCache,
+	getLastGraphBuildInfo,
+} from "../../clients/review-graph/builder.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
 describe("review graph service", () => {
@@ -159,6 +163,39 @@ describe("review graph service", () => {
 		}
 	});
 
+	it("updates cached graph incrementally when only the changed file mtime shifts", async () => {
+		const env = setupTestEnvironment("pi-lens-review-graph-incremental-");
+		try {
+			const aPath = createTempFile(
+				env.tmpDir,
+				"src/a.ts",
+				"export function alpha() { return 1; }\n",
+			);
+			const bPath = createTempFile(
+				env.tmpDir,
+				"src/b.ts",
+				"import { alpha } from './a';\nexport function beta() { return alpha(); }\n",
+			);
+
+			const facts = new FactStore();
+			await buildOrUpdateGraph(env.tmpDir, [aPath], facts);
+			clearGraphCache();
+			createTempFile(
+				env.tmpDir,
+				"src/a.ts",
+				"export function alpha() { return 222; }\n",
+			);
+
+			const graph = await buildOrUpdateGraph(env.tmpDir, [aPath], facts);
+			expect(getLastGraphBuildInfo()).toMatchObject({ mode: "incremental" });
+			const impact = computeImpactCascade(graph, aPath);
+			expect(impact.directImporters).toContain(normalizeMapKey(bPath));
+			expect(impact.directCallers).toContain(normalizeMapKey(bPath));
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("rebuilds indexes on workspace cache hit so impact cascade still works", async () => {
 		const env = setupTestEnvironment("pi-lens-review-graph-cache-");
 		try {
@@ -179,9 +216,6 @@ describe("review graph service", () => {
 			expect(firstGraph.edgesByTo.size).toBeGreaterThan(0);
 
 			// Force workspace cache lookup on next call
-			const { clearGraphCache } = await import(
-				"../../clients/review-graph/builder.js"
-			);
 			clearGraphCache();
 
 			const secondGraph = await buildOrUpdateGraph(env.tmpDir, [bPath], facts);
