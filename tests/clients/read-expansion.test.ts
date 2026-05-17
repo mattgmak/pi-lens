@@ -86,4 +86,53 @@ describe("tryExpandRead", () => {
 			env.cleanup();
 		}
 	});
+
+	it("expands markdown reads to the enclosing section", async () => {
+		const env = setupTestEnvironment("pi-lens-read-expansion-md-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.md");
+			fs.writeFileSync(
+				filePath,
+				"# Title\nline2\nline3\n## Section A\nline5\nline6\n## Section B\nline8\n",
+			);
+			const tsClient = {
+				init: async () => true,
+				parseFile: async () => {
+					throw new Error("should not be called for markdown");
+				},
+			};
+
+			// Read inside Section A (line 5), should expand to lines 4-6
+			const result = await tryExpandRead(filePath, 5, 1, 8, tsClient as any);
+			expect(result).toMatchObject({
+				newOffset: 4,
+				newLimit: 3,
+				enclosingSymbol: {
+					name: "Section A",
+					kind: "markdown_section",
+					startLine: 4,
+					endLine: 6,
+				},
+			});
+
+			// Read already covers the whole section — no expansion
+			const noExpand = await tryExpandRead(filePath, 4, 3, 8, tsClient as any);
+			expect(noExpand).toBeUndefined();
+
+			// Read inside top-level heading — expands to the whole top-level section
+			const topResult = await tryExpandRead(filePath, 2, 1, 8, tsClient as any);
+			expect(topResult).toMatchObject({
+				newOffset: 1,
+				newLimit: 8,
+				enclosingSymbol: {
+					name: "Title",
+					kind: "markdown_section",
+					startLine: 1,
+					endLine: 8,
+				},
+			});
+		} finally {
+			env.cleanup();
+		}
+	});
 });

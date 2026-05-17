@@ -6,6 +6,8 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Added
 
+- **Markdown section read expansion** — `tryExpandRead` now expands partial reads in `.md` and `.mdx` files to the full enclosing heading section (from the `## Heading` at or before the read anchor to the next heading of same or higher level). No tree-sitter is needed; expansion is synchronous and stays within the existing `EXPANDED_SIZE_CAP_LINES` (300) and `EXPANSION_LIMIT_LINES` (60) guards. Populates `enclosingSymbol` with `kind: "markdown_section"` and the heading text as the symbol name, giving the read guard precise section-level coverage instead of the previous blanket `.md` exemption.
+
 - **pi-lens log smell analyzer** — new `npm run logs:smells` script scans pi-lens telemetry across all projects where the extension was active (`latency.log`, `sessionstart.log`, `cascade.log`, `read-guard.log`, `tree-sitter.log`, and daily diagnostic JSONL logs), grouping operational smells such as slow hook paths, runner failures, LSP availability noise, cascade fallback/slowness, and read-guard friction.
 - **LSP batch diagnostics and document symbol search** — `lsp_diagnostics` now accepts explicit `filePaths` batches with bounded concurrency (`concurrency`, default 8/max 16) and optional `waitMs`, so agents can validate exactly the files they touched without scanning a directory. `lsp_navigation` adds `operation: "findSymbol"` for filtered document-symbol lookup by `query`, `kinds`, `exactMatch`, `topLevelOnly`, and `maxResults`.
 - **Review-graph feature hints and source grouping helpers** — review graph file/symbol metadata now includes deterministic `featureKind` and `trustBoundaries` hints derived from names/paths, and `source-groups.ts` can partition large source sets into stable labeled groups for context planning.
@@ -24,6 +26,10 @@ All notable changes to pi-lens will be documented in this file.
 - **5 new C post-filters** — `c_memset_sensitive_arg`, `c_stdlib_name`, `c_octal_literal`, `c_noreturn_attr`, `c_label_in_switch` added to `applyPostFilter` in `tree-sitter-client.ts`.
 - **C tree-sitter tests** — `tests/clients/tree-sitter-c-rules.test.ts` with 10 passing tests.
 - **C/C++ tree-sitter runner and cascade support** — `cxx` files (`.c`, `.h`, `.cpp`, `.cc`, `.hpp`, etc.) are now fully wired through the dispatch pipeline: tree-sitter structural analysis, review-graph construction with `#include` edge extraction, blast-radius entity snapshots, and cascade neighbor propagation. `cpp-check` runner enhanced with `clang-tidy` support. `language-profile.ts` adds C/C++-specific complexity baselines.
+
+### Changed
+
+- **`.md` read-guard exemption tightened from `allow` to `warn`** — markdown files are no longer silently exempt from the read-before-edit guard. With the new markdown-section expansion providing precise heading-level coverage, edits outside the expanded read range trigger a warning instead of passing unchecked. Plain-text (`.txt`) and log (`.log`) files remain exempt.
 
 ### Fixed
 

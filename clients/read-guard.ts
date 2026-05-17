@@ -73,7 +73,7 @@ const DEFAULT_CONFIG: ReadGuardConfig = {
 	mode: "block",
 	contextLines: 3,
 	exemptions: [
-		{ pattern: "*.md", mode: "allow" },
+		{ pattern: "*.md", mode: "warn" },
 		{ pattern: "*.txt", mode: "allow" },
 		{ pattern: "*.log", mode: "allow" },
 	],

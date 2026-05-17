@@ -128,6 +128,59 @@ function withBudget<T>(
 	});
 }
 
+function tryExpandMarkdownSection(
+	content: string,
+	requestedStartRow: number,
+	requestedLimit: number,
+	totalLines: number,
+): Omit<ExpandedRead, "durationMs"> | undefined {
+	const lines = content.split(/\r?\n/);
+	const lastRow = totalLines - 1;
+
+	// Find heading at or before the requested start row
+	let headingLevel = 7;
+	let sectionStartRow = 0;
+	let headingText = "";
+
+	for (let i = requestedStartRow; i >= 0; i--) {
+		const match = lines[i]?.match(/^(#{1,6})\s+(.*)/);
+		if (match) {
+			headingLevel = match[1].length;
+			sectionStartRow = i;
+			headingText = match[2].trim();
+			break;
+		}
+	}
+
+	// Find end: next heading of same or higher level (smaller or equal number)
+	let sectionEndRow = lastRow;
+	for (let i = sectionStartRow + 1; i <= lastRow; i++) {
+		const match = lines[i]?.match(/^(#{1,6})\s+/);
+		if (match && match[1].length <= headingLevel) {
+			sectionEndRow = i - 1;
+			break;
+		}
+	}
+
+	const expandedStart = sectionStartRow + 1;
+	const expandedEnd = sectionEndRow + 1;
+	const expandedSize = expandedEnd - expandedStart + 1;
+
+	if (expandedSize > EXPANDED_SIZE_CAP_LINES) return undefined;
+	if (expandedSize <= requestedLimit) return undefined;
+
+	return {
+		newOffset: expandedStart,
+		newLimit: expandedSize,
+		enclosingSymbol: {
+			name: headingText || "(untitled section)",
+			kind: "markdown_section",
+			startLine: expandedStart,
+			endLine: expandedEnd,
+		},
+	};
+}
+
 /**
  * Attempt to expand a partial read to its enclosing symbol using tree-sitter.
  *
@@ -149,16 +202,29 @@ export async function tryExpandRead(
 	if (requestedLimit >= totalLines) return undefined;
 
 	const ext = filePath.slice(filePath.lastIndexOf(".")).toLowerCase();
-	const languageId = EXT_TO_LANG[ext];
-	if (!languageId) return undefined;
-
-	const enclosingTypes = ENCLOSING_TYPES[languageId];
-	if (!enclosingTypes) return undefined;
-
 	const startedAt = Date.now();
 
 	try {
 		const content = fs.readFileSync(filePath, "utf8");
+
+		// Fast path: Markdown section expansion (no tree-sitter needed)
+		if (ext === ".md" || ext === ".mdx") {
+			const requestedStartRow = requestedOffset - 1;
+			const result = tryExpandMarkdownSection(
+				content,
+				requestedStartRow,
+				requestedLimit,
+				totalLines,
+			);
+			if (!result) return undefined;
+			return { ...result, durationMs: Date.now() - startedAt };
+		}
+
+		const languageId = EXT_TO_LANG[ext];
+		if (!languageId) return undefined;
+
+		const enclosingTypes = ENCLOSING_TYPES[languageId];
+		if (!enclosingTypes) return undefined;
 		const initOk = await withBudget(tsClient.init(), EXPANSION_BUDGET_MS);
 		if (!initOk) return undefined;
 
