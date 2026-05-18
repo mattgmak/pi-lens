@@ -85,13 +85,13 @@ pi-lens includes **37 language server definitions**. LSP is **enabled by default
 
 **Agent LSP tools:** `lsp_diagnostics` can check one file, a directory, or an explicit `filePaths` batch with bounded concurrency. `lsp_navigation` provides definitions, references, hover, workspace symbols, call hierarchy, rename edits, and `findSymbol` for filtered document-symbol lookup.
 
-LSP servers for: TypeScript, Deno, Python (pyright + pylsp), Go, Rust, Ruby (ruby-lsp + solargraph), PHP, C# (omnisharp), F#, Java, Kotlin, Swift, Dart, Lua, C/C++, Zig, Haskell, Elixir, Gleam, OCaml, Clojure, Terraform, Nix, Bash, Docker, YAML, JSON, HTML, TOML, Prisma, Vue, Svelte, ESLint, CSS.
+LSP servers for: TypeScript, Deno, Python (pyright/basedpyright + jedi), Go, Rust, Ruby (ruby-lsp + solargraph), PHP, C# (omnisharp), F#, Java, Kotlin, Swift, Dart, Lua, C/C++, Zig, Haskell, Elixir, Gleam, OCaml, Clojure, Terraform, Nix, Bash, Docker, YAML, JSON, HTML, TOML, Prisma, Vue, Svelte, ESLint, CSS.
 
 ### Formatters
 
-pi-lens auto-detects and runs **26 formatters** based on project config:
+pi-lens auto-detects and runs **27 formatters** based on project config:
 
-biome, prettier, ruff, black, sqlfluff, gofmt, rustfmt, zig fmt, dart format, shfmt, nixfmt, mix format, ocamlformat, clang-format, ktlint, rubocop, standardrb, gleam format, terraform fmt, php-cs-fixer, csharpier, fantomas, swiftformat, stylua, ormolu, taplo
+biome, prettier, ruff, black, sqlfluff, gofmt, rustfmt, zig fmt, dart format, shfmt, nixfmt, mix format, ocamlformat, clang-format, ktlint, rubocop, standardrb, gleam format, terraform fmt, php-cs-fixer, csharpier, fantomas, swiftformat, stylua, ormolu, taplo, fish_indent
 
 Detection rules:
 
@@ -112,7 +112,7 @@ pi-lens enforces a **read-before-edit** policy on all file writes and edits. Bef
 - **File-modified block** — blocks if the file changed on disk since the last read (auto-format, external tool, or a previous edit that was then reformatted)
 - **Out-of-range block** — blocks if the edit target lines fall outside the ranges previously read, ensuring the agent cannot modify code it hasn't seen
 
-Coverage is tracked across multiple reads: two reads of lines 1–100 and 101–200 together satisfy a full-file write. Symbol-expanded reads (small reads silently widened to the enclosing symbol via tree-sitter) count toward coverage at the symbol level. Markdown, text, and log files are exempt.
+Coverage is tracked across multiple reads: two reads of lines 1–100 and 101–200 together satisfy a full-file write. Symbol-expanded reads (small reads silently widened to the enclosing symbol via tree-sitter) count toward coverage at the symbol level. Markdown files generate a warning instead of blocking (edits outside the section-expanded read range are warned, not silently passed). Plain-text (`.txt`) and log (`.log`) files remain fully exempt.
 
 Override for a single edit: `/lens-allow-edit <path>`
 
@@ -315,13 +315,14 @@ Hide the diagnostics widget by default and run formatting immediately after writ
 - `/lens-widget-toggle` — show/hide the pi-lens diagnostics widget below the editor
 - `/lens-booboo` — full quality report for current project state
 - `/lens-health` — runtime health, latency, and diagnostic telemetry
+- `/lens-allow-edit <path>` — override the read-before-edit guard for a single edit
 - `/lens-tools` — tool installation status: globally installed, auto-installed, or npx fallback
 - `/lens-tdi` — Technical Debt Index (TDI) and project health trend
 - `/lens-semgrep` — manage experimental Semgrep dispatch (`status`, `init`, `enable`, `disable`, `clear`)
 
 ## Language Coverage
 
-pi-lens supports **35+ languages** through dispatch runners and LSP integration.
+pi-lens supports **36+ languages** through dispatch runners and LSP integration.
 
 Formatting uses a single selected formatter per file: explicit project config wins, otherwise pi-lens uses a smart default where supported, and config-first ecosystems do not autoformat without config.
 
@@ -334,12 +335,15 @@ Dispatch is diagnostics-oriented: automatic formatting and safe autofix happen i
 | Go                    | ✓   | lsp, go-vet, golangci-lint, tree-sitter                                                                        | gofmt               |
 | Rust                  | ✓   | lsp, rust-clippy, tree-sitter                                                                                  | rustfmt             |
 | Ruby                  | ✓   | lsp, rubocop, tree-sitter                                                                                      | rubocop, standardrb |
-| C/C++                 | ✓   | lsp, cpp-check                                                                                                 | clang-format        |
+| C/C++                 | ✓   | lsp, cpp-check, tree-sitter                                                                                    | clang-format        |
 | Shell                 | ✓   | lsp, shellcheck                                                                                                | shfmt               |
+| Fish                  | ✓   | lsp, fish-indent                                                                                               | fish_indent         |
 | CSS/SCSS/Less         | ✓   | lsp, stylelint                                                                                                 | biome, prettier     |
 | HTML                  | ✓   | lsp, htmlhint                                                                                                  | prettier            |
 | YAML                  | ✓   | lsp, yamllint                                                                                                  | prettier            |
 | JSON                  | ✓   | lsp                                                                                                            | biome, prettier     |
+| Svelte                | ✓   | lsp                                                                                                            | —                   |
+| Vue                   | ✓   | lsp                                                                                                            | —                   |
 | SQL                   | —   | sqlfluff                                                                                                       | sqlfluff            |
 | Markdown              | —   | spellcheck, markdownlint                                                                                       | prettier            |
 | Docker                | ✓   | lsp, hadolint                                                                                                  | —                   |
