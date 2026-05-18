@@ -45,6 +45,8 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Fixed
 
+- **ESLint LSP activation is config-gated for JS packages** — ESLint language-server startup now requires a real ESLint signal (config file, `eslintConfig`, or an `eslint` package dependency) instead of treating any `package.json` as enough. Plain JS packages without ESLint no longer spend the LSP timeout trying to start `vscode-eslint-language-server`, and nested packages without ESLint no longer inherit a parent repo ESLint config by accident. Closes #86.
+
 - **SonarCloud regex hotspot in workspace scanner** — replaced `workspace-modules.ts` multi-line manifest regexes with linear line scanners for `pnpm-workspace.yaml` and Cargo TOML sections/arrays, avoiding super-linear regex hotspot reports while preserving monorepo module detection.
 
 - **Agent guidance now promotes active LSP diagnostics and ast-grep retries** — session-start guidance and shipped skills now direct agents to use `lsp_diagnostics` for proactive file/folder/batch validation, keep `lsp_navigation` for code intelligence, and retry `ast_grep_search` once with a simpler valid AST pattern before falling back to grep. `ast_grep_search` tool docs now describe `selector` correctly as a node-kind filter rather than an extraction mechanism.
