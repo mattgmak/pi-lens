@@ -13,6 +13,7 @@ import {
 	getSgCommand,
 	isSgAvailable,
 } from "./dispatch/runners/utils/runner-helpers.js";
+import { getProjectIgnoreGlobs } from "./file-utils.js";
 import { safeSpawn, safeSpawnAsync } from "./safe-spawn.js";
 
 /**
@@ -25,6 +26,13 @@ function escapeWindowsArg(arg: string): string {
 
 	// Escape quotes by doubling them
 	return `"${arg.replace(/"/g, '""')}"`;
+}
+
+function sgExcludeArgsForProject(rootDir: string): string[] {
+	return getProjectIgnoreGlobs(rootDir).flatMap((glob) => [
+		"--globs",
+		`!${glob}`,
+	]);
 }
 
 export interface SgMatch {
@@ -299,7 +307,10 @@ export class SgRunner {
 
 	// --- Shared helpers for temp-dir rule scans ---
 
-	private prepareTempScan(ruleId: string, ruleYaml: string): {
+	private prepareTempScan(
+		ruleId: string,
+		ruleYaml: string,
+	): {
 		sessionDir: string;
 		configFile: string;
 	} {
@@ -343,7 +354,15 @@ export class SgRunner {
 			const { cmd: sgCmd, args: sgPre } = getSgCommand();
 			const result = safeSpawn(
 				sgCmd,
-				[...sgPre, "scan", "--config", configFile, "--json", dir],
+				[
+					...sgPre,
+					"scan",
+					"--config",
+					configFile,
+					"--json",
+					...sgExcludeArgsForProject(dir),
+					dir,
+				],
 				{ timeout },
 			);
 			return this.parseScanOutput(result.stdout || result.stderr || "");
@@ -365,7 +384,15 @@ export class SgRunner {
 			const { cmd: sgCmd, args: sgPre } = getSgCommand();
 			const result = await safeSpawnAsync(
 				sgCmd,
-				[...sgPre, "scan", "--config", configFile, "--json", dir],
+				[
+					...sgPre,
+					"scan",
+					"--config",
+					configFile,
+					"--json",
+					...sgExcludeArgsForProject(dir),
+					dir,
+				],
 				{ timeout },
 			);
 			return this.parseScanOutput(result.stdout || result.stderr || "");
