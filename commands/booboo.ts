@@ -13,8 +13,8 @@ import { runProviders } from "../clients/dispatch/fact-runner.js";
 import { FactStore } from "../clients/dispatch/fact-store.js";
 import {
 	getKnipIgnorePatterns,
+	getProjectIgnoreGlobs,
 	isTestFile,
-	readGitignoreDirs,
 } from "../clients/file-utils.js";
 import type { JscpdClient } from "../clients/jscpd-client.js";
 import type { KnipClient } from "../clients/knip-client.js";
@@ -137,12 +137,10 @@ export async function handleBooboo(
 	const targetPath = resolveProjectRoot(path.resolve(requestedPath));
 	const reviewRoot = targetPath;
 
-	// Dirs to exclude from all scanners — EXCLUDED_DIRS baseline + root .gitignore entries
-	const gitignoreDirs = readGitignoreDirs(targetPath);
-	// Build --globs exclusion args for sg scan
-	const sgExcludeGlobs = gitignoreDirs.flatMap((d) => [
+	// Build --globs exclusion args for sg scan from centralized .gitignore matching.
+	const sgExcludeGlobs = getProjectIgnoreGlobs(targetPath).flatMap((glob) => [
 		"--globs",
-		`!**/${d}/**`,
+		`!${glob}`,
 	]);
 
 	const categoryKey = (name: string) => name.toLowerCase().replace(/\s+/g, "-");
