@@ -1,3 +1,6 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const safeSpawnAsync = vi.fn();
@@ -116,6 +119,32 @@ describe("SgRunner", () => {
 			await runner.ensureAvailable();
 			await runner.ensureAvailable();
 			expect(safeSpawnAsync).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	describe("tempScanAsync()", () => {
+		it("passes centralized gitignore globs to ast-grep scan", async () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-sg-ignore-"));
+			try {
+				fs.writeFileSync(path.join(root, ".gitignore"), "/profiles/\n*.snap\n");
+				safeSpawnAsync.mockResolvedValueOnce({
+					status: 0,
+					error: null,
+					stdout: "[]",
+					stderr: "",
+				});
+
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+				const runner = new SgRunner();
+				await runner.tempScanAsync(root, "find", "id: find\nrule: { kind: function_declaration }\n");
+
+				const args = safeSpawnAsync.mock.calls[0][1] as string[];
+				expect(args).toContain("--globs");
+				expect(args).toContain("!profiles/**");
+				expect(args).toContain("!**/*.snap");
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
 		});
 	});
 
