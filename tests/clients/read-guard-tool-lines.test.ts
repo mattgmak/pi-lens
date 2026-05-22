@@ -470,6 +470,63 @@ describe("tryCorrectIndentationMismatch", () => {
 		}
 	});
 
+	it("corrects mixed-width space indentation to the exact tabbed file slice", () => {
+		const env = setupTestEnvironment("pi-lens-indent-mixed-to-tab-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			const actual =
+				"const group = {\n" +
+				"\t\tresults: items.map((r) => ({\n" +
+				"\t\t\ttitle: r.title,\n" +
+				"\t\t})),\n" +
+				"};\n";
+			fs.writeFileSync(filePath, actual);
+
+			const result = tryCorrectIndentationMismatch(
+				"  results: items.map((r) => ({\n      title: r.title,\n  })),",
+				filePath,
+			);
+			expect(result).toBe(
+				"\t\tresults: items.map((r) => ({\n\t\t\ttitle: r.title,\n\t\t})),",
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("resolves oldText line ranges after indentation correction", () => {
+		const env = setupTestEnvironment("pi-lens-indent-resolve-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(
+				filePath,
+				"const group = {\n\t\tresults: items.map((r) => ({\n\t\t\ttitle: r.title,\n\t\t})),\n};\n",
+			);
+
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "edit",
+					input: {
+						edits: [
+							{
+								oldText:
+									"  results: items.map((r) => ({\n      title: r.title,\n  })),",
+								newText:
+									"\t\tresults: items.map((r) => ({\n\t\t\ttitle: r.name,\n\t\t})),",
+							},
+						],
+					},
+				},
+				filePath,
+			);
+
+			expect(result.preflightError).toBeUndefined();
+			expect(result.touchedLines).toEqual([2, 4]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("returns undefined when no indentation conversion fixes the mismatch", () => {
 		const env = setupTestEnvironment("pi-lens-indent-no-fix-");
 		try {

@@ -1343,7 +1343,10 @@ export default function (pi: ExtensionAPI) {
 						const preview = value.trimStart().slice(0, 60).replace(/\n/g, "↵");
 						return (
 							`${label} ("${preview}…") has mismatched indentation (tabs vs spaces).\n` +
-							`Replace ${label} with this verbatim (do not shorten, do not change newText):\n\n${corrected}`
+							`In your next edit call, change ONLY ${label} to this exact text; keep path and newText unchanged:\n\n` +
+							"```text\n" +
+							corrected +
+							"\n```"
 						);
 					})
 					.join("\n\n");
@@ -1351,8 +1354,10 @@ export default function (pi: ExtensionAPI) {
 					block: true,
 					reason:
 						`🔄 RETRYABLE — Indentation mismatch detected\n\n` +
-						`The file uses a different indentation style than your oldText. ` +
-						`Retry the same edit call immediately with the corrected oldText shown below — copy it exactly as-is.\n\n` +
+						`The file uses a different indentation style than your oldText.\n\n` +
+						`Next action: retry the same edit tool call immediately. ` +
+						`For multi-edit calls, keep the edits array in the same order and keep every newText unchanged. ` +
+						`Replace only the oldText field(s) listed below.\n\n` +
 						details,
 				};
 			}

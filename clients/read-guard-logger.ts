@@ -17,8 +17,12 @@ const VERBOSE_READ_GUARD_LOG =
 	process.env.PI_LENS_READ_GUARD_VERBOSE === "1" ||
 	process.env.PI_LENS_READ_GUARD_LOG === "verbose";
 const LOG_ALLOWED_EDITS = process.env.PI_LENS_READ_GUARD_LOG_ALLOWS === "1";
-const LOG_SNAPSHOT_VALIDATION =
-	process.env.PI_LENS_READ_GUARD_LOG_SNAPSHOTS === "1";
+const SNAPSHOT_LOG_SETTING = (
+	process.env.PI_LENS_READ_GUARD_LOG_SNAPSHOTS ?? "1"
+).toLowerCase();
+const LOG_SNAPSHOT_VALIDATION = !["0", "false", "off"].includes(
+	SNAPSHOT_LOG_SETTING,
+);
 
 try {
 	if (!fs.existsSync(READ_GUARD_LOG_DIR)) {

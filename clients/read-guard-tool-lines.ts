@@ -354,6 +354,48 @@ export function tryCorrectIndentationMismatch(
 			return candidate;
 	}
 
+	const indentationInsensitiveCandidate = findIndentationInsensitiveCandidate(
+		content,
+		normalized,
+	);
+	if (indentationInsensitiveCandidate !== undefined) {
+		return indentationInsensitiveCandidate;
+	}
+
+	return undefined;
+}
+
+function findIndentationInsensitiveCandidate(
+	content: string,
+	oldText: string,
+): string | undefined {
+	const contentLines = content.split("\n");
+	const oldLines = oldText.split("\n");
+	const stripIndent = (line: string) => line.replace(/^[\t ]+/, "").trimEnd();
+	const expected = oldLines.map(stripIndent);
+
+	for (
+		let start = 0;
+		start <= contentLines.length - oldLines.length;
+		start += 1
+	) {
+		let matches = true;
+		for (let offset = 0; offset < oldLines.length; offset += 1) {
+			if (
+				stripIndent(contentLines[start + offset] ?? "") !== expected[offset]
+			) {
+				matches = false;
+				break;
+			}
+		}
+		if (matches) {
+			const candidate = contentLines
+				.slice(start, start + oldLines.length)
+				.join("\n");
+			if (candidate !== oldText) return candidate;
+		}
+	}
+
 	return undefined;
 }
 
