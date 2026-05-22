@@ -1,12 +1,21 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	countFileLines,
 	getTouchedLinesForGuard,
 	tryCorrectIndentationMismatch,
 } from "../../clients/read-guard-tool-lines.ts";
+import { logReadGuardEvent } from "../../clients/read-guard-logger.js";
 import { setupTestEnvironment } from "./test-utils.js";
+
+vi.mock("../../clients/read-guard-logger.js", () => ({
+	logReadGuardEvent: vi.fn(),
+}));
+
+beforeEach(() => {
+	vi.mocked(logReadGuardEvent).mockClear();
+});
 
 describe("read-guard tool line helpers", () => {
 	it("returns undefined touchedLines for text-replacement edits without explicit ranges and no filePath", () => {
@@ -298,6 +307,16 @@ describe("read-guard tool line helpers", () => {
 			expect(result.preflightError).toMatch(/2 times/);
 			expect(result.preflightError).toMatch(/Line 1/);
 			expect(result.preflightError).toMatch(/Line 5/);
+			expect(logReadGuardEvent).toHaveBeenCalledWith(
+				expect.objectContaining({
+					event: "edit_preflight_blocked",
+					filePath,
+					metadata: expect.objectContaining({
+						reasonKind: "oldtext_duplicate",
+						failedEditIndexes: [0],
+					}),
+				}),
+			);
 		} finally {
 			env.cleanup();
 		}
@@ -324,6 +343,17 @@ describe("read-guard tool line helpers", () => {
 			expect(result.preflightError).toMatch(/BLOCKED/);
 			expect(result.preflightError).toMatch(/was not found/);
 			expect(result.preflightError).toMatch(/Re-read the relevant section/);
+			expect(logReadGuardEvent).toHaveBeenCalledWith(
+				expect.objectContaining({
+					event: "edit_preflight_blocked",
+					filePath,
+					metadata: expect.objectContaining({
+						reasonKind: "oldtext_not_found",
+						failedEditIndexes: [0],
+						oldTextPreviews: ["function bar() {↵  return 2;↵}"],
+					}),
+				}),
+			);
 		} finally {
 			env.cleanup();
 		}

@@ -106,6 +106,21 @@ function resolveHashlineEditInput(
 	}
 
 	if (errors.length > 0) {
+		if (filePath) {
+			logReadGuardEvent({
+				event: "edit_preflight_blocked",
+				sessionId,
+				filePath,
+				metadata: {
+					tool: "edit",
+					source: "hashline_edit",
+					reasonKind: "unsupported_hashline_edit_target",
+					operationCount: operations.length,
+					errorCount: errors.length,
+					errors: errors.slice(0, 10),
+				},
+			});
+		}
 		return {
 			touchedLines: undefined,
 			preflightError: `🔴 BLOCKED — Unsupported hashline edit target\n\n${errors.join("\n")}`,
@@ -169,6 +184,9 @@ function resolveOldTextEdits(
 
 	const content = normalizeContent(rawContent);
 	const errors: string[] = [];
+	const failureKinds: string[] = [];
+	const failedEditIndexes: number[] = [];
+	const failedOldTextPreviews: string[] = [];
 	const resolvedRanges: [number, number][] = [];
 
 	for (let i = 0; i < edits.length; i++) {
@@ -201,6 +219,9 @@ function resolveOldTextEdits(
 
 		if (occurrenceLines.length === 0) {
 			const preview = oldText.trimStart().substring(0, 60).replace(/\n/g, "↵");
+			failureKinds.push("oldtext_not_found");
+			failedEditIndexes.push(editIndex);
+			failedOldTextPreviews.push(preview);
 			errors.push(
 				`edits[${editIndex}].oldText ("${preview}") was not found in the current file content. Re-read the relevant section of the file to confirm the exact text, then retry with the verbatim content.`,
 			);
@@ -232,6 +253,9 @@ function resolveOldTextEdits(
 			});
 		} else {
 			const preview = oldText.trimStart().substring(0, 60).replace(/\n/g, "↵");
+			failureKinds.push("oldtext_duplicate");
+			failedEditIndexes.push(editIndex);
+			failedOldTextPreviews.push(preview);
 			const lineList = occurrenceLines.map((l) => `  • Line ${l}`).join("\n");
 			errors.push(
 				`edits[${editIndex}].oldText ("${preview}") appears ${occurrenceLines.length} times:\n${lineList}\nAdd more surrounding context to make it unique.`,
@@ -260,6 +284,28 @@ function resolveOldTextEdits(
 				: [
 						"One or more edit targets could not be resolved to exact lines. Re-read the relevant section and retry with the exact content as it appears in the file.",
 					];
+		const uniqueFailureKinds = [...new Set(failureKinds)];
+		logReadGuardEvent({
+			event: "edit_preflight_blocked",
+			sessionId,
+			filePath,
+			metadata: {
+				tool: "edit",
+				source: "edits_without_ranges",
+				reasonKind:
+					uniqueFailureKinds.length === 1
+						? uniqueFailureKinds[0]
+						: "oldtext_resolution_failed",
+				failureKinds: uniqueFailureKinds,
+				editCount: edits.length,
+				oldTextEditCount,
+				resolvedOldTextEditCount: resolvedRanges.length,
+				unresolvedOldTextEditCount: oldTextEditCount - resolvedRanges.length,
+				failedEditIndexes,
+				oldTextPreviews: failedOldTextPreviews.slice(0, 5),
+				errorCount: errors.length,
+			},
+		});
 		return {
 			touchedLines: undefined,
 			preflightError: `🔴 BLOCKED — Ambiguous edit target\n\n${failureDetails.join("\n\n")}`,

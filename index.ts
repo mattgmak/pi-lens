@@ -35,6 +35,7 @@ import {
 	loadPiLensGlobalConfig,
 	resolvePiLensFlag,
 } from "./clients/lens-config.js";
+import { initLensEvents } from "./clients/lens-events.js";
 import { initLSPConfig } from "./clients/lsp/config.js";
 import { getLSPService, resetLSPService } from "./clients/lsp/index.js";
 import {
@@ -248,6 +249,89 @@ function shouldSkipLspAutoTouch(
 	return false;
 }
 
+function normalizeOldTextForMatch(text: string): string {
+	return text
+		.replace(/\r\n/g, "\n")
+		.split("\n")
+		.map((line) => line.trimEnd())
+		.join("\n");
+}
+
+function countTextOccurrences(haystack: string, needle: string): number {
+	if (!needle) return 0;
+	let count = 0;
+	let pos = 0;
+	while (pos < haystack.length) {
+		const idx = haystack.indexOf(needle, pos);
+		if (idx === -1) break;
+		count += 1;
+		pos = idx + needle.length;
+	}
+	return count;
+}
+
+function countOldTextMatches(filePath: string, oldText: string): number {
+	try {
+		const content = normalizeOldTextForMatch(
+			nodeFs.readFileSync(filePath, "utf-8"),
+		);
+		return countTextOccurrences(content, normalizeOldTextForMatch(oldText));
+	} catch {
+		return 0;
+	}
+}
+
+function isIndentationOnlyChange(before: string, after: string): boolean {
+	const beforeLines = before.replace(/\r\n/g, "\n").split("\n");
+	const afterLines = after.replace(/\r\n/g, "\n").split("\n");
+	if (beforeLines.length !== afterLines.length) return false;
+	return beforeLines.every(
+		(line, index) =>
+			line.replace(/^[\t ]+/, "") === afterLines[index].replace(/^[\t ]+/, ""),
+	);
+}
+
+function retargetReplacementIndentation(
+	newText: string,
+	oldText: string,
+	correctedOldText: string,
+): string | undefined {
+	const newline = newText.includes("\r\n") ? "\r\n" : "\n";
+	const oldLines = oldText.replace(/\r\n/g, "\n").split("\n");
+	const correctedLines = correctedOldText.replace(/\r\n/g, "\n").split("\n");
+	if (oldLines.length !== correctedLines.length) return undefined;
+
+	const indentMap = new Map<string, string>();
+	const ambiguousIndents = new Set<string>();
+	for (let i = 0; i < oldLines.length; i += 1) {
+		const oldIndent = oldLines[i].match(/^[\t ]*/)?.[0] ?? "";
+		const correctedIndent = correctedLines[i].match(/^[\t ]*/)?.[0] ?? "";
+		if (oldIndent === correctedIndent) continue;
+		const previous = indentMap.get(oldIndent);
+		if (previous !== undefined && previous !== correctedIndent) {
+			indentMap.delete(oldIndent);
+			ambiguousIndents.add(oldIndent);
+			continue;
+		}
+		if (!ambiguousIndents.has(oldIndent)) {
+			indentMap.set(oldIndent, correctedIndent);
+		}
+	}
+	if (indentMap.size === 0) return undefined;
+
+	let changed = false;
+	const newLines = newText.replace(/\r\n/g, "\n").split("\n");
+	const retargetedLines = newLines.map((line) => {
+		const indent = line.match(/^[\t ]*/)?.[0] ?? "";
+		const correctedIndent = indentMap.get(indent);
+		if (correctedIndent === undefined) return line;
+		changed = true;
+		return correctedIndent + line.slice(indent.length);
+	});
+
+	return changed ? retargetedLines.join(newline) : undefined;
+}
+
 function getNewContentFromToolCall(event: unknown): string | undefined {
 	if (isToolCallEventType("write", event as any)) {
 		return ((event as { input?: unknown }).input as { content?: string })
@@ -299,6 +383,7 @@ function cleanStaleTsBuildInfo(cwd: string): string[] {
 
 export default function (pi: ExtensionAPI) {
 	initI18n(pi);
+	initLensEvents(pi);
 	const astGrepClient = new AstGrepClient();
 	const cacheManager = new CacheManager();
 
@@ -1304,62 +1389,128 @@ export default function (pi: ExtensionAPI) {
 		if (isEditOnly && filePath) {
 			const editInput = (event as { input?: unknown }).input as {
 				oldText?: string;
-				edits?: Array<{ oldText?: string }>;
+				newText?: string;
+				edits?: Array<{ oldText?: string; newText?: string }>;
 			};
-			const oldTexts = editInput.oldText
-				? [{ label: "oldText", value: editInput.oldText }]
+			type EditIndentTarget = {
+				label: string;
+				value: string;
+				newText: string | undefined;
+				apply: (corrected: string) => void;
+				applyNewText: (corrected: string) => void;
+			};
+			const oldTexts: EditIndentTarget[] = editInput.oldText
+				? [
+						{
+							label: "oldText",
+							value: editInput.oldText,
+							newText: editInput.newText,
+							apply: (corrected: string) => {
+								editInput.oldText = corrected;
+							},
+							applyNewText: (corrected: string) => {
+								editInput.newText = corrected;
+							},
+						},
+					]
 				: (editInput.edits ?? [])
 						.map((e, i) =>
 							e.oldText
-								? { label: `edits[${i}].oldText`, value: e.oldText }
+								? {
+										label: `edits[${i}].oldText`,
+										value: e.oldText,
+										newText: e.newText,
+										apply: (corrected: string) => {
+											e.oldText = corrected;
+										},
+										applyNewText: (corrected: string) => {
+											e.newText = corrected;
+										},
+									}
 								: null,
 						)
-						.filter(
-							(
-								entry,
-							): entry is {
-								label: string;
-								value: string;
-							} => entry !== null,
-						);
+						.filter((entry): entry is EditIndentTarget => entry !== null);
 			const correctedOldTexts = oldTexts
-				.map(({ label, value }) => ({
-					label,
-					value,
-					corrected: tryCorrectIndentationMismatch(value, filePath),
-				}))
+				.map(({ label, value, newText, apply, applyNewText }) => {
+					const corrected = tryCorrectIndentationMismatch(value, filePath);
+					return corrected === undefined
+						? undefined
+						: {
+								label,
+								value,
+								newText,
+								corrected,
+								apply,
+								applyNewText,
+								currentMatchCount: countOldTextMatches(filePath, value),
+								correctedMatchCount: countOldTextMatches(filePath, corrected),
+								indentationOnly: isIndentationOnlyChange(value, corrected),
+							};
+				})
 				.filter(
 					(
 						entry,
-					): entry is {
-						label: string;
-						value: string;
+					): entry is EditIndentTarget & {
 						corrected: string;
-					} => entry.corrected !== undefined,
+						currentMatchCount: number;
+						correctedMatchCount: number;
+						indentationOnly: boolean;
+					} => entry !== undefined,
 				);
 			if (correctedOldTexts.length > 0) {
-				const details = correctedOldTexts
-					.map(({ label, value, corrected }) => {
-						const preview = value.trimStart().slice(0, 60).replace(/\n/g, "↵");
-						return (
-							`${label} ("${preview}…") has mismatched indentation (tabs vs spaces).\n` +
-							`In your next edit call, change ONLY ${label} to this exact text; keep path and newText unchanged:\n\n` +
-							"```text\n" +
-							corrected +
-							"\n```"
-						);
-					})
-					.join("\n\n");
-				return {
-					block: true,
-					reason:
-						`🔄 RETRYABLE — Indentation mismatch detected\n\n` +
-						`The file uses a different indentation style than your oldText.\n\n` +
-						`Next action: retry the same edit tool call immediately. ` +
-						`For multi-edit calls, keep the edits array in the same order and keep every newText unchanged. ` +
-						`Replace only the oldText field(s) listed below.\n\n` +
-						details,
-				};
+				const unsafeCorrections = correctedOldTexts.filter(
+					(entry) =>
+						!entry.indentationOnly ||
+						entry.currentMatchCount !== 0 ||
+						entry.correctedMatchCount !== 1,
+				);
+				if (unsafeCorrections.length === 0) {
+					for (const entry of correctedOldTexts) {
+						entry.apply(entry.corrected);
+						const correctedNewText = entry.newText
+							? retargetReplacementIndentation(
+									entry.newText,
+									entry.value,
+									entry.corrected,
+								)
+							: undefined;
+						if (correctedNewText !== undefined) {
+							entry.applyNewText(correctedNewText);
+						}
+						logReadGuardEvent({
+							event: "oldtext_indent_autopatched",
+							sessionId: runtime.telemetrySessionId,
+							filePath,
+							metadata: {
+								tool: "edit",
+								label: entry.label,
+								correctedMatchCount: entry.correctedMatchCount,
+								newTextIndentationPatched: correctedNewText !== undefined,
+							},
+						});
+					}
+				} else {
+					const details = unsafeCorrections
+						.map(({ label, value, correctedMatchCount, indentationOnly }) => {
+							const preview = value
+								.trimStart()
+								.slice(0, 60)
+								.replace(/\n/g, "↵");
+							const reason = !indentationOnly
+								? "the proposed correction was not indentation-only"
+								: `the corrected oldText matches ${correctedMatchCount} locations`;
+							return `${label} ("${preview}…") has mismatched indentation, but pi-lens cannot safely auto-patch it because ${reason}.`;
+						})
+						.join("\n");
+					return {
+						block: true,
+						reason:
+							`🔄 RETRYABLE — Indentation mismatch detected\n\n` +
+							`pi-lens can auto-patch indentation-only oldText mismatches only when the corrected text matches exactly one location.\n\n` +
+							`${details}\n\n` +
+							`Next action: re-read the relevant section, then retry with oldText copied verbatim from the read output.`,
+					};
+				}
 			}
 		}
 		if (isEditOnly && filePath && !getLensFlag("no-read-guard")) {

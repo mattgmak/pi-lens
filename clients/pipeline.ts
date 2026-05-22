@@ -37,6 +37,7 @@ import {
 } from "./file-utils.js";
 import type { FormatService } from "./format-service.js";
 import { logLatency } from "./latency-logger.js";
+import { emitLensAnalysisComplete } from "./lens-events.js";
 import { getLSPService } from "./lsp/index.js";
 import type { MetricsClient } from "./metrics-client.js";
 import { clearGraphCache } from "./review-graph/builder.js";
@@ -843,13 +844,44 @@ export async function runPipeline(
 	if (fileContent) {
 		const secretFindings = scanForSecrets(fileContent, filePath);
 		if (secretFindings.length > 0) {
+			const durationMs = Date.now() - pipelineStart;
 			logLatency({
 				type: "tool_result",
 				toolName,
 				filePath,
-				durationMs: Date.now() - pipelineStart,
+				durationMs,
 				result: "blocked_secrets",
 				metadata: { secretsFound: secretFindings.length },
+			});
+			const secretDiagnostics: Diagnostic[] = secretFindings.map((finding) => ({
+				id: `secrets:${finding.line}`,
+				message: finding.message,
+				filePath,
+				line: finding.line,
+				column: 1,
+				severity: "error",
+				semantic: "blocking",
+				tool: "secrets-scanner",
+				rule: "secrets",
+				defectClass: "secrets",
+			}));
+			emitLensAnalysisComplete({
+				cwd,
+				filePath,
+				toolName,
+				model: ctx.telemetry?.model ?? "unknown",
+				sessionId: ctx.telemetry?.sessionId ?? "unknown",
+				turnIndex: ctx.telemetry?.turnIndex ?? 0,
+				writeIndex: ctx.telemetry?.writeIndex ?? 0,
+				diagnostics: secretDiagnostics,
+				blockers: secretDiagnostics,
+				warnings: [],
+				fixed: [],
+				resolvedCount: 0,
+				hasBlockers: true,
+				fileModified: false,
+				changedFiles: [],
+				durationMs,
 			});
 			return {
 				output: `\n\n${formatSecrets(secretFindings, filePath)}`,
@@ -1060,13 +1092,34 @@ export async function runPipeline(
 
 	phase.end("total", { hasOutput: !!output });
 
+	const fileModified = formatChanged || fixedCount > 0;
+	const changedFiles = [...piChangedFiles];
+	emitLensAnalysisComplete({
+		cwd,
+		filePath,
+		toolName,
+		model: ctx.telemetry?.model ?? "unknown",
+		sessionId: ctx.telemetry?.sessionId ?? "unknown",
+		turnIndex: ctx.telemetry?.turnIndex ?? 0,
+		writeIndex: ctx.telemetry?.writeIndex ?? 0,
+		diagnostics: dispatchResult.diagnostics,
+		blockers: dispatchResult.blockers,
+		warnings: dispatchResult.warnings,
+		fixed: dispatchResult.fixed,
+		resolvedCount: dispatchResult.resolvedCount,
+		hasBlockers,
+		fileModified,
+		changedFiles,
+		durationMs: elapsed,
+	});
+
 	return {
 		output,
 		hasBlockers,
 		cascadeResult,
 		isError: false,
-		fileModified: formatChanged || fixedCount > 0,
-		changedFiles: [...piChangedFiles],
+		fileModified,
+		changedFiles,
 		inlineBlockerSummary: dispatchResult.hasBlockers
 			? dispatchResult.blockerOutput.trim() || undefined
 			: undefined,
