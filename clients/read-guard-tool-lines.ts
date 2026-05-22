@@ -32,6 +32,107 @@ function lineNumberAt(content: string, index: number): number {
 	return content.substring(0, index).split("\n").length;
 }
 
+function parseHashlineAnchor(anchor: unknown): number | undefined {
+	if (typeof anchor !== "string") return undefined;
+	const trimmed = anchor.trim();
+	const separator = trimmed.indexOf(":");
+	const lineText = separator === -1 ? trimmed : trimmed.slice(0, separator);
+	if (!/^\d+$/.test(lineText)) return undefined;
+	const line = Number(lineText);
+	return Number.isInteger(line) && line > 0 ? line : undefined;
+}
+
+function combineRanges(ranges: [number, number][]): GuardLineResult {
+	const starts = ranges.map(([start]) => start);
+	const ends = ranges.map(([, end]) => end);
+	return {
+		touchedLines: [Math.min(...starts), Math.max(...ends)],
+		editRanges: ranges.length > 1 ? ranges : undefined,
+	};
+}
+
+function getHashlineOperations(input: Record<string, unknown>): unknown[] {
+	if (Array.isArray(input.operations)) return input.operations;
+	if (Array.isArray(input.ops)) return input.ops;
+	if (input.set_line || input.replace_lines || input.replace_symbol)
+		return [input];
+	return [];
+}
+
+function resolveHashlineEditInput(
+	input: Record<string, unknown>,
+	filePath: string | undefined,
+	sessionId: string | undefined,
+): GuardLineResult | undefined {
+	const operations = getHashlineOperations(input);
+	if (operations.length === 0) return undefined;
+	const ranges: [number, number][] = [];
+	const errors: string[] = [];
+
+	for (let index = 0; index < operations.length; index += 1) {
+		const op = operations[index] as Record<string, unknown>;
+		if (op.set_line) {
+			const payload = op.set_line as Record<string, unknown>;
+			const line = parseHashlineAnchor(payload.anchor);
+			if (!line) {
+				errors.push(`operation[${index}].set_line.anchor is malformed`);
+				continue;
+			}
+			ranges.push([line, line]);
+			continue;
+		}
+		if (op.replace_lines) {
+			const payload = op.replace_lines as Record<string, unknown>;
+			const start = parseHashlineAnchor(payload.start_anchor);
+			const end = parseHashlineAnchor(payload.end_anchor);
+			if (!start || !end) {
+				errors.push(`operation[${index}].replace_lines anchors are malformed`);
+				continue;
+			}
+			if (start > end) {
+				errors.push(`operation[${index}].replace_lines range is inverted`);
+				continue;
+			}
+			ranges.push([start, end]);
+			continue;
+		}
+		if (op.replace_symbol) {
+			errors.push(
+				`operation[${index}].replace_symbol cannot be resolved safely yet; use line anchors or a native ranged edit`,
+			);
+			continue;
+		}
+		errors.push(`operation[${index}] is not a recognized hashline edit`);
+	}
+
+	if (errors.length > 0) {
+		return {
+			touchedLines: undefined,
+			preflightError: `🔴 BLOCKED — Unsupported hashline edit target\n\n${errors.join("\n")}`,
+		};
+	}
+	if (ranges.length === 0) return undefined;
+	const result = combineRanges(ranges);
+	if (filePath) {
+		logReadGuardEvent({
+			event: "touched_lines_detected",
+			sessionId,
+			filePath,
+			metadata: {
+				tool: "edit",
+				source:
+					ranges.length === 1 && ranges[0][0] === ranges[0][1]
+						? "hashline_set_line"
+						: "hashline_replace_lines",
+				touchedLines: result.touchedLines,
+				editRanges: result.editRanges,
+				operationCount: operations.length,
+			},
+		});
+	}
+	return result;
+}
+
 function findOccurrenceLines(content: string, needle: string): number[] {
 	const lines: number[] = [];
 	let pos = 0;
@@ -269,7 +370,18 @@ export function getTouchedLinesForGuard(
 				oldText?: string;
 				newText?: string;
 			}>;
+			operations?: unknown[];
+			ops?: unknown[];
+			set_line?: unknown;
+			replace_lines?: unknown;
+			replace_symbol?: unknown;
 		};
+		const hashlineResult = resolveHashlineEditInput(
+			editInput as Record<string, unknown>,
+			filePath,
+			sessionId,
+		);
+		if (hashlineResult) return hashlineResult;
 		if (editInput.oldRange) {
 			const touchedLines: [number, number] = [
 				editInput.oldRange.start.line,
@@ -364,13 +476,23 @@ export function getTouchedLinesForGuard(
 			return { touchedLines, editRanges };
 		}
 		if (filePath) {
+			const topLevelKeys = Object.keys(editInput as Record<string, unknown>);
 			logReadGuardEvent({
 				event: "touched_lines_missing",
 				sessionId,
 				filePath,
 				metadata: {
 					tool: "edit",
-					source: "no_oldRange_or_edits",
+					source: "unknown_edit_schema",
+					topLevelKeys,
+					hasNativeOldRange: !!editInput.oldRange,
+					hasNativeEdits: Array.isArray(editInput.edits),
+					hasHashlineSetLine: !!editInput.set_line,
+					hasHashlineReplaceLines: !!editInput.replace_lines,
+					hasHashlineReplaceSymbol: !!editInput.replace_symbol,
+					hasHashlineBatch:
+						Array.isArray(editInput.operations) || Array.isArray(editInput.ops),
+					strictModeWouldBlock: true,
 				},
 			});
 		}

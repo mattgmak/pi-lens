@@ -17,12 +17,16 @@ const VERBOSE_READ_GUARD_LOG =
 	process.env.PI_LENS_READ_GUARD_VERBOSE === "1" ||
 	process.env.PI_LENS_READ_GUARD_LOG === "verbose";
 const LOG_ALLOWED_EDITS = process.env.PI_LENS_READ_GUARD_LOG_ALLOWS === "1";
+const LOG_SNAPSHOT_VALIDATION =
+	process.env.PI_LENS_READ_GUARD_LOG_SNAPSHOTS === "1";
 
 try {
 	if (!fs.existsSync(READ_GUARD_LOG_DIR)) {
 		fs.mkdirSync(READ_GUARD_LOG_DIR, { recursive: true });
 	}
-} catch {}
+} catch (err) {
+	void err;
+}
 
 export interface ReadGuardLogEntry {
 	event: string;
@@ -42,6 +46,7 @@ export interface ReadGuardLogEntry {
 function shouldLogEvent(event: string): boolean {
 	if (VERBOSE_READ_GUARD_LOG) return true;
 	if (event === "edit_allowed") return LOG_ALLOWED_EDITS;
+	if (event === "range_snapshot_validation") return LOG_SNAPSHOT_VALIDATION;
 	return (
 		event === "edit_blocked" ||
 		event === "edit_warned" ||
@@ -59,9 +64,13 @@ function rotateIfNeeded(): void {
 		if (size < MAX_LOG_BYTES) return;
 		try {
 			fs.rmSync(READ_GUARD_LOG_BACKUP_FILE, { force: true });
-		} catch {}
+		} catch (err) {
+			void err;
+		}
 		fs.renameSync(READ_GUARD_LOG_FILE, READ_GUARD_LOG_BACKUP_FILE);
-	} catch {}
+	} catch (err) {
+		void err;
+	}
 }
 
 export function logReadGuardEvent(entry: ReadGuardLogEntry): void {
@@ -76,7 +85,9 @@ export function logReadGuardEvent(entry: ReadGuardLogEntry): void {
 	try {
 		rotateIfNeeded();
 		fs.appendFileSync(READ_GUARD_LOG_FILE, line);
-	} catch {}
+	} catch (err) {
+		void err;
+	}
 }
 
 export function getReadGuardLogPath(): string {

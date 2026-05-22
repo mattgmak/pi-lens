@@ -7,7 +7,11 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createReadGuard, type ReadRecord } from "../../clients/read-guard.js";
+import {
+	createReadGuard,
+	currentLinesMatchReadSnapshot,
+	type ReadRecord,
+} from "../../clients/read-guard.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
 const fileTimeState = vi.hoisted(() => ({ hasChanged: false }));
@@ -148,6 +152,86 @@ describe("ReadGuard", () => {
 				const verdict = guard.checkEdit(filePath, [1, 1]);
 				expect(verdict.action).toBe("block");
 				expect(verdict.reason).toContain("File modified since read");
+			} finally {
+				env.cleanup();
+			}
+		});
+	});
+
+	describe("Range snapshot validation building blocks", () => {
+		it("detects when current lines still match the remembered read snapshot", () => {
+			const env = setupTestEnvironment("read-guard-snapshot-match-");
+			try {
+				const filePath = path.join(env.tmpDir, "api.ts");
+				fs.writeFileSync(filePath, "one\ntwo\nthree\n");
+				const guard = createReadGuard("test-session");
+				const read = createReadRecord(filePath, {
+					effectiveOffset: 1,
+					effectiveLimit: 3,
+				});
+				guard.recordRead(read);
+				const storedRead = guard.getReadHistory(filePath)[0];
+
+				expect(
+					currentLinesMatchReadSnapshot(filePath, storedRead, [2, 3]),
+				).toMatchObject({
+					checked: true,
+					matches: true,
+					missingLines: [],
+					mismatchedLines: [],
+				});
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("detects stale target lines without enforcing yet", () => {
+			const env = setupTestEnvironment("read-guard-snapshot-stale-");
+			try {
+				const filePath = path.join(env.tmpDir, "api.ts");
+				fs.writeFileSync(filePath, "one\ntwo\nthree\n");
+				const guard = createReadGuard("test-session");
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 1,
+						effectiveLimit: 3,
+					}),
+				);
+				const storedRead = guard.getReadHistory(filePath)[0];
+				fs.writeFileSync(filePath, "one\nTWO\nthree\n");
+
+				expect(
+					currentLinesMatchReadSnapshot(filePath, storedRead, [2, 2]),
+				).toMatchObject({
+					checked: true,
+					matches: false,
+					mismatchedLines: [2],
+				});
+				fileTimeState.hasChanged = false;
+				expect(guard.checkEdit(filePath, [2, 2]).action).toBe("allow");
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("reports unavailable when a read lacks line hashes for the range", () => {
+			const env = setupTestEnvironment("read-guard-snapshot-missing-");
+			try {
+				const filePath = path.join(env.tmpDir, "api.ts");
+				fs.writeFileSync(filePath, "one\ntwo\n");
+				const read = createReadRecord(filePath, {
+					effectiveOffset: 1,
+					effectiveLimit: 2,
+					lineHashes: {},
+				});
+
+				expect(
+					currentLinesMatchReadSnapshot(filePath, read, [1, 1]),
+				).toMatchObject({
+					checked: false,
+					matches: false,
+					missingLines: [1],
+				});
 			} finally {
 				env.cleanup();
 			}

@@ -113,6 +113,13 @@ function lineContentHash(line: string): string {
 	return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
+function readRangeCoversLine(read: ReadRecord, lineNo: number): boolean {
+	return (
+		lineNo >= read.effectiveOffset &&
+		lineNo <= read.effectiveOffset + read.effectiveLimit - 1
+	);
+}
+
 function captureLineHashes(
 	filePath: string,
 	offset: number,
@@ -130,6 +137,60 @@ function captureLineHashes(
 	} catch {
 		return undefined;
 	}
+}
+
+export function currentLinesMatchReadSnapshot(
+	filePath: string,
+	read: ReadRecord,
+	[startLine, endLine]: [number, number],
+): {
+	checked: boolean;
+	matches: boolean;
+	missingLines: number[];
+	mismatchedLines: number[];
+} {
+	const hashes = read.lineHashes ?? {};
+	const missingLines: number[] = [];
+	const mismatchedLines: number[] = [];
+	for (let lineNo = startLine; lineNo <= endLine; lineNo += 1) {
+		if (!readRangeCoversLine(read, lineNo) || hashes[lineNo] === undefined) {
+			missingLines.push(lineNo);
+		}
+	}
+	if (missingLines.length > 0) {
+		return { checked: false, matches: false, missingLines, mismatchedLines };
+	}
+
+	let lines: string[];
+	try {
+		lines = splitLines(fs.readFileSync(filePath, "utf-8"));
+	} catch {
+		return {
+			checked: true,
+			matches: false,
+			missingLines,
+			mismatchedLines: [...Array(endLine - startLine + 1)].map(
+				(_, index) => startLine + index,
+			),
+		};
+	}
+
+	for (let lineNo = startLine; lineNo <= endLine; lineNo += 1) {
+		if (lineNo < 1 || lineNo > lines.length) {
+			mismatchedLines.push(lineNo);
+			continue;
+		}
+		if (lineContentHash(lines[lineNo - 1] ?? "") !== hashes[lineNo]) {
+			mismatchedLines.push(lineNo);
+		}
+	}
+
+	return {
+		checked: true,
+		matches: mismatchedLines.length === 0,
+		missingLines,
+		mismatchedLines,
+	};
 }
 
 // --- ReadGuard Class ---
@@ -284,6 +345,7 @@ export class ReadGuard {
 
 		let viaSymbol = false;
 		for (const range of rangesToCheck) {
+			this.recordSnapshotValidationTelemetry(filePath, range);
 			const coverage = this.checkCoverage(filePath, range);
 			if (!coverage.covered) {
 				const lastRead = fileReads[fileReads.length - 1];
@@ -491,6 +553,57 @@ export class ReadGuard {
 			read.enclosingSymbol.startLine <= editStart &&
 			read.enclosingSymbol.endLine >= editEnd
 		);
+	}
+
+	private recordSnapshotValidationTelemetry(
+		filePath: string,
+		range: [number, number],
+	): void {
+		const reads = this.reads.get(filePath) ?? [];
+		const candidates = reads.filter((read) =>
+			this.readCoversRange(read, range),
+		);
+		let status: "match" | "mismatch" | "unavailable" = "unavailable";
+		let matchingReadIndex = -1;
+		let missingLines: number[] = [];
+		let mismatchedLines: number[] = [];
+		for (let i = 0; i < candidates.length; i += 1) {
+			const validation = currentLinesMatchReadSnapshot(
+				filePath,
+				candidates[i],
+				range,
+			);
+			if (!validation.checked) {
+				missingLines = validation.missingLines;
+				continue;
+			}
+			if (validation.matches) {
+				status = "match";
+				matchingReadIndex = i;
+				missingLines = [];
+				mismatchedLines = [];
+				break;
+			}
+			status = "mismatch";
+			mismatchedLines = validation.mismatchedLines;
+		}
+
+		logReadGuardEvent({
+			event: "range_snapshot_validation",
+			sessionId: this.sessionId,
+			filePath,
+			metadata: {
+				range,
+				status,
+				candidateReadCount: candidates.length,
+				matchingReadIndex,
+				missingLineCount: missingLines.length,
+				mismatchedLineCount: mismatchedLines.length,
+				missingLines: missingLines.slice(0, 20),
+				mismatchedLines: mismatchedLines.slice(0, 20),
+				enforced: false,
+			},
+		});
 	}
 
 	private readHashesStillMatch(read: ReadRecord, lines: string[]): boolean {

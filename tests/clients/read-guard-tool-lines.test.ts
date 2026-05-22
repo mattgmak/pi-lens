@@ -41,6 +41,123 @@ describe("read-guard tool line helpers", () => {
 		expect(getTouchedLinesForGuard(event).touchedLines).toEqual([10, 12]);
 	});
 
+	it("parses hashline set_line anchors", () => {
+		const event = {
+			toolName: "edit",
+			input: {
+				set_line: { anchor: "45:4bf", new_text: "updated" },
+			},
+		};
+
+		const result = getTouchedLinesForGuard(event, "/src/file.ts");
+		expect(result.touchedLines).toEqual([45, 45]);
+		expect(result.editRanges).toBeUndefined();
+		expect(result.preflightError).toBeUndefined();
+	});
+
+	it("parses hashline replace_lines anchors", () => {
+		const event = {
+			toolName: "edit",
+			input: {
+				replace_lines: {
+					start_anchor: "45:4bf",
+					end_anchor: "48:abc",
+					new_text: "updated",
+				},
+			},
+		};
+
+		const result = getTouchedLinesForGuard(event, "/src/file.ts");
+		expect(result.touchedLines).toEqual([45, 48]);
+		expect(result.editRanges).toBeUndefined();
+		expect(result.preflightError).toBeUndefined();
+	});
+
+	it("parses batched hashline operations with editRanges", () => {
+		const event = {
+			toolName: "edit",
+			input: {
+				operations: [
+					{ set_line: { anchor: "4:a", new_text: "a" } },
+					{
+						replace_lines: {
+							start_anchor: "10:b",
+							end_anchor: "12:c",
+							new_text: "b",
+						},
+					},
+				],
+			},
+		};
+
+		const result = getTouchedLinesForGuard(event, "/src/file.ts");
+		expect(result.touchedLines).toEqual([4, 12]);
+		expect(result.editRanges).toEqual([
+			[4, 4],
+			[10, 12],
+		]);
+		expect(result.preflightError).toBeUndefined();
+	});
+
+	it("returns preflightError for malformed hashline anchors", () => {
+		const event = {
+			toolName: "edit",
+			input: {
+				set_line: { anchor: "line-45", new_text: "updated" },
+			},
+		};
+
+		const result = getTouchedLinesForGuard(event, "/src/file.ts");
+		expect(result.touchedLines).toBeUndefined();
+		expect(result.preflightError).toMatch(/Unsupported hashline edit target/);
+		expect(result.preflightError).toMatch(/malformed/);
+	});
+
+	it("returns preflightError for inverted hashline ranges", () => {
+		const event = {
+			toolName: "edit",
+			input: {
+				replace_lines: {
+					start_anchor: "50:a",
+					end_anchor: "45:b",
+					new_text: "updated",
+				},
+			},
+		};
+
+		const result = getTouchedLinesForGuard(event, "/src/file.ts");
+		expect(result.touchedLines).toBeUndefined();
+		expect(result.preflightError).toMatch(/inverted/);
+	});
+
+	it("returns preflightError for hashline replace_symbol until symbol resolution exists", () => {
+		const event = {
+			toolName: "edit",
+			input: {
+				replace_symbol: { symbol: "add", new_body: "return a + b;" },
+			},
+		};
+
+		const result = getTouchedLinesForGuard(event, "/src/file.ts");
+		expect(result.touchedLines).toBeUndefined();
+		expect(result.preflightError).toMatch(/replace_symbol/);
+		expect(result.preflightError).toMatch(/line anchors/);
+	});
+
+	it("logs unknown edit schemas as missing touched-line telemetry", () => {
+		const event = {
+			toolName: "edit",
+			input: {
+				path: "/src/file.ts",
+				custom_patch: { line: 1, value: "x" },
+			},
+		};
+
+		const result = getTouchedLinesForGuard(event, "/src/file.ts");
+		expect(result.touchedLines).toBeUndefined();
+		expect(result.preflightError).toBeUndefined();
+	});
+
 	it("uses actual on-disk line count for writes", () => {
 		const env = setupTestEnvironment("read-guard-lines-");
 		try {
