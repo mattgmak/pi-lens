@@ -6,6 +6,8 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Added
 
+- **actionlint runner for GitHub Actions workflows** — actionlint is now a dispatch runner for `.github/workflows/*.yml` and `.yaml` files. It runs as its own independently-gated group alongside the existing YAML pipeline (lsp + yamllint fallback), so non-workflow YAML behaviour is unchanged. Auto-installed from GitHub releases with full platform/arch coverage (linux/darwin/win32, amd64 + arm64). Diagnostics map to `blocking`/`correctness` severity with structured IDs. JSON and NDJSON output formats are both handled, with a plain-text fallback diagnostic on non-zero exit.
+
 - **Inter-extension events for lens findings** — pi-lens now emits structured, versioned payloads on the shared `pi.events` bus so companion extensions can react to diagnostics without scraping rendered text or log files. New events include `pi-lens/analysis-complete` for every file analysis, `pi-lens/findings` when diagnostics/fixes are present, and `pi-lens/turn-findings` for aggregated turn-end blockers/advisories. Payloads include telemetry/session metadata, affected files, blockers/warnings/fixed diagnostics, and bounded/truncated text fields.
 
 ### Fixed
