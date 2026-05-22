@@ -135,8 +135,8 @@ const PRIMARY_DISPATCH_GROUPS: Partial<Record<FileKind, RunnerGroup>> = {
 		filterKinds: ["css"],
 	},
 	yaml: {
-		mode: "fallback",
-		runnerIds: ["lsp", "yamllint"],
+		mode: "all",
+		runnerIds: ["lsp", "yamllint", "actionlint"],
 		filterKinds: ["yaml"],
 	},
 	sql: {

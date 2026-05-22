@@ -12,13 +12,13 @@ describe("dispatch integration groups", () => {
 		expect(groups[0].filterKinds).toEqual(["css"]);
 	});
 
-	it("uses centralized yaml primary fallback group", () => {
+	it("uses centralized yaml primary group with actionlint", () => {
 		const groups = getDispatchGroupsForKind("yaml", {
 			getFlag: (name: string) => name === "lens-lsp",
 		});
 
 		expect(groups).toHaveLength(1);
-		expect(groups[0].runnerIds).toEqual(["lsp", "yamllint"]);
+		expect(groups[0].runnerIds).toEqual(["lsp", "yamllint", "actionlint"]);
 		expect(groups[0].filterKinds).toEqual(["yaml"]);
 	});
 
