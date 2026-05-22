@@ -540,6 +540,9 @@ describe("index.ts integration", () => {
 		expect(event.input.edits[0].oldText).toBe(
 			"function foo() {\n\treturn 1;\n}",
 		);
+		expect(event.input.edits[0].newText).toBe(
+			"function foo() {\n\treturn 2;\n}",
+		);
 		expect(checkEdit).toHaveBeenCalled();
 	}, 15_000);
 
@@ -638,6 +641,12 @@ describe("index.ts integration", () => {
 		);
 		expect(event.input.edits[1].oldText).toBe(
 			"function bar() {\n\treturn 2;\n}",
+		);
+		expect(event.input.edits[0].newText).toBe(
+			"function foo() {\n\treturn 10;\n}",
+		);
+		expect(event.input.edits[1].newText).toBe(
+			"function bar() {\n\treturn 20;\n}",
 		);
 		expect(checkEdit).toHaveBeenCalled();
 	}, 15_000);

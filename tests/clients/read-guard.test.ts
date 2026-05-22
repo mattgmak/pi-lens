@@ -12,6 +12,7 @@ import {
 	currentLinesMatchReadSnapshot,
 	type ReadRecord,
 } from "../../clients/read-guard.js";
+import { logReadGuardEvent } from "../../clients/read-guard-logger.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
 const fileTimeState = vi.hoisted(() => ({ hasChanged: false }));
@@ -44,6 +45,7 @@ vi.mock("../../clients/file-time.js", () => ({
 describe("ReadGuard", () => {
 	beforeEach(() => {
 		fileTimeState.hasChanged = false;
+		vi.mocked(logReadGuardEvent).mockClear();
 	});
 	describe("Phase 1: Zero-read and FileTime checks", () => {
 		it("blocks edit on never-read file", () => {
@@ -231,6 +233,50 @@ describe("ReadGuard", () => {
 					checked: false,
 					matches: false,
 					missingLines: [1],
+				});
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("does not carry missing lines from one snapshot candidate into mismatch telemetry", () => {
+			const env = setupTestEnvironment("read-guard-snapshot-telemetry-");
+			try {
+				const filePath = path.join(env.tmpDir, "api.ts");
+				fs.writeFileSync(filePath, "one\ntwo\nthree\n");
+				const guard = createReadGuard("test-session");
+
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 1,
+						effectiveLimit: 3,
+						lineHashes: {},
+					}),
+				);
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 1,
+						effectiveLimit: 3,
+					}),
+				);
+				vi.mocked(logReadGuardEvent).mockClear();
+
+				fs.writeFileSync(filePath, "one\nTWO\nthree\n");
+				expect(guard.checkEdit(filePath, [2, 2]).action).toBe("allow");
+
+				const validationEntry = vi
+					.mocked(logReadGuardEvent)
+					.mock.calls.find(
+						([entry]) => entry.event === "range_snapshot_validation",
+					)?.[0];
+
+				expect(validationEntry?.metadata).toMatchObject({
+					status: "mismatch",
+					candidateReadCount: 2,
+					missingLineCount: 0,
+					mismatchedLineCount: 1,
+					missingLines: [],
+					mismatchedLines: [2],
 				});
 			} finally {
 				env.cleanup();

@@ -10,6 +10,8 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Fixed
 
+- **Safe indentation-only edit retries preserve replacement indentation** — when pi-lens auto-patches an `edit` call's tab/space-only `oldText` mismatch, it now also retargets leading whitespace in the paired `newText` using the same indentation mapping. Successful tab-vs-space retries no longer introduce mixed indentation in the edited block.
+- **Read-guard snapshot telemetry no longer mixes candidate states** — snapshot-validation events now clear stale `missingLines` when a later candidate produces a real mismatch, so `mismatch` telemetry no longer reports lines as both missing and mismatched.
 - **Safe indentation-only edit retries are auto-patched** — when an `edit` call's `oldText` differs only by leading tabs/spaces and the corrected text matches exactly one location, pi-lens now mutates the tool input before execution instead of blocking with a visually lossy retry instruction. Ambiguous or non-indentation-only corrections still block and require a re-read.
 - **Read-guard snapshot validation and retry guidance** — edit preflight now validates captured `oldText` snapshots against current file content, reports structured snapshot-validation events, and gives clearer retryable indentation-mismatch guidance with corrected `oldText` candidates. This reduces false blocks from stale reads while steering agents to retry exact tab/space corrections instead of improvising.
 - **Path normalization avoids regex hotspots** — slash normalization in ignore/path matching no longer relies on regex replacement patterns that static analyzers flagged as potential hotspots.

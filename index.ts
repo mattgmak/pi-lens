@@ -291,6 +291,47 @@ function isIndentationOnlyChange(before: string, after: string): boolean {
 	);
 }
 
+function retargetReplacementIndentation(
+	newText: string,
+	oldText: string,
+	correctedOldText: string,
+): string | undefined {
+	const newline = newText.includes("\r\n") ? "\r\n" : "\n";
+	const oldLines = oldText.replace(/\r\n/g, "\n").split("\n");
+	const correctedLines = correctedOldText.replace(/\r\n/g, "\n").split("\n");
+	if (oldLines.length !== correctedLines.length) return undefined;
+
+	const indentMap = new Map<string, string>();
+	const ambiguousIndents = new Set<string>();
+	for (let i = 0; i < oldLines.length; i += 1) {
+		const oldIndent = oldLines[i].match(/^[\t ]*/)?.[0] ?? "";
+		const correctedIndent = correctedLines[i].match(/^[\t ]*/)?.[0] ?? "";
+		if (oldIndent === correctedIndent) continue;
+		const previous = indentMap.get(oldIndent);
+		if (previous !== undefined && previous !== correctedIndent) {
+			indentMap.delete(oldIndent);
+			ambiguousIndents.add(oldIndent);
+			continue;
+		}
+		if (!ambiguousIndents.has(oldIndent)) {
+			indentMap.set(oldIndent, correctedIndent);
+		}
+	}
+	if (indentMap.size === 0) return undefined;
+
+	let changed = false;
+	const newLines = newText.replace(/\r\n/g, "\n").split("\n");
+	const retargetedLines = newLines.map((line) => {
+		const indent = line.match(/^[\t ]*/)?.[0] ?? "";
+		const correctedIndent = indentMap.get(indent);
+		if (correctedIndent === undefined) return line;
+		changed = true;
+		return correctedIndent + line.slice(indent.length);
+	});
+
+	return changed ? retargetedLines.join(newline) : undefined;
+}
+
 function getNewContentFromToolCall(event: unknown): string | undefined {
 	if (isToolCallEventType("write", event as any)) {
 		return ((event as { input?: unknown }).input as { content?: string })
@@ -1348,15 +1389,27 @@ export default function (pi: ExtensionAPI) {
 		if (isEditOnly && filePath) {
 			const editInput = (event as { input?: unknown }).input as {
 				oldText?: string;
-				edits?: Array<{ oldText?: string }>;
+				newText?: string;
+				edits?: Array<{ oldText?: string; newText?: string }>;
 			};
-			const oldTexts = editInput.oldText
+			type EditIndentTarget = {
+				label: string;
+				value: string;
+				newText: string | undefined;
+				apply: (corrected: string) => void;
+				applyNewText: (corrected: string) => void;
+			};
+			const oldTexts: EditIndentTarget[] = editInput.oldText
 				? [
 						{
 							label: "oldText",
 							value: editInput.oldText,
+							newText: editInput.newText,
 							apply: (corrected: string) => {
 								editInput.oldText = corrected;
+							},
+							applyNewText: (corrected: string) => {
+								editInput.newText = corrected;
 							},
 						},
 					]
@@ -1366,31 +1419,29 @@ export default function (pi: ExtensionAPI) {
 								? {
 										label: `edits[${i}].oldText`,
 										value: e.oldText,
+										newText: e.newText,
 										apply: (corrected: string) => {
 											e.oldText = corrected;
+										},
+										applyNewText: (corrected: string) => {
+											e.newText = corrected;
 										},
 									}
 								: null,
 						)
-						.filter(
-							(
-								entry,
-							): entry is {
-								label: string;
-								value: string;
-								apply: (corrected: string) => void;
-							} => entry !== null,
-						);
+						.filter((entry): entry is EditIndentTarget => entry !== null);
 			const correctedOldTexts = oldTexts
-				.map(({ label, value, apply }) => {
+				.map(({ label, value, newText, apply, applyNewText }) => {
 					const corrected = tryCorrectIndentationMismatch(value, filePath);
 					return corrected === undefined
 						? undefined
 						: {
 								label,
 								value,
+								newText,
 								corrected,
 								apply,
+								applyNewText,
 								currentMatchCount: countOldTextMatches(filePath, value),
 								correctedMatchCount: countOldTextMatches(filePath, corrected),
 								indentationOnly: isIndentationOnlyChange(value, corrected),
@@ -1399,11 +1450,8 @@ export default function (pi: ExtensionAPI) {
 				.filter(
 					(
 						entry,
-					): entry is {
-						label: string;
-						value: string;
+					): entry is EditIndentTarget & {
 						corrected: string;
-						apply: (corrected: string) => void;
 						currentMatchCount: number;
 						correctedMatchCount: number;
 						indentationOnly: boolean;
@@ -1419,6 +1467,16 @@ export default function (pi: ExtensionAPI) {
 				if (unsafeCorrections.length === 0) {
 					for (const entry of correctedOldTexts) {
 						entry.apply(entry.corrected);
+						const correctedNewText = entry.newText
+							? retargetReplacementIndentation(
+									entry.newText,
+									entry.value,
+									entry.corrected,
+								)
+							: undefined;
+						if (correctedNewText !== undefined) {
+							entry.applyNewText(correctedNewText);
+						}
 						logReadGuardEvent({
 							event: "oldtext_indent_autopatched",
 							sessionId: runtime.telemetrySessionId,
@@ -1427,6 +1485,7 @@ export default function (pi: ExtensionAPI) {
 								tool: "edit",
 								label: entry.label,
 								correctedMatchCount: entry.correctedMatchCount,
+								newTextIndentationPatched: correctedNewText !== undefined,
 							},
 						});
 					}

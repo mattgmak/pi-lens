@@ -574,7 +574,9 @@ export class ReadGuard {
 				range,
 			);
 			if (!validation.checked) {
-				missingLines = validation.missingLines;
+				if (status === "unavailable") {
+					missingLines = validation.missingLines;
+				}
 				continue;
 			}
 			if (validation.matches) {
@@ -585,6 +587,7 @@ export class ReadGuard {
 				break;
 			}
 			status = "mismatch";
+			missingLines = [];
 			mismatchedLines = validation.mismatchedLines;
 		}
 
