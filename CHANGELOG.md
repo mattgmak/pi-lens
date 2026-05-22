@@ -4,6 +4,10 @@ All notable changes to pi-lens will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Inter-extension events for lens findings** — pi-lens now emits structured, versioned payloads on the shared `pi.events` bus so companion extensions can react to diagnostics without scraping rendered text or log files. New events include `pi-lens/analysis-complete` for every file analysis, `pi-lens/findings` when diagnostics/fixes are present, and `pi-lens/turn-findings` for aggregated turn-end blockers/advisories. Payloads include telemetry/session metadata, affected files, blockers/warnings/fixed diagnostics, and bounded/truncated text fields.
+
 ### Fixed
 
 - **Project scans now respect `.gitignore` and generated artifacts** — centralized project ignore matching now supports rooted patterns (`/profiles/`), globbed trees (`profiles/**`), nested `.gitignore` files, and negations, and is shared by source collection, startup counting, jscpd, tree-sitter collection, review-graph workspace module scans, autofix snapshots, ast-grep temp scans, `/lens-booboo` ast-grep scan globs, and write/read hook paths. pi-lens now skips gitignored files before LSP warming or dispatching the pipeline, and generated/artifact detection is centralized for common codegen dirs, protobuf/sqlc/OpenAPI outputs, minified/bundled files, declaration stubs, and generated-file headers. Also avoids source-scanning `$HOME` during session start when startup gating has already classified the cwd as `home-dir`. Refs #91.

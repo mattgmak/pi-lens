@@ -10,6 +10,7 @@ import {
 import { getKnipIgnorePatterns } from "./file-utils.js";
 import type { KnipClient, KnipIssue, KnipResult } from "./knip-client.js";
 import { logLatency } from "./latency-logger.js";
+import { emitLensTurnFindings } from "./lens-events.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
 import type { TestRunnerClient } from "./test-runner-client.js";
@@ -489,6 +490,15 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			{ signature, sessionId: runtime.telemetrySessionId },
 			cwd,
 		);
+		emitLensTurnFindings({
+			cwd,
+			filePaths: files.map((file) => resolveRunnerPath(cwd, file)),
+			sessionId: runtime.telemetrySessionId,
+			turnIndex: runtime.turnIndex,
+			blockerSections: blockerParts.length,
+			advisorySections: advisoryParts.length,
+			content,
+		});
 	}
 	if (blockerParts.length === 0) {
 		cacheManager.clearTurnState(cwd);

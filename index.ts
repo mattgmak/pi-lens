@@ -35,6 +35,7 @@ import {
 	loadPiLensGlobalConfig,
 	resolvePiLensFlag,
 } from "./clients/lens-config.js";
+import { initLensEvents } from "./clients/lens-events.js";
 import { initLSPConfig } from "./clients/lsp/config.js";
 import { getLSPService, resetLSPService } from "./clients/lsp/index.js";
 import {
@@ -299,6 +300,7 @@ function cleanStaleTsBuildInfo(cwd: string): string[] {
 
 export default function (pi: ExtensionAPI) {
 	initI18n(pi);
+	initLensEvents(pi);
 	const astGrepClient = new AstGrepClient();
 	const cacheManager = new CacheManager();
 
