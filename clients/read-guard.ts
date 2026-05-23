@@ -220,9 +220,11 @@ export class ReadGuard {
 		{ turnIndex: number; writeIndex: number }
 	>();
 	private readonly sessionId: string;
+	private readonly sessionStartMs: number;
 
 	constructor(sessionId: string, config: Partial<ReadGuardConfig> = {}) {
 		this.sessionId = sessionId;
+		this.sessionStartMs = Date.now();
 		this.config = { ...DEFAULT_CONFIG, ...config };
 		this.fileTime = createFileTime(sessionId);
 	}
@@ -310,6 +312,19 @@ export class ReadGuard {
 		// 1. Zero-read check
 		const fileReads = this.reads.get(filePath);
 		if (!fileReads || fileReads.length === 0) {
+			// If the file was written after this session started, the agent authored
+			// it in this session (via Write or any other mechanism). Allow the edit —
+			// a synthetic read would have been injected for Write tool calls, but
+			// this catches cases where the write bypassed the hook or the session
+			// restarted between write and edit.
+			if (this.wasWrittenThisSession(filePath)) {
+				this.injectCreationRead(filePath, 0, 0);
+				const verdict = this.allow();
+				this.recordVerdict(filePath, "edit", touchedLines, verdict, {
+					reasonKind: "session_authored",
+				});
+				return verdict;
+			}
 			const verdict = this.blockOrWarn(
 				"zero-read",
 				`🔴 BLOCKED — Edit without read\n\nYou are trying to edit \`${filePath}\` but have not read it in this conversation.\n\nRead the file first, then retry the edit: \`read path="${filePath}"\``,
@@ -593,6 +608,14 @@ export class ReadGuard {
 			writeIndex,
 			timestamp: Date.now(),
 		});
+	}
+
+	private wasWrittenThisSession(filePath: string): boolean {
+		try {
+			return fs.statSync(filePath).mtimeMs >= this.sessionStartMs;
+		} catch {
+			return false;
+		}
 	}
 
 	private canTreatStalenessAsOwnPriorEdit(
