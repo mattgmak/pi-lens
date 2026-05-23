@@ -15,7 +15,8 @@ On every `write` and `edit`, pi-lens runs a fast, language-aware pipeline (check
 1. **Secrets scan** — blocking; aborts the write if credentials are detected
 2. **Auto-format** — deferred to `agent_end` by default; queued files are formatted once after all agent tool calls complete. Use `--immediate-format` or global config `format.mode: "immediate"` for per-edit formatting
 3. **Auto-fix** — safe autofixes from 6 tools (Biome `check --write`, Ruff `check --fix`, ESLint `--fix`, stylelint `--fix`, sqlfluff `fix`, RuboCop `-a`) applied before analysis
-4. **LSP file sync** — opens/updates the file in active language servers
+4. **Edit autopatch** — before an `edit` tool call lands, pi-lens silently corrects two classes of `oldText` mismatch: leading tab/space indentation (when the corrected text matches exactly one location) and trailing whitespace stripped by formatters. Both corrections also retarget `newText` so the replacement matches the file's whitespace style
+5. **LSP file sync** — opens/updates the file in active language servers
 5. **Dispatch lint** — parallel runner groups: LSP diagnostics, tree-sitter structural rules, ast-grep security/correctness rules, fact rules, language-specific linters, experimental Semgrep security scans, similarity detection
 6. **Cascade diagnostics** — review-graph impact cascade showing which other files were affected and how diagnostics propagated
 
@@ -30,6 +31,7 @@ Results are inline and actionable:
 At `agent_end` (once per user prompt, after all agent tool calls complete):
 
 - **Deferred formatting** — any files queued during the turn are formatted once, synced to LSP, and tracked for read-guard coverage
+- **Conservative LSP warning autofix** — when `actionableWarnings.autoFix.enabled` is set, applies up to 5 preferred LSP quickfixes for warnings flagged in the turn's actionable warnings report. Each fix is re-validated against the live LSP server at apply time, checked for ambiguity (skipped if multiple eligible actions exist), and gated by a safety check before any write occurs. Changed files are registered with the read-guard and cache manager
 - **Summary notification** — concise status: how many files were formatted, which changed, and whether any formatter failed
 
 ### Session Start
@@ -56,6 +58,7 @@ At `turn_end`, pi-lens:
 - renders a review-graph impact cascade showing affected files and diagnostic propagation
 - fires test runs for all modified files (non-blocking); failures are injected into the next turn's context when ready
 - manages LSP server lifecycle with a 240s idle timeout (resets when editing resumes)
+- **Actionable warnings report** — writes `.pi-lens/cache/actionable-warnings.json` with fixable warnings introduced by the current turn (delta-only by default). Merges pipeline `fixable` diagnostics with optional LSP code-action warnings. Uses stable `aw:<hash>` IDs so warnings can be tracked and suppressed across turns. When warnings are present, injects a concise advisory into the agent context instead of blocker language
 
 ## Install
 
@@ -83,7 +86,7 @@ pi-lens includes **37 language server definitions**. LSP is **enabled by default
 { "warmFiles": ["src/main.cpp", "src/lib.cpp"] }
 ```
 
-**Agent LSP tools:** `lsp_diagnostics` can check one file, a directory, or an explicit `filePaths` batch with bounded concurrency. `lsp_navigation` provides definitions, references, hover, workspace symbols, call hierarchy, rename edits, and `findSymbol` for filtered document-symbol lookup.
+**Agent LSP tools:** `lsp_diagnostics` can check one file, a directory, or an explicit `filePaths` batch with bounded concurrency. `lsp_navigation` provides definitions, references, hover, workspace symbols, call hierarchy, rename edits, and `findSymbol` for filtered document-symbol lookup. Rename accepts `apply: true` to write the returned workspace edits to disk immediately, with per-file LSP re-sync after application.
 
 LSP servers for: TypeScript, Deno, Python (pyright/basedpyright + jedi), Go, Rust, Ruby (ruby-lsp + solargraph), PHP, C# (omnisharp), F#, Java, Kotlin, Swift, Dart, Lua, C/C++, Zig, Haskell, Elixir, Gleam, OCaml, Clojure, Terraform, Nix, Bash, Docker, YAML, JSON, HTML, TOML, Prisma, Vue, Svelte, ESLint, CSS.
 
@@ -108,15 +111,41 @@ pi-lens builds a review graph (`file → symbol → dependency`) during session 
 
 pi-lens enforces a **read-before-edit** policy on all file writes and edits. Before allowing a `write` or `edit` tool call on an existing file, it verifies that the agent has previously read sufficient context:
 
-- **Zero-read block** — blocks any edit to a file not read in the current session
+- **Zero-read block** — blocks any edit to a file not read in the current session. Agent-created files are exempt: when a `write` tool creates a new file, pi-lens registers the written content as a synthetic read, so an immediate follow-up `edit` is not blocked
 - **File-modified block** — blocks if the file changed on disk since the last read (auto-format, external tool, or a previous edit that was then reformatted)
 - **Out-of-range block** — blocks if the edit target lines fall outside the ranges previously read, ensuring the agent cannot modify code it hasn't seen
+- **Snapshot validation** — covered edit ranges are hash-checked against the lines the agent actually saw at read time; stale-range edits are rejected even when range coverage exists. Hash capture covers reads up to 3 000 lines
 
 Coverage is tracked across multiple reads: two reads of lines 1–100 and 101–200 together satisfy a full-file write. Symbol-expanded reads (small reads silently widened to the enclosing symbol via tree-sitter) count toward coverage at the symbol level. Markdown files generate a warning instead of blocking (edits outside the section-expanded read range are warned, not silently passed). Plain-text (`.txt`) and log (`.log`) files remain fully exempt.
 
 Override for a single edit: `/lens-allow-edit <path>`
 
 Configure behavior with `--no-read-guard` to disable entirely, or set mode to `warn` instead of `block`.
+
+### Actionable Warnings
+
+At `turn_end`, pi-lens writes `.pi-lens/cache/actionable-warnings.json` summarizing fixable warnings introduced by the current turn. This powers the optional conservative autofix at `agent_end`.
+
+**Report contents:**
+- Warnings are delta-only by default: only diagnostics in lines touched during the current turn are included. Pass `--lens-actionable-warning-all` to report all warnings regardless of location
+- Each warning carries a stable `aw:<hash>` ID derived from file, rule, and message, so suppression state persists across turns in `.pi-lens/cache/actionable-warning-state.json`
+- Sources: pipeline `fixable` diagnostics (always included) and LSP code-action warnings when `--lens-actionable-warning-actions` is set
+- When warnings are present, a concise advisory is injected into the agent context (no blocker language)
+
+**Conservative autofix (`agent_end`):**
+
+When `actionableWarnings.autoFix.enabled` is set in global config (or `--lens-actionable-warning-autofix`), pi-lens applies LSP quickfixes from the report at `agent_end`. Safety gates:
+- Re-fetches code actions from the live LSP server at fix time (stale actions are skipped)
+- Skips any warning with zero or multiple eligible actions (ambiguity is not resolved)
+- Applies only `edit`-kind actions (no command-only or create/delete operations)
+- Hard cap of 5 fixes per `agent_end`
+- Suppressed warnings are never autofixed
+
+**Flags:**
+- `--lens-actionable-warnings` — enable the turn_end report
+- `--lens-actionable-warning-actions` — include LSP code-action warnings in the report
+- `--lens-actionable-warning-autofix` — apply conservative fixes at agent_end
+- `--lens-actionable-warning-all` — report all warnings, not just delta
 
 ### Opportunistic Read Expansion
 
@@ -282,7 +311,7 @@ pi --lens-semgrep-config p/ci  # Explicit Semgrep config for dispatch (requires 
 
 pi-lens reads optional user preferences from `~/.pi-lens/config.json` (`%USERPROFILE%\\.pi-lens\\config.json` on Windows). Unknown keys are ignored, and missing or invalid config falls back to defaults.
 
-Hide the diagnostics widget by default and run formatting immediately after write/edit tool calls instead of at `agent_end`:
+Hide the diagnostics widget by default, run formatting immediately after write/edit tool calls instead of at `agent_end`, and enable actionable warnings with conservative autofix:
 
 ```json
 {
@@ -292,11 +321,22 @@ Hide the diagnostics widget by default and run formatting immediately after writ
   "format": {
     "enabled": true,
     "mode": "immediate"
+  },
+  "actionableWarnings": {
+    "enabled": true,
+    "includeLspCodeActions": true,
+    "deltaOnly": true,
+    "autoFix": {
+      "enabled": false,
+      "maxFixes": 5
+    }
   }
 }
 ```
 
 `format.mode` can be `"deferred"` (default) or `"immediate"`. Set `format.enabled` to `false` to match `--no-autoformat`. `/lens-widget-toggle` still works as a session-only override.
+
+`actionableWarnings.enabled` gates the turn_end report. `includeLspCodeActions` fetches LSP code actions for each warning (requires an active language server). `deltaOnly` (default `true`) limits the report to lines touched in the current turn. `autoFix.enabled` applies conservative LSP quickfixes at `agent_end`; `autoFix.maxFixes` caps the number applied per turn (default `5`).
 
 ## Environment Variables
 

@@ -98,9 +98,9 @@ const OWN_EDIT_STALE_GRACE_MS = Math.max(
 const READ_HASH_MAX_LINES = Math.max(
 	0,
 	Number.parseInt(
-		process.env.PI_LENS_READ_GUARD_HASH_MAX_LINES ?? "1000",
+		process.env.PI_LENS_READ_GUARD_HASH_MAX_LINES ?? "3000",
 		10,
-	) || 1000,
+	) || 3000,
 );
 
 function splitLines(text: string): string[] {
@@ -215,6 +215,10 @@ export class ReadGuard {
 	private readonly edits = new Map<string, EditRecord[]>();
 	private readonly fileTime: FileTime;
 	private readonly exemptions = new Set<string>(); // One-time exemptions via /lens-allow-edit
+	private readonly pendingCreations = new Map<
+		string,
+		{ turnIndex: number; writeIndex: number }
+	>();
 	private readonly sessionId: string;
 
 	constructor(sessionId: string, config: Partial<ReadGuardConfig> = {}) {
@@ -447,12 +451,31 @@ export class ReadGuard {
 	}
 
 	/**
+	 * Mark a file as pending creation (Write tool to a non-existing file).
+	 * Must be called from the tool_call handler before the write lands so
+	 * isNewFile() still returns true. recordWritten will inject a synthetic
+	 * read so immediate follow-up edits are not blocked by zero_read.
+	 */
+	noteCreatedFile(
+		filePath: string,
+		turnIndex: number,
+		writeIndex: number,
+	): void {
+		this.pendingCreations.set(filePath, { turnIndex, writeIndex });
+	}
+
+	/**
 	 * Refresh the FileTime stamp after the model's own write lands on disk.
 	 * Call this from the tool_result handler so the next checkEdit on the same
 	 * file doesn't see "file_modified" caused by our own previous edit.
 	 */
 	recordWritten(filePath: string): void {
 		this.fileTime.read(filePath);
+		const creation = this.pendingCreations.get(filePath);
+		if (creation) {
+			this.pendingCreations.delete(filePath);
+			this.injectCreationRead(filePath, creation.turnIndex, creation.writeIndex);
+		}
 	}
 
 	/**
@@ -536,6 +559,31 @@ export class ReadGuard {
 	}
 
 	// --- Private helpers ---
+
+	private injectCreationRead(
+		filePath: string,
+		turnIndex: number,
+		writeIndex: number,
+	): void {
+		let lineCount = 0;
+		try {
+			lineCount = splitLines(fs.readFileSync(filePath, "utf-8")).length;
+		} catch {
+			return;
+		}
+		if (lineCount === 0) return;
+		this.recordRead({
+			filePath,
+			requestedOffset: 1,
+			requestedLimit: lineCount,
+			effectiveOffset: 1,
+			effectiveLimit: lineCount,
+			expandedByLsp: false,
+			turnIndex,
+			writeIndex,
+			timestamp: Date.now(),
+		});
+	}
 
 	private canTreatStalenessAsOwnPriorEdit(
 		filePath: string,

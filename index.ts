@@ -297,7 +297,6 @@ function isIndentationOnlyChange(before: string, after: string): boolean {
 	);
 }
 
-
 function getNewContentFromToolCall(event: unknown): string | undefined {
 	if (isToolCallEventType("write", event as any)) {
 		return ((event as { input?: unknown }).input as { content?: string })
@@ -448,8 +447,17 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	const globalConfig = loadPiLensGlobalConfig();
+	const globalConfigOnlyFlags = new Set([
+		"lens-actionable-warnings",
+		"lens-actionable-warning-actions",
+		"lens-actionable-warning-autofix",
+		"lens-actionable-warning-all",
+	]);
 	function getLensFlag(name: string): boolean | string | undefined {
-		return resolvePiLensFlag(name, pi.getFlag(name), globalConfig);
+		const cliValue = globalConfigOnlyFlags.has(name)
+			? undefined
+			: pi.getFlag(name);
+		return resolvePiLensFlag(name, cliValue, globalConfig);
 	}
 
 	let lensEnabled = !getLensFlag("no-lens");
@@ -1348,6 +1356,18 @@ export default function (pi: ExtensionAPI) {
 		const isEditOnly = isToolCallEventType("edit", event);
 		const isWriteOrEdit = isToolCallEventType("write", event) || isEditOnly;
 
+		// Track Write-to-new-file so recordWritten can inject a synthetic read.
+		// The agent authored the content, so it trivially "knows" the file.
+		if (!isEditOnly && isWriteOrEdit && filePath && !getLensFlag("no-read-guard")) {
+			if (runtime.readGuard.isNewFile(filePath)) {
+				runtime.readGuard.noteCreatedFile(
+					filePath,
+					runtime.turnIndex,
+					runtime.peekWriteIndex(),
+				);
+			}
+		}
+
 		// --- Indentation mismatch correction ---
 		// Some models output spaces in oldText when the file uses tabs (or vice versa).
 		// Detect this before the read guard runs so a recoverable mismatch does not
@@ -1408,6 +1428,32 @@ export default function (pi: ExtensionAPI) {
 			} catch {
 				// File unreadable — corrections will be skipped gracefully below.
 			}
+
+			// --- Pass 1: trailing whitespace correction ---
+			// Editors strip trailing whitespace on save; the model may copy content
+			// that had it. Normalize before indentation correction so the subsequent
+			// pass sees clean input. Safety gate: stripped version must match exactly once.
+			if (matchNormalizedContent !== undefined) {
+				for (const entry of oldTexts) {
+					const normalizedValue = entry.value.replace(/\r\n/g, "\n");
+					const stripped = normalizedValue
+						.split("\n")
+						.map((l) => l.trimEnd())
+						.join("\n");
+					if (stripped === normalizedValue) continue;
+					if (countOldTextMatches(filePath, stripped, matchNormalizedContent) !== 1)
+						continue;
+					entry.apply(stripped);
+					entry.value = stripped;
+					logReadGuardEvent({
+						event: "oldtext_trailing_ws_autopatched",
+						sessionId: runtime.telemetrySessionId,
+						filePath,
+						metadata: { tool: "edit", label: entry.label },
+					});
+				}
+			}
+
 			const correctedOldTexts = oldTexts
 				.map(({ label, value, newText, apply, applyNewText }) => {
 					const corrected =
