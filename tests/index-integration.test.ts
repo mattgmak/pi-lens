@@ -14,6 +14,8 @@ vi.mock("../clients/read-guard.js", () => ({
 			return { action: "allow" };
 		}
 		recordRead() {}
+		recordWritten() {}
+		noteCreatedFile() {}
 		getReadHistory() {
 			return [];
 		}
@@ -40,6 +42,8 @@ vi.mock("../clients/read-guard.js", () => ({
 				return { action: "allow" };
 			}
 			recordRead() {}
+			recordWritten() {}
+			noteCreatedFile() {}
 			getReadHistory() {
 				return [];
 			}
@@ -369,6 +373,8 @@ describe("index.ts integration", () => {
 			recordRead,
 			getReadHistory: () => [],
 			isNewFile: () => false,
+			noteCreatedFile: () => {},
+			recordWritten: () => {},
 			checkEdit: () => ({ action: "allow" as const }),
 		};
 		const sourceFile = path.join(tmpDir, "src", "full-read.ts");
@@ -471,6 +477,8 @@ describe("index.ts integration", () => {
 					recordRead: () => {},
 					getReadHistory: () => [],
 					isNewFile: () => false,
+					noteCreatedFile: () => {},
+					recordWritten: () => {},
 					checkEdit,
 				};
 				shouldWarmLspOnRead() {
@@ -566,6 +574,8 @@ describe("index.ts integration", () => {
 					recordRead: () => {},
 					getReadHistory: () => [],
 					isNewFile: () => false,
+					noteCreatedFile: () => {},
+					recordWritten: () => {},
 					checkEdit,
 				};
 				shouldWarmLspOnRead() {
@@ -676,6 +686,8 @@ describe("index.ts integration", () => {
 					recordRead: () => {},
 					getReadHistory: () => [],
 					isNewFile: () => false,
+					noteCreatedFile: () => {},
+					recordWritten: () => {},
 					checkEdit: () => ({ action: "allow" as const }),
 				};
 				shouldWarmLspOnRead = shouldWarmLspOnRead;
@@ -766,6 +778,8 @@ describe("index.ts integration", () => {
 					recordRead: () => {},
 					getReadHistory: () => [],
 					isNewFile: () => false,
+					noteCreatedFile: () => {},
+					recordWritten: () => {},
 					checkEdit: () => ({ action: "allow" as const }),
 				};
 				shouldWarmLspOnRead = shouldWarmLspOnRead;
@@ -851,6 +865,8 @@ describe("index.ts integration", () => {
 					recordRead: () => {},
 					getReadHistory: () => [],
 					isNewFile: () => false,
+					noteCreatedFile: () => {},
+					recordWritten: () => {},
 					checkEdit: () => ({ action: "allow" as const }),
 				};
 				shouldWarmLspOnRead = shouldWarmLspOnRead;
@@ -935,6 +951,8 @@ describe("index.ts integration", () => {
 				sessionStartedAt = Date.now() - 5 * 60_000;
 				readGuard = {
 					isNewFile: () => false,
+					noteCreatedFile: () => {},
+					recordWritten: () => {},
 					checkEdit: () => ({ action: "allow" }),
 					recordRead: () => {},
 				};
