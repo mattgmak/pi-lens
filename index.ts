@@ -291,9 +291,11 @@ function isIndentationOnlyChange(before: string, after: string): boolean {
 	const beforeLines = before.replace(/\r\n/g, "\n").split("\n");
 	const afterLines = after.replace(/\r\n/g, "\n").split("\n");
 	if (beforeLines.length !== afterLines.length) return false;
+	// Strip both leading and trailing whitespace: consistent with
+	// findIndentationInsensitiveCandidate which matches via .trimEnd(), so a
+	// candidate that differs only in trailing whitespace is still indentation-only.
 	return beforeLines.every(
-		(line, index) =>
-			line.replace(/^[\t ]+/, "") === afterLines[index].replace(/^[\t ]+/, ""),
+		(line, index) => line.trim() === afterLines[index].trim(),
 	);
 }
 
