@@ -1554,9 +1554,43 @@ export default function (pi: ExtensionAPI) {
 				typeof readGuard?.isNewFile !== "function" ||
 				!readGuard.isNewFile(filePath);
 			if (readGuard && isExistingFile && !isExternalOrVendor) {
-				const { touchedLines, editRanges, preflightError } =
+				const { touchedLines, editRanges, preflightError, partiallyApplicable } =
 					getTouchedLinesForGuard(event, filePath, runtime.telemetrySessionId);
 				if (preflightError) {
+					if (partiallyApplicable && partiallyApplicable.length > 0) {
+						try {
+							let content = nodeFs.readFileSync(filePath, "utf-8");
+							const useCrlf = content.includes("\r\n");
+							let normalized = content.replace(/\r\n/g, "\n");
+							for (const { oldText, newText } of partiallyApplicable) {
+								normalized = normalized.replace(
+									oldText.replace(/\r\n/g, "\n"),
+									(newText ?? "").replace(/\r\n/g, "\n"),
+								);
+							}
+							nodeFs.writeFileSync(
+								filePath,
+								useCrlf ? normalized.replace(/\n/g, "\r\n") : normalized,
+								"utf-8",
+							);
+							const n = partiallyApplicable.length;
+							logReadGuardEvent({
+								event: "edit_partial_apply",
+								sessionId: runtime.telemetrySessionId,
+								filePath,
+								metadata: { appliedCount: n },
+							});
+							return {
+								block: true,
+								reason: preflightError.replace(
+									"🔴 BLOCKED — Ambiguous edit target",
+									`⚠️ PARTIAL APPLY — ${n} edit${n !== 1 ? "s" : ""} applied`,
+								),
+							};
+						} catch {
+							// fall through to full block
+						}
+					}
 					return { block: true, reason: preflightError };
 				}
 				logReadGuardEvent({

@@ -8,6 +8,9 @@ export interface GuardLineResult {
 	// When set, read-guard checks each range independently instead of the bounding box.
 	editRanges?: [number, number][];
 	preflightError?: string;
+	// Edits that resolved successfully when only a subset failed preflight.
+	// Caller can apply these directly and return a ⚠️ PARTIAL APPLY message.
+	partiallyApplicable?: Array<{ oldText: string; newText: string | undefined }>;
 }
 
 export function countFileLines(filePath: string): number {
@@ -161,7 +164,7 @@ function findOccurrenceLines(content: string, needle: string): number[] {
 }
 
 function resolveOldTextEdits(
-	edits: Array<{ oldText?: string; originalIndex?: number }>,
+	edits: Array<{ oldText?: string; newText?: string; originalIndex?: number }>,
 	filePath: string,
 	sessionId: string | undefined,
 ): GuardLineResult {
@@ -188,6 +191,7 @@ function resolveOldTextEdits(
 	const failedEditIndexes: number[] = [];
 	const failedOldTextPreviews: string[] = [];
 	const resolvedRanges: [number, number][] = [];
+	const passedEdits: Array<{ oldText: string; newText: string | undefined }> = [];
 
 	for (let i = 0; i < edits.length; i++) {
 		const oldText = edits[i].oldText;
@@ -243,6 +247,7 @@ function resolveOldTextEdits(
 			const startLine = occurrenceLines[0];
 			const endLine = startLine + needle.split("\n").length - 1;
 			resolvedRanges.push([startLine, endLine]);
+			passedEdits.push({ oldText, newText: edits[i].newText });
 			logReadGuardEvent({
 				event: "oldtext_resolved",
 				sessionId,
@@ -312,6 +317,7 @@ function resolveOldTextEdits(
 		return {
 			touchedLines: undefined,
 			preflightError: `🔴 BLOCKED — Ambiguous edit target\n\n${failureDetails.join("\n\n")}`,
+			partiallyApplicable: passedEdits.length > 0 ? passedEdits : undefined,
 		};
 	}
 
