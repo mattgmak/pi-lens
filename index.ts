@@ -1578,7 +1578,7 @@ export default function (pi: ExtensionAPI) {
 				typeof readGuard?.isNewFile !== "function" ||
 				!readGuard.isNewFile(filePath);
 			if (readGuard && isExistingFile && !isExternalOrVendor) {
-				const { touchedLines, editRanges, preflightError, partiallyApplicable } =
+				const { touchedLines, editRanges, preflightError, partiallyApplicable, contentMatchValidated } =
 					getTouchedLinesForGuard(event, filePath, runtime.telemetrySessionId);
 				if (preflightError) {
 					if (partiallyApplicable && partiallyApplicable.length > 0) {
@@ -1629,7 +1629,7 @@ export default function (pi: ExtensionAPI) {
 				});
 				const verdict =
 					typeof readGuard.checkEdit === "function"
-						? readGuard.checkEdit(filePath, touchedLines, editRanges)
+						? readGuard.checkEdit(filePath, touchedLines, editRanges, { skipSnapshotCheck: !!contentMatchValidated })
 						: { action: "allow" as const };
 				if (verdict.action === "block") {
 					return {

@@ -11,6 +11,9 @@ export interface GuardLineResult {
 	// Edits that resolved successfully when only a subset failed preflight.
 	// Caller can apply these directly and return a ⚠️ PARTIAL APPLY message.
 	partiallyApplicable?: Array<{ oldText: string; newText: string | undefined }>;
+	// All edits were resolved by exact content match — range snapshot staleness
+	// is irrelevant since the content IS the edit target.
+	contentMatchValidated?: boolean;
 }
 
 export function countFileLines(filePath: string): number {
@@ -354,7 +357,7 @@ function resolveOldTextEdits(
 			totalEditCount: edits.length,
 		},
 	});
-	return { touchedLines, editRanges };
+	return { touchedLines, editRanges, contentMatchValidated: true };
 }
 
 /**

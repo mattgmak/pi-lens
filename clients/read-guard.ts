@@ -283,6 +283,7 @@ export class ReadGuard {
 		filePath: string,
 		touchedLines?: [number, number],
 		editRanges?: [number, number][],
+		options?: { skipSnapshotCheck?: boolean },
 	): ReadGuardVerdict {
 		// Check exemptions
 		if (this.exemptions.has(filePath)) {
@@ -417,7 +418,7 @@ export class ReadGuard {
 				});
 				return verdict;
 			}
-			if (snapshotValidation.shouldBlock) {
+			if (snapshotValidation.shouldBlock && !options?.skipSnapshotCheck) {
 				const [editStart, editEnd] = range;
 				const verdict = this.blockOrWarn(
 					"range-stale",

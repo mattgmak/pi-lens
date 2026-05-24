@@ -211,6 +211,7 @@ describe("read-guard tool line helpers", () => {
 			expect(result.touchedLines).toEqual([5, 7]);
 			expect(result.editRanges).toBeUndefined();
 			expect(result.preflightError).toBeUndefined();
+			expect(result.contentMatchValidated).toBe(true);
 		} finally {
 			env.cleanup();
 		}

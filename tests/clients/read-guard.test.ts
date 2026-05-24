@@ -222,6 +222,35 @@ describe("ReadGuard", () => {
 			}
 		});
 
+		it("skips snapshot check when skipSnapshotCheck is set (content-match validated)", () => {
+			const env = setupTestEnvironment("read-guard-snapshot-skip-");
+			try {
+				const filePath = path.join(env.tmpDir, "api.ts");
+				fs.writeFileSync(filePath, "one\ntwo\nthree\n");
+				const guard = createReadGuard("test-session");
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 1,
+						effectiveLimit: 3,
+					}),
+				);
+				fs.writeFileSync(filePath, "one\nTWO\nthree\n");
+				fileTimeState.hasChanged = false;
+
+				// Without skipSnapshotCheck: blocks (stale snapshot)
+				expect(guard.checkEdit(filePath, [2, 2]).action).toBe("block");
+
+				// With skipSnapshotCheck: allows (content match bypasses range staleness)
+				expect(
+					guard.checkEdit(filePath, [2, 2], undefined, {
+						skipSnapshotCheck: true,
+					}).action,
+				).toBe("allow");
+			} finally {
+				env.cleanup();
+			}
+		});
+
 		it("allows edits when only unrelated lines changed after read", () => {
 			const env = setupTestEnvironment("read-guard-snapshot-unrelated-");
 			try {
