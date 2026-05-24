@@ -16,6 +16,38 @@ export interface GuardLineResult {
 	contentMatchValidated?: boolean;
 }
 
+// Track repeated oldtext_not_found failures per (filePath, preview) to escalate messages.
+const recentOldTextFailures = new Map<string, { count: number; lastTs: number }>();
+const REPEAT_FAILURE_TTL_MS = 30_000;
+const MAX_FAILURE_TRACKER_SIZE = 200;
+
+function trackOldTextFailure(filePath: string, preview: string): number {
+	const key = `${filePath}::${preview}`;
+	const now = Date.now();
+	const prev = recentOldTextFailures.get(key);
+	const count =
+		prev && now - prev.lastTs < REPEAT_FAILURE_TTL_MS ? prev.count + 1 : 1;
+	if (recentOldTextFailures.size >= MAX_FAILURE_TRACKER_SIZE) {
+		const oldest = recentOldTextFailures.keys().next().value;
+		if (oldest !== undefined) recentOldTextFailures.delete(oldest);
+	}
+	recentOldTextFailures.set(key, { count, lastTs: now });
+	return count;
+}
+
+function findFirstLineOfOldText(content: string, oldText: string): number | undefined {
+	const firstLine = oldText
+		.replace(/\r\n/g, "\n")
+		.split("\n")[0]
+		.trim();
+	if (firstLine.length < 5) return undefined;
+	const lines = content.split("\n");
+	for (let i = 0; i < lines.length; i++) {
+		if (lines[i].trim() === firstLine) return i + 1;
+	}
+	return undefined;
+}
+
 export function countFileLines(filePath: string): number {
 	try {
 		const content = nodeFs.readFileSync(filePath, "utf-8");
@@ -232,9 +264,21 @@ function resolveOldTextEdits(
 			failureKinds.push("oldtext_not_found");
 			failedEditIndexes.push(editIndex);
 			failedOldTextPreviews.push(preview);
-			errors.push(
-				`edits[${editIndex}].oldText ("${preview}") was not found in the current file content. Re-read the relevant section of the file to confirm the exact text, then retry with the verbatim content.`,
-			);
+			const failCount = trackOldTextFailure(filePath, preview);
+			let errorMsg = `edits[${editIndex}].oldText ("${preview}") was not found in the current file content.`;
+			if (failCount >= 2) {
+				const lineHint = findFirstLineOfOldText(content, oldText);
+				errorMsg +=
+					` This is attempt #${failCount} for this text — your mental model of this file is stale.` +
+					` Copy oldText verbatim from a fresh read; do NOT reconstruct from memory.` +
+					(lineHint !== undefined
+						? ` The first line of your oldText appears near line ${lineHint} — re-read: \`offset=${Math.max(1, lineHint - 2)} limit=20\``
+						: ` Re-read the full relevant section before retrying.`);
+			} else {
+				errorMsg +=
+					` Re-read the relevant section of the file to confirm the exact text, then retry with the verbatim content.`;
+			}
+			errors.push(errorMsg);
 			logReadGuardEvent({
 				event: "oldtext_not_found",
 				sessionId,
@@ -244,6 +288,7 @@ function resolveOldTextEdits(
 					source: "edits_without_ranges",
 					editIndex,
 					oldTextPreview: preview,
+					repeatFailureCount: failCount,
 				},
 			});
 		} else if (occurrenceLines.length === 1) {

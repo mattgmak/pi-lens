@@ -420,6 +420,16 @@ export class ReadGuard {
 			}
 			if (snapshotValidation.shouldBlock && !options?.skipSnapshotCheck) {
 				const [editStart, editEnd] = range;
+				// Grace period: when the snapshot is stale because THIS session's own
+				// earlier edit shifted line numbers (ignoredOwnEditStaleness), and
+				// the agent read the file recently, downgrade to a warning rather
+				// than blocking. The agent has fresh context — they just don't
+				// know the exact new line numbers after the shift.
+				const RANGE_STALE_GRACE_MS = 60_000;
+				const lastRead = fileReads[fileReads.length - 1];
+				const graceActive =
+					ignoredOwnEditStaleness &&
+					Date.now() - lastRead.timestamp < RANGE_STALE_GRACE_MS;
 				const verdict = this.blockOrWarn(
 					"range-stale",
 					`🔄 RETRYABLE — Edit range changed since read\n\nYou are editing \`${filePath}\` lines ${editStart}-${editEnd}, but those lines no longer match the content you read earlier.\n\nRe-read the relevant section, then retry the edit using the current line range/content:\n  \`read path="${filePath}" offset=${Math.max(1, editStart - 5)} limit=${Math.min(30, editEnd - editStart + 10)}\``,
@@ -442,12 +452,13 @@ export class ReadGuard {
 							missingLines: snapshotValidation.missingLines,
 						},
 					},
-					effectiveMode,
+					graceActive ? "warn" : effectiveMode,
 				);
 				this.recordVerdict(filePath, "edit", touchedLines, verdict, {
 					reasonKind: "range_stale",
 					range,
 					mismatchedLines: snapshotValidation.mismatchedLines.slice(0, 20),
+					graceActive,
 				});
 				return verdict;
 			}

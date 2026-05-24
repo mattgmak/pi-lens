@@ -1516,59 +1516,38 @@ export default function (pi: ExtensionAPI) {
 						indentationOnly: boolean;
 					} => entry !== undefined,
 				);
-			if (correctedOldTexts.length > 0) {
-				const unsafeCorrections = correctedOldTexts.filter(
-					(entry) =>
-						!entry.indentationOnly ||
-						entry.currentMatchCount !== 0 ||
-						entry.correctedMatchCount !== 1,
-				);
-				if (unsafeCorrections.length === 0) {
-					for (const entry of correctedOldTexts) {
-						entry.apply(entry.corrected);
-						const correctedNewText = entry.newText
-							? retargetReplacementIndentation(
-									entry.newText,
-									entry.value,
-									entry.corrected,
-								)
-							: undefined;
-						if (correctedNewText !== undefined) {
-							entry.applyNewText(correctedNewText);
-						}
-						logReadGuardEvent({
-							event: "oldtext_indent_autopatched",
-							sessionId: runtime.telemetrySessionId,
-							filePath,
-							metadata: {
-								tool: "edit",
-								label: entry.label,
-								correctedMatchCount: entry.correctedMatchCount,
-								newTextIndentationPatched: correctedNewText !== undefined,
-							},
-						});
+			// Apply safe corrections individually — each edit stands alone.
+			// Unsafe corrections (non-indentation-only or ambiguous) fall through
+			// to resolveOldTextEdits, which handles them per-edit with proper
+			// oldtext_duplicate / oldtext_not_found reporting and partial apply.
+			for (const entry of correctedOldTexts) {
+				if (
+					entry.indentationOnly &&
+					entry.currentMatchCount === 0 &&
+					entry.correctedMatchCount === 1
+				) {
+					entry.apply(entry.corrected);
+					const correctedNewText = entry.newText
+						? retargetReplacementIndentation(
+								entry.newText,
+								entry.value,
+								entry.corrected,
+							)
+						: undefined;
+					if (correctedNewText !== undefined) {
+						entry.applyNewText(correctedNewText);
 					}
-				} else {
-					const details = unsafeCorrections
-						.map(({ label, value, correctedMatchCount, indentationOnly }) => {
-							const preview = value
-								.trimStart()
-								.slice(0, 60)
-								.replace(/\n/g, "↵");
-							const reason = !indentationOnly
-								? "the proposed correction was not indentation-only"
-								: `the corrected oldText matches ${correctedMatchCount} locations`;
-							return `${label} ("${preview}…") has mismatched indentation, but pi-lens cannot safely auto-patch it because ${reason}.`;
-						})
-						.join("\n");
-					return {
-						block: true,
-						reason:
-							`🔄 RETRYABLE — Indentation mismatch detected\n\n` +
-							`pi-lens can auto-patch indentation-only oldText mismatches only when the corrected text matches exactly one location.\n\n` +
-							`${details}\n\n` +
-							`Next action: re-read the relevant section, then retry with oldText copied verbatim from the read output.`,
-					};
+					logReadGuardEvent({
+						event: "oldtext_indent_autopatched",
+						sessionId: runtime.telemetrySessionId,
+						filePath,
+						metadata: {
+							tool: "edit",
+							label: entry.label,
+							correctedMatchCount: entry.correctedMatchCount,
+							newTextIndentationPatched: correctedNewText !== undefined,
+						},
+					});
 				}
 			}
 		}
