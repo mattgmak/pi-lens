@@ -316,7 +316,7 @@ function resolveOldTextEdits(
 		});
 		return {
 			touchedLines: undefined,
-			preflightError: `🔴 BLOCKED — Ambiguous edit target\n\n${failureDetails.join("\n\n")}`,
+			preflightError: `🔄 RETRYABLE — Edit target not found\n\n${failureDetails.join("\n\n")}`,
 			partiallyApplicable: passedEdits.length > 0 ? passedEdits : undefined,
 		};
 	}

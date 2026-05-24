@@ -302,7 +302,7 @@ describe("read-guard tool line helpers", () => {
 
 			const result = getTouchedLinesForGuard(event, filePath);
 			expect(result.touchedLines).toBeUndefined();
-			expect(result.preflightError).toMatch(/BLOCKED/);
+			expect(result.preflightError).toMatch(/RETRYABLE/);
 			expect(result.preflightError).toMatch(/edits\[0\]/);
 			expect(result.preflightError).toMatch(/2 times/);
 			expect(result.preflightError).toMatch(/Line 1/);
@@ -340,7 +340,7 @@ describe("read-guard tool line helpers", () => {
 
 			const result = getTouchedLinesForGuard(event, filePath);
 			expect(result.touchedLines).toBeUndefined();
-			expect(result.preflightError).toMatch(/BLOCKED/);
+			expect(result.preflightError).toMatch(/RETRYABLE/);
 			expect(result.preflightError).toMatch(/was not found/);
 			expect(result.preflightError).toMatch(/Re-read the relevant section/);
 			expect(logReadGuardEvent).toHaveBeenCalledWith(
@@ -381,7 +381,7 @@ describe("read-guard tool line helpers", () => {
 
 			const result = getTouchedLinesForGuard(event, filePath);
 			expect(result.touchedLines).toBeUndefined();
-			expect(result.preflightError).toMatch(/BLOCKED/);
+			expect(result.preflightError).toMatch(/RETRYABLE/);
 			expect(result.preflightError).toMatch(/edits\[1\]/);
 			expect(result.preflightError).toMatch(/was not found/);
 		} finally {
@@ -414,7 +414,7 @@ describe("read-guard tool line helpers", () => {
 
 			const result = getTouchedLinesForGuard(event, filePath);
 			expect(result.touchedLines).toBeUndefined();
-			expect(result.preflightError).toMatch(/BLOCKED/);
+			expect(result.preflightError).toMatch(/RETRYABLE/);
 			expect(result.preflightError).toMatch(/edits\[1\]/);
 			expect(result.preflightError).toMatch(/was not found/);
 		} finally {
