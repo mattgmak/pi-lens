@@ -327,7 +327,7 @@ export class ReadGuard {
 			}
 			const verdict = this.blockOrWarn(
 				"zero-read",
-				`🔴 BLOCKED — Edit without read\n\nYou are trying to edit \`${filePath}\` but have not read it in this conversation.\n\nRead the file first, then retry the edit: \`read path="${filePath}"\``,
+				`🔄 RETRYABLE — Edit without read\n\nYou are trying to edit \`${filePath}\` but have not read it in this conversation.\n\nRead the file first, then retry the edit: \`read path="${filePath}"\``,
 				undefined,
 				effectiveMode,
 			);
@@ -356,7 +356,7 @@ export class ReadGuard {
 			} else {
 				const verdict = this.blockOrWarn(
 					"file-modified",
-					`🔴 BLOCKED — File modified since read\n\nYou last read \`${filePath}\` at ${new Date(lastRead.timestamp).toISOString()}.\nThe file has been modified on disk since then (auto-format, external tool, or previous edit).\n\nYour mental model is out of sync with the actual file content.\nTo proceed:\n  1. Re-read the file: \`read path="${filePath}"\``,
+					`🔄 RETRYABLE — File modified since read\n\nYou last read \`${filePath}\` at ${new Date(lastRead.timestamp).toISOString()}.\nThe file has been modified on disk since then (auto-format, external tool, or previous edit).\n\nYour mental model is out of sync with the actual file content.\nTo proceed:\n  1. Re-read the file: \`read path="${filePath}"\``,
 					undefined,
 					effectiveMode,
 				);
@@ -395,7 +395,7 @@ export class ReadGuard {
 					lastRead.effectiveOffset + lastRead.effectiveLimit - 1;
 				const verdict = this.blockOrWarn(
 					"out-of-range",
-					`🔴 BLOCKED — Edit outside read range\n\nYou read \`${filePath}\` lines ${lastRead.effectiveOffset}-${lastReadEnd}${lastRead.enclosingSymbol ? ` (${lastRead.enclosingSymbol.kind} \`${lastRead.enclosingSymbol.name}\`)` : ""}, but your edit touches lines ${editStart}-${editEnd}.\n\nRead the relevant section first, then retry the edit:\n  \`read path="${filePath}" offset=${Math.max(1, editStart - 5)} limit=${Math.min(30, editEnd - editStart + 10)}\``,
+					`🔄 RETRYABLE — Edit outside read range\n\nYou read \`${filePath}\` lines ${lastRead.effectiveOffset}-${lastReadEnd}${lastRead.enclosingSymbol ? ` (${lastRead.enclosingSymbol.kind} \`${lastRead.enclosingSymbol.name}\`)` : ""}, but your edit touches lines ${editStart}-${editEnd}.\n\nRead the relevant section first, then retry the edit:\n  \`read path="${filePath}" offset=${Math.max(1, editStart - 5)} limit=${Math.min(30, editEnd - editStart + 10)}\``,
 					{
 						editRange: range,
 						readRanges: fileReads.map((r) => ({
@@ -421,7 +421,7 @@ export class ReadGuard {
 				const [editStart, editEnd] = range;
 				const verdict = this.blockOrWarn(
 					"range-stale",
-					`🔴 BLOCKED — Edit range changed since read\n\nYou are editing \`${filePath}\` lines ${editStart}-${editEnd}, but those lines no longer match the content you read earlier.\n\nRe-read the relevant section, then retry the edit using the current line range/content:\n  \`read path="${filePath}" offset=${Math.max(1, editStart - 5)} limit=${Math.min(30, editEnd - editStart + 10)}\``,
+					`🔄 RETRYABLE — Edit range changed since read\n\nYou are editing \`${filePath}\` lines ${editStart}-${editEnd}, but those lines no longer match the content you read earlier.\n\nRe-read the relevant section, then retry the edit using the current line range/content:\n  \`read path="${filePath}" offset=${Math.max(1, editStart - 5)} limit=${Math.min(30, editEnd - editStart + 10)}\``,
 					{
 						editRange: range,
 						readRanges: fileReads.map((r) => ({
