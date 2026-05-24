@@ -266,7 +266,14 @@ if (occurrenceLines.length === 0) {
 			failedOldTextPreviews.push(preview);
 			const failCount = trackOldTextFailure(filePath, preview);
 			let errorMsg = `edits[${editIndex}].oldText ("${preview}") was not found in the current file content.`;
-			if (failCount >= 2) {
+			// Quote-style hint: if swapping " ↔ ' gives exactly one match, tell the agent why it failed.
+			const quoteSwapCandidates: string[] = [];
+			if (needle.includes('"')) quoteSwapCandidates.push(needle.replace(/"/g, "'"));
+			if (needle.includes("'")) quoteSwapCandidates.push(needle.replace(/'/g, '"'));
+			const quoteHit = quoteSwapCandidates.find(s => s !== needle && findOccurrenceLines(content, s).length === 1);
+			if (quoteHit !== undefined) {
+				errorMsg += ` The file uses a different quote style — your oldText has ${needle.includes('"') ? "double" : "single"} quotes but the file has ${needle.includes('"') ? "single" : "double"} quotes. Fix the quote style in both oldText and newText before retrying.`;
+			} else if (failCount >= 2) {
 				const lineHint = findFirstLineOfOldText(content, oldText);
 				errorMsg +=
 					` This is attempt #${failCount} for this text — your mental model of this file is stale.` +
