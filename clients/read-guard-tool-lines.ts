@@ -18,7 +18,7 @@ export interface GuardLineResult {
 
 // Track repeated oldtext_not_found failures per (filePath, preview) to escalate messages.
 const recentOldTextFailures = new Map<string, { count: number; lastTs: number }>();
-const REPEAT_FAILURE_TTL_MS = 30_000;
+const REPEAT_FAILURE_TTL_MS = 300_000;
 const MAX_FAILURE_TRACKER_SIZE = 200;
 
 function trackOldTextFailure(filePath: string, preview: string): number {
@@ -227,6 +227,7 @@ function resolveOldTextEdits(
 	const failedOldTextPreviews: string[] = [];
 	const resolvedRanges: [number, number][] = [];
 	const passedEdits: Array<{ oldText: string; newText: string | undefined; originalIndex: number }> = [];
+	let maxFailCount = 0;
 
 	for (let i = 0; i < edits.length; i++) {
 		const oldText = edits[i].oldText;
@@ -265,6 +266,7 @@ if (occurrenceLines.length === 0) {
 			failedEditIndexes.push(editIndex);
 			failedOldTextPreviews.push(preview);
 			const failCount = trackOldTextFailure(filePath, preview);
+			if (failCount > maxFailCount) maxFailCount = failCount;
 			let errorMsg = `edits[${editIndex}].oldText ("${preview}") was not found in the current file content.`;
 			// Quote-style hint: if swapping " ↔ ' gives exactly one match, tell the agent why it failed.
 			const quoteSwapCandidates: string[] = [];
@@ -373,9 +375,12 @@ if (occurrenceLines.length === 0) {
 			passedEdits.length > 0
 				? `\n\n${passedEdits.map(e => `edits[${e.originalIndex}]`).join(", ")} ${passedEdits.length === 1 ? "was" : "were"} applied — do NOT re-submit ${passedEdits.length === 1 ? "it" : "them"}.`
 				: "";
+		const header = maxFailCount >= 2
+			? `🛑 RE-READ REQUIRED — You have submitted this oldText before and it still does not match.\n\nDo NOT retry from memory. Re-read \`${filePath}\` to get the current content, then rebuild your edit from the verbatim file text.`
+			: `🔄 RETRYABLE — Edit target not found`;
 		return {
 			touchedLines: undefined,
-			preflightError: `🔄 RETRYABLE — Edit target not found\n\n${failureDetails.join("\n\n")}${appliedNote}`,
+			preflightError: `${header}\n\n${failureDetails.join("\n\n")}${appliedNote}`,
 			partiallyApplicable: passedEdits.length > 0 ? passedEdits : undefined,
 		};
 	}
