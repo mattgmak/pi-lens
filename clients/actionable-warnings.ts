@@ -8,6 +8,7 @@ import { applyWorkspaceEdit } from "./lsp/edits.js";
 import { getLSPService } from "./lsp/index.js";
 import { normalizeMapKey } from "./path-utils.js";
 import { toRunnerDisplayPath } from "./dispatch/runner-context.js";
+import { logActionableWarningsEvent } from "./actionable-warnings-logger.js";
 
 export interface ActionableWarningAction {
 	title: string;
@@ -327,10 +328,30 @@ export async function buildActionableWarningsReport(args: {
 	const records: ActionableWarningRecord[] = [...args.dispatchWarnings];
 	const lspService = getLSPService();
 
+	logActionableWarningsEvent({
+		event: "report_started",
+		sessionId: args.sessionId,
+		metadata: {
+			turnIndex: args.turnIndex,
+			filesCount: args.files.length,
+			dispatchWarningsCount: args.dispatchWarnings.length,
+			deltaOnly: args.deltaOnly !== false,
+			includeLspCodeActions: args.includeLspCodeActions,
+		},
+	});
+
 	if (args.includeLspCodeActions) {
 		for (const file of args.files) {
 			const filePath = path.resolve(cwd, file);
-			if (!lspService.supportsLSP(filePath)) continue;
+			if (!lspService.supportsLSP(filePath)) {
+				logActionableWarningsEvent({
+					event: "lsp_file_skipped",
+					sessionId: args.sessionId,
+					filePath,
+					metadata: { reason: "no_lsp_support" },
+				});
+				continue;
+			}
 			let diags: LSPDiagnostic[] = [];
 			try {
 				const content = fs.existsSync(filePath)
@@ -342,15 +363,25 @@ export async function buildActionableWarningsReport(args: {
 				args.dbg?.(
 					`actionable_warnings: LSP diagnostics failed for ${filePath}: ${err}`,
 				);
+				logActionableWarningsEvent({
+					event: "lsp_file_skipped",
+					sessionId: args.sessionId,
+					filePath,
+					metadata: { reason: "lsp_error", error: String(err) },
+				});
 				continue;
 			}
 			const ranges =
 				args.modifiedRangesByFile.get(normalizeMapKey(filePath)) ?? [];
-			for (const diag of diags) {
-				if (diag.severity !== 2) continue;
+			const diagsWarning = diags.filter((d) => d.severity === 2);
+			let deltaFiltered = 0;
+			let enriched = 0;
+			for (const diag of diagsWarning) {
 				const line = diag.range.start.line + 1;
-				if (args.deltaOnly !== false && !lineInModifiedRanges(line, ranges))
+				if (args.deltaOnly !== false && !lineInModifiedRanges(line, ranges)) {
+					deltaFiltered++;
 					continue;
+				}
 				const record = recordFromLspDiagnostic(diag, filePath, cwd);
 				try {
 					const actions = await lspService.codeAction(
@@ -366,8 +397,23 @@ export async function buildActionableWarningsReport(args: {
 						`actionable_warnings: LSP codeAction failed for ${filePath}: ${err}`,
 					);
 				}
-				if (record.actions.length > 0) records.push(record);
+				if (record.actions.length > 0) {
+					records.push(record);
+					enriched++;
+				}
 			}
+			logActionableWarningsEvent({
+				event: "lsp_file_checked",
+				sessionId: args.sessionId,
+				filePath,
+				metadata: {
+					diagsTotal: diags.length,
+					diagsWarning: diagsWarning.length,
+					deltaFiltered,
+					enriched,
+					modifiedRangesCount: ranges.length,
+				},
+			});
 		}
 	}
 
@@ -385,6 +431,22 @@ export async function buildActionableWarningsReport(args: {
 		warnings,
 	}));
 	const allActions = merged.flatMap((warning) => warning.actions);
+	const summary = {
+		warnings: merged.length,
+		unsuppressed: merged.filter((warning) => !warning.suppressed).length,
+		suppressed: merged.filter((warning) => warning.suppressed).length,
+		files: files.length,
+		actions: allActions.length,
+		autoFixEligible: allActions.filter((action) => action.autoFixEligible)
+			.length,
+	};
+
+	logActionableWarningsEvent({
+		event: "report_complete",
+		sessionId: args.sessionId,
+		metadata: { turnIndex: args.turnIndex, summary },
+	});
+
 	return {
 		generatedAt: new Date().toISOString(),
 		scope: "turn_delta",
@@ -393,15 +455,7 @@ export async function buildActionableWarningsReport(args: {
 		deltaOnly: args.deltaOnly !== false,
 		includeLspCodeActions: args.includeLspCodeActions,
 		files,
-		summary: {
-			warnings: merged.length,
-			unsuppressed: merged.filter((warning) => !warning.suppressed).length,
-			suppressed: merged.filter((warning) => warning.suppressed).length,
-			files: files.length,
-			actions: allActions.length,
-			autoFixEligible: allActions.filter((action) => action.autoFixEligible)
-				.length,
-		},
+		summary,
 	};
 }
 

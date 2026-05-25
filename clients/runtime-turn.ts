@@ -4,6 +4,7 @@ import {
 	formatActionableWarningsAdvisory,
 	writeActionableWarningsReport,
 } from "./actionable-warnings.js";
+import { logActionableWarningsEvent } from "./actionable-warnings-logger.js";
 import type { CacheManager } from "./cache-manager.js";
 import { logCascade } from "./cascade-logger.js";
 import { normalizeMapKey } from "./path-utils.js";
@@ -481,6 +482,14 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			writeActionableWarningsReport(cacheManager, cwd, report);
 			const advisory = formatActionableWarningsAdvisory(report);
 			if (advisory) advisoryParts.push(advisory);
+			logActionableWarningsEvent({
+				event: advisory ? "advisory_injected" : "advisory_skipped",
+				sessionId: runtime.telemetrySessionId,
+				metadata: {
+					turnIndex: runtime.turnIndex,
+					unsuppressed: report.summary.unsuppressed,
+				},
+			});
 			logLatency({
 				type: "phase",
 				toolName: "turn_end",
