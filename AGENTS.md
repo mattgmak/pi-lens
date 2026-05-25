@@ -36,8 +36,10 @@ Do not hand-edit generated `.js`; regenerate it from the corresponding `.ts`.
 ## Debug logs
 - `~/.pi-lens/sessionstart.log` — timestamped lines for every session_start event and tool lifecycle
 - `~/.pi-lens/latency.log` — NDJSON per-runner timings
+- `~/.pi-lens/read-guard.log` — NDJSON for every read-guard verdict, autopatch, and preflight block (rotates at 1 MiB); key events: `edit_blocked`, `edit_warned`, `edit_preflight_blocked`, `oldtext_not_found`, `oldtext_trailing_ws_autopatched`, `oldtext_indent_autopatched`, `oldtext_escape_autopatched`
+- `~/.pi-lens/actionable-warnings.log` — NDJSON for the actionable-warnings advisory pipeline (rotates at 1 MiB); events: `report_started`, `lsp_file_checked`, `lsp_file_skipped`, `report_complete`, `advisory_injected`, `advisory_skipped`
 - `~/.pi-lens/probe-cache.json` — tool binary path cache (TTL 24h)
-- `.pi-lens/cache/` — knip, jscpd, todo-baseline, turn-end-findings caches
+- `.pi-lens/cache/` — knip, jscpd, todo-baseline, turn-end-findings, actionable-warnings caches
 
 ## Lifecycle and pipeline flow
 
@@ -47,7 +49,7 @@ Four hooks in `index.ts` drive everything:
 Resets `RuntimeCoordinator`. Fires tool preinstall (typescript-language-server, biome, etc.) and background scans (knip, jscpd, ast-grep exports, project index) as fire-and-forget tasks. LSP config walk is deferred via `setImmediate`. Returns in ~150ms; background tasks finish asynchronously. Knip/jscpd startup scans are async and guarded against duplicate in-flight scans.
 
 **`tool_call`** (write/edit events) → inline handler in `index.ts`
-Warms the LSP for the file and records read-guard lines. For write/edit tools, records read-guard preflight data before the later `tool_result` dispatch.
+Warms the LSP for the file and records read-guard lines. For write/edit tools, runs the read-guard autopatch pipeline (Passes 0–2) before the edit lands, then records preflight data for the later `tool_result` dispatch.
 
 **`tool_result`** → `handleToolResult` (`clients/runtime-tool-result.ts`)
 Tracks modified file ranges per turn for turn_end targeting. For write/edit events, runs the dispatch pipeline: format → autofix → LSP diagnostics sync → parallel async runner dispatch → dedup/merge → findings stored on `RuntimeCoordinator`.
@@ -76,6 +78,28 @@ Holds: `filePath`, language-root `cwd`, `kind` (`FileKind` — `jsts`, `python`,
 - Check cheap filesystem/root preconditions before availability probes or auto-install. Example: Knip/jscpd/Madge skip non-project or empty roots before probing/installing tools.
 - `createAvailabilityChecker()` now exposes `isAvailableAsync()`; use it in runners. The sync `isAvailable()` remains only for legacy/test compatibility.
 - Formatter execution (`clients/formatters.ts::formatFile`) uses `safeSpawnAsync()` so timeout wrappers are meaningful.
+
+## Read-guard autopatch pipeline
+
+Runs in the `edit` PreToolUse handler (`index.ts`) before the edit tool executes. Mutates `e.oldText` in-place and logs a structured event for each correction applied.
+
+| Pass | What it fixes | Event logged |
+|------|--------------|--------------|
+| 0 | Literal `\n`/`\t` escape sequences vs actual newline/tab in `oldText` | `oldtext_escape_autopatched` |
+| 1 | Trailing whitespace per line **and** trailing empty lines (e.g. model appends `\n\t\t\t\t` from the next line's indent) | `oldtext_trailing_ws_autopatched` |
+| 2a | Fixed tab↔space conversions (tabs→2sp, tabs→4sp, 2sp→tabs, 4sp→tabs) | `oldtext_indent_autopatched` |
+| 2b | `findIndentationInsensitiveCandidate` — strips all leading whitespace, matches on content only, returns actual file lines; handles arbitrary indentation depth mismatches | `oldtext_indent_autopatched` |
+
+**Safety gates (all must hold for a patch to apply):**
+- Stripped/corrected form differs from the original
+- `countOldTextMatches === 1` on the corrected form (no ambiguity)
+- Pass 2: `isIndentationOnlyChange === true` (every line's `.trim()` content is identical) and `currentMatchCount === 0` (original doesn't already match)
+
+**Known gaps (fix when seen in logs):** internal whitespace differences (e.g. `foo  =  bar` vs `foo = bar`) and missing/extra blank lines within a block are not handled. Add a new pass if either pattern appears as repeated `oldtext_not_found` events.
+
+**`out_of_range` downgrade:** when all `oldText` strings in an edit were resolved (content-match proof, flagged as `oldTextResolved`), an out-of-range verdict is downgraded from `block` to `warn`. Line drift from earlier inserts is the common cause; the model demonstrably knew the content.
+
+**Repeat-failure escalation:** `REPEAT_FAILURE_TTL_MS` is 300 s (inter-turn delays routinely exceed 30 s). At ≥ 2 failures within that window the preflight error header escalates from `🔄 RETRYABLE` to `🛑 RE-READ REQUIRED`.
 
 ## Open design TODOs
 
@@ -110,7 +134,7 @@ Mixing different capture names in one `[...]` block causes tree-sitter to silent
 **Post-filters** (`post_filter` in YAML, `applyPostFilter` in `clients/tree-sitter-client.ts`): evaluated after query matching to reject false positives. Key ones: `count_params` (long-param-list: excludes optional/defaulted params), `ts_ssrf_sink` (requires URL to look like external input), `check_secret_pattern` (variable name must match secret-sounding pattern).
 
 ## Current version / state
-v3.8.44 is the package version. Master includes unreleased async runner consistency work after the Knip freeze fix: jscpd/Madge/formatters/dispatch runners now use async subprocess execution in hook paths, with in-flight guards for expensive scans. CI runs `npm ci` + tsc lint + vitest.
+v3.8.45 is the package version. Master includes unreleased work: read-guard autopatch improvements (trailing empty lines, `out_of_range` downgrade, repeat-failure escalation), structured NDJSON telemetry for the actionable-warnings pipeline (`actionable-warnings-logger.ts`), and async runner consistency (jscpd/Madge/formatters use `safeSpawnAsync` in hook paths). CI runs `npm ci` + tsc lint + vitest.
 
 ## Conventions
 - TypeScript ESM throughout (`"type": "module"`)
