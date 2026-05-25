@@ -422,6 +422,18 @@ if (occurrenceLines.length === 0) {
 }
 
 /**
+ * Normalises an oldText string for whitespace-only differences that editors routinely
+ * introduce: trailing spaces/tabs on each line are stripped, and any trailing blank
+ * lines (lines that are empty after trimming) are removed from the end. CRLF is
+ * normalised to LF. Returns the same string if no change was needed.
+ */
+export function stripOldTextTrailingWhitespace(value: string): string {
+	const lines = value.replace(/\r\n/g, "\n").split("\n").map((l) => l.trimEnd());
+	while (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+	return lines.join("\n");
+}
+
+/**
  * Tries to fix a tab/space indentation mismatch between the model's oldText and the
  * actual file. Returns the corrected oldText if a matching variant is found, or
  * undefined if the text already matches or no indentation conversion fixes it.

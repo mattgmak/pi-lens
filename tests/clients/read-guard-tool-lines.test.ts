@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	countFileLines,
 	getTouchedLinesForGuard,
+	stripOldTextTrailingWhitespace,
 	tryCorrectIndentationMismatch,
 } from "../../clients/read-guard-tool-lines.ts";
 import { logReadGuardEvent } from "../../clients/read-guard-logger.js";
@@ -569,6 +570,115 @@ describe("tryCorrectIndentationMismatch", () => {
 					filePath,
 				),
 			).toBeUndefined();
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+describe("stripOldTextTrailingWhitespace", () => {
+	it("strips trailing spaces from each line", () => {
+		expect(stripOldTextTrailingWhitespace("foo   \nbar  \nbaz")).toBe(
+			"foo\nbar\nbaz",
+		);
+	});
+
+	it("strips trailing tabs from each line", () => {
+		expect(stripOldTextTrailingWhitespace("foo\t\nbar\t\t")).toBe("foo\nbar");
+	});
+
+	it("removes trailing empty lines produced by a trailing newline + indent", () => {
+		// Model wrote }) as any,\n\t\t\t\t — file has }) as any, with no blank line after
+		expect(stripOldTextTrailingWhitespace("\t\t\t\t}) as any,\n\t\t\t\t")).toBe(
+			"\t\t\t\t}) as any,",
+		);
+	});
+
+	it("removes multiple trailing empty lines", () => {
+		expect(stripOldTextTrailingWhitespace("foo\n\n\n")).toBe("foo");
+	});
+
+	it("preserves internal empty lines", () => {
+		expect(stripOldTextTrailingWhitespace("foo\n\nbar\n")).toBe("foo\n\nbar");
+	});
+
+	it("preserves a single-line value with no trailing whitespace", () => {
+		expect(stripOldTextTrailingWhitespace("foo")).toBe("foo");
+	});
+
+	it("does not strip a single-line value that is pure whitespace to empty", () => {
+		// A value of just whitespace stays as-is — length is 1, loop guard fires
+		expect(stripOldTextTrailingWhitespace("   ")).toBe("");
+	});
+
+	it("normalises CRLF to LF before stripping", () => {
+		expect(stripOldTextTrailingWhitespace("foo\r\nbar  \r\n\t\t")).toBe(
+			"foo\nbar",
+		);
+	});
+
+	it("returns the same string when nothing needs stripping", () => {
+		const s = "function foo() {\n\treturn 1;\n}";
+		expect(stripOldTextTrailingWhitespace(s)).toBe(s);
+	});
+});
+
+// These tests verify the post-strip contract: after index.ts Pass 1 applies
+// stripOldTextTrailingWhitespace and mutates e.oldText, getTouchedLinesForGuard
+// receives the cleaned value and can resolve it correctly.
+describe("getTouchedLinesForGuard — post-strip oldText resolution", () => {
+	it("resolves the stripped form of an oldText that had a trailing newline + indent", () => {
+		const env = setupTestEnvironment("rg-post-strip-resolve-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			// Unique occurrence — only one line matching the cast
+			fs.writeFileSync(filePath, "const x = [\n\t\t\t\t}) as any,\n];\n");
+			// Pass 1 would have stripped "\t\t\t\t}) as any,\n\t\t\t\t" → "\t\t\t\t}) as any,"
+			const stripped = stripOldTextTrailingWhitespace(
+				"\t\t\t\t}) as any,\n\t\t\t\t",
+			);
+			expect(stripped).toBe("\t\t\t\t}) as any,");
+
+			const event = {
+				toolName: "edit",
+				input: {
+					path: filePath,
+					edits: [{ oldText: stripped, newText: "\t\t\t\t})," }],
+				},
+			};
+
+			const result = getTouchedLinesForGuard(event, filePath);
+			expect(result.preflightError).toBeUndefined();
+			expect(result.touchedLines).toEqual([2, 2]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("blocks when stripped oldText matches multiple lines (autopatch correctly skipped by index.ts)", () => {
+		const env = setupTestEnvironment("rg-post-strip-ambiguous-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			// Two identical lines — index.ts Pass 1 would NOT apply the patch
+			// (countOldTextMatches !== 1), so getTouchedLinesForGuard still gets the original
+			fs.writeFileSync(
+				filePath,
+				"\t\t\t\t}) as any,\n\t\t\t\t}) as any,\n",
+			);
+			const stripped = stripOldTextTrailingWhitespace(
+				"\t\t\t\t}) as any,\n\t\t\t\t",
+			);
+			const event = {
+				toolName: "edit",
+				input: {
+					path: filePath,
+					edits: [{ oldText: stripped, newText: "\t\t\t\t})," }],
+				},
+			};
+
+			const result = getTouchedLinesForGuard(event, filePath);
+			expect(result.preflightError).toMatch(/RETRYABLE/);
+			expect(result.preflightError).toMatch(/2 times/);
 		} finally {
 			env.cleanup();
 		}

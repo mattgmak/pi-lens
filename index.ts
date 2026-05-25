@@ -47,6 +47,7 @@ import { logReadGuardEvent } from "./clients/read-guard-logger.js";
 import {
 	countFileLines,
 	getTouchedLinesForGuard,
+	stripOldTextTrailingWhitespace,
 	tryCorrectIndentationMismatch,
 	tryCorrectIndentationMismatchFromContent,
 } from "./clients/read-guard-tool-lines.js";
@@ -1460,10 +1461,7 @@ export default function (pi: ExtensionAPI) {
 			if (matchNormalizedContent !== undefined) {
 				for (const entry of oldTexts) {
 					const normalizedValue = entry.value.replace(/\r\n/g, "\n");
-					const stripped = normalizedValue
-						.split("\n")
-						.map((l) => l.trimEnd())
-						.join("\n");
+					const stripped = stripOldTextTrailingWhitespace(entry.value);
 					if (stripped === normalizedValue) continue;
 					if (countOldTextMatches(filePath, stripped, matchNormalizedContent) !== 1)
 						continue;
