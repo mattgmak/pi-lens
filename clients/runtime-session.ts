@@ -221,6 +221,7 @@ function scheduleStartupScans(
 	runtime: RuntimeCoordinator,
 	sessionGeneration: number,
 	analysisRoot: string,
+	snapshotRoot: string,
 	languageProfile: ReturnType<typeof detectProjectLanguageProfile>,
 	dbg: SessionStartDeps["dbg"],
 ): void {
@@ -343,7 +344,7 @@ function scheduleStartupScans(
 			for (const [name, file] of exports) {
 				runtime.cachedExports.set(name, file);
 			}
-			saveRuntimeProjectSnapshot({ cwd: analysisRoot, runtime, dbg });
+			saveRuntimeProjectSnapshot({ cwd: snapshotRoot, runtime, dbg });
 		}
 	});
 
@@ -361,7 +362,7 @@ function scheduleStartupScans(
 			dbg(
 				`session_start: loaded fresh project index (${existing.entries.size} entries)`,
 			);
-			saveRuntimeProjectSnapshot({ cwd: analysisRoot, runtime, dbg });
+			saveRuntimeProjectSnapshot({ cwd: snapshotRoot, runtime, dbg });
 		} else {
 			const sourceFiles = getSourceFiles(analysisRoot, true);
 			const tsFiles = sourceFiles.filter(
@@ -377,7 +378,7 @@ function scheduleStartupScans(
 				dbg(
 					`session_start: built project index (${runtime.cachedProjectIndex.entries.size} entries from ${tsFiles.length} files)`,
 				);
-				saveRuntimeProjectSnapshot({ cwd: analysisRoot, runtime, dbg });
+				saveRuntimeProjectSnapshot({ cwd: snapshotRoot, runtime, dbg });
 			} else {
 				if (!runtime.isCurrentSession(sessionGeneration)) return;
 				dbg(`session_start: skipped project index (${tsFiles.length} files)`);
@@ -648,7 +649,7 @@ export async function handleSessionStart(
 
 	runtime.projectRulesScan = scanProjectRules(analysisRoot);
 	saveRuntimeProjectSnapshot({
-		cwd: analysisRoot,
+		cwd: snapshotRoot,
 		runtime,
 		startupScan,
 		languageProfile,
@@ -689,6 +690,7 @@ export async function handleSessionStart(
 			runtime,
 			sessionGeneration,
 			analysisRoot,
+			snapshotRoot,
 			languageProfile,
 			dbg,
 		);

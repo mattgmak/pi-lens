@@ -820,7 +820,7 @@ export async function handleNotifyChange(
 	});
 }
 
-async function clientShutdown(
+export async function clientShutdown(
 	state: LSPClientState,
 	options: LSPShutdownOptions = {},
 ): Promise<void> {
@@ -833,18 +833,20 @@ async function clientShutdown(
 	state.pendingOpens.clear();
 	state.openDocuments.clear();
 	state.diagnosticEmitter.removeAllListeners();
-	try {
-		await withTimeout(
-			safeSendRequest(state.connection, "shutdown", {}),
-			SHUTDOWN_REQUEST_TIMEOUT_MS,
-		);
-	} catch {
-		/* ignore — proceed to exit/kill so shutdown cannot hang the session */
-	}
-	try {
-		await safeSendNotification(state.connection, "exit", {});
-	} catch {
-		/* ignore */
+	if (!options.fast) {
+		try {
+			await withTimeout(
+				safeSendRequest(state.connection, "shutdown", {}),
+				SHUTDOWN_REQUEST_TIMEOUT_MS,
+			);
+		} catch {
+			/* ignore — proceed to exit/kill so shutdown cannot hang the session */
+		}
+		try {
+			await safeSendNotification(state.connection, "exit", {});
+		} catch {
+			/* ignore */
+		}
 	}
 	disposeClientConnection(state);
 	const pid = state.lspProcess.pid;
