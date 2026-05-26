@@ -429,7 +429,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		!getFlag("immediate-format") &&
 		nodeFs.existsSync(filePath)
 	) {
-		runtime.deferFormat(filePath, dispatchCwd, event.toolName);
+		runtime.deferFormat(filePath, dispatchCwd, event.toolName, turnStateCwd);
 		dbg(`tool_result: queued deferred format for ${filePath}`);
 		logLatency({
 			type: "phase",

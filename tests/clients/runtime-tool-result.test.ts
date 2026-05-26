@@ -77,6 +77,12 @@ describe("monorepo turn-state cwd alignment", () => {
 			// all turn state belongs under the workspace root.
 			const langRootState = cacheManager.readTurnState(goModuleDir);
 			expect(Object.keys(langRootState.files).length).toBe(0);
+
+			// Project sequence/change-log bookkeeping is also workspace-scoped.
+			expect(readChangesSince(workspaceRoot, 0)).toMatchObject([
+				{ source: "agent-edit", filePath },
+			]);
+			expect(readChangesSince(goModuleDir, 0)).toEqual([]);
 		} finally {
 			if (previousDataDir === undefined) {
 				delete process.env.PILENS_DATA_DIR;
@@ -277,6 +283,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				filePath,
 				expect.any(String),
 				"edit",
+				env.tmpDir,
 			);
 		} finally {
 			env.cleanup();
