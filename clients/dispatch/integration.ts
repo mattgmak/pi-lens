@@ -54,11 +54,9 @@ import {
 	clearReviewGraphWorkspaceCache,
 	getLastGraphBuildInfo,
 } from "../review-graph/builder.js";
-import { readLatestProjectSequence } from "../project-changes.js";
 import {
 	buildReverseDependencyIndexFromGraph,
 	getAffectedFilesFromIndex,
-	loadReverseDependencyIndexFromSnapshot,
 	writeReverseDependencyIndexToSnapshot,
 } from "../reverse-deps.js";
 import {
@@ -606,60 +604,37 @@ export async function computeCascadeForFile(
 		});
 
 		impact = computeImpactCascade(graph, normalizedFile, cwd);
-		const currentProjectSeq = readLatestProjectSequence(cwd).projectSeq;
-		const cachedReverseDeps = loadReverseDependencyIndexFromSnapshot({
-			cwd,
-			currentProjectSeq,
-		});
+		const reverseDepNeighbors = getAffectedFilesFromIndex(
+			reverseDepsIndex,
+			normalizedFile,
+			1,
+			MAX_FILES * 2,
+		);
 		logCascade({
 			phase: "reverse_deps_cache",
 			filePath,
 			metadata: {
-				action: "load_for_cascade",
-				cacheHit: Boolean(cachedReverseDeps),
-				currentProjectSeq,
-				cacheSeq: cachedReverseDeps?.seq,
-				importsFileCount: cachedReverseDeps
-					? Object.keys(cachedReverseDeps.imports).length
-					: 0,
-				importedByFileCount: cachedReverseDeps
-					? Object.keys(cachedReverseDeps.importedBy).length
-					: 0,
+				action: "merge_neighbors",
+				depth: 1,
+				neighborCount: reverseDepNeighbors.length,
+				neighbors: reverseDepNeighbors.slice(0, 10),
 			},
 		});
-		if (cachedReverseDeps) {
-			const reverseDepNeighbors = getAffectedFilesFromIndex(
-				cachedReverseDeps,
-				normalizedFile,
-				1,
-				MAX_FILES * 2,
-			);
+		if (reverseDepNeighbors.length > 0) {
+			impact.directImporters = [
+				...new Set([...impact.directImporters, ...reverseDepNeighbors]),
+			];
+			impact.neighborFiles = [
+				...new Set([...impact.neighborFiles, ...reverseDepNeighbors]),
+			];
 			logCascade({
-				phase: "reverse_deps_cache",
+				phase: "neighbor_snapshot",
 				filePath,
-				metadata: {
-					action: "merge_neighbors",
-					depth: 1,
-					neighborCount: reverseDepNeighbors.length,
-					neighbors: reverseDepNeighbors.slice(0, 10),
-				},
+				neighborFile: "[reverse-deps-cache]",
+				diagnosticCount: reverseDepNeighbors.length,
+				autoPropagate: false,
+				metadata: { reverseDepsCache: true },
 			});
-			if (reverseDepNeighbors.length > 0) {
-				impact.directImporters = [
-					...new Set([...impact.directImporters, ...reverseDepNeighbors]),
-				];
-				impact.neighborFiles = [
-					...new Set([...impact.neighborFiles, ...reverseDepNeighbors]),
-				];
-				logCascade({
-					phase: "neighbor_snapshot",
-					filePath,
-					neighborFile: "[reverse-deps-cache]",
-					diagnosticCount: reverseDepNeighbors.length,
-					autoPropagate: false,
-					metadata: { reverseDepsCache: true },
-				});
-			}
 		}
 
 		// Symbol-level blast radius via LSP references (precision upgrade over
