@@ -15,6 +15,10 @@ All notable changes to pi-lens will be documented in this file.
 - **Project change sequencing foundation** — pi-lens now tracks monotonic project/file sequence numbers for observed mutations and appends them to `<project-data-dir>/change-log.jsonl`. Agent writes/edits, partial applies, deferred formatting, and conservative autofixes record their source, session/turn metadata, file sequence, and optional changed range; actionable and code-quality warning reports now include project/file sequence metadata for future stale-report detection.
 - **Project intelligence snapshot foundation** — session start now loads a versioned `.pi-lens/cache/project-snapshot.json` when it matches the current project sequence, hydrating cached exports and project rule scan state before background scans finish. Startup scans refresh the snapshot as project rules, ast-grep exports, and project-index metadata become available, creating a shared seq-stamped cache for future reverse-dependency and hot-file features.
 
+### Performance
+
+- **Deferred format runs concurrently across files at agent_end** — `handleAgentEnd` now dispatches all formatter subprocesses in parallel via `Promise.all` before sequentially flushing results (sequence bumps, cache mutations, LSP resyncs). Sessions with multiple queued files no longer pay N × ~400 ms; all formatters run simultaneously instead of back-to-back.
+
 ### Fixed
 
 - **TypeScript LSP no longer blocks the edit pipeline on loose Pi extension files** — dispatch LSP diagnostics now use the bounded `touchFile` document path instead of opening the file and then waiting on unbounded aggregate diagnostics, preventing cold TypeScript server startup from holding the TUI until the generic 30s runner timeout. TypeScript LSP root detection also skips loose files under `.pi/agent/extensions` unless a real JS/TS project marker exists inside that extension tree, avoiding tsserver walks through global Pi/npm dependency paths for tiny extension edits. Fixes #104.

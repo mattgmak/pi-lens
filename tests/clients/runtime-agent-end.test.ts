@@ -75,6 +75,61 @@ describe("runtime-agent-end deferred formatting", () => {
 		}
 	});
 
+	it("formats multiple files and preserves all side effects", async () => {
+		const env = setupTestEnvironment("pi-lens-agent-end-multi-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const file1 = createTempFile(env.tmpDir, "src/a.ts", "const a=1");
+			const file2 = createTempFile(env.tmpDir, "src/b.ts", "const b=2");
+			const file3 = createTempFile(env.tmpDir, "src/c.ts", "const c=3");
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			runtime.deferFormat(file1, env.tmpDir, "edit");
+			runtime.deferFormat(file2, env.tmpDir, "edit");
+			runtime.deferFormat(file3, env.tmpDir, "edit");
+
+			const formatFile = vi.fn(async (fp: string) => {
+				fs.writeFileSync(fp, fs.readFileSync(fp, "utf-8") + "\n");
+				return {
+					filePath: fp,
+					formatters: [{ name: "biome", success: true, changed: true }],
+					anyChanged: true,
+					allSucceeded: true,
+				};
+			});
+
+			const modifiedRanges: string[] = [];
+			const summary = await handleAgentEnd({
+				ctxCwd: env.tmpDir,
+				getFlag: (name) => name === "no-lsp",
+				notify: vi.fn(),
+				dbg: () => {},
+				runtime,
+				cacheManager: {
+					addModifiedRange: (fp: string) => modifiedRanges.push(path.basename(fp)),
+				} as any,
+				getFormatService: () => ({ recordRead: () => {}, formatFile }) as any,
+			});
+
+			// All three files formatted
+			expect(formatFile).toHaveBeenCalledTimes(3);
+			expect(summary?.queued).toBe(3);
+			expect(summary?.changed).toHaveLength(3);
+
+			// Side effects recorded for all three files
+			expect(modifiedRanges).toHaveLength(3);
+			expect(readChangesSince(env.tmpDir, 0)).toHaveLength(3);
+		} finally {
+			if (previousDataDir === undefined) {
+				delete process.env.PILENS_DATA_DIR;
+			} else {
+				process.env.PILENS_DATA_DIR = previousDataDir;
+			}
+			env.cleanup();
+		}
+	});
+
 	it("skips queued files when autoformat is disabled", async () => {
 		const env = setupTestEnvironment("pi-lens-agent-end-format-");
 		try {
