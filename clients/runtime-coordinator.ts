@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import * as path from "node:path";
 import type { ActionableWarningRecord } from "./actionable-warnings.js";
 import type { CascadeResult } from "./cascade-types.js";
+import type { CodeQualityWarningRecord } from "./code-quality-warnings.js";
 import type { FileComplexity } from "./complexity-client.js";
 import { normalizeMapKey } from "./path-utils.js";
 import type { ProjectIndex } from "./project-index.js";
@@ -54,6 +55,9 @@ export class RuntimeCoordinator {
 	private _telemetryModel = "unknown";
 	private _turnIndex = 0;
 	private _writeIndex = 0;
+	private _projectSeq = 0;
+	private _turnStartProjectSeq = 0;
+	private readonly _fileSeq = new Map<string, number>();
 	private _gitGuardHasBlockers = false;
 	private _gitGuardSummary = "";
 	private _readGuard: ReadGuard | null = null;
@@ -72,6 +76,10 @@ export class RuntimeCoordinator {
 	private readonly _actionableWarningsThisTurn = new Map<
 		string,
 		ActionableWarningRecord
+	>();
+	private readonly _codeQualityWarningsThisTurn = new Map<
+		string,
+		CodeQualityWarningRecord
 	>();
 
 	resetForSession(): void {
@@ -94,6 +102,9 @@ export class RuntimeCoordinator {
 		this._telemetryModel = "unknown";
 		this._turnIndex = 0;
 		this._writeIndex = 0;
+		this._projectSeq = 0;
+		this._turnStartProjectSeq = 0;
+		this._fileSeq.clear();
 		this._gitGuardHasBlockers = false;
 		this._gitGuardSummary = "";
 		this._readGuard = null;
@@ -101,6 +112,7 @@ export class RuntimeCoordinator {
 		this._lspReadWarmState.clear();
 		this._pendingInlineBlockers.clear();
 		this._actionableWarningsThisTurn.clear();
+		this._codeQualityWarningsThisTurn.clear();
 	}
 
 	get sessionStartedAt(): number {
@@ -148,6 +160,8 @@ export class RuntimeCoordinator {
 		this._cascadeResults = [];
 		this._pendingInlineBlockers.clear();
 		this._actionableWarningsThisTurn.clear();
+		this._codeQualityWarningsThisTurn.clear();
+		this._turnStartProjectSeq = this._projectSeq;
 		this._turnIndex += 1;
 		this._writeIndex = 0;
 		this._reportedThisTurn.clear();
@@ -195,6 +209,45 @@ export class RuntimeCoordinator {
 
 	get turnIndex(): number {
 		return this._turnIndex;
+	}
+
+	get projectSeq(): number {
+		return this._projectSeq;
+	}
+
+	get turnStartProjectSeq(): number {
+		return this._turnStartProjectSeq;
+	}
+
+	seedProjectSequence(
+		projectSeq: number,
+		fileSeqByPath?: Map<string, number>,
+	): void {
+		this._projectSeq = Math.max(0, Math.floor(projectSeq));
+		this._turnStartProjectSeq = this._projectSeq;
+		this._fileSeq.clear();
+		for (const [filePath, seq] of fileSeqByPath ?? []) {
+			this._fileSeq.set(
+				normalizeMapKey(path.resolve(filePath)),
+				Math.max(0, seq),
+			);
+		}
+	}
+
+	bumpFileSeq(filePath: string): { projectSeq: number; fileSeq: number } {
+		const key = normalizeMapKey(path.resolve(filePath));
+		this._projectSeq += 1;
+		const fileSeq = (this._fileSeq.get(key) ?? 0) + 1;
+		this._fileSeq.set(key, fileSeq);
+		return { projectSeq: this._projectSeq, fileSeq };
+	}
+
+	getFileSeq(filePath: string): number {
+		return this._fileSeq.get(normalizeMapKey(path.resolve(filePath))) ?? 0;
+	}
+
+	getFileSeqEntries(): Array<[string, number]> {
+		return [...this._fileSeq.entries()];
 	}
 
 	get sessionGeneration(): number {
@@ -311,6 +364,20 @@ export class RuntimeCoordinator {
 
 	clearActionableWarnings(): void {
 		this._actionableWarningsThisTurn.clear();
+	}
+
+	recordCodeQualityWarnings(warnings: CodeQualityWarningRecord[]): void {
+		for (const warning of warnings) {
+			this._codeQualityWarningsThisTurn.set(warning.id, warning);
+		}
+	}
+
+	peekCodeQualityWarnings(): CodeQualityWarningRecord[] {
+		return [...this._codeQualityWarningsThisTurn.values()];
+	}
+
+	clearCodeQualityWarnings(): void {
+		this._codeQualityWarningsThisTurn.clear();
 	}
 
 	get complexityBaselines(): Map<string, FileComplexity> {

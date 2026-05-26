@@ -1,4 +1,5 @@
 import * as nodeFs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { AstGrepClient } from "./ast-grep-client.js";
 import type { BiomeClient } from "./biome-client.js";
@@ -19,6 +20,7 @@ import { runLogCleanup } from "./log-cleanup.js";
 import { setSessionLanguages } from "./widget-state.js";
 import { initLSPConfig, loadLSPConfig } from "./lsp/config.js";
 import { getLSPService } from "./lsp/index.js";
+import type { LSPShutdownOptions } from "./lsp/client.js";
 import type { MetricsClient } from "./metrics-client.js";
 import {
 	buildProjectIndex,
@@ -26,13 +28,24 @@ import {
 	loadIndex,
 	saveIndex,
 } from "./project-index.js";
+import { readLatestProjectSequence } from "./project-changes.js";
+import {
+	hydrateRuntimeFromProjectSnapshot,
+	isProjectSnapshotFresh,
+	loadProjectSnapshot,
+	saveRuntimeProjectSnapshot,
+} from "./project-snapshot.js";
 import type { RuffClient } from "./ruff-client.js";
 import { scanProjectRules } from "./rules-scanner.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
 import type { RustClient } from "./rust-client.js";
 
 import { getSourceFiles } from "./scan-utils.js";
-import { resolveStartupScanContext } from "./startup-scan.js";
+import {
+	findNearestProjectRoot,
+	resolveStartupScanContext,
+	type StartupScanContext,
+} from "./startup-scan.js";
 import type { TestRunnerClient } from "./test-runner-client.js";
 import type { TodoScanner } from "./todo-scanner.js";
 import type { TypeCoverageClient } from "./type-coverage-client.js";
@@ -60,10 +73,19 @@ interface SessionStartDeps {
 	ensureTool: (name: string) => Promise<string | null | undefined>;
 	cleanStaleTsBuildInfo: (cwd: string) => string[];
 	resetDispatchBaselines: () => void;
-	resetLSPService: () => void;
+	resetLSPService: (options?: LSPShutdownOptions) => void;
 }
 
 type StartupMode = "full" | "minimal" | "quick";
+
+function resolveSnapshotRoot(cwd: string): string {
+	const resolvedCwd = path.resolve(cwd);
+	const nearest = findNearestProjectRoot(resolvedCwd);
+	if (!nearest || path.resolve(nearest) === path.resolve(os.homedir())) {
+		return resolvedCwd;
+	}
+	return nearest;
+}
 
 function resolveStartupMode(): StartupMode {
 	const envMode = (process.env.PI_LENS_STARTUP_MODE ?? "").trim().toLowerCase();
@@ -200,6 +222,7 @@ function scheduleStartupScans(
 	runtime: RuntimeCoordinator,
 	sessionGeneration: number,
 	analysisRoot: string,
+	snapshotRoot: string,
 	languageProfile: ReturnType<typeof detectProjectLanguageProfile>,
 	dbg: SessionStartDeps["dbg"],
 ): void {
@@ -208,22 +231,27 @@ function scheduleStartupScans(
 
 	const runTask = (name: string, task: () => Promise<void>): void => {
 		const startedAt = Date.now();
-		dbg(`session_start task ${name}: start`);
+		dbg(`session_start task ${name}: scheduled`);
 		runtime.markStartupScanInFlight(name, sessionGeneration);
-		void task()
-			.then(() => {
-				dbg(
-					`session_start task ${name}: success (${Date.now() - startedAt}ms)`,
-				);
-			})
-			.catch((err) => {
-				dbg(`session_start: ${name} background scan failed: ${err}`);
-				dbg(`session_start task ${name}: failed (${Date.now() - startedAt}ms)`);
-			})
-			.finally(() => {
-				runtime.clearStartupScanInFlight(name, sessionGeneration);
-				dbg(`session_start task ${name}: end`);
-			});
+		setImmediate(() => {
+			dbg(`session_start task ${name}: start`);
+			void task()
+				.then(() => {
+					dbg(
+						`session_start task ${name}: success (${Date.now() - startedAt}ms)`,
+					);
+				})
+				.catch((err) => {
+					dbg(`session_start: ${name} background scan failed: ${err}`);
+					dbg(
+						`session_start task ${name}: failed (${Date.now() - startedAt}ms)`,
+					);
+				})
+				.finally(() => {
+					runtime.clearStartupScanInFlight(name, sessionGeneration);
+					dbg(`session_start task ${name}: end`);
+				});
+		});
 	};
 
 	const canRunJsTsHeavyScans = canRunStartupHeavyScans(languageProfile, "jsts");
@@ -317,6 +345,7 @@ function scheduleStartupScans(
 			for (const [name, file] of exports) {
 				runtime.cachedExports.set(name, file);
 			}
+			saveRuntimeProjectSnapshot({ cwd: snapshotRoot, runtime, dbg });
 		}
 	});
 
@@ -334,6 +363,7 @@ function scheduleStartupScans(
 			dbg(
 				`session_start: loaded fresh project index (${existing.entries.size} entries)`,
 			);
+			saveRuntimeProjectSnapshot({ cwd: snapshotRoot, runtime, dbg });
 		} else {
 			const sourceFiles = getSourceFiles(analysisRoot, true);
 			const tsFiles = sourceFiles.filter(
@@ -349,6 +379,7 @@ function scheduleStartupScans(
 				dbg(
 					`session_start: built project index (${runtime.cachedProjectIndex.entries.size} entries from ${tsFiles.length} files)`,
 				);
+				saveRuntimeProjectSnapshot({ cwd: snapshotRoot, runtime, dbg });
 			} else {
 				if (!runtime.isCurrentSession(sessionGeneration)) return;
 				dbg(`session_start: skipped project index (${tsFiles.length} files)`);
@@ -456,7 +487,7 @@ export async function handleSessionStart(
 	dbg(`session_start startup mode: ${startupMode}`);
 
 	if (!getFlag("no-lsp")) {
-		resetLSPService();
+		resetLSPService({ fast: true });
 		dbg("session_start: LSP service reset");
 		dbg(
 			"session_start: phase0 workspace diagnostics observation enabled (capability probe only)",
@@ -467,6 +498,21 @@ export async function handleSessionStart(
 	const cwd = ctxCwd ?? process.cwd();
 	if (quickMode) {
 		runtime.projectRoot = cwd;
+		const snapshotRoot = resolveSnapshotRoot(cwd);
+		const latestSeq = readLatestProjectSequence(snapshotRoot);
+		runtime.seedProjectSequence?.(
+			latestSeq.projectSeq,
+			latestSeq.fileSeqByPath,
+		);
+		const effectiveSeq = runtime.projectSeq ?? latestSeq.projectSeq;
+		dbg(`session_start sequence: projectSeq=${effectiveSeq}`);
+		const snapshot = loadProjectSnapshot(snapshotRoot);
+		if (isProjectSnapshotFresh(snapshot, effectiveSeq)) {
+			hydrateRuntimeFromProjectSnapshot(runtime, snapshot);
+			dbg(
+				`project_snapshot: loaded seq=${snapshot.seq} exports=${snapshot.cachedExports.length}`,
+			);
+		}
 		const quickTools: string[] = [];
 		if (!getFlag("no-lsp")) {
 			quickTools.push("LSP Service");
@@ -498,17 +544,38 @@ export async function handleSessionStart(
 		}
 	}
 
-	const startupScan = resolveStartupScanContext(cwd);
+	const snapshotRoot = resolveSnapshotRoot(cwd);
+	const latestSeq = readLatestProjectSequence(snapshotRoot);
+	runtime.seedProjectSequence?.(latestSeq.projectSeq, latestSeq.fileSeqByPath);
+	const effectiveSeq = runtime.projectSeq ?? latestSeq.projectSeq;
+	dbg(`session_start sequence: projectSeq=${effectiveSeq}`);
+
+	const snapshot = loadProjectSnapshot(snapshotRoot);
+	const freshSnapshot = isProjectSnapshotFresh(snapshot, effectiveSeq)
+		? snapshot
+		: null;
+	if (freshSnapshot) {
+		hydrateRuntimeFromProjectSnapshot(runtime, freshSnapshot);
+		dbg(
+			`project_snapshot: loaded seq=${freshSnapshot.seq} exports=${freshSnapshot.cachedExports.length}`,
+		);
+	}
+
+	const startupScan: StartupScanContext = freshSnapshot?.startupScan
+		? { ...freshSnapshot.startupScan, cwd: path.resolve(cwd) }
+		: resolveStartupScanContext(cwd);
 	phase("scan-context");
 	const scanRoot = startupScan.projectRoot ?? cwd;
 	const useScanRootForSignals =
 		startupScan.canWarmCaches || startupScan.reason === "too-many-source-files";
 	const analysisRoot = useScanRootForSignals ? scanRoot : cwd;
 	runtime.projectRoot = cwd;
-	const languageProfile = detectProjectLanguageProfile(
-		analysisRoot,
-		startupScan.canWarmCaches ? undefined : [],
-	);
+	const languageProfile = freshSnapshot?.languageProfile
+		? freshSnapshot.languageProfile
+		: detectProjectLanguageProfile(
+				analysisRoot,
+				startupScan.canWarmCaches ? undefined : [],
+			);
 	phase("language-profile");
 	dbg(`session_start cwd: ${cwd}`);
 	dbg(
@@ -582,6 +649,13 @@ export async function handleSessionStart(
 	];
 
 	runtime.projectRulesScan = scanProjectRules(analysisRoot);
+	saveRuntimeProjectSnapshot({
+		cwd: snapshotRoot,
+		runtime,
+		startupScan,
+		languageProfile,
+		dbg,
+	});
 	phase("project-rules");
 	if (runtime.projectRulesScan.hasCustomRules) {
 		const ruleCount = runtime.projectRulesScan.rules.length;
@@ -617,6 +691,7 @@ export async function handleSessionStart(
 			runtime,
 			sessionGeneration,
 			analysisRoot,
+			snapshotRoot,
 			languageProfile,
 			dbg,
 		);

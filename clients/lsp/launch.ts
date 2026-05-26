@@ -380,6 +380,21 @@ function trySpawn(
  * This catches "command not found" errors and other spawn failures
  * Returns a promise that rejects if an immediate error occurs
  */
+function unrefLspProcessHandles(proc: ChildProcess): void {
+	try {
+		proc.unref();
+	} catch {
+		// best-effort
+	}
+	for (const stream of [proc.stdin, proc.stdout, proc.stderr]) {
+		try {
+			(stream as { unref?: () => void } | null | undefined)?.unref?.();
+		} catch {
+			// best-effort
+		}
+	}
+}
+
 function _attachErrorHandler(
 	proc: ChildProcess,
 	context: string,
@@ -705,6 +720,7 @@ export async function launchLSP(
 		cwd,
 		pid: proc.pid ?? 0,
 	});
+	unrefLspProcessHandles(proc);
 
 	return {
 		process: proc,
@@ -799,6 +815,7 @@ export async function launchViaPackageManager(
 
 		// Attach permanent error handler
 		_attachErrorHandler(proc, packageName);
+		unrefLspProcessHandles(proc);
 
 		return {
 			process: proc,

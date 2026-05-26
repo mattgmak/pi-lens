@@ -47,10 +47,11 @@ import { logReadGuardEvent } from "./clients/read-guard-logger.js";
 import {
 	countFileLines,
 	getTouchedLinesForGuard,
-	stripOldTextTrailingWhitespace,
 	tryCorrectIndentationMismatch,
 	tryCorrectIndentationMismatchFromContent,
 } from "./clients/read-guard-tool-lines.js";
+import { computeTrailingWhitespaceOldTextPatch } from "./clients/oldtext-autopatch.js";
+import { applyPartiallyApplicableEdits } from "./clients/partial-edit-apply.js";
 import { retargetReplacementIndentation } from "./clients/indent-retarget.js";
 import { handleAgentEnd } from "./clients/runtime-agent-end.js";
 import {
@@ -1361,7 +1362,12 @@ export default function (pi: ExtensionAPI) {
 
 		// Track any Write so recordWritten can inject a synthetic read afterward.
 		// The agent authored the content (new or overwritten), so it trivially "knows" the file.
-		if (!isEditOnly && isWriteOrEdit && filePath && !getLensFlag("no-read-guard")) {
+		if (
+			!isEditOnly &&
+			isWriteOrEdit &&
+			filePath &&
+			!getLensFlag("no-read-guard")
+		) {
 			runtime.readGuard.noteCreatedFile(
 				filePath,
 				runtime.turnIndex,
@@ -1439,10 +1445,14 @@ export default function (pi: ExtensionAPI) {
 				for (const entry of oldTexts) {
 					const v = entry.value;
 					if (!v.includes("\t") && !v.includes("\n")) continue;
-					if (countOldTextMatches(filePath, v, matchNormalizedContent) !== 0) continue;
+					if (countOldTextMatches(filePath, v, matchNormalizedContent) !== 0)
+						continue;
 					const escaped = v.replace(/\t/g, "\\t").replace(/\n/g, "\\n");
 					if (escaped === v) continue;
-					if (countOldTextMatches(filePath, escaped, matchNormalizedContent) !== 1) continue;
+					if (
+						countOldTextMatches(filePath, escaped, matchNormalizedContent) !== 1
+					)
+						continue;
 					entry.apply(escaped);
 					entry.value = escaped;
 					logReadGuardEvent({
@@ -1456,27 +1466,44 @@ export default function (pi: ExtensionAPI) {
 
 			// --- Pass 1: trailing whitespace correction ---
 			// Editors strip trailing whitespace on save; the model may copy content
-			// that had it. Normalize before indentation correction so the subsequent
-			// pass sees clean input. Safety gate: stripped version must match exactly once.
-			if (matchNormalizedContent !== undefined) {
+			// that had it. Safety gates: the original raw oldText must not already
+			// match, and the stripped raw candidate must match exactly once. When
+			// trailing empty lines are stripped from oldText, strip the equivalent
+			// suffix from newText so the replacement span is not accidentally widened.
+			if (crlfContent !== undefined) {
 				for (const entry of oldTexts) {
-					const normalizedValue = entry.value.replace(/\r\n/g, "\n");
-					const stripped = stripOldTextTrailingWhitespace(entry.value);
-					if (stripped === normalizedValue) continue;
-					if (countOldTextMatches(filePath, stripped, matchNormalizedContent) !== 1)
-						continue;
-					entry.apply(stripped);
-					entry.value = stripped;
+					const patch = computeTrailingWhitespaceOldTextPatch({
+						oldText: entry.value,
+						newText: entry.newText,
+						fileContent: crlfContent,
+					});
+					if (!patch) continue;
+					entry.apply(patch.oldText);
+					entry.value = patch.oldText;
+					const newTextPatched =
+						patch.newText !== undefined && patch.newText !== entry.newText;
+					if (newTextPatched) {
+						entry.applyNewText(patch.newText!);
+						entry.newText = patch.newText;
+					}
 					logReadGuardEvent({
 						event: "oldtext_trailing_ws_autopatched",
 						sessionId: runtime.telemetrySessionId,
 						filePath,
-						metadata: { tool: "edit", label: entry.label },
+						metadata: {
+							tool: "edit",
+							label: entry.label,
+							removedLineTrailingWhitespace:
+								patch.removedLineTrailingWhitespace,
+							removedTrailingEmptyLineCount:
+								patch.removedTrailingEmptyLineCount,
+							newTextTrailingEmptyLinesPatched: newTextPatched,
+						},
 					});
 				}
 			}
 
-const correctedOldTexts = oldTexts
+			const correctedOldTexts = oldTexts
 				.map(({ label, value, newText, apply, applyNewText }) => {
 					const corrected =
 						crlfContent !== undefined
@@ -1555,40 +1582,84 @@ const correctedOldTexts = oldTexts
 				typeof readGuard?.isNewFile !== "function" ||
 				!readGuard.isNewFile(filePath);
 			if (readGuard && isExistingFile && !isExternalOrVendor) {
-				const { touchedLines, editRanges, preflightError, partiallyApplicable, contentMatchValidated } =
-					getTouchedLinesForGuard(event, filePath, runtime.telemetrySessionId);
+				const {
+					touchedLines,
+					editRanges,
+					preflightError,
+					partiallyApplicable,
+					contentMatchValidated,
+				} = getTouchedLinesForGuard(
+					event,
+					filePath,
+					runtime.telemetrySessionId,
+				);
 				if (preflightError) {
 					if (partiallyApplicable && partiallyApplicable.length > 0) {
 						try {
-							let content = nodeFs.readFileSync(filePath, "utf-8");
-							const useCrlf = content.includes("\r\n");
-							let normalized = content.replace(/\r\n/g, "\n");
-							for (const { oldText, newText } of partiallyApplicable) {
-								normalized = normalized.replace(
-									oldText.replace(/\r\n/g, "\n"),
-									(newText ?? "").replace(/\r\n/g, "\n"),
-								);
-							}
-							nodeFs.writeFileSync(
+							const partial = await applyPartiallyApplicableEdits({
 								filePath,
-								useCrlf ? normalized.replace(/\n/g, "\r\n") : normalized,
-								"utf-8",
-							);
-							const n = partiallyApplicable.length;
-							const appliedIndices = partiallyApplicable.map(e => `edits[${e.originalIndex}]`).join(", ");
-							logReadGuardEvent({
-								event: "edit_partial_apply",
-								sessionId: runtime.telemetrySessionId,
-								filePath,
-								metadata: { appliedCount: n, appliedIndices },
+								edits: partiallyApplicable,
+								afterWrite: async () => {
+									const {
+										biomeClient,
+										ruffClient,
+										metricsClient,
+										agentBehaviorClient,
+									} = await loadBootstrapClients();
+									const result = await handleToolResult({
+										event: {
+											toolName: "write",
+											input: { path: filePath },
+											details: { piLensPartialApply: true },
+											content: [],
+											provider: (event as { provider?: string }).provider,
+											model: (event as { model?: string }).model,
+											sessionId: (event as { sessionId?: string }).sessionId,
+											session: (event as { session?: { id?: string } }).session,
+										},
+										getFlag: (name: string) => getLensFlag(name),
+										dbg,
+										runtime,
+										cacheManager,
+										biomeClient,
+										ruffClient,
+										metricsClient,
+										resetLSPService,
+										readGuard: runtime.readGuard,
+										agentBehaviorRecord: (toolName, analyzedPath) =>
+											agentBehaviorClient.recordToolCall(
+												toolName,
+												analyzedPath,
+											),
+										formatBehaviorWarnings: (warnings) =>
+											agentBehaviorClient.formatWarnings(warnings as any),
+									});
+									return result?.content
+										?.map((item) => item.text)
+										.filter((text): text is string => !!text)
+										.join("\n\n");
+								},
 							});
-							return {
-								block: true,
-								reason: preflightError.replace(
+							if (partial.appliedCount > 0) {
+								logReadGuardEvent({
+									event: "edit_partial_apply",
+									sessionId: runtime.telemetrySessionId,
+									filePath,
+									metadata: {
+										appliedCount: partial.appliedCount,
+										appliedIndices: partial.appliedIndices,
+										routedThroughPostEditPipeline: true,
+									},
+								});
+								let reason = preflightError.replace(
 									"🔄 RETRYABLE — Edit target not found",
-									`⚠️ PARTIAL APPLY — ${n} edit${n !== 1 ? "s" : ""} applied (${appliedIndices})`,
-								),
-							};
+									`⚠️ PARTIAL APPLY — ${partial.appliedCount} edit${partial.appliedCount !== 1 ? "s" : ""} applied (${partial.appliedIndices})`,
+								);
+								if (partial.postEditOutput) {
+									reason += `\n\nPost-apply analysis:\n${partial.postEditOutput}`;
+								}
+								return { block: true, reason };
+							}
 						} catch {
 							// fall through to full block
 						}
@@ -1607,7 +1678,10 @@ const correctedOldTexts = oldTexts
 				});
 				const verdict =
 					typeof readGuard.checkEdit === "function"
-						? readGuard.checkEdit(filePath, touchedLines, editRanges, { skipSnapshotCheck: !!contentMatchValidated, oldTextResolved: !!contentMatchValidated })
+						? readGuard.checkEdit(filePath, touchedLines, editRanges, {
+								skipSnapshotCheck: !!contentMatchValidated,
+								oldTextResolved: !!contentMatchValidated,
+							})
 						: { action: "allow" as const };
 				if (verdict.action === "block") {
 					return {
@@ -1836,7 +1910,7 @@ const correctedOldTexts = oldTexts
 	// so it does not fire after shutdown. resetLSPService shuts down any live clients.
 	(pi as any).on("session_shutdown", () => {
 		cancelLSPIdleReset();
-		resetLSPService();
+		resetLSPService({ fast: true });
 	});
 
 	// --- Inject turn-end findings into next agent turn ---
