@@ -1,6 +1,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { CacheManager } from "../../clients/cache-manager.js";
+import { readChangesSince } from "../../clients/project-changes.js";
+import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleToolResult } from "../../clients/runtime-tool-result.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
@@ -12,6 +15,70 @@ describe("runtime-tool-result inline behavior warnings", () => {
 	beforeEach(async () => {
 		const pipeline = await import("../../clients/pipeline.js");
 		vi.mocked(pipeline.runPipeline).mockReset();
+	});
+
+	it("appends project change log entries for analyzed agent edits", async () => {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		vi.mocked(runPipeline).mockResolvedValue({
+			output: "✓ no blockers",
+			hasBlockers: false,
+			isError: false,
+			fileModified: false,
+		});
+
+		const env = setupTestEnvironment("pi-lens-runtime-tool-change-log-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const filePath = path.join(env.tmpDir, "src", "app.ts");
+			fs.mkdirSync(path.dirname(filePath), { recursive: true });
+			fs.writeFileSync(filePath, "export const x = 1;\n");
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			runtime.setTelemetryIdentity({ sessionId: "change-session" });
+			runtime.beginTurn();
+
+			await handleToolResult({
+				event: {
+					toolName: "edit",
+					input: { path: filePath },
+					details: { diff: "+  1 export const x = 1;" },
+					content: [{ type: "text", text: "base" }],
+				},
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager: new CacheManager(false),
+				biomeClient: {},
+				ruffClient: {},
+				testRunnerClient: {},
+				metricsClient: {},
+				resetLSPService: () => {},
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+			} as any);
+
+			const changes = readChangesSince(env.tmpDir, 0);
+			expect(changes).toHaveLength(1);
+			expect(changes[0]).toMatchObject({
+				seq: 1,
+				sessionId: "change-session",
+				turnIndex: 1,
+				source: "agent-edit",
+				filePath,
+				fileSeq: 1,
+				changedRange: { start: 1, end: 1 },
+			});
+			expect(runtime.projectSeq).toBe(1);
+			expect(runtime.getFileSeq(filePath)).toBe(1);
+		} finally {
+			if (previousDataDir === undefined) {
+				delete process.env.PILENS_DATA_DIR;
+			} else {
+				process.env.PILENS_DATA_DIR = previousDataDir;
+			}
+			env.cleanup();
+		}
 	});
 
 	it("queues successful write/edit files for deferred formatting by default", async () => {

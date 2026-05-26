@@ -69,6 +69,9 @@ describe("actionable warnings", () => {
 				cwd,
 				sessionId: "s1",
 				turnIndex: 2,
+				projectSeqStart: 4,
+				projectSeqEnd: 5,
+				fileSeqByPath: new Map([[filePath.replace(/\\/g, "/"), 1]]),
 				files: ["src/a.ts"],
 				modifiedRangesByFile: new Map(),
 				dispatchWarnings: record ? [record] : [],
@@ -79,6 +82,8 @@ describe("actionable warnings", () => {
 				unsuppressed: 1,
 				files: 1,
 			});
+			expect(report).toMatchObject({ projectSeqStart: 4, projectSeqEnd: 5 });
+			expect(report.files[0]?.fileSeq).toBe(1);
 			expect(report.files[0]?.warnings[0]?.fixSuggestion).toBe(
 				"remove this statement",
 			);

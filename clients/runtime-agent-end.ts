@@ -8,6 +8,10 @@ import type { CacheManager } from "./cache-manager.js";
 import type { FormatService } from "./format-service.js";
 import { logLatency } from "./latency-logger.js";
 import { resyncLspFile, runFormatPhase } from "./pipeline.js";
+import {
+	appendProjectChange,
+	type ProjectChangeSource,
+} from "./project-changes.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
 
 interface AgentEndDeps {
@@ -26,6 +30,31 @@ export interface AgentEndFormatSummary {
 	changed: string[];
 	failed: Array<{ filePath: string; errors: string[] }>;
 	skipped: Array<{ filePath: string; reason: string }>;
+}
+
+function recordProjectChange(args: {
+	runtime: RuntimeCoordinator;
+	cwd: string;
+	filePath: string;
+	source: ProjectChangeSource;
+	dbg: (msg: string) => void;
+}): void {
+	const bump = (args.runtime as Partial<RuntimeCoordinator>).bumpFileSeq;
+	if (!bump) return;
+	const { projectSeq, fileSeq } = bump.call(args.runtime, args.filePath);
+	try {
+		appendProjectChange(args.cwd, {
+			seq: projectSeq,
+			timestamp: new Date().toISOString(),
+			sessionId: args.runtime.telemetrySessionId,
+			turnIndex: args.runtime.turnIndex,
+			source: args.source,
+			filePath: path.resolve(args.filePath),
+			fileSeq,
+		});
+	} catch (err) {
+		args.dbg(`project change log append failed for ${args.filePath}: ${err}`);
+	}
 }
 
 export async function handleAgentEnd({
@@ -90,6 +119,13 @@ export async function handleAgentEnd({
 
 				if (result.formatChanged) {
 					summary.changed.push(filePath);
+					recordProjectChange({
+						runtime,
+						cwd: record.cwd || ctxCwd || runtime.projectRoot,
+						filePath,
+						source: "format",
+						dbg,
+					});
 					if (!getFlag("no-read-guard")) {
 						runtime.readGuard.recordWritten(filePath);
 					}
@@ -163,6 +199,13 @@ export async function handleAgentEnd({
 			});
 			for (const changedFile of fixSummary.changedFiles) {
 				if (!nodeFs.existsSync(changedFile)) continue;
+				recordProjectChange({
+					runtime,
+					cwd: ctxCwd ?? runtime.projectRoot,
+					filePath: changedFile,
+					source: "autofix",
+					dbg,
+				});
 				if (!getFlag("no-read-guard"))
 					runtime.readGuard.recordWritten(changedFile);
 				try {

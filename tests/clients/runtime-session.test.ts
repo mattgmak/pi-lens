@@ -1,4 +1,7 @@
+import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { saveProjectSnapshot } from "../../clients/project-snapshot.js";
+import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleSessionStart } from "../../clients/runtime-session.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
@@ -141,6 +144,70 @@ afterEach(() => {
 });
 
 describe("runtime-session notifications", () => {
+	it("quick mode hydrates cached exports and rules from a fresh project snapshot", async () => {
+		const env = setupTestEnvironment("pi-lens-session-snapshot-");
+		const restoreStartupMode = setStartupMode("quick");
+		const runtime = new RuntimeCoordinator();
+		try {
+			saveProjectSnapshot(env.tmpDir, {
+				version: 1,
+				projectRoot: env.tmpDir,
+				generatedAt: new Date().toISOString(),
+				seq: 0,
+				files: {},
+				symbols: {},
+				reverseDeps: {},
+				cachedExports: [["fromSnapshot", path.join(env.tmpDir, "src/a.ts")]],
+				projectRulesScan: {
+					hasCustomRules: true,
+					rules: [
+						{
+							source: "root",
+							name: "AGENTS.md",
+							filePath: path.join(env.tmpDir, "AGENTS.md"),
+							relativePath: "AGENTS.md",
+						},
+					],
+				},
+			});
+
+			await handleSessionStart({
+				ctxCwd: env.tmpDir,
+				getFlag: (name: string) => name === "no-lsp",
+				notify: () => {},
+				dbg: () => {},
+				log: () => {},
+				runtime,
+				metricsClient: { reset: () => {} },
+				cacheManager: { writeCache: () => {}, readCache: () => null },
+				todoScanner: { scanDirectory: () => ({ items: [] }) },
+				astGrepClient: {},
+				biomeClient: {},
+				ruffClient: {},
+				knipClient: {},
+				jscpdClient: {},
+				typeCoverageClient: {},
+				depChecker: {},
+				testRunnerClient: {},
+				goClient: {},
+				rustClient: {},
+				ensureTool: async () => null,
+				cleanStaleTsBuildInfo: () => [],
+				resetDispatchBaselines: () => {},
+				resetLSPService: () => {},
+			} as any);
+
+			expect(runtime.cachedExports.get("fromSnapshot")).toBe(
+				path.join(env.tmpDir, "src/a.ts"),
+			);
+			expect(runtime.projectRulesScan.hasCustomRules).toBe(true);
+			expect(runtime.projectRulesScan.rules[0]?.name).toBe("AGENTS.md");
+		} finally {
+			restoreStartupMode();
+			env.cleanup();
+		}
+	});
+
 	it("full mode emits build-cache warning while avoiding startup info noise", async () => {
 		const { env, notify, scanDirectory, ensureTool } =
 			await runSessionStart("full");

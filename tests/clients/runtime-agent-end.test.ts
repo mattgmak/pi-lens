@@ -1,12 +1,16 @@
 import * as fs from "node:fs";
 import { describe, expect, it, vi } from "vitest";
+import * as path from "node:path";
+import { readChangesSince } from "../../clients/project-changes.js";
 import { handleAgentEnd } from "../../clients/runtime-agent-end.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
 describe("runtime-agent-end deferred formatting", () => {
-	it("formats each queued file once and clears the queue", async () => {
+	it("formats each queued file once, clears the queue, and records a format change", async () => {
 		const env = setupTestEnvironment("pi-lens-agent-end-format-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
 		try {
 			const filePath = createTempFile(env.tmpDir, "src/app.ts", "const x=1");
 			const runtime = new RuntimeCoordinator();
@@ -49,11 +53,24 @@ describe("runtime-agent-end deferred formatting", () => {
 			expect(summary?.changed).toEqual([filePath]);
 			expect(runtime.pendingDeferredFormatCount).toBe(0);
 			expect(modifiedRanges.map((entry) => entry.filePath)).toEqual([filePath]);
+			expect(readChangesSince(env.tmpDir, 0)).toMatchObject([
+				{
+					seq: 1,
+					source: "format",
+					filePath,
+					fileSeq: 1,
+				},
+			]);
 			expect(notify).toHaveBeenCalledWith(
 				"pi-lens deferred format applied to 1 file(s): app.ts",
 				"info",
 			);
 		} finally {
+			if (previousDataDir === undefined) {
+				delete process.env.PILENS_DATA_DIR;
+			} else {
+				process.env.PILENS_DATA_DIR = previousDataDir;
+			}
 			env.cleanup();
 		}
 	});

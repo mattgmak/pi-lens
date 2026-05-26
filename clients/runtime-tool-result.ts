@@ -12,6 +12,11 @@ import { resolveLanguageRootForFile } from "./language-profile.js";
 import { logLatency } from "./latency-logger.js";
 import type { MetricsClient } from "./metrics-client.js";
 import { runPipeline, type PipelineResult } from "./pipeline.js";
+import {
+	appendProjectChange,
+	type ProjectChangeRange,
+	type ProjectChangeSource,
+} from "./project-changes.js";
 import type { RuffClient } from "./ruff-client.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
 
@@ -95,6 +100,52 @@ function getFileStateHash(filePath: string): string {
 	} catch (err) {
 		const code = (err as { code?: string }).code ?? "unknown";
 		return `unreadable:${code}`;
+	}
+}
+
+function sourceForToolName(
+	toolName: string,
+	details?: unknown,
+): ProjectChangeSource {
+	if (
+		(details as { piLensPartialApply?: unknown } | undefined)
+			?.piLensPartialApply
+	) {
+		return "partial-apply";
+	}
+	return toolName === "write" ? "agent-write" : "agent-edit";
+}
+
+function singleRange(
+	ranges: Array<{ start: number; end: number }> | undefined,
+): ProjectChangeRange | undefined {
+	return ranges?.length === 1 ? ranges[0] : undefined;
+}
+
+function recordProjectChange(args: {
+	runtime: RuntimeCoordinator;
+	cwd: string;
+	filePath: string;
+	source: ProjectChangeSource;
+	changedRange?: ProjectChangeRange;
+	dbg: (msg: string) => void;
+}): void {
+	const bump = (args.runtime as Partial<RuntimeCoordinator>).bumpFileSeq;
+	if (!bump) return;
+	const { projectSeq, fileSeq } = bump.call(args.runtime, args.filePath);
+	try {
+		appendProjectChange(args.cwd, {
+			seq: projectSeq,
+			timestamp: new Date().toISOString(),
+			sessionId: args.runtime.telemetrySessionId,
+			turnIndex: args.runtime.turnIndex,
+			source: args.source,
+			filePath: path.resolve(args.filePath),
+			fileSeq,
+			changedRange: args.changedRange,
+		});
+	} catch (err) {
+		args.dbg(`project change log append failed for ${args.filePath}: ${err}`);
 	}
 }
 
@@ -277,6 +328,15 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		dbg(`turn state tracking error stack: ${(err as Error).stack}`);
 	}
 
+	recordProjectChange({
+		runtime,
+		cwd,
+		filePath,
+		source: sourceForToolName(event.toolName, event.details),
+		changedRange: singleRange(modifiedRanges),
+		dbg,
+	});
+
 	const turnStateMs = Date.now() - toolResultStart;
 	logLatency({
 		type: "phase",
@@ -381,8 +441,15 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 
 	for (const changedFile of result.changedFiles ?? []) {
 		const resolvedChanged = path.resolve(changedFile);
-		if (resolvedChanged === path.resolve(filePath)) continue;
 		if (!nodeFs.existsSync(resolvedChanged)) continue;
+		recordProjectChange({
+			runtime,
+			cwd,
+			filePath: resolvedChanged,
+			source: "autofix",
+			dbg,
+		});
+		if (resolvedChanged === path.resolve(filePath)) continue;
 		try {
 			const content = nodeFs.readFileSync(resolvedChanged, "utf-8");
 			const lineCount = content.split("\n").length;

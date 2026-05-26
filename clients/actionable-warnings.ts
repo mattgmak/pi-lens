@@ -46,11 +46,14 @@ export interface ActionableWarningsReport {
 	scope: "turn_delta";
 	sessionId: string;
 	turnIndex: number;
+	projectSeqStart?: number;
+	projectSeqEnd?: number;
 	deltaOnly: boolean;
 	includeLspCodeActions: boolean;
 	files: Array<{
 		filePath: string;
 		displayPath: string;
+		fileSeq?: number;
 		warnings: ActionableWarningRecord[];
 	}>;
 	summary: {
@@ -321,6 +324,9 @@ export async function buildActionableWarningsReport(args: {
 	modifiedRangesByFile: Map<string, ModifiedRange[]>;
 	dispatchWarnings: ActionableWarningRecord[];
 	includeLspCodeActions: boolean;
+	projectSeqStart?: number;
+	projectSeqEnd?: number;
+	fileSeqByPath?: Map<string, number>;
 	deltaOnly?: boolean;
 	dbg?: (msg: string) => void;
 }): Promise<ActionableWarningsReport> {
@@ -428,6 +434,7 @@ export async function buildActionableWarningsReport(args: {
 	const files = [...byFile.entries()].map(([filePath, warnings]) => ({
 		filePath,
 		displayPath: toRunnerDisplayPath(cwd, filePath),
+		fileSeq: args.fileSeqByPath?.get(normalizeMapKey(filePath)),
 		warnings,
 	}));
 	const allActions = merged.flatMap((warning) => warning.actions);
@@ -452,6 +459,8 @@ export async function buildActionableWarningsReport(args: {
 		scope: "turn_delta",
 		sessionId: args.sessionId,
 		turnIndex: args.turnIndex,
+		projectSeqStart: args.projectSeqStart,
+		projectSeqEnd: args.projectSeqEnd,
 		deltaOnly: args.deltaOnly !== false,
 		includeLspCodeActions: args.includeLspCodeActions,
 		files,

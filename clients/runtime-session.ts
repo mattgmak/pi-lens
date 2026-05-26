@@ -26,6 +26,13 @@ import {
 	loadIndex,
 	saveIndex,
 } from "./project-index.js";
+import { readLatestProjectSequence } from "./project-changes.js";
+import {
+	hydrateRuntimeFromProjectSnapshot,
+	isProjectSnapshotFresh,
+	loadProjectSnapshot,
+	saveRuntimeProjectSnapshot,
+} from "./project-snapshot.js";
 import type { RuffClient } from "./ruff-client.js";
 import { scanProjectRules } from "./rules-scanner.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
@@ -317,6 +324,7 @@ function scheduleStartupScans(
 			for (const [name, file] of exports) {
 				runtime.cachedExports.set(name, file);
 			}
+			saveRuntimeProjectSnapshot({ cwd: analysisRoot, runtime, dbg });
 		}
 	});
 
@@ -334,6 +342,7 @@ function scheduleStartupScans(
 			dbg(
 				`session_start: loaded fresh project index (${existing.entries.size} entries)`,
 			);
+			saveRuntimeProjectSnapshot({ cwd: analysisRoot, runtime, dbg });
 		} else {
 			const sourceFiles = getSourceFiles(analysisRoot, true);
 			const tsFiles = sourceFiles.filter(
@@ -349,6 +358,7 @@ function scheduleStartupScans(
 				dbg(
 					`session_start: built project index (${runtime.cachedProjectIndex.entries.size} entries from ${tsFiles.length} files)`,
 				);
+				saveRuntimeProjectSnapshot({ cwd: analysisRoot, runtime, dbg });
 			} else {
 				if (!runtime.isCurrentSession(sessionGeneration)) return;
 				dbg(`session_start: skipped project index (${tsFiles.length} files)`);
@@ -467,6 +477,20 @@ export async function handleSessionStart(
 	const cwd = ctxCwd ?? process.cwd();
 	if (quickMode) {
 		runtime.projectRoot = cwd;
+		const latestSeq = readLatestProjectSequence(cwd);
+		runtime.seedProjectSequence?.(
+			latestSeq.projectSeq,
+			latestSeq.fileSeqByPath,
+		);
+		const effectiveSeq = runtime.projectSeq ?? latestSeq.projectSeq;
+		dbg(`session_start sequence: projectSeq=${effectiveSeq}`);
+		const snapshot = loadProjectSnapshot(cwd);
+		if (isProjectSnapshotFresh(snapshot, effectiveSeq)) {
+			hydrateRuntimeFromProjectSnapshot(runtime, snapshot);
+			dbg(
+				`project_snapshot: loaded seq=${snapshot.seq} exports=${snapshot.cachedExports.length}`,
+			);
+		}
 		const quickTools: string[] = [];
 		if (!getFlag("no-lsp")) {
 			quickTools.push("LSP Service");
@@ -505,6 +529,17 @@ export async function handleSessionStart(
 		startupScan.canWarmCaches || startupScan.reason === "too-many-source-files";
 	const analysisRoot = useScanRootForSignals ? scanRoot : cwd;
 	runtime.projectRoot = cwd;
+	const latestSeq = readLatestProjectSequence(cwd);
+	runtime.seedProjectSequence?.(latestSeq.projectSeq, latestSeq.fileSeqByPath);
+	const effectiveSeq = runtime.projectSeq ?? latestSeq.projectSeq;
+	dbg(`session_start sequence: projectSeq=${effectiveSeq}`);
+	const snapshot = loadProjectSnapshot(analysisRoot);
+	if (isProjectSnapshotFresh(snapshot, effectiveSeq)) {
+		hydrateRuntimeFromProjectSnapshot(runtime, snapshot);
+		dbg(
+			`project_snapshot: loaded seq=${snapshot.seq} exports=${snapshot.cachedExports.length}`,
+		);
+	}
 	const languageProfile = detectProjectLanguageProfile(
 		analysisRoot,
 		startupScan.canWarmCaches ? undefined : [],
@@ -582,6 +617,7 @@ export async function handleSessionStart(
 	];
 
 	runtime.projectRulesScan = scanProjectRules(analysisRoot);
+	saveRuntimeProjectSnapshot({ cwd: analysisRoot, runtime, dbg });
 	phase("project-rules");
 	if (runtime.projectRulesScan.hasCustomRules) {
 		const ruleCount = runtime.projectRulesScan.rules.length;

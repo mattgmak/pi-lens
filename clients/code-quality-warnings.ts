@@ -31,8 +31,10 @@ export interface CodeQualityWarningsHistoryEntry {
 	timestamp: string;
 	sessionId: string;
 	turnIndex: number;
+	projectSeq?: number;
 	filePath: string;
 	displayPath: string;
+	fileSeq?: number;
 	line?: number;
 	column?: number;
 	severity: "warning" | "info" | "hint";
@@ -49,10 +51,13 @@ export interface CodeQualityWarningsReport {
 	scope: "turn_delta";
 	sessionId: string;
 	turnIndex: number;
+	projectSeqStart?: number;
+	projectSeqEnd?: number;
 	deltaOnly: true;
 	files: Array<{
 		filePath: string;
 		displayPath: string;
+		fileSeq?: number;
 		warnings: CodeQualityWarningRecord[];
 	}>;
 	summary: {
@@ -175,6 +180,9 @@ export function buildCodeQualityWarningsReport(args: {
 	turnIndex: number;
 	warnings: CodeQualityWarningRecord[];
 	modifiedRangesByFile: Map<string, ModifiedRange[]>;
+	projectSeqStart?: number;
+	projectSeqEnd?: number;
+	fileSeqByPath?: Map<string, number>;
 	maxWarnings?: number;
 }): CodeQualityWarningsReport {
 	const cwd = path.resolve(args.cwd);
@@ -204,6 +212,7 @@ export function buildCodeQualityWarningsReport(args: {
 	const files = [...byFile.entries()].map(([filePath, warnings]) => ({
 		filePath,
 		displayPath: toRunnerDisplayPath(cwd, filePath),
+		fileSeq: args.fileSeqByPath?.get(normalizeMapKey(filePath)),
 		warnings,
 	}));
 	const ruleCounts = new Map<string, number>();
@@ -221,6 +230,8 @@ export function buildCodeQualityWarningsReport(args: {
 		scope: "turn_delta",
 		sessionId: args.sessionId,
 		turnIndex: args.turnIndex,
+		projectSeqStart: args.projectSeqStart,
+		projectSeqEnd: args.projectSeqEnd,
 		deltaOnly: true,
 		files,
 		summary: {
@@ -253,8 +264,10 @@ export function appendCodeQualityWarningsHistory(
 				timestamp: report.generatedAt,
 				sessionId: report.sessionId,
 				turnIndex: report.turnIndex,
+				projectSeq: report.projectSeqEnd,
 				filePath: warning.filePath,
 				displayPath: warning.displayPath,
+				fileSeq: file.fileSeq,
 				line: warning.line,
 				column: warning.column,
 				severity: warning.severity,

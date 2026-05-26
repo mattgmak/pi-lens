@@ -76,6 +76,9 @@ describe("code quality warnings", () => {
 			cwd,
 			sessionId: "s1",
 			turnIndex: 3,
+			projectSeqStart: 10,
+			projectSeqEnd: 12,
+			fileSeqByPath: new Map([[filePath.replace(/\\/g, "/"), 2]]),
 			warnings: [included!, excluded!],
 			modifiedRangesByFile: new Map([
 				[filePath.replace(/\\/g, "/"), [{ start: 9, end: 11 }]],
@@ -83,6 +86,8 @@ describe("code quality warnings", () => {
 		});
 
 		expect(report.summary).toMatchObject({ warnings: 1, files: 1 });
+		expect(report).toMatchObject({ projectSeqStart: 10, projectSeqEnd: 12 });
+		expect(report.files[0]?.fileSeq).toBe(2);
 		expect(report.summary.topRules).toEqual([
 			{ rule: "high-complexity", count: 1 },
 		]);

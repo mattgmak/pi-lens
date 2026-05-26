@@ -472,6 +472,14 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			state.modifiedRanges,
 		]),
 	);
+	const getFileSeq = (runtime as Partial<RuntimeCoordinator>).getFileSeq;
+	const fileSeqByPath = new Map<string, number>();
+	if (getFileSeq) {
+		for (const file of files) {
+			const filePath = normalizeMapKey(resolveRunnerPath(cwd, file));
+			fileSeqByPath.set(filePath, getFileSeq.call(runtime, filePath));
+		}
+	}
 	if (getFlag("lens-actionable-warnings")) {
 		try {
 			const report = await buildActionableWarningsReport({
@@ -482,6 +490,9 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				modifiedRangesByFile,
 				dispatchWarnings: runtime.peekActionableWarnings(),
 				includeLspCodeActions: !!getFlag("lens-actionable-warning-actions"),
+				projectSeqStart: runtime.turnStartProjectSeq,
+				projectSeqEnd: runtime.projectSeq,
+				fileSeqByPath,
 				deltaOnly: !getFlag("lens-actionable-warning-all"),
 				dbg,
 			});
@@ -528,6 +539,9 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			turnIndex: runtime.turnIndex,
 			warnings: runtime.peekCodeQualityWarnings(),
 			modifiedRangesByFile,
+			projectSeqStart: runtime.turnStartProjectSeq,
+			projectSeqEnd: runtime.projectSeq,
+			fileSeqByPath,
 		});
 		writeCodeQualityWarningsReport(cacheManager, cwd, qualityReport);
 		appendCodeQualityWarningsHistory(cwd, qualityReport);
@@ -590,7 +604,12 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		cacheManager.writeCache("turn-end-findings", { content }, cwd);
 		cacheManager.writeCache(
 			"turn-end-findings-last",
-			{ signature, sessionId: runtime.telemetrySessionId },
+			{
+				signature,
+				sessionId: runtime.telemetrySessionId,
+				projectSeqStart: runtime.turnStartProjectSeq,
+				projectSeqEnd: runtime.projectSeq,
+			},
 			cwd,
 		);
 		emitLensTurnFindings({
