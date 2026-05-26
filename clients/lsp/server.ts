@@ -463,6 +463,24 @@ function rejectHomeRoot(root: string): string | undefined {
 		: root;
 }
 
+function normalizeSlashKey(value: string): string {
+	const normalized = path.resolve(value).replace(/\\/g, "/");
+	return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function piAgentExtensionsRootKey(file: string): string | undefined {
+	const dirKey = normalizeSlashKey(path.dirname(path.resolve(file)));
+	const marker = "/.pi/agent/extensions";
+	const index = dirKey.indexOf(marker);
+	if (index === -1) return undefined;
+	return dirKey.slice(0, index + marker.length);
+}
+
+function isSameOrUnderSlashKey(child: string, parentKey: string): boolean {
+	const childKey = normalizeSlashKey(child);
+	return childKey === parentKey || childKey.startsWith(`${parentKey}/`);
+}
+
 export const EslintRoot: RootFunction = async (file: string) => {
 	let currentDir = path.resolve(path.dirname(file));
 	const fsRoot = path.parse(currentDir).root;
@@ -974,25 +992,35 @@ const JS_TS_LSP_EXTENSIONS = KIND_EXTENSIONS["jsts"].filter(
 	(ext) => ext !== ".svelte" && ext !== ".vue",
 );
 
+const TypeScriptProjectRoot = IgnoreHomeRoot(
+	createRootDetector([
+		"package-lock.json",
+		"bun.lockb",
+		"bun.lock",
+		"pnpm-lock.yaml",
+		"yarn.lock",
+		"package.json",
+	]),
+);
+
+const TypeScriptRoot: RootFunction = DenoExcludeRoot(async (file) => {
+	const extensionRootKey = piAgentExtensionsRootKey(file);
+	const projectRoot = await TypeScriptProjectRoot(file);
+	if (extensionRootKey) {
+		return projectRoot && isSameOrUnderSlashKey(projectRoot, extensionRootKey)
+			? projectRoot
+			: undefined;
+	}
+	if (projectRoot) return projectRoot;
+	return FileDirRoot(file);
+});
+
 export const TypeScriptServer: LSPServerInfo = {
 	id: "typescript",
 	name: "TypeScript Language Server",
 	extensions: JS_TS_LSP_EXTENSIONS,
 	autoPropagateDiagnostics: true,
-	root: DenoExcludeRoot(
-		RootWithFallback(
-			IgnoreHomeRoot(
-				createRootDetector([
-					"package-lock.json",
-					"bun.lockb",
-					"bun.lock",
-					"pnpm-lock.yaml",
-					"yarn.lock",
-					"package.json",
-				]),
-			),
-		),
-	),
+	root: TypeScriptRoot,
 	async spawn(root, options) {
 		const fs = await import("node:fs/promises");
 		let source: "direct" | "managed" = "direct";

@@ -27,6 +27,7 @@ import { readFileContent } from "./utils.js";
 
 const LSP_MAX_FILE_BYTES = RUNTIME_CONFIG.pipeline.lspMaxFileBytes;
 const LSP_MAX_FILE_LINES = RUNTIME_CONFIG.pipeline.lspMaxFileLines;
+const LSP_SPAWN_BUDGET_MS = RUNTIME_CONFIG.pipeline.lspSpawnBudgetMs;
 const MAX_CODE_ACTION_LOOKUPS = 6;
 const MAX_CODE_ACTION_TITLES = 3;
 
@@ -127,9 +128,14 @@ const lspRunner: RunnerDefinition = {
 		}
 
 		try {
-			await lspService.openFile(ctx.filePath, content);
-			// getDiagnostics() internally waits for published diagnostics.
-			lspDiags = await lspService.getDiagnostics(ctx.filePath);
+			const touched = await lspService.touchFile(ctx.filePath, content, {
+				diagnostics: "document",
+				collectDiagnostics: true,
+				clientScope: "primary",
+				maxClientWaitMs: LSP_SPAWN_BUDGET_MS,
+				source: "dispatch-lsp-runner",
+			});
+			lspDiags = touched ?? [];
 		} catch (err) {
 			serverFailed = true;
 			failureReason = err instanceof Error ? err.message : String(err);
@@ -212,7 +218,11 @@ const lspRunner: RunnerDefinition = {
 		);
 
 		const hasErrors = diagnostics.some((d) => d.semantic === "blocking");
-		const resultSemantic = hasErrors ? "blocking" : (diagnostics.length > 0 ? "warning" : "none");
+		const resultSemantic = hasErrors
+			? "blocking"
+			: diagnostics.length > 0
+				? "warning"
+				: "none";
 
 		return {
 			status: hasErrors ? "failed" : "succeeded",
