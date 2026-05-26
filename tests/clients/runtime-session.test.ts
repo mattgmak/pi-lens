@@ -215,6 +215,75 @@ describe("runtime-session notifications", () => {
 		}
 	});
 
+	it("quick mode hydrates project-root snapshot when started from a nested cwd", async () => {
+		const env = setupTestEnvironment("pi-lens-session-nested-snapshot-");
+		const restoreStartupMode = setStartupMode("quick");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		const runtime = new RuntimeCoordinator();
+		const nestedFile = createTempFile(
+			env.tmpDir,
+			"packages/app/src/index.ts",
+			"export const value = 1;\n",
+		);
+		const nestedCwd = path.dirname(nestedFile);
+		createTempFile(
+			env.tmpDir,
+			"package.json",
+			JSON.stringify({ type: "module" }),
+		);
+		try {
+			saveProjectSnapshot(env.tmpDir, {
+				version: 1,
+				projectRoot: env.tmpDir,
+				generatedAt: new Date().toISOString(),
+				seq: 0,
+				files: {},
+				symbols: {},
+				reverseDeps: {},
+				cachedExports: [["nestedSnapshot", nestedFile]],
+				projectRulesScan: { hasCustomRules: true, rules: [] },
+			});
+
+			await handleSessionStart({
+				ctxCwd: nestedCwd,
+				getFlag: (name: string) => name === "no-lsp",
+				notify: () => {},
+				dbg: () => {},
+				log: () => {},
+				runtime,
+				metricsClient: { reset: () => {} },
+				cacheManager: { writeCache: () => {}, readCache: () => null },
+				todoScanner: { scanDirectory: () => ({ items: [] }) },
+				astGrepClient: {},
+				biomeClient: {},
+				ruffClient: {},
+				knipClient: {},
+				jscpdClient: {},
+				typeCoverageClient: {},
+				depChecker: {},
+				testRunnerClient: {},
+				goClient: {},
+				rustClient: {},
+				ensureTool: async () => null,
+				cleanStaleTsBuildInfo: () => [],
+				resetDispatchBaselines: () => {},
+				resetLSPService: () => {},
+			} as any);
+
+			expect(runtime.cachedExports.get("nestedSnapshot")).toBe(nestedFile);
+			expect(runtime.projectRulesScan.hasCustomRules).toBe(true);
+		} finally {
+			restoreStartupMode();
+			if (previousDataDir === undefined) {
+				delete process.env.PILENS_DATA_DIR;
+			} else {
+				process.env.PILENS_DATA_DIR = previousDataDir;
+			}
+			env.cleanup();
+		}
+	});
+
 	it("full mode emits build-cache warning while avoiding startup info noise", async () => {
 		const { env, notify, scanDirectory, ensureTool } =
 			await runSessionStart("full");
