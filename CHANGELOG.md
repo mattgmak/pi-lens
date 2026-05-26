@@ -18,6 +18,8 @@ All notable changes to pi-lens will be documented in this file.
 ### Performance
 
 - **Deferred format runs concurrently across files at agent_end** — `handleAgentEnd` now dispatches all formatter subprocesses in parallel via `Promise.all` before sequentially flushing results (sequence bumps, cache mutations, LSP resyncs). Sessions with multiple queued files no longer pay N × ~400 ms; all formatters run simultaneously instead of back-to-back.
+- **Session startup avoids repeated cold filesystem walks** — project snapshots now persist `startupScan` and `languageProfile` data keyed by project sequence, so `/new` can reuse the prior scan-context and language-profile results instead of re-running two recursive `readdirSync` walks over the same project tree. Startup background scan bodies are also deferred with `setImmediate`, so synchronous tasks such as TODO scanning cannot inflate the interactive `session_start` path before control returns to the TUI.
+- **LSP child handles are unreferenced after launch** — LSP subprocess and stdio handles are unref'd once startup succeeds, complementing fast session shutdown so live language servers do not keep Node/Pi alive during Ctrl+C or session replacement flows.
 
 ### Fixed
 

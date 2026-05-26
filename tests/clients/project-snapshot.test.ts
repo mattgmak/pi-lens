@@ -86,6 +86,36 @@ describe("project snapshot", () => {
 			expect(isProjectSnapshotFresh(snapshot, 3)).toBe(true);
 		}));
 
+	it("persists startup scan context and language profile", () =>
+		withProjectDataDir((cwd) => {
+			const runtime = new RuntimeCoordinator();
+			runtime.seedProjectSequence(9);
+			const snapshot = buildProjectSnapshotFromRuntime({
+				cwd,
+				runtime,
+				startupScan: {
+					cwd,
+					scanRoot: cwd,
+					projectRoot: cwd,
+					canWarmCaches: true,
+					sourceFileCount: 2,
+				},
+				languageProfile: {
+					present: { jsts: true } as never,
+					configured: { jsts: true },
+					counts: { jsts: 2 },
+					detectedKinds: ["jsts"],
+				},
+			});
+			saveProjectSnapshot(cwd, snapshot);
+			const loaded = loadProjectSnapshot(cwd);
+			expect(loaded?.startupScan).toMatchObject({
+				canWarmCaches: true,
+				sourceFileCount: 2,
+			});
+			expect(loaded?.languageProfile?.detectedKinds).toEqual(["jsts"]);
+		}));
+
 	it("hydrates cached exports and rules into a new runtime", () =>
 		withProjectDataDir((cwd) => {
 			const source = new RuntimeCoordinator();

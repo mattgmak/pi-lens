@@ -147,6 +147,8 @@ describe("runtime-session notifications", () => {
 	it("quick mode hydrates cached exports and rules from a fresh project snapshot", async () => {
 		const env = setupTestEnvironment("pi-lens-session-snapshot-");
 		const restoreStartupMode = setStartupMode("quick");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
 		const runtime = new RuntimeCoordinator();
 		try {
 			saveProjectSnapshot(env.tmpDir, {
@@ -204,6 +206,11 @@ describe("runtime-session notifications", () => {
 			expect(runtime.projectRulesScan.rules[0]?.name).toBe("AGENTS.md");
 		} finally {
 			restoreStartupMode();
+			if (previousDataDir === undefined) {
+				delete process.env.PILENS_DATA_DIR;
+			} else {
+				process.env.PILENS_DATA_DIR = previousDataDir;
+			}
 			env.cleanup();
 		}
 	});
@@ -262,6 +269,24 @@ describe("runtime-session notifications", () => {
 		}
 	});
 
+	it("defers startup scan task bodies until after session_start returns", async () => {
+		const { env, scanDirectory } = await runSessionStart("full", (tmpDir) => {
+			createTempFile(
+				tmpDir,
+				"package.json",
+				JSON.stringify({ type: "module" }),
+			);
+			createTempFile(tmpDir, "src/index.ts", "export const value = 1;\n");
+		});
+
+		try {
+			expect(scanDirectory).not.toHaveBeenCalled();
+			await vi.waitFor(() => expect(scanDirectory).toHaveBeenCalledTimes(1));
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("limits deferred availability probes to relevant uncovered tools", async () => {
 		const {
 			env,
@@ -283,12 +308,12 @@ describe("runtime-session notifications", () => {
 
 		try {
 			await vi.waitFor(() => expect(depEnsure).toHaveBeenCalledTimes(1));
+			await vi.waitFor(() => expect(astGrepEnsure).toHaveBeenCalledTimes(1));
 
 			// biome is covered by startup preinstall; ast-grep/knip/jscpd by startup
 			// scans. ruff is irrelevant for this JS/TS-only project.
 			expect(biomeEnsure).not.toHaveBeenCalled();
 			expect(ruffEnsure).not.toHaveBeenCalled();
-			expect(astGrepEnsure).toHaveBeenCalledTimes(1);
 			expect(knipEnsure).not.toHaveBeenCalled();
 			expect(knipAnalyze).toHaveBeenCalledTimes(1);
 			expect(jscpdEnsure).toHaveBeenCalledTimes(1);
