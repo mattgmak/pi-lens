@@ -20,6 +20,7 @@ import { runLogCleanup } from "./log-cleanup.js";
 import { setSessionLanguages } from "./widget-state.js";
 import { initLSPConfig, loadLSPConfig } from "./lsp/config.js";
 import { getLSPService } from "./lsp/index.js";
+import type { LSPShutdownOptions } from "./lsp/client.js";
 import type { MetricsClient } from "./metrics-client.js";
 import {
 	buildProjectIndex,
@@ -72,7 +73,7 @@ interface SessionStartDeps {
 	ensureTool: (name: string) => Promise<string | null | undefined>;
 	cleanStaleTsBuildInfo: (cwd: string) => string[];
 	resetDispatchBaselines: () => void;
-	resetLSPService: () => void;
+	resetLSPService: (options?: LSPShutdownOptions) => void;
 }
 
 type StartupMode = "full" | "minimal" | "quick";
@@ -486,7 +487,7 @@ export async function handleSessionStart(
 	dbg(`session_start startup mode: ${startupMode}`);
 
 	if (!getFlag("no-lsp")) {
-		resetLSPService();
+		resetLSPService({ fast: true });
 		dbg("session_start: LSP service reset");
 		dbg(
 			"session_start: phase0 workspace diagnostics observation enabled (capability probe only)",

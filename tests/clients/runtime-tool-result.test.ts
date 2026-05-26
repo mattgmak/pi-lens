@@ -522,6 +522,46 @@ describe("runtime-tool-result inline behavior warnings", () => {
 		}
 	});
 
+	it("uses fast LSP reset when pipeline crash recovery resets clients", async () => {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		vi.mocked(runPipeline).mockRejectedValue(new Error("boom"));
+
+		const env = setupTestEnvironment("pi-lens-runtime-tool-crash-reset-");
+		try {
+			const filePath = path.join(env.tmpDir, "src", "app.ts");
+			fs.mkdirSync(path.dirname(filePath), { recursive: true });
+			fs.writeFileSync(filePath, "export const x = 1;\n");
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			runtime.beginTurn();
+			const resetLSPService = vi.fn();
+
+			await handleToolResult({
+				event: {
+					toolName: "edit",
+					input: { path: filePath },
+					details: { diff: "+  1 export const x = 2;" },
+					content: [{ type: "text", text: "base" }],
+				},
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager: new CacheManager(false),
+				biomeClient: {},
+				ruffClient: {},
+				testRunnerClient: {},
+				metricsClient: {},
+				resetLSPService,
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+			} as any);
+
+			expect(resetLSPService).toHaveBeenCalledWith({ fast: true });
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("resolves relative tool_result paths against the workspace root", async () => {
 		const { runPipeline } = await import("../../clients/pipeline.js");
 		vi.mocked(runPipeline).mockResolvedValue({

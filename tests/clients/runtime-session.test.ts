@@ -40,6 +40,7 @@ async function runSessionStart(
 	const knipAnalyze = vi.fn(async () => EMPTY_KNIP_RESULT);
 	const jscpdEnsure = vi.fn(async () => false);
 	const depEnsure = vi.fn(async () => false);
+	const resetLSPService = vi.fn();
 	const restoreStartupMode = setStartupMode(mode);
 
 	try {
@@ -115,7 +116,7 @@ async function runSessionStart(
 			ensureTool,
 			cleanStaleTsBuildInfo: () => ["tsconfig.tsbuildinfo"],
 			resetDispatchBaselines: () => {},
-			resetLSPService: () => {},
+			resetLSPService,
 		} as any);
 
 		return {
@@ -130,6 +131,7 @@ async function runSessionStart(
 			knipAnalyze,
 			jscpdEnsure,
 			depEnsure,
+			resetLSPService,
 		};
 	} catch (error) {
 		env.cleanup();
@@ -285,7 +287,7 @@ describe("runtime-session notifications", () => {
 	});
 
 	it("full mode emits build-cache warning while avoiding startup info noise", async () => {
-		const { env, notify, scanDirectory, ensureTool } =
+		const { env, notify, scanDirectory, ensureTool, resetLSPService } =
 			await runSessionStart("full");
 
 		try {
@@ -307,6 +309,7 @@ describe("runtime-session notifications", () => {
 			);
 			expect(scanDirectory).not.toHaveBeenCalled();
 			expect(ensureTool).not.toHaveBeenCalled();
+			expect(resetLSPService).toHaveBeenCalledWith({ fast: true });
 		} finally {
 			env.cleanup();
 		}

@@ -10,6 +10,7 @@ import { getFormatService } from "./format-service.js";
 import { isExternalOrVendorFile } from "./path-utils.js";
 import { resolveLanguageRootForFile } from "./language-profile.js";
 import { logLatency } from "./latency-logger.js";
+import type { LSPShutdownOptions } from "./lsp/client.js";
 import type { MetricsClient } from "./metrics-client.js";
 import { runPipeline, type PipelineResult } from "./pipeline.js";
 import {
@@ -40,7 +41,7 @@ interface ToolResultDeps {
 	biomeClient: BiomeClient;
 	ruffClient: RuffClient;
 	metricsClient: MetricsClient;
-	resetLSPService: () => void;
+	resetLSPService: (options?: LSPShutdownOptions) => void;
 	agentBehaviorRecord: (toolName: string, filePath?: string) => unknown[];
 	formatBehaviorWarnings: (warnings: unknown[]) => string;
 	readGuard?: ReadGuard;
@@ -378,7 +379,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		dbg(`runPipeline crashed: ${pipelineErr}`);
 		dbg(`runPipeline crash stack: ${(pipelineErr as Error).stack}`);
 		if (!getFlag("no-lsp")) {
-			resetLSPService();
+			resetLSPService({ fast: true });
 		}
 
 		logLatency({
