@@ -18,6 +18,10 @@ import {
 	recordFromDispatchDiagnostic,
 	type ActionableWarningRecord,
 } from "./actionable-warnings.js";
+import {
+	recordFromCodeQualityDiagnostic,
+	type CodeQualityWarningRecord,
+} from "./code-quality-warnings.js";
 import type { BiomeClient } from "./biome-client.js";
 import { recordDiagnostics } from "./widget-state.js";
 import { getDiagnosticLogger } from "./diagnostic-logger.js";
@@ -196,6 +200,8 @@ export interface PipelineResult {
 	inlineBlockerSummary?: string;
 	/** Fixable warning diagnostics introduced by this pipeline run. */
 	actionableWarnings?: ActionableWarningRecord[];
+	/** Non-fixable code-quality warnings introduced/touched by this pipeline run. */
+	codeQualityWarnings?: CodeQualityWarningRecord[];
 }
 
 // --- Phase timing helpers ---
@@ -995,6 +1001,9 @@ export async function runPipeline(
 	const actionableWarnings = dispatchResult.warnings
 		.map((diagnostic) => recordFromDispatchDiagnostic(diagnostic, cwd))
 		.filter((warning): warning is ActionableWarningRecord => Boolean(warning));
+	const codeQualityWarnings = dispatchResult.warnings
+		.map((diagnostic) => recordFromCodeQualityDiagnostic(diagnostic, cwd))
+		.filter((warning): warning is CodeQualityWarningRecord => Boolean(warning));
 
 	if (dispatchResult.diagnostics.length > 0) {
 		const logger = getDiagnosticLogger();
@@ -1133,5 +1142,6 @@ export async function runPipeline(
 			? dispatchResult.blockerOutput.trim() || undefined
 			: undefined,
 		actionableWarnings,
+		codeQualityWarnings,
 	};
 }

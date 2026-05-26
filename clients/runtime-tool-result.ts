@@ -410,6 +410,9 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	if (result.actionableWarnings?.length) {
 		runtime.recordActionableWarnings(result.actionableWarnings);
 	}
+	if (result.codeQualityWarnings?.length) {
+		runtime.recordCodeQualityWarnings(result.codeQualityWarnings);
+	}
 
 	if (result.inlineBlockerSummary) {
 		runtime.recordInlineBlockers(filePath, result.inlineBlockerSummary);

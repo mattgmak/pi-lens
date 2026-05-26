@@ -386,6 +386,43 @@ describe("read-guard tool line helpers", () => {
 			expect(result.preflightError).toMatch(/RETRYABLE/);
 			expect(result.preflightError).toMatch(/edits\[1\]/);
 			expect(result.preflightError).toMatch(/was not found/);
+			expect(result.partiallyApplicable).toEqual([
+				{
+					oldText: "function bar() {\n  return 2;\n}",
+					newText: "ok",
+					originalIndex: 0,
+				},
+			]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not mark normalized-only matches as partially applicable", () => {
+		const env = setupTestEnvironment("read-guard-lines-partial-not-exact-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "const a = 1;   \nconst b = 2;\n");
+
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "edit",
+					input: {
+						path: filePath,
+						edits: [
+							{
+								oldText: "const a = 1;\nconst b = 2;",
+								newText: "const a = 10;\nconst b = 20;",
+							},
+							{ oldText: "const missing = true;", newText: "noop" },
+						],
+					},
+				},
+				filePath,
+			);
+
+			expect(result.preflightError).toMatch(/RETRYABLE/);
+			expect(result.partiallyApplicable).toBeUndefined();
 		} finally {
 			env.cleanup();
 		}
@@ -661,10 +698,7 @@ describe("getTouchedLinesForGuard — post-strip oldText resolution", () => {
 			const filePath = path.join(env.tmpDir, "file.ts");
 			// Two identical lines — index.ts Pass 1 would NOT apply the patch
 			// (countOldTextMatches !== 1), so getTouchedLinesForGuard still gets the original
-			fs.writeFileSync(
-				filePath,
-				"\t\t\t\t}) as any,\n\t\t\t\t}) as any,\n",
-			);
+			fs.writeFileSync(filePath, "\t\t\t\t}) as any,\n\t\t\t\t}) as any,\n");
 			const stripped = stripOldTextTrailingWhitespace(
 				"\t\t\t\t}) as any,\n\t\t\t\t",
 			);

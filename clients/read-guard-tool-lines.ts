@@ -10,14 +10,21 @@ export interface GuardLineResult {
 	preflightError?: string;
 	// Edits that resolved successfully when only a subset failed preflight.
 	// Caller can apply these directly and return a ⚠️ PARTIAL APPLY message.
-	partiallyApplicable?: Array<{ oldText: string; newText: string | undefined; originalIndex: number }>;
+	partiallyApplicable?: Array<{
+		oldText: string;
+		newText: string | undefined;
+		originalIndex: number;
+	}>;
 	// All edits were resolved by exact content match — range snapshot staleness
 	// is irrelevant since the content IS the edit target.
 	contentMatchValidated?: boolean;
 }
 
 // Track repeated oldtext_not_found failures per (filePath, preview) to escalate messages.
-const recentOldTextFailures = new Map<string, { count: number; lastTs: number }>();
+const recentOldTextFailures = new Map<
+	string,
+	{ count: number; lastTs: number }
+>();
 const REPEAT_FAILURE_TTL_MS = 300_000;
 const MAX_FAILURE_TRACKER_SIZE = 200;
 
@@ -35,11 +42,11 @@ function trackOldTextFailure(filePath: string, preview: string): number {
 	return count;
 }
 
-function findFirstLineOfOldText(content: string, oldText: string): number | undefined {
-	const firstLine = oldText
-		.replace(/\r\n/g, "\n")
-		.split("\n")[0]
-		.trim();
+function findFirstLineOfOldText(
+	content: string,
+	oldText: string,
+): number | undefined {
+	const firstLine = oldText.replace(/\r\n/g, "\n").split("\n")[0].trim();
 	if (firstLine.length < 5) return undefined;
 	const lines = content.split("\n");
 	for (let i = 0; i < lines.length; i++) {
@@ -198,6 +205,35 @@ function findOccurrenceLines(content: string, needle: string): number[] {
 	return lines;
 }
 
+function countRawOccurrences(content: string, needle: string): number {
+	if (!needle) return 0;
+	let count = 0;
+	let pos = 0;
+	while (pos < content.length) {
+		const idx = content.indexOf(needle, pos);
+		if (idx === -1) break;
+		count += 1;
+		pos = idx + needle.length;
+	}
+	return count;
+}
+
+function exactOldTextForApply(
+	rawContentLf: string,
+	oldText: string,
+	candidate: string,
+): string | undefined {
+	const oldTextLf = oldText.replace(/\r\n/g, "\n");
+	if (countRawOccurrences(rawContentLf, oldTextLf) === 1) return oldTextLf;
+	if (
+		candidate !== oldTextLf &&
+		countRawOccurrences(rawContentLf, candidate) === 1
+	) {
+		return candidate;
+	}
+	return undefined;
+}
+
 function resolveOldTextEdits(
 	edits: Array<{ oldText?: string; newText?: string; originalIndex?: number }>,
 	filePath: string,
@@ -220,13 +256,18 @@ function resolveOldTextEdits(
 		return { touchedLines: undefined };
 	}
 
+	const rawContentLf = rawContent.replace(/\r\n/g, "\n");
 	const content = normalizeContent(rawContent);
 	const errors: string[] = [];
 	const failureKinds: string[] = [];
 	const failedEditIndexes: number[] = [];
 	const failedOldTextPreviews: string[] = [];
 	const resolvedRanges: [number, number][] = [];
-	const passedEdits: Array<{ oldText: string; newText: string | undefined; originalIndex: number }> = [];
+	const passedEdits: Array<{
+		oldText: string;
+		newText: string | undefined;
+		originalIndex: number;
+	}> = [];
 	let maxFailCount = 0;
 
 	for (let i = 0; i < edits.length; i++) {
@@ -240,7 +281,7 @@ function resolveOldTextEdits(
 		if (occurrenceLines.length === 0) {
 			const corrected = tryCorrectIndentationMismatchFromContent(
 				oldText,
-				rawContent.replace(/\r\n/g, "\n"),
+				rawContentLf,
 			);
 			if (corrected !== undefined) {
 				needle = normalizeContent(corrected);
@@ -260,7 +301,7 @@ function resolveOldTextEdits(
 			}
 		}
 
-if (occurrenceLines.length === 0) {
+		if (occurrenceLines.length === 0) {
 			const preview = oldText.trimStart().substring(0, 60).replace(/\n/g, "↵");
 			failureKinds.push("oldtext_not_found");
 			failedEditIndexes.push(editIndex);
@@ -270,9 +311,13 @@ if (occurrenceLines.length === 0) {
 			let errorMsg = `edits[${editIndex}].oldText ("${preview}") was not found in the current file content.`;
 			// Quote-style hint: if swapping " ↔ ' gives exactly one match, tell the agent why it failed.
 			const quoteSwapCandidates: string[] = [];
-			if (needle.includes('"')) quoteSwapCandidates.push(needle.replace(/"/g, "'"));
-			if (needle.includes("'")) quoteSwapCandidates.push(needle.replace(/'/g, '"'));
-			const quoteHit = quoteSwapCandidates.find(s => s !== needle && findOccurrenceLines(content, s).length === 1);
+			if (needle.includes('"'))
+				quoteSwapCandidates.push(needle.replace(/"/g, "'"));
+			if (needle.includes("'"))
+				quoteSwapCandidates.push(needle.replace(/'/g, '"'));
+			const quoteHit = quoteSwapCandidates.find(
+				(s) => s !== needle && findOccurrenceLines(content, s).length === 1,
+			);
 			if (quoteHit !== undefined) {
 				errorMsg += ` The file uses a different quote style — your oldText has ${needle.includes('"') ? "double" : "single"} quotes but the file has ${needle.includes('"') ? "single" : "double"} quotes. Fix the quote style in both oldText and newText before retrying.`;
 			} else if (failCount >= 2) {
@@ -284,8 +329,7 @@ if (occurrenceLines.length === 0) {
 						? ` The first line of your oldText appears near line ${lineHint} — re-read: \`offset=${Math.max(1, lineHint - 2)} limit=20\``
 						: ` Re-read the full relevant section before retrying.`);
 			} else {
-				errorMsg +=
-					` Re-read the relevant section of the file to confirm the exact text, then retry with the verbatim content.`;
+				errorMsg += ` Re-read the relevant section of the file to confirm the exact text, then retry with the verbatim content.`;
 			}
 			errors.push(errorMsg);
 			logReadGuardEvent({
@@ -304,7 +348,14 @@ if (occurrenceLines.length === 0) {
 			const startLine = occurrenceLines[0];
 			const endLine = startLine + needle.split("\n").length - 1;
 			resolvedRanges.push([startLine, endLine]);
-			passedEdits.push({ oldText: needle, newText: edits[i].newText, originalIndex: editIndex });
+			const applyOldText = exactOldTextForApply(rawContentLf, oldText, needle);
+			if (applyOldText !== undefined) {
+				passedEdits.push({
+					oldText: applyOldText,
+					newText: edits[i].newText,
+					originalIndex: editIndex,
+				});
+			}
 			logReadGuardEvent({
 				event: "oldtext_resolved",
 				sessionId,
@@ -373,11 +424,12 @@ if (occurrenceLines.length === 0) {
 		});
 		const appliedNote =
 			passedEdits.length > 0
-				? `\n\n${passedEdits.map(e => `edits[${e.originalIndex}]`).join(", ")} ${passedEdits.length === 1 ? "was" : "were"} applied — do NOT re-submit ${passedEdits.length === 1 ? "it" : "them"}.`
+				? `\n\n${passedEdits.map((e) => `edits[${e.originalIndex}]`).join(", ")} ${passedEdits.length === 1 ? "was" : "were"} applied — do NOT re-submit ${passedEdits.length === 1 ? "it" : "them"}.`
 				: "";
-		const header = maxFailCount >= 2
-			? `🛑 RE-READ REQUIRED — You have submitted this oldText before and it still does not match.\n\nDo NOT retry from memory. Re-read \`${filePath}\` to get the current content, then rebuild your edit from the verbatim file text.`
-			: `🔄 RETRYABLE — Edit target not found`;
+		const header =
+			maxFailCount >= 2
+				? `🛑 RE-READ REQUIRED — You have submitted this oldText before and it still does not match.\n\nDo NOT retry from memory. Re-read \`${filePath}\` to get the current content, then rebuild your edit from the verbatim file text.`
+				: `🔄 RETRYABLE — Edit target not found`;
 		return {
 			touchedLines: undefined,
 			preflightError: `${header}\n\n${failureDetails.join("\n\n")}${appliedNote}`,
@@ -428,7 +480,10 @@ if (occurrenceLines.length === 0) {
  * normalised to LF. Returns the same string if no change was needed.
  */
 export function stripOldTextTrailingWhitespace(value: string): string {
-	const lines = value.replace(/\r\n/g, "\n").split("\n").map((l) => l.trimEnd());
+	const lines = value
+		.replace(/\r\n/g, "\n")
+		.split("\n")
+		.map((l) => l.trimEnd());
 	while (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
 	return lines.join("\n");
 }

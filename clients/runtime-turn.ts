@@ -5,6 +5,12 @@ import {
 	writeActionableWarningsReport,
 } from "./actionable-warnings.js";
 import { logActionableWarningsEvent } from "./actionable-warnings-logger.js";
+import {
+	appendCodeQualityWarningsHistory,
+	buildCodeQualityWarningsReport,
+	formatCodeQualityWarningsAdvisory,
+	writeCodeQualityWarningsReport,
+} from "./code-quality-warnings.js";
 import type { CacheManager } from "./cache-manager.js";
 import { logCascade } from "./cascade-logger.js";
 import { normalizeMapKey } from "./path-utils.js";
@@ -460,14 +466,14 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	// distracting the agent with non-blocking telemetry.
 
 	const t4 = Date.now();
+	const modifiedRangesByFile = new Map(
+		Object.entries(turnState.files).map(([file, state]) => [
+			normalizeMapKey(resolveRunnerPath(cwd, file)),
+			state.modifiedRanges,
+		]),
+	);
 	if (getFlag("lens-actionable-warnings")) {
 		try {
-			const modifiedRangesByFile = new Map(
-				Object.entries(turnState.files).map(([file, state]) => [
-					normalizeMapKey(resolveRunnerPath(cwd, file)),
-					state.modifiedRanges,
-				]),
-			);
 			const report = await buildActionableWarningsReport({
 				cwd,
 				sessionId: runtime.telemetrySessionId,
@@ -512,6 +518,42 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				},
 			});
 		}
+	}
+
+	const t5 = Date.now();
+	try {
+		const qualityReport = buildCodeQualityWarningsReport({
+			cwd,
+			sessionId: runtime.telemetrySessionId,
+			turnIndex: runtime.turnIndex,
+			warnings: runtime.peekCodeQualityWarnings(),
+			modifiedRangesByFile,
+		});
+		writeCodeQualityWarningsReport(cacheManager, cwd, qualityReport);
+		appendCodeQualityWarningsHistory(cwd, qualityReport);
+		const advisory = formatCodeQualityWarningsAdvisory(qualityReport);
+		if (advisory) advisoryParts.push(advisory);
+		logLatency({
+			type: "phase",
+			toolName: "turn_end",
+			filePath: cwd,
+			phase: "code_quality_warnings_report",
+			durationMs: Date.now() - t5,
+			metadata: qualityReport.summary,
+		});
+	} catch (err) {
+		dbg(`turn_end: code quality warning report failed: ${err}`);
+		logLatency({
+			type: "phase",
+			toolName: "turn_end",
+			filePath: cwd,
+			phase: "code_quality_warnings_report",
+			durationMs: Date.now() - t5,
+			metadata: {
+				failed: true,
+				error: err instanceof Error ? err.message : String(err),
+			},
+		});
 	}
 
 	cacheManager.incrementTurnCycle(cwd);
@@ -567,6 +609,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 
 	runtime.fixedThisTurn.clear();
 	runtime.clearActionableWarnings();
+	runtime.clearCodeQualityWarnings();
 	logLatency({
 		type: "tool_result",
 		toolName: "turn_end",
