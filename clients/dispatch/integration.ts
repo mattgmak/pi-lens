@@ -54,6 +54,13 @@ import {
 	clearReviewGraphWorkspaceCache,
 	getLastGraphBuildInfo,
 } from "../review-graph/builder.js";
+import { readLatestProjectSequence } from "../project-changes.js";
+import {
+	buildReverseDependencyIndexFromGraph,
+	getAffectedFilesFromIndex,
+	loadReverseDependencyIndexFromSnapshot,
+	writeReverseDependencyIndexToSnapshot,
+} from "../reverse-deps.js";
 import {
 	buildOrUpdateGraph,
 	computeImpactCascade,
@@ -547,6 +554,30 @@ export async function computeCascadeForFile(
 		const graphStart = Date.now();
 		const graph = await buildOrUpdateGraph(cwd, [normalizedFile], sessionFacts);
 		const graphMs = Date.now() - graphStart;
+		const reverseDepsIndex = buildReverseDependencyIndexFromGraph({
+			cwd,
+			graph,
+		});
+		const reverseDepsSaved = writeReverseDependencyIndexToSnapshot({
+			cwd,
+			index: reverseDepsIndex,
+			dbg,
+		});
+		logCascade({
+			phase: "reverse_deps_cache",
+			filePath,
+			durationMs: Date.now() - graphStart,
+			metadata: {
+				action: "refresh_from_review_graph",
+				savedToSnapshot: reverseDepsSaved,
+				importsFileCount: Object.keys(reverseDepsIndex.imports).length,
+				importedByFileCount: Object.keys(reverseDepsIndex.importedBy).length,
+				importEdgeCount: Object.values(reverseDepsIndex.imports).reduce(
+					(total, imports) => total + imports.length,
+					0,
+				),
+			},
+		});
 
 		// Count files represented in the graph (nodes with a filePath).
 		const graphFileCount = new Set(
@@ -575,6 +606,61 @@ export async function computeCascadeForFile(
 		});
 
 		impact = computeImpactCascade(graph, normalizedFile, cwd);
+		const currentProjectSeq = readLatestProjectSequence(cwd).projectSeq;
+		const cachedReverseDeps = loadReverseDependencyIndexFromSnapshot({
+			cwd,
+			currentProjectSeq,
+		});
+		logCascade({
+			phase: "reverse_deps_cache",
+			filePath,
+			metadata: {
+				action: "load_for_cascade",
+				cacheHit: Boolean(cachedReverseDeps),
+				currentProjectSeq,
+				cacheSeq: cachedReverseDeps?.seq,
+				importsFileCount: cachedReverseDeps
+					? Object.keys(cachedReverseDeps.imports).length
+					: 0,
+				importedByFileCount: cachedReverseDeps
+					? Object.keys(cachedReverseDeps.importedBy).length
+					: 0,
+			},
+		});
+		if (cachedReverseDeps) {
+			const reverseDepNeighbors = getAffectedFilesFromIndex(
+				cachedReverseDeps,
+				normalizedFile,
+				1,
+				MAX_FILES * 2,
+			);
+			logCascade({
+				phase: "reverse_deps_cache",
+				filePath,
+				metadata: {
+					action: "merge_neighbors",
+					depth: 1,
+					neighborCount: reverseDepNeighbors.length,
+					neighbors: reverseDepNeighbors.slice(0, 10),
+				},
+			});
+			if (reverseDepNeighbors.length > 0) {
+				impact.directImporters = [
+					...new Set([...impact.directImporters, ...reverseDepNeighbors]),
+				];
+				impact.neighborFiles = [
+					...new Set([...impact.neighborFiles, ...reverseDepNeighbors]),
+				];
+				logCascade({
+					phase: "neighbor_snapshot",
+					filePath,
+					neighborFile: "[reverse-deps-cache]",
+					diagnosticCount: reverseDepNeighbors.length,
+					autoPropagate: false,
+					metadata: { reverseDepsCache: true },
+				});
+			}
+		}
 
 		// Symbol-level blast radius via LSP references (precision upgrade over
 		// file-level import edges). Only when changed symbols are detected.
@@ -984,7 +1070,7 @@ export async function computeCascadeForFile(
 			// Log when cascade ran but found nothing — distinguishes "clean" from "no signal"
 			noNeighbors: visibleNeighbors.length === 0,
 			noErrors: visibleNeighbors.length > 0 && filesWithErrors === 0,
-			neighbors: visibleNeighbors.slice(0, 10).map(n => ({
+			neighbors: visibleNeighbors.slice(0, 10).map((n) => ({
 				file: n.filePath.replace(/\\/g, "/").split("/").slice(-2).join("/"),
 				diagnostics: n.diagnostics.length,
 			})),

@@ -189,6 +189,8 @@ readChangesSince(cwd, seq, maxEntries?)
 
 ## Phase 4 — First-class reverse dependency index
 
+Status: **foundation implemented**. `clients/reverse-deps.ts` can build `file -> imports` and `file -> importedBy` indexes from the existing review graph, persist them into the project snapshot, reload fresh snapshot-backed indexes, and answer bounded reverse-dependency / affected-file queries. Cascade graph builds now opportunistically refresh the snapshot reverse-dependency section and merge fresh cached reverse-dependency neighbors into cascade neighbor selection.
+
 Make reverse dependency lookup a cheap primitive instead of only a cascade byproduct.
 
 ### Build source
@@ -253,45 +255,114 @@ Recently active files:
 
 Keep this concise and advisory-only.
 
-## Phase 6 — Safer native edit path
+## Phase 6 — Internal edit substrate to reduce failed edits
 
-codedb's line-range edit model is a good direction for pi-lens.
+Status: **not implemented**. This phase should be an internal pi-lens mutation substrate, not a new exposed `lens_edit` tool.
 
 ### Goal
 
-Create a pi-lens-owned edit helper that uses explicit file version/hash/range checks and automatically runs post-edit pipeline.
+Reduce failed edits by giving pi-lens-owned mutations a range + sequence/hash validated write path that complements the existing native edit lifecycle:
 
-### Possible tool/API
+```text
+Native agent edit/write path:
+read expansion → read guard → oldText autopatch → native edit → tool_result pipeline
 
-`lens_edit` or internal helper first:
+pi-lens-owned mutation path:
+seq/hash/range validation → atomic apply → read-guard stamp → seq/change-log → normal post-edit pipeline
+```
+
+Keep the native `edit` tool path intact. Read expansion, read-guard preflight, oldText autopatch, and exact-text matching remain the first line of defense for model-authored edits. The new helper should be used where pi-lens itself already mutates disk or could safely do so after read-guard has proven a subset of changes.
+
+### Why this limits failed edits
+
+Recent read-guard telemetry showed common failures:
+
+- `oldtext_duplicate` — exact `oldText` appears at multiple locations. A range-backed internal edit can target the specific resolved line range instead of matching ambiguous text globally.
+- `oldtext_not_found` — file drift or copied text mismatch. A seq/hash check can fail early with a clear stale-file reason and current seq/hash instead of retrying fragile text.
+- `file_modified` / snapshot `mismatch` — file changed after read or partial apply. `expectedFileSeq`/`expectedHash` makes the rejection explicit and actionable: re-read before editing.
+- `out_of_range` — line drift outside recorded read ranges. The helper can require explicit range coverage or consume ranges already proven safe by read-guard resolution.
+
+### Internal API sketch
+
+Use an internal helper, likely `clients/lens-edit.ts` or similar:
 
 ```ts
-applyLensEdit({
+applyInternalEdit({
+  cwd,
+  runtime,
+  cacheManager,
   filePath,
-  expectedFileSeq,
+  source: "partial-apply" | "lsp-edit" | "autofix",
+  expectedFileSeq?,
   expectedHash?,
   edits: [
-    { startLine, endLine, newText }
-  ]
+    {
+      startLine,
+      endLine,
+      newText,
+      expectedText?, // optional extra guard for the exact span
+    }
+  ],
+  runPostEditPipeline?,
 })
+```
+
+Return structured results:
+
+```ts
+type ApplyInternalEditResult =
+  | { ok: true; changed: boolean; projectSeq: number; fileSeq: number }
+  | {
+      ok: false;
+      reason:
+        | "stale_seq"
+        | "hash_mismatch"
+        | "overlap"
+        | "expected_text_mismatch"
+        | "out_of_read_range";
+      currentFileSeq?: number;
+      currentHash?: string;
+      suggestedAction: "re-read";
+    };
 ```
 
 ### Safety
 
-- rejects stale `expectedFileSeq`
-- rejects overlapping ranges
-- applies bottom-up
-- atomic write via temp file + rename where possible
-- records project change
-- bumps file/project seq
-- records read-guard write stamp
-- runs `handleToolResult`/pipeline
+- Reject stale `expectedFileSeq` when provided.
+- Reject stale `expectedHash` when provided.
+- Reject overlapping ranges.
+- Optionally verify `expectedText` against the exact range being replaced.
+- Apply edits bottom-up to avoid line drift.
+- Prefer atomic write via temp file + rename where possible.
+- Record project change with the correct source.
+- Bump file/project seq exactly once per changed file.
+- Record read-guard write stamp.
+- Add modified ranges/import-change metadata to `CacheManager`.
+- Route through `handleToolResult`/normal post-edit pipeline when requested.
+- Never silently guess or widen stale ranges.
+
+### Initial integration order
+
+1. **Partial apply** — first target. Read-guard already resolves which exact oldText replacements are safe; use the helper to apply only those proven replacements with range/seq bookkeeping and normal post-edit routing.
+2. **LSP workspace edits** — share the same bottom-up/atomic/range application core, then add seq/change-log/read-guard bookkeeping for applied workspace edits.
+3. **Actionable autofix** — after stale report checks pass, apply selected LSP quickfix edits through the same internal substrate.
+4. **Future project autofix/manual flows** — only opt-in, never default hook-path project-wide mutation.
+
+### Non-goals
+
+- Do not expose a public `lens_edit` tool initially.
+- Do not bypass read guard for normal agent edits.
+- Do not replace oldText autopatch.
+- Do not silently apply broad/project-wide edits.
+- Do not downgrade safety to make stale edits succeed.
 
 ### Acceptance criteria
 
-- Partial apply uses this path eventually.
-- LSP workspace edits can reuse the same bookkeeping.
-- Agent-facing edit failures include current seq/hash and suggested re-read.
+- Partial apply uses this internal path for resolved replacements.
+- Failed internal edits return stale seq/hash/range details and recommend re-read.
+- LSP workspace edits can reuse the same atomic/range application core.
+- Actionable autofix can reuse the same bookkeeping after report freshness validation.
+- Normal native `edit` behavior, read expansion, read-guard checks, and oldText autopatches remain unchanged.
 
 ## Phase 7 — Lazy heavy indexes
 
@@ -349,7 +420,7 @@ A lightweight word/symbol lookup cache for agent guidance:
 2. ~~Append-only change log.~~ Done.
 3. ~~Add seq metadata to actionable/code-quality reports.~~ Done.
 4. ~~Project snapshot cache consolidating existing indexes.~~ Foundation done.
-5. Reverse dependency cache/query helper.
+5. ~~Reverse dependency cache/query helper.~~ Foundation done.
 6. Hot files report.
 7. Native versioned edit helper.
 8. Optional search index experiment.
@@ -362,7 +433,7 @@ Add tests for:
 - stale report detection by seq
 - changesSince filtering and max cap
 - snapshot load/save/version invalidation
-- reverse dependency lookup from cached graph
+- reverse dependency lookup from cached graph — foundation covered
 - hot files aggregation
 - native edit stale-seq rejection
 - native edit post-pipeline routing
@@ -372,4 +443,4 @@ Add tests for:
 - Should project sequence be persisted across sessions or reset per session? Prefer persisted per project.
 - Should file hashes be cheap line hashes, full content hashes, or mtime+size initially? Prefer mtime+size initially, full hash only for touched files.
 - Should a future `lens_changes` tool be exposed to agents, or only used internally for guidance?
-- Should native edit be an exposed pi tool or just an internal helper used by read-guard/autofix/LSP edits?
+- Native edit helper decision: keep it internal initially. It should complement read expansion/read-guard/autopatch by powering pi-lens-owned mutations, not replace the native agent `edit` path or be exposed as a model-facing tool.
