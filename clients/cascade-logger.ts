@@ -16,6 +16,7 @@ export interface CascadeLogEntry {
 	phase:
 		| "cascade_skip" // primary has blockers, non-code file, or unsupported graph kind
 		| "graph_build" // graph built or reused
+		| "reverse_deps_cache" // reverse dependency cache refresh/load/merge
 		| "neighbors_computed" // impact cascade result ready
 		| "neighbor_touch" // single neighbor LSP active touch result
 		| "neighbor_snapshot" // neighbor read from passive snapshot (autoPropagate jsts)

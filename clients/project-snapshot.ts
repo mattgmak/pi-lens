@@ -188,6 +188,11 @@ export function saveRuntimeProjectSnapshot(args: {
 			startupScan: args.startupScan ?? existing?.startupScan,
 			languageProfile: args.languageProfile ?? existing?.languageProfile,
 		});
+		if (existing) {
+			snapshot.files = existing.files ?? {};
+			snapshot.symbols = existing.symbols ?? {};
+			snapshot.reverseDeps = existing.reverseDeps ?? {};
+		}
 		saveProjectSnapshot(args.cwd, snapshot);
 		args.dbg?.(
 			`project_snapshot: saved seq=${snapshot.seq} exports=${snapshot.cachedExports.length}`,
