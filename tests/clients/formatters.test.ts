@@ -27,6 +27,7 @@ import {
 	rubocopFormatter,
 	ruffFormatter,
 	standardrbFormatter,
+	styluaFormatter,
 } from "../../clients/formatters.ts";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
@@ -246,6 +247,31 @@ describe("resolveCommand — bundle exec", () => {
 // ---------------------------------------------------------------------------
 // 4: vendor/bin resolution (php-cs-fixer)
 // ---------------------------------------------------------------------------
+
+describe("resolveCommand — stylua config walk-up", () => {
+	it("stylua: passes --config-path to parent .stylua.toml from nested subdir", async () => {
+		const nestedDir = path.join(tmpDir, "scripts");
+		fs.mkdirSync(nestedDir, { recursive: true });
+		createTempFile(tmpDir, ".stylua.toml", "column_width = 100\n");
+		const filePath = path.join(nestedDir, "init.lua");
+		fs.writeFileSync(filePath, "local x=1\n");
+
+		const origPath = process.env.PATH;
+		const fakeStylua = path.join(tmpDir, "bin", "stylua");
+		makeFakeExe(fakeStylua);
+		process.env.PATH = `${path.dirname(fakeStylua)}${path.delimiter}${origPath ?? ""}`;
+
+		try {
+			const cmd = await styluaFormatter.resolveCommand!(filePath, nestedDir);
+			expect(cmd).not.toBeNull();
+			expect(cmd).toContain("--config-path");
+			expect(cmd).toContain(path.join(tmpDir, ".stylua.toml"));
+			expect(cmd).toContain(filePath);
+		} finally {
+			process.env.PATH = origPath;
+		}
+	});
+});
 
 describe("resolveCommand — vendor/bin", () => {
 	it("php-cs-fixer: prefers vendor/bin over global binary", async () => {

@@ -719,8 +719,18 @@ export const swiftformatFormatter: FormatterInfo = {
 
 export const styluaFormatter: FormatterInfo = {
 	name: "stylua",
-	command: ["stylua", "$FILE"],
+	command: ["stylua", "--search-parent-directories", "$FILE"],
 	extensions: [".lua"],
+	async resolveCommand(filePath, cwd) {
+		const stylua = await which("stylua");
+		if (!stylua) return null;
+		const configs = ["stylua.toml", ".stylua.toml"];
+		const found = await findUp(configs, cwd);
+		if (found.length > 0) {
+			return [stylua, "--config-path", found[0], filePath];
+		}
+		return [stylua, "--search-parent-directories", filePath];
+	},
 	async detect(cwd: string) {
 		if ((await which("stylua")) === null) return false;
 		// Prefer explicit config but also run if binary is present in a Lua project
