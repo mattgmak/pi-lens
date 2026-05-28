@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FactStore } from "../../clients/dispatch/fact-store.js";
+import { getProjectDataDir } from "../../clients/file-utils.js";
 import {
 	buildOrUpdateGraph,
 	clearGraphCache,
@@ -18,11 +19,18 @@ vi.mock("../../clients/scan-utils.js", () => ({
 describe("buildOrUpdateGraph — Promise dedup cache", () => {
 	const dirs: string[] = [];
 
+	const originalDataDir = process.env.PILENS_DATA_DIR;
+
 	beforeEach(() => {
 		clearReviewGraphWorkspaceCache();
 	});
 
 	afterEach(() => {
+		if (originalDataDir === undefined) {
+			delete process.env.PILENS_DATA_DIR;
+		} else {
+			process.env.PILENS_DATA_DIR = originalDataDir;
+		}
 		for (const dir of dirs.splice(0)) {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
@@ -111,5 +119,29 @@ describe("buildOrUpdateGraph — Promise dedup cache", () => {
 		const graph = await buildOrUpdateGraph(tmpDir(), [], facts);
 		expect(graph).toHaveProperty("version");
 		expect(graph).toHaveProperty("builtAt");
+	});
+
+	it("stores review graph cache under the configured data directory", async () => {
+		const facts = new FactStore();
+		const cwd = tmpDir();
+		process.env.PILENS_DATA_DIR = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-graph-data-"),
+		);
+		dirs.push(process.env.PILENS_DATA_DIR);
+
+		await buildOrUpdateGraph(cwd, [path.join(cwd, "a.ts")], facts);
+
+		const cachePath = path.join(
+			getProjectDataDir(cwd),
+			"cache",
+			"review-graph.json",
+		);
+		for (let attempt = 0; attempt < 20; attempt++) {
+			if (fs.existsSync(cachePath)) break;
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		}
+
+		expect(fs.existsSync(path.join(cwd, ".pi-lens"))).toBe(false);
+		expect(fs.existsSync(cachePath)).toBe(true);
 	});
 });
