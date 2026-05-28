@@ -25,6 +25,7 @@ const rustClippyRunner: RunnerDefinition = {
 	appliesTo: ["rust"],
 	priority: PRIORITY.SPECIALIZED_ANALYSIS,
 	enabledByDefault: true,
+	timeoutMs: 90_000,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		// Resolve cargo path using platform-aware lookup (handles ~/.cargo/bin on Windows)

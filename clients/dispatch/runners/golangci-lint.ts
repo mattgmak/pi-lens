@@ -75,6 +75,7 @@ const golangciRunner: RunnerDefinition = {
 	appliesTo: ["go"],
 	priority: PRIORITY.GENERAL_ANALYSIS,
 	enabledByDefault: true,
+	timeoutMs: 90_000,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		const cwd = ctx.cwd || process.cwd();

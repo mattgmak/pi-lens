@@ -906,20 +906,22 @@ async function runRunner(
 	runner: RunnerDefinition,
 	defaultSemantic: OutputSemantic,
 ): Promise<RunnerResult> {
+	const timeoutMs = runner.timeoutMs ?? RUNNER_TIMEOUT_MS;
+	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
 		const result = await Promise.race([
-			runner.run(ctx),
-			new Promise<never>((_, reject) =>
-				setTimeout(
+			runner.run(ctx).finally(() => clearTimeout(timer)),
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(
 					() =>
 						reject(
 							new Error(
-								`Runner ${runner.id} timed out after ${RUNNER_TIMEOUT_MS}ms`,
+								`Runner ${runner.id} timed out after ${timeoutMs}ms`,
 							),
 						),
-					RUNNER_TIMEOUT_MS,
-				),
-			),
+					timeoutMs,
+				);
+			}),
 		]);
 
 		const diagnostics = result.diagnostics.map((d) => ({
@@ -933,6 +935,7 @@ async function runRunner(
 			semantic: result.semantic ?? defaultSemantic,
 		};
 	} catch (error) {
+		clearTimeout(timer);
 		ctx.log(`Runner ${runner.id} failed: ${error}`);
 		return {
 			status: "failed",
