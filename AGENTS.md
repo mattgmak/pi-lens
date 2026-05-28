@@ -36,6 +36,26 @@ npm run build && npm test
 ```
 Do not hand-edit generated `.js`; regenerate it from the corresponding `.ts`.
 
+## Data directory conventions
+
+**All project-scoped persistent data must go through `getProjectDataDir(cwd)`** (`clients/file-utils.ts`).
+
+```typescript
+import { getProjectDataDir } from "./file-utils.js";
+const cacheFile = path.join(getProjectDataDir(cwd), "cache", "my-file.json");
+```
+
+`getProjectDataDir` respects `PILENS_DATA_DIR`:
+- If `PILENS_DATA_DIR` is set → `$PILENS_DATA_DIR/<project-slug>/`
+- Otherwise, if `<cwd>/.pi-lens/` already exists → use it (legacy)
+- Default → `~/.pi-lens/projects/<project-slug>/`
+
+**Project-scoped** (must use `getProjectDataDir`): caches, snapshots, indexes, worklogs, change-log, code-quality-warnings, actionable-warning-state, review-graph, semgrep config, install-choices.
+
+**Machine-global** (intentionally hardcoded to `~/.pi-lens/`): latency.log, cascade.log, tree-sitter.log, sessionstart.log, read-guard.log, actionable-warnings.log, tools/, bin/, intelephense/, logs/. These are shared across all projects.
+
+Never write `path.join(cwd, ".pi-lens", ...)` for a project cache — it breaks when `PILENS_DATA_DIR` is set.
+
 ## Debug logs
 - `~/.pi-lens/sessionstart.log` — timestamped lines for every session_start event and tool lifecycle; includes project snapshot probe/miss/load summaries, seeded project/file sequence counts, scan-context/profile cache source, and deferred task queued/run timings
 - `~/.pi-lens/cascade.log` — NDJSON cascade graph/neighbor diagnostics, including reverse-dependency cache refresh/load/merge events (`phase: "reverse_deps_cache"`)
