@@ -324,6 +324,108 @@ describe("read-guard tool line helpers", () => {
 		}
 	});
 
+	it("includes surrounding line context for each duplicate occurrence", () => {
+		const env = setupTestEnvironment("read-guard-lines-dup-ctx-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(
+				filePath,
+				[
+					"function a() {",
+					"  return value;",
+					"}",
+					"",
+					"function b() {",
+					"  return value;",
+					"}",
+					"",
+				].join("\n"),
+			);
+
+			const event = {
+				toolName: "edit",
+				input: {
+					path: filePath,
+					edits: [{ oldText: "  return value;", newText: "  return 42;" }],
+				},
+			};
+
+			const result = getTouchedLinesForGuard(event, filePath);
+			expect(result.preflightError).toBeDefined();
+			const err = result.preflightError as string;
+			expect(err).toMatch(/Line 2:/);
+			expect(err).toMatch(/Line 6:/);
+			expect(err).toMatch(/function a\(\)/);
+			expect(err).toMatch(/function b\(\)/);
+			expect(err).toMatch(/← match/);
+			expect(err).toMatch(/Pick the location/);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("collapses long duplicate context lists with overflow marker", () => {
+		const env = setupTestEnvironment("read-guard-lines-dup-overflow-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			const block = ["  return value;", ""];
+			fs.writeFileSync(filePath, block.concat(block, block, block, block, block, block).join("\n"));
+
+			const event = {
+				toolName: "edit",
+				input: {
+					path: filePath,
+					edits: [{ oldText: "  return value;", newText: "  return 42;" }],
+				},
+			};
+
+			const result = getTouchedLinesForGuard(event, filePath);
+			const err = result.preflightError as string;
+			expect(err).toMatch(/appears 7 times/);
+			expect(err).toMatch(/and 2 more occurrences/);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("shows match-start/match-end markers for multi-line duplicate oldText", () => {
+		const env = setupTestEnvironment("read-guard-lines-dup-multiline-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(
+				filePath,
+				[
+					"function a() {",
+					"  log();",
+					"  return value;",
+					"}",
+					"",
+					"function b() {",
+					"  log();",
+					"  return value;",
+					"}",
+				].join("\n"),
+			);
+
+			const event = {
+				toolName: "edit",
+				input: {
+					path: filePath,
+					edits: [
+						{ oldText: "  log();\n  return value;", newText: "  return 0;" },
+					],
+				},
+			};
+
+			const result = getTouchedLinesForGuard(event, filePath);
+			const err = result.preflightError as string;
+			expect(err).toMatch(/← match start/);
+			expect(err).toMatch(/← match end/);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("returns preflightError when oldText is not found", () => {
 		const env = setupTestEnvironment("read-guard-lines-missing-");
 		try {
@@ -356,6 +458,46 @@ describe("read-guard tool line helpers", () => {
 					}),
 				}),
 			);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("includes first-line locator hint on first attempt when first line matches uniquely", () => {
+		const env = setupTestEnvironment("read-guard-lines-firstline-hint-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(
+				filePath,
+				[
+					"// header",
+					"",
+					"function findModelByHint(name: string) {",
+					"  return registry.lookup(name);",
+					"}",
+					"",
+				].join("\n"),
+			);
+
+			const event = {
+				toolName: "edit",
+				input: {
+					path: filePath,
+					edits: [
+						{
+							oldText:
+								"function findModelByHint(name: string) {\n  return registry.lookupExact(name);\n}",
+							newText: "noop",
+						},
+					],
+				},
+			};
+
+			const result = getTouchedLinesForGuard(event, filePath);
+			const err = result.preflightError as string;
+			expect(err).toMatch(/RETRYABLE/);
+			expect(err).toMatch(/first line of your oldText appears near line 3/);
+			expect(err).toMatch(/offset=1 limit=20/);
 		} finally {
 			env.cleanup();
 		}

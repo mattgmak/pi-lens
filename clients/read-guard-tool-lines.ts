@@ -205,6 +205,44 @@ function findOccurrenceLines(content: string, needle: string): number[] {
 	return lines;
 }
 
+function formatOccurrenceContext(
+	content: string,
+	occurrenceLines: number[],
+	matchSpanLines: number,
+	maxOccurrences = 5,
+): string {
+	const fileLines = content.split("\n");
+	const shown = occurrenceLines.slice(0, maxOccurrences);
+	const extra = occurrenceLines.length - shown.length;
+	const pad = (n: number) => String(n).padStart(4, " ");
+	const blocks = shown.map((startLine) => {
+		const endLine = startLine + matchSpanLines - 1;
+		const before = startLine > 1 ? fileLines[startLine - 2] : undefined;
+		const after =
+			endLine < fileLines.length ? fileLines[endLine] : undefined;
+		const lines: string[] = [`  • Line ${startLine}:`];
+		if (before !== undefined)
+			lines.push(`      ${pad(startLine - 1)} │ ${before}`);
+		if (matchSpanLines === 1) {
+			lines.push(`      ${pad(startLine)} │ ${fileLines[startLine - 1] ?? ""}  ← match`);
+		} else {
+			lines.push(`      ${pad(startLine)} │ ${fileLines[startLine - 1] ?? ""}  ← match start`);
+			if (matchSpanLines > 2) {
+				lines.push(`      ${pad(0)} │ … (${matchSpanLines - 2} more line${matchSpanLines - 2 === 1 ? "" : "s"})`);
+			}
+			lines.push(`      ${pad(endLine)} │ ${fileLines[endLine - 1] ?? ""}  ← match end`);
+		}
+		if (after !== undefined)
+			lines.push(`      ${pad(endLine + 1)} │ ${after}`);
+		return lines.join("\n");
+	});
+	const tail =
+		extra > 0
+			? `\n  • … and ${extra} more occurrence${extra === 1 ? "" : "s"}`
+			: "";
+	return blocks.join("\n") + tail;
+}
+
 function countRawOccurrences(content: string, needle: string): number {
 	if (!needle) return 0;
 	let count = 0;
@@ -329,7 +367,11 @@ function resolveOldTextEdits(
 						? ` The first line of your oldText appears near line ${lineHint} — re-read: \`offset=${Math.max(1, lineHint - 2)} limit=20\``
 						: ` Re-read the full relevant section before retrying.`);
 			} else {
-				errorMsg += ` Re-read the relevant section of the file to confirm the exact text, then retry with the verbatim content.`;
+				const lineHint = findFirstLineOfOldText(content, oldText);
+				errorMsg +=
+					lineHint !== undefined
+						? ` The first line of your oldText appears near line ${lineHint}, but the rest doesn't match — re-read \`offset=${Math.max(1, lineHint - 2)} limit=20\` and rebuild oldText from the verbatim file content.`
+						: ` Re-read the relevant section of the file to confirm the exact text, then retry with the verbatim content.`;
 			}
 			errors.push(errorMsg);
 			logReadGuardEvent({
@@ -372,9 +414,14 @@ function resolveOldTextEdits(
 			failureKinds.push("oldtext_duplicate");
 			failedEditIndexes.push(editIndex);
 			failedOldTextPreviews.push(preview);
-			const lineList = occurrenceLines.map((l) => `  • Line ${l}`).join("\n");
+			const matchSpanLines = needle.split("\n").length;
+			const contextBlock = formatOccurrenceContext(
+				content,
+				occurrenceLines,
+				matchSpanLines,
+			);
 			errors.push(
-				`edits[${editIndex}].oldText ("${preview}") appears ${occurrenceLines.length} times:\n${lineList}\nAdd more surrounding context to make it unique.`,
+				`edits[${editIndex}].oldText ("${preview}") appears ${occurrenceLines.length} times:\n${contextBlock}\nPick the location you want and extend your oldText with the unique line above or below it (shown as context).`,
 			);
 			logReadGuardEvent({
 				event: "oldtext_duplicate",
