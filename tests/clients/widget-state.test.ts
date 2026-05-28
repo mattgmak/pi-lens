@@ -101,6 +101,92 @@ describe("widget-state renderWidget", () => {
 		expect(allLines).not.toContain("error in pi-lens");
 	});
 
+	it("paints the file row red when any diagnostic carries semantic=blocking, even if severity is warning", () => {
+		const filePath = `${process.cwd()}/cors.ts`;
+		recordRunner(filePath, "sonar-rules", "succeeded", 1);
+		recordDiagnostics(filePath, [
+			{
+				severity: "warning",
+				semantic: "blocking",
+				message: "CORS wildcard origin",
+				rule: "cors-wildcard",
+			},
+		]);
+
+		const lines = renderWidget(120, theme);
+		const fileRow = lines.find((l) => l.includes("cors.ts")) ?? "";
+		// red(●) — wrapped in theme color escape; assert the bullet appears
+		// before the filename and that no warning-only triangle preceded it.
+		expect(fileRow).toMatch(/●.*cors\.ts/);
+		expect(fileRow).not.toMatch(/▲.*cors\.ts/);
+	});
+
+	it("falls back to severity=error when semantic is absent so plain tsc errors stay red", () => {
+		const filePath = `${process.cwd()}/legacy.ts`;
+		recordRunner(filePath, "type-safety", "failed", 1);
+		recordDiagnostics(filePath, [
+			{
+				severity: "error",
+				message: "TS2451: cannot redeclare",
+				rule: "typescript:2451",
+			},
+		]);
+
+		const lines = renderWidget(120, theme);
+		const fileRow = lines.find((l) => l.includes("legacy.ts")) ?? "";
+		expect(fileRow).toMatch(/●.*legacy\.ts/);
+	});
+
+	it("paints the file row yellow when severity=error but semantic explicitly demotes it", () => {
+		const filePath = `${process.cwd()}/advisory.ts`;
+		recordRunner(filePath, "lint", "succeeded", 1);
+		recordDiagnostics(filePath, [
+			{
+				severity: "error",
+				semantic: "warning",
+				message: "advisory error from non-blocking rule",
+				rule: "advisory-rule",
+			},
+		]);
+
+		const lines = renderWidget(120, theme);
+		const fileRow = lines.find((l) => l.includes("advisory.ts")) ?? "";
+		expect(fileRow).toMatch(/▲.*advisory\.ts/);
+		expect(fileRow).not.toMatch(/●.*advisory\.ts/);
+	});
+
+	it("details block lists only blocking diagnostics before non-blocking ones", () => {
+		const filePath = `${process.cwd()}/mixed.ts`;
+		recordRunner(filePath, "lint", "succeeded", 3);
+		recordDiagnostics(filePath, [
+			{
+				severity: "warning",
+				semantic: "warning",
+				message: "non-blocking advisory",
+				rule: "advice",
+				line: 10,
+			},
+			{
+				severity: "warning",
+				semantic: "blocking",
+				message: "blocking sonar issue",
+				rule: "cors-wildcard",
+				line: 20,
+			},
+		]);
+
+		const lines = renderWidget(120, theme);
+		const allLines = lines.join("\n");
+		expect(allLines).toContain("blocking sonar issue");
+		// The non-blocking one is included as a tail filler (slot remaining).
+		// What matters is that the blocking diagnostic appears before the
+		// non-blocking one in the rendered output.
+		const blockIdx = allLines.indexOf("blocking sonar issue");
+		const adviceIdx = allLines.indexOf("non-blocking advisory");
+		expect(blockIdx).toBeGreaterThan(0);
+		if (adviceIdx >= 0) expect(blockIdx).toBeLessThan(adviceIdx);
+	});
+
 	it("shows formatter name when a formatter changed the file", () => {
 		const filePath = `${process.cwd()}/app.ts`;
 		recordFormatter(filePath, "biome", true, true);

@@ -6,12 +6,25 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 export interface WidgetDiagnostic {
 	severity: string;
+	semantic?: string;
 	message: string;
 	line?: number;
 	col?: number;
 	rule?: string;
 	tool?: string;
 	uri?: string;
+}
+
+/**
+ * A diagnostic is "blocking" when pi-lens classifies it as a hard stop
+ * (`semantic === "blocking"`). Falls back to severity for sources that
+ * don't set `semantic` (raw tsc/eslint diagnostics) so the red dot still
+ * fires on traditional compile errors.
+ */
+function isBlocking(d: WidgetDiagnostic): boolean {
+	if (d.semantic === "blocking") return true;
+	if (d.semantic == null && d.severity === "error") return true;
+	return false;
 }
 
 interface FileRecord {
@@ -90,6 +103,7 @@ export function recordDiagnostics(
 		line?: number;
 		column?: number;
 		severity?: string;
+		semantic?: string;
 	}>,
 ): void {
 	const rec = getOrCreate(filePath);
@@ -102,6 +116,7 @@ export function recordDiagnostics(
 				: base;
 		return {
 			severity: d.severity ?? "info",
+			semantic: d.semantic,
 			message: d.message ?? "",
 			line: d.line,
 			col: d.column,
@@ -155,28 +170,38 @@ export function renderWidget(
 	const deduped = dedupeByBasename([...files.values()]);
 	const sorted = deduped.slice(0, 5);
 	const langStr = sessionLanguages.slice(0, 6).join(" ");
+	const totalBlocking = countBlockingIn(deduped);
 	const totalErrors = countTotalIn("error", deduped);
 	const totalWarnings = countTotalIn("warning", deduped);
-	const summary =
+	const errorChunk =
 		totalErrors > 0
-			? red(`●${totalErrors}E`) +
-				(totalWarnings > 0 ? " " + yellow(`▲${totalWarnings}W`) : "")
-			: totalWarnings > 0
-				? yellow(`▲${totalWarnings}W`)
-				: files.size > 0
-					? green("✓ clean")
-					: "";
+			? (totalBlocking > 0 ? red : yellow)(`●${totalErrors}E`)
+			: "";
+	const warningChunk = totalWarnings > 0 ? yellow(`▲${totalWarnings}W`) : "";
+	const summary = errorChunk
+		? errorChunk + (warningChunk ? " " + warningChunk : "")
+		: warningChunk
+			? warningChunk
+			: files.size > 0
+				? green("✓ clean")
+				: "";
 	const header = ` ${cyan("pi-lens")}${langStr ? "  " + dim(langStr) : ""}${summary ? "  " + summary : ""}`;
 	lines.push(fitLine(header, w));
 
 	// File list — most recently touched first, dedup by basename (last wins), cap at 5
 	for (const rec of sorted) {
 		const base = path.basename(rec.filePath);
+		const blocking = rec.diagnostics.filter(isBlocking).length;
 		const errors = rec.diagnostics.filter((d) => d.severity === "error").length;
 		const warnings = rec.diagnostics.filter(
 			(d) => d.severity === "warning",
 		).length;
-		const dot = errors > 0 ? red("●") : warnings > 0 ? yellow("▲") : green("✓");
+		const dot =
+			blocking > 0
+				? red("●")
+				: warnings > 0 || errors > 0
+					? yellow("▲")
+					: green("✓");
 		const runnerNames = [...rec.runners.entries()]
 			.filter(([, r]) => r.status !== "skipped")
 			.map(([id]) => id)
@@ -200,25 +225,21 @@ export function renderWidget(
 		lines.push(fitLine(row, w));
 	}
 
-	// Diagnostics — errors from the most recently touched file that has them
-	const withErrors = sorted.filter((r) =>
-		r.diagnostics.some((d) => d.severity === "error"),
-	);
-	if (withErrors.length > 0) {
-		const rec = withErrors[0];
+	// Diagnostics — blocking-first from the most recently touched file that has them
+	const withBlocking = sorted.filter((r) => r.diagnostics.some(isBlocking));
+	if (withBlocking.length > 0) {
+		const rec = withBlocking[0];
 		lines.push(fitLine(dim("─".repeat(Math.min(w, 60))), w));
 		lines.push(fitLine(` ${dim(path.basename(rec.filePath))}`, w));
-		const errors = rec.diagnostics
-			.filter((d) => d.severity === "error")
-			.slice(0, 5);
-		const warnings =
-			errors.length < 5
+		const blockers = rec.diagnostics.filter(isBlocking).slice(0, 5);
+		const others =
+			blockers.length < 5
 				? rec.diagnostics
-						.filter((d) => d.severity === "warning")
-						.slice(0, 5 - errors.length)
+						.filter((d) => !isBlocking(d))
+						.slice(0, 5 - blockers.length)
 				: [];
-		for (const d of [...errors, ...warnings]) {
-			const sev = d.severity === "error" ? red("●") : yellow("▲");
+		for (const d of [...blockers, ...others]) {
+			const sev = isBlocking(d) ? red("●") : yellow("▲");
 			const loc = d.line != null ? osc8(d.uri ?? "", `L${d.line}`) : "";
 			const rule = d.rule ? dim(` ${d.rule}`) : "";
 			const prefix = `   ${sev} ${loc}${rule}  `;
@@ -258,6 +279,12 @@ function countTotalIn(severity: string, recs: FileRecord[]): number {
 	let n = 0;
 	for (const rec of recs)
 		n += rec.diagnostics.filter((d) => d.severity === severity).length;
+	return n;
+}
+
+function countBlockingIn(recs: FileRecord[]): number {
+	let n = 0;
+	for (const rec of recs) n += rec.diagnostics.filter(isBlocking).length;
 	return n;
 }
 
