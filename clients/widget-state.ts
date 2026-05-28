@@ -149,6 +149,8 @@ export function recordLsp(
 
 // ── Render ────────────────────────────────────────────────────────────────────
 
+const HORIZONTAL_MIN_WIDTH = 70;
+
 export function renderWidget(
 	width: number,
 	theme: {
@@ -161,6 +163,7 @@ export function renderWidget(
 	const green = (s: string) => theme.fg("success", s);
 	const cyan = (s: string) => theme.fg("accent", s);
 	const w = Math.max(1, width || 80);
+	const useHorizontal = w >= HORIZONTAL_MIN_WIDTH;
 
 	if (files.size === 0 && lspServers.size === 0) return [];
 
@@ -168,7 +171,7 @@ export function renderWidget(
 
 	// Header — counts from deduplicated files only
 	const deduped = dedupeByBasename([...files.values()]);
-	const sorted = deduped.slice(0, 5);
+	const recencySorted = deduped.slice(0, 5);
 	const langStr = sessionLanguages.slice(0, 6).join(" ");
 	const totalBlocking = countBlockingIn(deduped);
 	const totalErrors = countTotalIn("error", deduped);
@@ -185,48 +188,32 @@ export function renderWidget(
 			: files.size > 0
 				? green("✓ clean")
 				: "";
-	const header = ` ${cyan("pi-lens")}${langStr ? "  " + dim(langStr) : ""}${summary ? "  " + summary : ""}`;
+
+	// LSP spawning — folded into the header in horizontal mode, tail line otherwise
+	const spawning = [...lspServers.values()].filter(
+		(s) => s.status === "spawning",
+	);
+	const lspChip =
+		useHorizontal && spawning.length > 0 ? "  " + dim("LSP↑") : "";
+
+	const header = ` ${cyan("pi-lens")}${langStr ? "  " + dim(langStr) : ""}${lspChip}${summary ? "  " + summary : ""}`;
 	lines.push(fitLine(header, w));
 
-	// File list — most recently touched first, dedup by basename (last wins), cap at 5
-	for (const rec of sorted) {
-		const base = path.basename(rec.filePath);
-		const blocking = rec.diagnostics.filter(isBlocking).length;
-		const errors = rec.diagnostics.filter((d) => d.severity === "error").length;
-		const warnings = rec.diagnostics.filter(
-			(d) => d.severity === "warning",
-		).length;
-		const dot =
-			blocking > 0
-				? red("●")
-				: warnings > 0 || errors > 0
-					? yellow("▲")
-					: green("✓");
-		const runnerNames = [...rec.runners.entries()]
-			.filter(([, r]) => r.status !== "skipped")
-			.map(([id]) => id)
-			.join(" ");
-		const counts =
-			errors > 0
-				? " " +
-					red(`${errors}E`) +
-					(warnings > 0 ? " " + yellow(`${warnings}W`) : "")
-				: warnings > 0
-					? " " + yellow(`${warnings}W`)
-					: " " + dim("clean");
-		const changedFormatters = [...rec.formatters.entries()]
-			.filter(([, f]) => f.changed)
-			.map(([name]) => name);
-		const formatMark =
-			changedFormatters.length > 0
-				? dim(` fmt:${changedFormatters.join(",")}`)
-				: "";
-		const row = ` ${dot} ${base}  ${dim(runnerNames)}${formatMark}${counts}`;
-		lines.push(fitLine(row, w));
+	// File list — display order varies by mode
+	if (useHorizontal) {
+		const displayOrder = sortByTierThenRecency(recencySorted);
+		const rowLine = packHorizontalRow(displayOrder, w, theme);
+		if (rowLine.length > 0) lines.push(rowLine);
+	} else {
+		for (const rec of recencySorted) {
+			lines.push(fitLine(formatFileRowVertical(rec, theme), w));
+		}
 	}
 
 	// Diagnostics — blocking-first from the most recently touched file that has them
-	const withBlocking = sorted.filter((r) => r.diagnostics.some(isBlocking));
+	const withBlocking = recencySorted.filter((r) =>
+		r.diagnostics.some(isBlocking),
+	);
 	if (withBlocking.length > 0) {
 		const rec = withBlocking[0];
 		lines.push(fitLine(dim("─".repeat(Math.min(w, 60))), w));
@@ -249,16 +236,199 @@ export function renderWidget(
 		}
 	}
 
-	// LSP status — only spawning servers (ready ones are quiet)
-	const spawning = [...lspServers.values()].filter(
-		(s) => s.status === "spawning",
-	);
-	if (spawning.length > 0) {
+	// LSP status tail — only in vertical mode; horizontal folds into header
+	if (!useHorizontal && spawning.length > 0) {
 		const ids = spawning.map((s) => s.serverId).join(" ");
 		lines.push(fitLine(` ${dim(`LSP spawning: ${ids}`)}`, w));
 	}
 
 	return lines;
+}
+
+// ── File row layout ──────────────────────────────────────────────────────────
+
+type FileTier = "blocking" | "warning" | "clean";
+
+function classifyFileTier(rec: FileRecord): FileTier {
+	if (rec.diagnostics.some(isBlocking)) return "blocking";
+	if (
+		rec.diagnostics.some(
+			(d) => d.severity === "error" || d.severity === "warning",
+		)
+	) {
+		return "warning";
+	}
+	return "clean";
+}
+
+function sortByTierThenRecency(recs: FileRecord[]): FileRecord[] {
+	const order: Record<FileTier, number> = { blocking: 0, warning: 1, clean: 2 };
+	return [...recs].sort((a, b) => {
+		const ta = order[classifyFileTier(a)];
+		const tb = order[classifyFileTier(b)];
+		if (ta !== tb) return ta - tb;
+		return b.touchedAt - a.touchedAt;
+	});
+}
+
+function formatFileRowVertical(
+	rec: FileRecord,
+	theme: { fg: (color: string, s: string) => string },
+): string {
+	const dim = (s: string) => theme.fg("dim", s);
+	const red = (s: string) => theme.fg("error", s);
+	const yellow = (s: string) => theme.fg("warning", s);
+	const green = (s: string) => theme.fg("success", s);
+
+	const base = path.basename(rec.filePath);
+	const blocking = rec.diagnostics.filter(isBlocking).length;
+	const errors = rec.diagnostics.filter((d) => d.severity === "error").length;
+	const warnings = rec.diagnostics.filter(
+		(d) => d.severity === "warning",
+	).length;
+	const dot =
+		blocking > 0
+			? red("●")
+			: warnings > 0 || errors > 0
+				? yellow("▲")
+				: green("✓");
+	const runnerNames = [...rec.runners.entries()]
+		.filter(([, r]) => r.status !== "skipped")
+		.map(([id]) => id)
+		.join(" ");
+	const counts =
+		errors > 0
+			? " " +
+				(blocking > 0 ? red : yellow)(`${errors}E`) +
+				(warnings > 0 ? " " + yellow(`${warnings}W`) : "")
+			: warnings > 0
+				? " " + yellow(`${warnings}W`)
+				: " " + dim("clean");
+	const changedFormatters = [...rec.formatters.entries()]
+		.filter(([, f]) => f.changed)
+		.map(([name]) => name);
+	const formatMark =
+		changedFormatters.length > 0
+			? dim(` fmt:${changedFormatters.join(",")}`)
+			: "";
+	return ` ${dot} ${base}  ${dim(runnerNames)}${formatMark}${counts}`;
+}
+
+function packHorizontalRow(
+	recs: FileRecord[],
+	totalWidth: number,
+	theme: { fg: (color: string, s: string) => string },
+): string {
+	if (recs.length === 0) return "";
+	const dim = (s: string) => theme.fg("dim", s);
+	const indent = "   ";
+	const sep = "  ";
+	// Reserve worst-case overflow space upfront so the marker always fits.
+	// " +NN" — 4 visible chars covers up to two-digit overflow.
+	const overflowReserve = 4;
+	let used = visibleWidth(indent);
+	const parts: string[] = [indent];
+	const addedTokenWidths: number[] = [];
+	let droppedAt = -1;
+	for (let i = 0; i < recs.length; i++) {
+		const sepWidth = parts.length > 1 ? visibleWidth(sep) : 0;
+		const willOverflow = i < recs.length - 1;
+		const reserve = willOverflow ? overflowReserve : 0;
+		const remaining = totalWidth - used - sepWidth - reserve;
+		if (remaining < 4) {
+			droppedAt = i;
+			break;
+		}
+		const token = formatFileTokenHorizontal(recs[i], remaining, theme);
+		const tokenWidth = visibleWidth(token);
+		if (token.length === 0 || used + sepWidth + tokenWidth > totalWidth) {
+			droppedAt = i;
+			break;
+		}
+		if (sepWidth > 0) {
+			parts.push(sep);
+			used += sepWidth;
+		}
+		parts.push(token);
+		used += tokenWidth;
+		addedTokenWidths.push(tokenWidth + sepWidth);
+	}
+	if (droppedAt >= 0) {
+		let dropped = recs.length - droppedAt;
+		let overflow = " " + dim(`+${dropped}`);
+		// If reservation was insufficient (e.g. last token grew because no
+		// reserve was applied), shed accepted tokens until overflow fits.
+		while (
+			used + visibleWidth(overflow) > totalWidth &&
+			addedTokenWidths.length > 0
+		) {
+			const lastWidth = addedTokenWidths.pop() as number;
+			used -= lastWidth;
+			parts.pop(); // token
+			if (parts.length > 1) parts.pop(); // preceding separator
+			dropped++;
+			overflow = " " + dim(`+${dropped}`);
+		}
+		if (used + visibleWidth(overflow) <= totalWidth) {
+			parts.push(overflow);
+		}
+	}
+	return fitLine(parts.join(""), totalWidth);
+}
+
+function formatFileTokenHorizontal(
+	rec: FileRecord,
+	remainingWidth: number,
+	theme: { fg: (color: string, s: string) => string },
+): string {
+	const dim = (s: string) => theme.fg("dim", s);
+	const red = (s: string) => theme.fg("error", s);
+	const yellow = (s: string) => theme.fg("warning", s);
+
+	const blocking = rec.diagnostics.filter(isBlocking).length;
+	const errors = rec.diagnostics.filter((d) => d.severity === "error").length;
+	const warnings = rec.diagnostics.filter(
+		(d) => d.severity === "warning",
+	).length;
+	const formatterChanged = [...rec.formatters.values()].some((f) => f.changed);
+
+	let dotChar: string;
+	if (blocking > 0) dotChar = red("●");
+	else if (errors > 0 || warnings > 0) dotChar = yellow("▲");
+	else if (formatterChanged) dotChar = dim("✎");
+	else dotChar = dim("·");
+
+	let countsStyled = "";
+	if (errors > 0 && warnings > 0) {
+		const eColor = blocking > 0 ? red : yellow;
+		countsStyled = " " + eColor(`${errors}E`) + yellow(`${warnings}W`);
+	} else if (errors > 0) {
+		const eColor = blocking > 0 ? red : yellow;
+		countsStyled = " " + eColor(`${errors}E`);
+	} else if (warnings > 0) {
+		countsStyled = " " + yellow(`${warnings}W`);
+	}
+
+	const fullBasename = path.basename(rec.filePath);
+	const fixedWidth = visibleWidth(dotChar) + 1 + visibleWidth(countsStyled);
+	const basenameBudget = remainingWidth - fixedWidth;
+	if (basenameBudget < 3) return "";
+	const truncated = truncateBasename(fullBasename, basenameBudget);
+	const linked = osc8(pathToFileURL(rec.filePath).href, truncated);
+	return `${dotChar} ${linked}${countsStyled}`;
+}
+
+function truncateBasename(name: string, maxWidth: number): string {
+	if (visibleWidth(name) <= maxWidth) return name;
+	if (maxWidth < 2) return "…";
+	const ext = path.extname(name);
+	const stem = name.slice(0, name.length - ext.length);
+	const keep = maxWidth - ext.length - 1;
+	if (keep < 1) {
+		// Extension alone wouldn't fit; truncate the whole name.
+		return name.slice(0, maxWidth - 1) + "…";
+	}
+	return stem.slice(0, keep) + "…" + ext;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
