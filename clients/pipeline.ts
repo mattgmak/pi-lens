@@ -189,7 +189,7 @@ export interface PipelineResult {
 	 * Intentionally NOT included in output — surfaced at turn_end instead
 	 * so mid-refactor intermediate errors don't derail the agent.
 	 */
-	cascadeResult?: import("./cascade-types.js").CascadeResult;
+	cascadeRun?: import("./cascade-types.js").CascadeRun;
 	/** True if secrets found — block the agent */
 	isError: boolean;
 	/** True if file was modified by format/autofix */
@@ -1093,7 +1093,7 @@ export async function runPipeline(
 	// --- 7. Cascade diagnostics (LSP only) ---
 	// Deferred: cascade errors in OTHER files are NOT shown inline — surfaced at
 	// turn_end so mid-refactor intermediate errors don't derail the agent.
-	const cascadeResult = getFlag("no-lsp")
+	const cascadeRun = getFlag("no-lsp")
 		? undefined
 		: await computeCascadeForFile(filePath, cwd, {
 				hasBlockers,
@@ -1134,7 +1134,7 @@ export async function runPipeline(
 	return {
 		output,
 		hasBlockers,
-		cascadeResult,
+		cascadeRun,
 		isError: false,
 		fileModified,
 		changedFiles,

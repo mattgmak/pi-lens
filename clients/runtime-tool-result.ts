@@ -472,8 +472,8 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		}
 	}
 
-	if (result.cascadeResult) {
-		runtime.appendCascadeResult(result.cascadeResult);
+	if (result.cascadeRun) {
+		runtime.appendCascadeRun(result.cascadeRun);
 	}
 
 	if (result.actionableWarnings?.length) {

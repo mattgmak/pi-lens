@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import * as path from "node:path";
 import type { ActionableWarningRecord } from "./actionable-warnings.js";
-import type { CascadeResult } from "./cascade-types.js";
+import type { CascadeRun } from "./cascade-types.js";
 import type { CodeQualityWarningRecord } from "./code-quality-warnings.js";
 import type { FileComplexity } from "./complexity-client.js";
 import { normalizeMapKey } from "./path-utils.js";
@@ -41,7 +41,7 @@ export class RuntimeCoordinator {
 	private _cachedExports = new Map<string, string>();
 	private _cachedProjectIndex: ProjectIndex | null = null;
 	private _startupScansInFlight = new Map<string, number>();
-	private _cascadeResults: CascadeResult[] = [];
+	private _cascadeRuns: CascadeRun[] = [];
 	private _cascadeSessionStats: CascadeSessionStats = {
 		runs: 0,
 		diagnosticsSurfaced: 0,
@@ -93,7 +93,7 @@ export class RuntimeCoordinator {
 		this._cachedExports.clear();
 		this._cachedProjectIndex = null;
 		this._startupScansInFlight.clear();
-		this._cascadeResults = [];
+		this._cascadeRuns = [];
 		this._cascadeSessionStats = {
 			runs: 0,
 			diagnosticsSurfaced: 0,
@@ -160,7 +160,7 @@ export class RuntimeCoordinator {
 	}
 
 	beginTurn(): void {
-		this._cascadeResults = [];
+		this._cascadeRuns = [];
 		this._pendingInlineBlockers.clear();
 		this._actionableWarningsThisTurn.clear();
 		this._codeQualityWarningsThisTurn.clear();
@@ -328,14 +328,14 @@ export class RuntimeCoordinator {
 		this._cachedProjectIndex = value;
 	}
 
-	appendCascadeResult(result: CascadeResult): void {
-		this._cascadeResults.push(result);
+	appendCascadeRun(run: CascadeRun): void {
+		this._cascadeRuns.push(run);
 	}
 
-	consumeCascadeResults(): CascadeResult[] {
-		const results = this._cascadeResults;
-		this._cascadeResults = [];
-		return results;
+	consumeCascadeRuns(): CascadeRun[] {
+		const runs = this._cascadeRuns;
+		this._cascadeRuns = [];
+		return runs;
 	}
 
 	recordInlineBlockers(filePath: string, summary: string): void {

@@ -161,7 +161,8 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	//   2. Neighbor-level: each neighbor is claimed by the latest cascade result
 	//      that covers it — suppresses stale neighbor state from earlier writes.
 	const t0 = Date.now();
-	const cascadeResults = runtime.consumeCascadeResults();
+	const cascadeRuns = runtime.consumeCascadeRuns();
+	const cascadeResults = cascadeRuns.flatMap((r) => (r.result ? [r.result] : []));
 	if (cascadeResults.length > 0) {
 		const seen = new Map<string, (typeof cascadeResults)[number]>();
 		for (const result of cascadeResults) {
@@ -227,13 +228,23 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			},
 		});
 	}
+	const cascadeSkipped = { blockers: 0, non_code: 0, no_neighbors: 0, clean: 0 };
+	for (const r of cascadeRuns) {
+		if (r.skipReason) cascadeSkipped[r.skipReason] = (cascadeSkipped[r.skipReason] ?? 0) + 1;
+	}
 	logLatency({
 		type: "phase",
 		toolName: "turn_end",
 		filePath: cwd,
 		phase: "cascade_merge",
 		durationMs: Date.now() - t0,
-		metadata: { resultCount: cascadeResults.length },
+		metadata: {
+			runsTotal: cascadeRuns.length,
+			resultCount: cascadeResults.length,
+			neighborCount: cascadeRuns.reduce((s, r) => s + r.neighborCount, 0),
+			diagnosticCount: cascadeRuns.reduce((s, r) => s + r.diagnosticCount, 0),
+			skipped: cascadeSkipped,
+		},
 	});
 
 	const t2 = Date.now();

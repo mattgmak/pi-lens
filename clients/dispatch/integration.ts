@@ -45,7 +45,7 @@ import * as nodeFs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { formatCascadeNeighborDiagnostics } from "../cascade-format.js";
 import { logCascade } from "../cascade-logger.js";
-import type { CascadeResult } from "../cascade-types.js";
+import type { CascadeResult, CascadeRun, CascadeSkipReason } from "../cascade-types.js";
 import { getDiagnosticTracker } from "../diagnostic-tracker.js";
 import { getServersForFileWithConfig } from "../lsp/config.js";
 import { getLSPService } from "../lsp/index.js";
@@ -508,7 +508,7 @@ export async function computeCascadeForFile(
 		turnSeq?: number;
 		writeSeq?: number;
 	} = {},
-): Promise<CascadeResult | undefined> {
+): Promise<CascadeRun> {
 	const { hasBlockers = false, dbg, turnSeq = 0, writeSeq } = options;
 
 	ensureCascadeTurnScope(turnSeq);
@@ -519,13 +519,13 @@ export async function computeCascadeForFile(
 			filePath,
 			reason: "primary_has_blockers",
 		});
-		return undefined;
+		return { filePath, result: undefined, neighborCount: 0, diagnosticCount: 0, skipReason: "blockers" as CascadeSkipReason };
 	}
 
 	const fileKind = detectFileKind(filePath);
 	if (!fileKind) {
 		logCascade({ phase: "cascade_skip", filePath, reason: "non_code_file" });
-		return undefined;
+		return { filePath, result: undefined, neighborCount: 0, diagnosticCount: 0, skipReason: "non_code" as CascadeSkipReason };
 	}
 
 	const normalizedFile = resolveRunnerPath(cwd, filePath);
@@ -731,7 +731,7 @@ export async function computeCascadeForFile(
 			reason: "unsupported_graph_kind",
 			metadata: { fileKind },
 		});
-		return undefined;
+		return { filePath, result: undefined, neighborCount: 0, diagnosticCount: 0, skipReason: "non_code" as CascadeSkipReason };
 	}
 
 	logCascade({
@@ -1052,20 +1052,23 @@ export async function computeCascadeForFile(
 		},
 	});
 
+	const diagCount = visibleNeighbors.reduce((sum, n) => sum + n.diagnostics.length, 0);
+
 	cascadeSessionStats.runs += 1;
-	cascadeSessionStats.diagnosticsSurfaced += visibleNeighbors.reduce(
-		(sum, n) => sum + n.diagnostics.length,
-		0,
-	);
+	cascadeSessionStats.diagnosticsSurfaced += diagCount;
 	cascadeSessionStats.coldSnapshotTouches += coldSnapshotPaths.length;
 
-	if (!formatted) return undefined;
+	if (!formatted) {
+		const skipReason: CascadeSkipReason =
+			visibleNeighbors.length === 0 ? "no_neighbors" : "clean";
+		return { filePath, result: undefined, neighborCount: visibleNeighbors.length, diagnosticCount: diagCount, skipReason };
+	}
 
 	getDiagnosticTracker().trackShown(
 		visibleNeighbors.flatMap((n) => n.diagnostics),
 	);
 
-	return { filePath, impact, neighbors: visibleNeighbors, formatted };
+	return { filePath, result: { filePath, impact, neighbors: visibleNeighbors, formatted }, neighborCount: visibleNeighbors.length, diagnosticCount: diagCount };
 }
 
 function diagnosticDeltaKey(
