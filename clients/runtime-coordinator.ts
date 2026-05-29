@@ -25,8 +25,13 @@ export interface DeferredFormatRecord {
 	filePath: string;
 	/** Formatter/language cwd captured when the edit was analyzed. */
 	cwd: string;
-	/** Workspace/project cwd used for turn-state and change-log bookkeeping. */
-	turnStateCwd?: string;
+	/**
+	 * Workspace/project cwd used for turn-state and change-log bookkeeping.
+	 * Required: omitting it silently routes bookkeeping through `record.cwd`
+	 * (the language root), which is the monorepo-cwd-mismatch bug PR #105
+	 * fixed. The agent-end consumer trusts this is set.
+	 */
+	turnStateCwd: string;
 	firstTouchedAt: number;
 	lastTouchedAt: number;
 	toolNames: Set<"write" | "edit">;
@@ -408,7 +413,7 @@ export class RuntimeCoordinator {
 		filePath: string,
 		cwd: string,
 		toolName: "write" | "edit",
-		turnStateCwd?: string,
+		turnStateCwd: string,
 	): void {
 		const key = path.resolve(filePath);
 		const now = Date.now();
@@ -416,7 +421,7 @@ export class RuntimeCoordinator {
 		if (existing) {
 			existing.lastTouchedAt = now;
 			existing.cwd = cwd;
-			existing.turnStateCwd = turnStateCwd ?? existing.turnStateCwd;
+			existing.turnStateCwd = turnStateCwd;
 			existing.toolNames.add(toolName);
 			return;
 		}
