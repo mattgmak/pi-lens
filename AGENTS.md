@@ -162,6 +162,24 @@ Use it first for partial apply, then LSP workspace edits/actionable autofix. It 
 - Audit explicit command flows such as `/lens-booboo` for remaining full-project `safeSpawn()` calls; they are lower priority than hook paths but should not freeze the TUI.
 - Keep tests mocking both `safeSpawn` and `safeSpawnAsync` where legacy compatibility remains; prefer async mocks for new runner tests.
 
+## Actionable warnings routing
+
+Every dispatch warning passes through one of two recorders in `clients/pipeline.ts`:
+
+| Recorder | Required diagnostic fields | Destination |
+|---|---|---|
+| `recordFromDispatchDiagnostic` | `semantic === "warning"` AND `severity === "warning"` AND (`fixable` OR `fixSuggestion`) | `actionable-warnings.json` — surfaces an advisory and can drive autofix |
+| `recordFromCodeQualityDiagnostic` | `semantic === "warning"` or `"none"` AND `severity !== "error"` AND (no fixable, no fixSuggestion, no autoFixAvailable) | `code-quality-warnings.json` — informational history only |
+
+A runner that wraps a tool with an auto-fix capability **must** propagate `fixable: true` or `fixSuggestion: "<rule-specific guidance>"` per diagnostic — otherwise everything it produces silently goes to code-quality and never reaches the actionable advisory. Severity-`error` diagnostics route to blockers instead, regardless of fixability.
+
+Patterns by tool capability:
+- **Tool exposes per-diagnostic fix metadata** (biome, eslint, ruff, rubocop, shellcheck, semgrep, oxlint via `--format json` + `help`, ast-grep, tree-sitter via `has_fix`): read it directly, set `fixable: !!fix` or `fixSuggestion: help`.
+- **Tool has `--fix` but no per-warning fix flag** (stylelint, markdownlint): static allowlist of rule IDs documented as deterministically fixable. False positives are worse than false negatives — keep the list conservative.
+- **Tool has no auto-fix** (cpp-check, phpstan, javac, pyright, mypy, go-vet, actionlint, yamllint, etc.): hard-code `fixable: false`. The diagnostic correctly lands in code-quality.
+
+When changing a serialized cache that feeds this pipeline (e.g. `clients/cache/rule-cache.ts`), bump `CACHE_VERSION` so old entries invalidate. The tree-sitter rule cache previously stripped `has_fix` on roundtrip, silently demoting every tree-sitter rule with auto-fix to non-fixable on any cache hit (commit `24af518`).
+
 ## Tree-sitter rules
 
 Rules live in `rules/tree-sitter-queries/<language>/`. Disabled rules are in `rules/tree-sitter-queries/<language>-disabled/` — they load in tests (via `getAllQueries()`) but are excluded from the production dispatch runner (which calls `getQueriesForLanguage("typescript")`).
@@ -193,3 +211,5 @@ v3.8.45 is the package version. Master includes unreleased work: read-guard auto
 - Fire-and-forget background work uses `void expr` or `setImmediate`
 - `logSessionStart()` is a no-op in test mode (`VITEST` env var)
 - LSP tool: use `goToDefinition` / `findReferences` before grepping for symbols
+- `clients/runtime-config.ts` is "pure constants" by intent. Resolutions that read disk or env (e.g. `getRunnerTimeoutFloorMs`) must be **lazy memoized getters** with a `_resetForTests` hook, not module-level reads, so importing the file has no I/O side effect and tests can override inputs deterministically.
+- Numeric inputs from env vars or JSON config that flow into `Math.max` / `Math.min` must be coerced through a `Number.isFinite(n) && n > 0` guard. `Number(undefined) === NaN`, and a single NaN argument makes `Math.max` return NaN, which `setTimeout` silently treats as 0.
