@@ -20,6 +20,76 @@ const DETEKT_CONFIG_CANDIDATES = [
 	path.join("detekt", "detekt.yml"),
 ];
 
+// Rules that `detekt --auto-correct` rewrites deterministically. Detekt's
+// formatting ruleset wraps ktlint, whose rules are all autocorrectable; a
+// small handful of style rules also support autocorrect. Detekt's text
+// output does not surface a per-finding `canAutoCorrect` flag, so we keep a
+// curated allowlist here. Source: https://detekt.dev/docs/rules/formatting/
+// plus the autoCorrect-capable rules under style/comments. Conservative —
+// when in doubt, leave a rule off this list.
+const DETEKT_FIXABLE_RULES = new Set<string>([
+	// formatting (ktlint wrapper) — every rule supports autocorrect
+	"AnnotationOnSeparateLine",
+	"AnnotationSpacing",
+	"ArgumentListWrapping",
+	"BlockCommentInitialStarAlignment",
+	"ChainWrapping",
+	"CommentSpacing",
+	"CommentWrapping",
+	"EnumEntryNameCase",
+	"Filename",
+	"FinalNewline",
+	"ImportOrdering",
+	"Indentation",
+	"MaximumLineLength",
+	"ModifierListSpacing",
+	"ModifierOrdering",
+	"MultiLineIfElse",
+	"NoBlankLineBeforeRbrace",
+	"NoBlankLinesInChainedMethodCalls",
+	"NoConsecutiveBlankLines",
+	"NoEmptyClassBody",
+	"NoEmptyFirstLineInMethodBlock",
+	"NoLineBreakAfterElse",
+	"NoLineBreakBeforeAssignment",
+	"NoMultipleSpaces",
+	"NoSemicolons",
+	"NoTrailingSpaces",
+	"NoUnitReturn",
+	"NoUnusedImports",
+	"NoWildcardImports",
+	"PackageName",
+	"ParameterListWrapping",
+	"SpacingAroundAngleBrackets",
+	"SpacingAroundColon",
+	"SpacingAroundComma",
+	"SpacingAroundCurly",
+	"SpacingAroundDot",
+	"SpacingAroundDoubleColon",
+	"SpacingAroundKeyword",
+	"SpacingAroundOperators",
+	"SpacingAroundParens",
+	"SpacingAroundRangeOperator",
+	"SpacingAroundUnaryOperator",
+	"SpacingBetweenDeclarationsWithAnnotations",
+	"SpacingBetweenDeclarationsWithComments",
+	"StringTemplate",
+	"TrailingCommaOnCallSite",
+	"TrailingCommaOnDeclarationSite",
+	"TypeArgumentListSpacing",
+	"TypeParameterListSpacing",
+	"UnnecessaryParenthesesBeforeTrailingLambda",
+	"Wrapping",
+	// style / comments — these implement autoCorrect in their detekt rule classes
+	"OptionalUnit",
+	"OptionalAbstractKeyword",
+	"ProtectedMemberInFinalClass",
+	"UnnecessaryParentheses",
+	"UnusedImports",
+	"UnusedPrivateClass",
+	"RedundantVisibilityModifierRule",
+]);
+
 function findDetektConfig(cwd: string): string | undefined {
 	for (const candidate of DETEKT_CONFIG_CANDIDATES) {
 		const full = path.join(cwd, candidate);
@@ -42,9 +112,11 @@ function parseDetektOutput(raw: string, filePath: string): Diagnostic[] {
 		const severity = level === "error" ? "error" : "warning";
 		const lineNum = Number.parseInt(lineStr, 10);
 		const colNum = Number.parseInt(colStr, 10);
+		const ruleId = rule ?? "detekt";
+		const fixable = rule ? DETEKT_FIXABLE_RULES.has(rule) : false;
 
 		diagnostics.push({
-			id: `detekt-${rule ?? "unknown"}-${lineNum}-${colNum}`,
+			id: `detekt-${ruleId}-${lineNum}-${colNum}`,
 			message: rule ? `[${rule}] ${message}` : message,
 			filePath,
 			line: lineNum,
@@ -52,7 +124,12 @@ function parseDetektOutput(raw: string, filePath: string): Diagnostic[] {
 			severity,
 			semantic: severity === "error" ? "blocking" : "warning",
 			tool: "detekt",
-			rule: rule ?? "detekt",
+			rule: ruleId,
+			defectClass: "style",
+			fixable,
+			fixSuggestion: fixable
+				? "Run `detekt --auto-correct` to apply the deterministic auto-correction for this rule."
+				: undefined,
 		});
 	}
 	return diagnostics;
@@ -112,3 +189,4 @@ const detektRunner: RunnerDefinition = {
 };
 
 export default detektRunner;
+export { parseDetektOutput, DETEKT_FIXABLE_RULES };
