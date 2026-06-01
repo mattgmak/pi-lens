@@ -50,7 +50,10 @@ import {
 	tryCorrectIndentationMismatch,
 	tryCorrectIndentationMismatchFromContent,
 } from "./clients/read-guard-tool-lines.js";
-import { computeTrailingWhitespaceOldTextPatch } from "./clients/oldtext-autopatch.js";
+import {
+	computeTrailingWhitespaceOldTextPatch,
+	findUniqueMatchLineRange,
+} from "./clients/oldtext-autopatch.js";
 import { applyPartiallyApplicableEdits } from "./clients/partial-edit-apply.js";
 import { retargetReplacementIndentation } from "./clients/indent-retarget.js";
 import { handleAgentEnd } from "./clients/runtime-agent-end.js";
@@ -1501,6 +1504,31 @@ export default function (pi: ExtensionAPI) {
 							newTextTrailingEmptyLinesPatched: newTextPatched,
 						},
 					});
+					// Bridge: same rationale as the indent autopatch — the
+					// trailing-ws patcher only applies when the stripped oldText
+					// matches exactly once against the file, so the agent's text
+					// reflects real content at the matched span. Register a
+					// synthetic read covering it so the read-guard downstream
+					// doesn't fire a zero_read block after the verification.
+					if (matchNormalizedContent !== undefined && runtime.readGuard) {
+						const range = findUniqueMatchLineRange(
+							matchNormalizedContent,
+							patch.oldText,
+						);
+						if (range) {
+							runtime.readGuard.recordRead({
+								filePath,
+								requestedOffset: range.startLine,
+								requestedLimit: range.endLine - range.startLine + 1,
+								effectiveOffset: range.startLine,
+								effectiveLimit: range.endLine - range.startLine + 1,
+								expandedByLsp: false,
+								turnIndex: runtime.turnIndex,
+								writeIndex: 0,
+								timestamp: Date.now(),
+							});
+						}
+					}
 				}
 			}
 
@@ -1574,6 +1602,29 @@ export default function (pi: ExtensionAPI) {
 							newTextIndentationPatched: correctedNewText !== undefined,
 						},
 					});
+					// Bridge: a unique-match autopatch proves the agent's oldText
+					// reflects real content at this span. Register a synthetic read
+					// for the matched range so a zero_read block downstream isn't
+					// thrown after the autopatch already verified the content.
+					if (matchNormalizedContent !== undefined && runtime.readGuard) {
+						const range = findUniqueMatchLineRange(
+							matchNormalizedContent,
+							entry.corrected,
+						);
+						if (range) {
+							runtime.readGuard.recordRead({
+								filePath,
+								requestedOffset: range.startLine,
+								requestedLimit: range.endLine - range.startLine + 1,
+								effectiveOffset: range.startLine,
+								effectiveLimit: range.endLine - range.startLine + 1,
+								expandedByLsp: false,
+								turnIndex: runtime.turnIndex,
+								writeIndex: 0,
+								timestamp: Date.now(),
+							});
+						}
+					}
 				}
 			}
 		}

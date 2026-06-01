@@ -11,6 +11,52 @@ export interface TrailingWhitespaceStripResult {
 	removedTrailingEmptyLineCount: number;
 }
 
+/**
+ * Normalize text the same way the read-guard's match-counter does: CRLF →
+ * LF, then trim trailing whitespace on each line. Used as the canonical
+ * form for comparing oldText against file content.
+ */
+export function normalizeOldTextForMatch(text: string): string {
+	return normalizeLf(text)
+		.split("\n")
+		.map((line) => line.trimEnd())
+		.join("\n");
+}
+
+/**
+ * Locate the line range of a uniquely-matching oldText inside the
+ * trim-end-normalized file content. Returns `undefined` when the needle
+ * is empty, not found, or matches more than once. Lines are 1-indexed.
+ *
+ * Used by the autopatch → synthetic-read bridge: a successful unique-match
+ * autopatch (indent or trailing-ws) proves the agent's oldText reflects
+ * real content at that span, so we can safely register a synthetic read
+ * covering it and avoid a downstream zero_read block.
+ */
+export function findUniqueMatchLineRange(
+	matchNormalizedContent: string,
+	oldText: string,
+): { startLine: number; endLine: number } | undefined {
+	const needle = normalizeOldTextForMatch(oldText);
+	if (!needle) return undefined;
+	const firstIdx = matchNormalizedContent.indexOf(needle);
+	if (firstIdx === -1) return undefined;
+	const secondIdx = matchNormalizedContent.indexOf(
+		needle,
+		firstIdx + needle.length,
+	);
+	if (secondIdx !== -1) return undefined;
+	let startLine = 1;
+	for (let i = 0; i < firstIdx; i++) {
+		if (matchNormalizedContent.charCodeAt(i) === 10) startLine++;
+	}
+	let lineCount = 1;
+	for (let i = 0; i < needle.length; i++) {
+		if (needle.charCodeAt(i) === 10) lineCount++;
+	}
+	return { startLine, endLine: startLine + lineCount - 1 };
+}
+
 function normalizeLf(value: string): string {
 	return value.replace(/\r\n/g, "\n");
 }
