@@ -4,6 +4,44 @@ All notable changes to pi-lens will be documented in this file.
 
 ## [Unreleased]
 
+## [3.8.47] - 2026-06-01
+
+### Added
+
+- **Actionable-warnings ecosystem expansion (closes #112)** — six dispatch runners now propagate `fixable` + a `fixSuggestion` so the actionable-warnings advisory can surface them instead of dropping them into code-quality. rust-clippy and golangci-lint read the structured replacement metadata each tool already publishes (`suggested_replacement` / `Replacement`); sqlfluff, detekt, swiftlint, and dart-analyze use curated allowlists of rules their respective `--fix` / `--auto-correct` / `dart fix --apply` commands rewrite deterministically. oxlint, stylelint, and markdownlint received the same treatment earlier in the cycle. Each slice ships parser-level unit tests against the runner's real output shape.
+- **Framework / convention detector foundation (#118 Phases 1 + 2)** — new `clients/project-conventions.ts` exports `detectProjectConventions(cwd)` returning detected `frameworks` (react / next / vite / vitest in the first cut, each with confidence + signals), `testRunners`, `buildTools`, and `agentDocs`. Detection is purely deterministic — no LLM, no spawn — from `package.json` deps, canonical config files, and directory shape. `ProjectSnapshot` gained an optional `conventions` field with explicit-arg → previously-saved → fresh-detect precedence so a snapshot rewrite without conventions inherits rather than blanks.
+- **Per-runner timeoutMs overrides the global 30 s default (#107)** — each `RunnerDefinition` may now declare its own `timeoutMs`; the dispatch harness honours it instead of the shared `RUNNER_TIMEOUT_FLOOR_MS`. The floor is also configurable via `pi-lens.runnerTimeoutFloorMs` config and `PI_LENS_RUNNER_TIMEOUT_FLOOR_MS` env, guarded against NaN, and lazy-resolved so tests can reset it.
+- **LSP diagnostics-wait cap with env override (#117)** — dispatch LSP wait is now capped at 2.5 s by default to prevent slow language servers from holding edit feedback; tunable via `PI_LENS_LSP_DIAGNOSTICS_MAX_WAIT_MS`. A new `lsp_diagnostics_timeout` phase event and a `diagnosticsTimedOut` flag in the success log surface when the cap fires.
+- **Tool-result debounce window (#115)** — `PI_LENS_TOOL_RESULT_DEBOUNCE_MS` (default 0, max 1 s) coalesces sequential tool_results for the same file so burst edits no longer rerun the full pipeline on every keystroke. Off by default; opt-in via env.
+- **Custom rules guide + JSON schemas** — new docs and JSON schemas for tree-sitter and ast-grep custom rule authoring, plus tightened agent skill docs for write-ast-grep-rule, write-tree-sitter-rule, ast-grep, and lsp-navigation.
+- **Read-guard `oldtext_duplicate` disambiguation** — the first `oldtext_not_found` and every `oldtext_duplicate` now include surrounding line context so the agent can pick the right occurrence without rereading the whole file.
+
+### Performance
+
+- **In-flight dedupe on RuffClient and BiomeClient (#120)** — concurrent first-time callers to `ensureAvailable()` now share a single probe + auto-install promise via `ensureInFlight`, mirroring the pattern that closed #113 for SgRunner. Previously two parallel session-start tasks (one Python, one JS/TS) could each race the `ensureTool()` auto-install branch and produce partial state in `~/.pi-lens/tools`.
+- **SgRunner in-flight dedupe (#113)** — concurrent ast-grep `ensureAvailable()` callers now share one probe; the auto-install branch runs at most once across a session.
+- **Centralized `~/.pi-lens` and `walkUpDirs` helpers** — every `~/.pi-lens` computation now routes through `getGlobalPiLensDir()` (#122), and the parent-dir walk is consolidated as a `walkUpDirs` generator + `findNearestContaining` helper in `path-utils.ts`. Same behaviour, fewer ad-hoc walks.
+
+### Fixed
+
+- **Cascade reverse-dependency neighbors now use the in-memory index** — the cascade builder was building a reverse-dep index from the review graph, saving it to the project snapshot, then immediately reloading it from disk to compute affected-file neighbors. The reload almost always returned `null` during active editing because the project sequence had advanced past the snapshot sequence, silently discarding the freshly computed data every time. Affected-file queries now run directly against the in-memory index built from the just-completed graph.
+- **Tree-sitter rule cache preserves `has_fix` across the roundtrip** — `has_fix` was set on first load but dropped on the cache rehydration path, so cached runs never marked tree-sitter findings as fixable. Restored — the cache now roundtrips the flag end to end.
+- **TypeScript LSP starts for pi-extension files when only `~/.pi/agent/package.json` exists (#123)** — root detection now performs a bounded walk to the extension boundary; if no marker is found inside that scope, it falls back to `FileDirRoot` provided the agent-level `package.json` exists, instead of silently giving up.
+- **BiomeClient resolves binaries per project cwd, not `process.cwd()` (#121)** — `getBiomeBinary` now accepts a per-call cwd and caches resolved binaries keyed by cwd, so monorepos with sub-package biome installs reach the right binary even when pi-lens was invoked from a different directory.
+- **Skip redundant `notify.open` on `touchFile` when content was already pushed within the debounce window (#116)** — split `shouldSkipTouch` from `shouldSkipNotify`; the latter avoids re-opening but still waits for diagnostics so cache invalidation isn't lost. A `notifySkipped` flag in the latency log records when the optimization fires.
+- **dispatch runner `--version` probes flow through `createAvailabilityChecker`** — cpp-check is now cwd-keyed and dedupes concurrent first-time callers, eliminating one of the hottest uncached spawn paths in the audit.
+- **PILENS_DATA_DIR compliance in actionable-warnings, review-graph, semgrep-config** — these paths now route through `getProjectDataDir(cwd)` instead of hardcoding `.pi-lens/` under cwd, so the data dir override is respected end to end.
+- **Read-guard tracks session writes in an explicit Set** — unreliable mtime checks could let a Write→Edit sequence be blocked by a zero-read violation; an explicit per-session write set is the new authoritative signal.
+- **Read-guard partial apply routes through post-edit analysis** — when only some `oldText` edits resolve, partial application performs exact replacements and then invokes the normal `handleToolResult` pipeline so staleness stamps, modified ranges, deferred formatting, dispatch diagnostics, cascade, and warning collection stay in sync with disk.
+- **Read-guard staleness escalation fires across inter-turn gaps** — `REPEAT_FAILURE_TTL_MS` raised from 30 s to 300 s so repeated stale `oldText` attempts 2–3 minutes apart are still counted as the same streak; at ≥ 2 failures the preflight error is upgraded from `🔄 RETRYABLE` to `🛑 RE-READ REQUIRED`.
+- **dart-analyze / detekt drop the dead sync `isAvailable` fallback** — both runners now use only the async availability check, eliminating a dead code path that masked test-mock mismatches.
+- **ReDoS hotspots in oxlint rule extraction and cors-wildcard patterns** — bounded the affected regexes; the oxlint fix also backfills `defectClass` on five runners that had been missing it.
+- **5 runners that were missing `defectClass`** — backfilled correctness/style/etc. classifications so downstream taxonomy + advisory routing work consistently.
+
+### Widget
+
+- **Quieter widget glyphs and tighter horizontal layout** — warning glyph swapped from triangle to exclamation mark, dispatch findings pack into a single horizontal row at normal widths, the red dot now reflects blocking semantics (not just severity), and the divider/filename header / non-blocking fillers in horizontal mode were dropped.
+
 ## [3.8.46] - 2026-05-27
 
 ### Added
