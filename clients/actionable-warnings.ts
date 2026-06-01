@@ -357,24 +357,36 @@ export async function buildActionableWarningsReport(args: {
 				});
 				continue;
 			}
-			let diags: LSPDiagnostic[] = [];
-			try {
-				const content = fs.existsSync(filePath)
-					? fs.readFileSync(filePath, "utf-8")
-					: undefined;
-				if (content) await lspService.openFile(filePath, content);
-				diags = await lspService.getDiagnostics(filePath);
-			} catch (err) {
-				args.dbg?.(
-					`actionable_warnings: LSP diagnostics failed for ${filePath}: ${err}`,
-				);
-				logActionableWarningsEvent({
-					event: "lsp_file_skipped",
-					sessionId: args.sessionId,
-					filePath,
-					metadata: { reason: "lsp_error", error: String(err) },
-				});
-				continue;
+			// Prefer the cache primed by the dispatch pipeline (touchFile already
+			// ran in this turn for every modified file). A second open + wait
+			// here costs ~1 s/file with the LSP cold and produces an identical
+			// result. Fall through to the slow path only when the cache is
+			// missing — that means dispatch didn't see this file in this turn.
+			let diags: LSPDiagnostic[] | undefined;
+			let lspSource: "cache" | "fresh" = "cache";
+			const cached = lspService.getLastKnownDiagnostics(filePath);
+			if (cached !== undefined) {
+				diags = cached;
+			} else {
+				try {
+					const content = fs.existsSync(filePath)
+						? fs.readFileSync(filePath, "utf-8")
+						: undefined;
+					if (content) await lspService.openFile(filePath, content);
+					diags = await lspService.getDiagnostics(filePath);
+					lspSource = "fresh";
+				} catch (err) {
+					args.dbg?.(
+						`actionable_warnings: LSP diagnostics failed for ${filePath}: ${err}`,
+					);
+					logActionableWarningsEvent({
+						event: "lsp_file_skipped",
+						sessionId: args.sessionId,
+						filePath,
+						metadata: { reason: "lsp_error", error: String(err) },
+					});
+					continue;
+				}
 			}
 			const ranges =
 				args.modifiedRangesByFile.get(normalizeMapKey(filePath)) ?? [];
@@ -417,6 +429,7 @@ export async function buildActionableWarningsReport(args: {
 					deltaFiltered,
 					enriched,
 					modifiedRangesCount: ranges.length,
+					lspSource,
 				},
 			});
 		}

@@ -886,6 +886,22 @@ export class LSPService {
 		return this.lastDiagnosticsHealth.get(normalizeMapKey(filePath));
 	}
 
+	/**
+	 * Return whatever LSP diagnostics were last cached for this file without
+	 * triggering a fresh open / wait / merge. Returns `undefined` when nothing
+	 * was ever cached; callers should treat that as distinct from "cached but
+	 * empty" (`[]`), which means LSP confirmed no diagnostics last time.
+	 *
+	 * Intended for hot-path consumers (e.g. actionable-warnings at turn_end)
+	 * that already paid for a `touchFile` during dispatch and just want to
+	 * read the result without a second LSP round trip.
+	 */
+	getLastKnownDiagnostics(
+		filePath: string,
+	): import("./client.js").LSPDiagnostic[] | undefined {
+		return this.lastKnownDiagnostics.get(normalizeMapKey(filePath));
+	}
+
 	async getDiagnostics(
 		filePath: string,
 		diagnosticsMode: LSPDiagnosticsMode = "full",
