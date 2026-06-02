@@ -51,7 +51,6 @@ import valeRunner from "./vale.js";
 // Import tree-sitter runner
 import treeSitterRunner from "./tree-sitter.js";
 import tsLspRunner from "./ts-lsp.js";
-import typeSafetyRunner from "./type-safety.js";
 import yamllintRunner from "./yamllint.js";
 import zigCheckRunner from "./zig-check.js";
 
@@ -68,7 +67,6 @@ export function registerDefaultRunners(registry: RunnerRegistry): void {
 	registry.register(treeSitterRunner); // Tree-sitter structural analysis (priority 14)
 	registry.register(ruffRunner); // Python linting (priority 10)
 	registry.register(pythonSlopRunner); // Python slop via CLI (priority 25)
-	registry.register(typeSafetyRunner); // Type safety checks (priority 20)
 	registry.register(shellcheckRunner); // Shell script linting (priority 20)
 	registry.register(semgrepRunner); // Semgrep security/deep static analysis (config/flag-gated, priority 50)
 	// DISABLED: registerRunner(astGrepRunner); // Replaced by ast-grep-napi for dispatch

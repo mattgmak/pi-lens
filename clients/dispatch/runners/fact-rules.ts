@@ -19,7 +19,7 @@ import { evaluateRules } from "../fact-rule-runner.js";
 const factRulesRunner: RunnerDefinition = {
 	id: "fact-rules",
 	appliesTo: ["jsts", "python", "go", "rust", "ruby", "shell", "cmake"],
-	priority: PRIORITY.GENERAL_ANALYSIS + 1, // just after type-safety
+	priority: PRIORITY.GENERAL_ANALYSIS + 1,
 	enabledByDefault: true,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
