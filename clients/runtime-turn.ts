@@ -21,6 +21,7 @@ import {
 	toRunnerDisplayPath,
 } from "./dispatch/runner-context.js";
 import { getKnipIgnorePatterns } from "./file-utils.js";
+import type { GitleaksResult } from "./gitleaks-client.js";
 import type { GovulncheckResult } from "./govulncheck-client.js";
 import type { KnipClient, KnipIssue, KnipResult } from "./knip-client.js";
 import { logLatency } from "./latency-logger.js";
@@ -376,6 +377,27 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			report += `  … and ${govCacheEntry.data.findings.length - findings.length} more\n`;
 		}
 		advisoryParts.push(report);
+	}
+
+	// gitleaks — surface session_start-cached committed-secret findings.
+	// Treated as a BLOCKER (not advisory) because committed credentials
+	// are real production risk and need rotation before merge.
+	const gitleaksCacheEntry = cacheManager.readCache<GitleaksResult>(
+		"gitleaks",
+		cwd,
+	);
+	if (gitleaksCacheEntry?.data?.findings?.length) {
+		const findings = gitleaksCacheEntry.data.findings.slice(0, 5);
+		let report =
+			"🔴 STOP — committed secrets detected (gitleaks). Rotate the credentials and remove from source:\n";
+		for (const f of findings) {
+			const where = `${toRunnerDisplayPath(cwd, f.file)}:${f.startLine}`;
+			report += `  ${where} — ${f.ruleId}${f.description ? `: ${f.description}` : ""}\n`;
+		}
+		if (gitleaksCacheEntry.data.findings.length > findings.length) {
+			report += `  … and ${gitleaksCacheEntry.data.findings.length - findings.length} more\n`;
+		}
+		blockerParts.push(report);
 	}
 
 	const t3 = Date.now();

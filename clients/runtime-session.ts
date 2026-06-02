@@ -8,6 +8,10 @@ import type { DependencyChecker } from "./dependency-checker.js";
 import { getDiagnosticTracker } from "./diagnostic-tracker.js";
 import { clearAllSessions as clearFileTimeSessions } from "./file-time.js";
 import { getKnipIgnorePatterns } from "./file-utils.js";
+import {
+	GitleaksClient,
+	type GitleaksResult,
+} from "./gitleaks-client.js";
 import type { GoClient } from "./go-client.js";
 import {
 	GovulncheckClient,
@@ -65,6 +69,7 @@ interface SessionStartDeps {
 	knipClient: KnipClient;
 	jscpdClient: JscpdClient;
 	govulncheckClient: GovulncheckClient;
+	gitleaksClient: GitleaksClient;
 	typeCoverageClient: TypeCoverageClient;
 	depChecker: DependencyChecker;
 	testRunnerClient: TestRunnerClient;
@@ -263,6 +268,7 @@ function scheduleStartupScans(
 		knipClient,
 		jscpdClient,
 		govulncheckClient,
+		gitleaksClient,
 		astGrepClient,
 	} = deps;
 
@@ -421,6 +427,40 @@ function scheduleStartupScans(
 		});
 		dbg(
 			`session_start govulncheck: ${result.findings.length} reachable findings (${Date.now() - startMs}ms)`,
+		);
+	});
+
+	// gitleaks — committed-secrets detection (#130)
+	// Config-gated: opts in via .gitleaks.toml / .gitleaksignore / git
+	// hook / gitleaks dep. Cross-language by design.
+	runTask("gitleaks", async () => {
+		if (!GitleaksClient.hasGitleaksSignal(analysisRoot)) {
+			dbg("session_start gitleaks: no opt-in signal — skipped");
+			return;
+		}
+		if (!(await gitleaksClient.ensureAvailable())) {
+			if (!runtime.isCurrentSession(sessionGeneration)) return;
+			dbg("session_start gitleaks: not available (install failed?)");
+			return;
+		}
+		if (!runtime.isCurrentSession(sessionGeneration)) return;
+		const cached =
+			cacheManager.readCache<GitleaksResult>("gitleaks", analysisRoot);
+		if (cached) {
+			if (!runtime.isCurrentSession(sessionGeneration)) return;
+			dbg(
+				`session_start gitleaks: cache hit (${cached.data.findings.length} findings)`,
+			);
+			return;
+		}
+		const startMs = Date.now();
+		const result = await gitleaksClient.scan(analysisRoot);
+		if (!runtime.isCurrentSession(sessionGeneration)) return;
+		cacheManager.writeCache("gitleaks", result, analysisRoot, {
+			scanDurationMs: Date.now() - startMs,
+		});
+		dbg(
+			`session_start gitleaks: ${result.findings.length} findings (${Date.now() - startMs}ms)`,
 		);
 	});
 

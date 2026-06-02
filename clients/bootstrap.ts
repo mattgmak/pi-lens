@@ -2,6 +2,7 @@ import type { AgentBehaviorClient } from "./agent-behavior-client.js";
 import type { BiomeClient } from "./biome-client.js";
 import type { ComplexityClient } from "./complexity-client.js";
 import type { DependencyChecker } from "./dependency-checker.js";
+import type { GitleaksClient } from "./gitleaks-client.js";
 import type { GoClient } from "./go-client.js";
 import type { GovulncheckClient } from "./govulncheck-client.js";
 import type { JscpdClient } from "./jscpd-client.js";
@@ -26,6 +27,7 @@ export interface BootstrapClients {
 	complexityClient: ComplexityClient;
 	goClient: GoClient;
 	govulncheckClient: GovulncheckClient;
+	gitleaksClient: GitleaksClient;
 	rustClient: RustClient;
 	agentBehaviorClient: AgentBehaviorClient;
 }
@@ -47,6 +49,7 @@ export function loadBootstrapClients(): Promise<BootstrapClients> {
 			complexityMod,
 			goMod,
 			govulncheckMod,
+			gitleaksMod,
 			rustMod,
 			agentBehaviorMod,
 		] = await Promise.all([
@@ -62,6 +65,7 @@ export function loadBootstrapClients(): Promise<BootstrapClients> {
 			import("./complexity-client.js"),
 			import("./go-client.js"),
 			import("./govulncheck-client.js"),
+			import("./gitleaks-client.js"),
 			import("./rust-client.js"),
 			import("./agent-behavior-client.js"),
 		]);
@@ -79,6 +83,7 @@ export function loadBootstrapClients(): Promise<BootstrapClients> {
 			complexityClient: new complexityMod.ComplexityClient(),
 			goClient: new goMod.GoClient(),
 			govulncheckClient: new govulncheckMod.GovulncheckClient(),
+			gitleaksClient: new gitleaksMod.GitleaksClient(),
 			rustClient: new rustMod.RustClient(),
 			agentBehaviorClient: new agentBehaviorMod.AgentBehaviorClient(),
 		};
