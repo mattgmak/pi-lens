@@ -1750,9 +1750,6 @@ export default function (pi: ExtensionAPI) {
 		if (isWriteOrEdit && runtime.cachedExports.size > 0) {
 			const newContent = getNewContentFromToolCall(event);
 			if (newContent) {
-				const INLINE_SIMILARITY_THRESHOLD = 0.9;
-				const INLINE_SIMILARITY_MAX_HINTS = 3;
-				const INLINE_SIMILARITY_MAX_CHARS = 700;
 				const dupeWarnings: string[] = [];
 				const exportRe =
 					/export\s+(?:async\s+)?(?:function|class|const|let|type|interface)\s+(\w+)/g;
@@ -1795,88 +1792,6 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
-				// --- Structural similarity check (Phase 7b) ---
-				// If the project index was built at session_start, check new
-				// functions against it for structural clones (~50ms).
-				if (
-					runtime.cachedProjectIndex &&
-					runtime.cachedProjectIndex.entries.size > 0 &&
-					/\.(ts|tsx)$/.test(filePath)
-				) {
-					try {
-						const ts = await import("typescript");
-						const sourceFile = ts.createSourceFile(
-							filePath,
-							newContent,
-							ts.ScriptTarget.Latest,
-							true,
-						);
-						const { extractFunctions } = await import(
-							"./clients/dispatch/runners/similarity.js"
-						);
-						const { findSimilarFunctions } = await import(
-							"./clients/project-index.js"
-						);
-						const newFunctions = extractFunctions(ts, sourceFile, newContent);
-						const simWarnings: string[] = [];
-						let simHintsTruncated = false;
-						const relPath = path.relative(runtime.projectRoot, filePath);
-
-						for (const func of newFunctions) {
-							if (simWarnings.length >= INLINE_SIMILARITY_MAX_HINTS) {
-								simHintsTruncated = true;
-								break;
-							}
-							if (func.transitionCount < 20) continue;
-							const matches = findSimilarFunctions(
-								func.matrix,
-								runtime.cachedProjectIndex,
-								INLINE_SIMILARITY_THRESHOLD,
-								1,
-							);
-							for (const match of matches) {
-								if (simWarnings.length >= INLINE_SIMILARITY_MAX_HINTS) {
-									simHintsTruncated = true;
-									break;
-								}
-								const targetPathMatch = String(match.targetLocation).match(
-									/^(.*):\d+$/,
-								);
-								const targetPath =
-									targetPathMatch?.[1] ?? String(match.targetLocation);
-								const resolvedTarget = path.isAbsolute(targetPath)
-									? targetPath
-									: path.join(runtime.projectRoot, targetPath);
-								if (!nodeFs.existsSync(resolvedTarget)) continue;
-
-								// Skip self-matches
-								if (match.targetId === `${relPath}:${func.name}`) continue;
-								const pct = Math.round(match.similarity * 100);
-								simWarnings.push(
-									`\`${func.name}\` is ${pct}% similar to \`${match.targetName}\` at \`${String(match.targetLocation).replace(/\\/g, "/")}\``,
-								);
-							}
-						}
-
-						if (simWarnings.length > 0) {
-							let reason = `⚠️ Potential structural similarity (advisory):\n${simWarnings.map((w) => `  • ${w}`).join("\n")}`;
-							if (simHintsTruncated) {
-								reason += "\n  • ... additional similar candidates omitted";
-							}
-							reason +=
-								"\nUse this only as a hint; verify behavior before refactoring.";
-							if (reason.length > INLINE_SIMILARITY_MAX_CHARS) {
-								reason = `${reason.slice(0, INLINE_SIMILARITY_MAX_CHARS)}\n... (truncated)`;
-							}
-							return {
-								block: false,
-								reason,
-							};
-						}
-					} catch {
-						// Parsing failed - skip similarity check silently
-					}
-				}
 			}
 		}
 	});

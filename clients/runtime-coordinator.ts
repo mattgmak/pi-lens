@@ -5,7 +5,6 @@ import type { CascadeRun } from "./cascade-types.js";
 import type { CodeQualityWarningRecord } from "./code-quality-warnings.js";
 import type { FileComplexity } from "./complexity-client.js";
 import { normalizeMapKey } from "./path-utils.js";
-import type { ProjectIndex } from "./project-index.js";
 import { ReadGuard } from "./read-guard.js";
 import type { RuleScanResult } from "./rules-scanner.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
@@ -44,7 +43,6 @@ export class RuntimeCoordinator {
 	private _errorDebtBaseline: ErrorDebtBaseline | null = null;
 	private _pipelineCrashCounts = new Map<string, number>();
 	private _cachedExports = new Map<string, string>();
-	private _cachedProjectIndex: ProjectIndex | null = null;
 	private _startupScansInFlight = new Map<string, number>();
 	private _cascadeRuns: CascadeRun[] = [];
 	private _cascadeSessionStats: CascadeSessionStats = {
@@ -96,7 +94,6 @@ export class RuntimeCoordinator {
 		this._complexityBaselines.clear();
 		this._pipelineCrashCounts.clear();
 		this._cachedExports.clear();
-		this._cachedProjectIndex = null;
 		this._startupScansInFlight.clear();
 		this._cascadeRuns = [];
 		this._cascadeSessionStats = {
@@ -323,14 +320,6 @@ export class RuntimeCoordinator {
 
 	get cachedExports(): Map<string, string> {
 		return this._cachedExports;
-	}
-
-	get cachedProjectIndex(): ProjectIndex | null {
-		return this._cachedProjectIndex;
-	}
-
-	set cachedProjectIndex(value: ProjectIndex | null) {
-		this._cachedProjectIndex = value;
 	}
 
 	appendCascadeRun(run: CascadeRun): void {

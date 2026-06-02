@@ -54,7 +54,6 @@ function makeDeps(ctxCwd: string, dbg: (msg: string) => void = () => {}) {
 			projectRoot: "",
 			projectRulesScan: { hasCustomRules: false, rules: [] },
 			cachedExports: new Map(),
-			cachedProjectIndex: null,
 			errorDebtBaseline: { testsPassed: true, buildPassed: true },
 		},
 		metricsClient: { reset: () => {} },

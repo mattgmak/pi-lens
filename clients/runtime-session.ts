@@ -22,12 +22,6 @@ import { initLSPConfig, loadLSPConfig } from "./lsp/config.js";
 import { getLSPService } from "./lsp/index.js";
 import type { LSPShutdownOptions } from "./lsp/client.js";
 import type { MetricsClient } from "./metrics-client.js";
-import {
-	buildProjectIndex,
-	isIndexFresh,
-	loadIndex,
-	saveIndex,
-} from "./project-index.js";
 import { readLatestProjectSequence } from "./project-changes.js";
 import {
 	getProjectSnapshotPath,
@@ -42,7 +36,6 @@ import { scanProjectRules } from "./rules-scanner.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
 import type { RustClient } from "./rust-client.js";
 
-import { getSourceFiles } from "./scan-utils.js";
 import {
 	findNearestProjectRoot,
 	resolveStartupScanContext,
@@ -249,7 +242,7 @@ async function probePrettierInstall(
 
 // Fire off heavy scans as background tasks — don't block session start.
 // Each consumer already handles the "not ready yet" case gracefully
-// (cachedExports.size > 0, cachedProjectIndex != null, cache miss paths).
+// (cachedExports.size > 0, cache miss paths).
 function scheduleStartupScans(
 	deps: SessionStartDeps,
 	runtime: RuntimeCoordinator,
@@ -383,43 +376,6 @@ function scheduleStartupScans(
 		}
 	});
 
-	// Project index — structural similarity detection
-	runTask("project-index", async () => {
-		const existing = await loadIndex(analysisRoot);
-		if (!runtime.isCurrentSession(sessionGeneration)) return;
-		if (
-			existing &&
-			existing.entries.size > 0 &&
-			(await isIndexFresh(analysisRoot))
-		) {
-			if (!runtime.isCurrentSession(sessionGeneration)) return;
-			runtime.cachedProjectIndex = existing;
-			dbg(
-				`session_start: loaded fresh project index (${existing.entries.size} entries)`,
-			);
-			saveRuntimeProjectSnapshot({ cwd: snapshotRoot, runtime, dbg });
-		} else {
-			const sourceFiles = getSourceFiles(analysisRoot, true);
-			const tsFiles = sourceFiles.filter(
-				(f) => f.endsWith(".ts") || f.endsWith(".tsx"),
-			);
-			if (tsFiles.length > 0 && tsFiles.length <= 500) {
-				runtime.cachedProjectIndex = await buildProjectIndex(
-					analysisRoot,
-					tsFiles,
-				);
-				if (!runtime.isCurrentSession(sessionGeneration)) return;
-				await saveIndex(runtime.cachedProjectIndex, analysisRoot);
-				dbg(
-					`session_start: built project index (${runtime.cachedProjectIndex.entries.size} entries from ${tsFiles.length} files)`,
-				);
-				saveRuntimeProjectSnapshot({ cwd: snapshotRoot, runtime, dbg });
-			} else {
-				if (!runtime.isCurrentSession(sessionGeneration)) return;
-				dbg(`session_start: skipped project index (${tsFiles.length} files)`);
-			}
-		}
-	});
 }
 
 function scheduleDeferredToolProbes(

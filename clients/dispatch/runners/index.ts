@@ -39,8 +39,6 @@ import semgrepRunner from "./semgrep.js";
 import shellcheckRunner from "./shellcheck.js";
 import fishIndentRunner from "./fish-indent.js";
 import shfmtRunner from "./shfmt.js";
-// Import similarity runner
-import similarityRunner from "./similarity.js";
 import spellcheckRunner from "./spellcheck.js";
 import sqlfluffRunner from "./sqlfluff.js";
 import stylelintRunner from "./stylelint.js";
@@ -71,7 +69,6 @@ export function registerDefaultRunners(registry: RunnerRegistry): void {
 	registry.register(semgrepRunner); // Semgrep security/deep static analysis (config/flag-gated, priority 50)
 	// DISABLED: registerRunner(astGrepRunner); // Replaced by ast-grep-napi for dispatch
 	// CLI ast-grep kept for ast_grep_search/ast_grep_replace tools only
-	registry.register(similarityRunner); // Semantic reuse detection (priority 35)
 	registry.register(eslintRunner); // ESLint (priority 12, jsts, config-gated)
 	registry.register(oxlintRunner); // Oxlint (priority 12, jsts, config-aware default fallback)
 	registry.register(golangciRunner); // golangci-lint (priority 20, go, config-gated)

@@ -240,153 +240,6 @@ describe("index.ts integration", () => {
 		});
 	}, 15_000);
 
-	it("tool_call handler executes captureSnapshot and similarity paths without crashing", async () => {
-		const captureSnapshotMock = vi.fn();
-		const touchFileMock = vi.fn().mockResolvedValue(undefined);
-		const sourceFile = path.join(tmpDir, "src", "feature.ts");
-		const similarTarget = path.join(tmpDir, "src", "existing.ts");
-		fs.mkdirSync(path.dirname(sourceFile), { recursive: true });
-		fs.writeFileSync(
-			sourceFile,
-			"export function freshFeature() { return 1; }\n",
-		);
-		fs.writeFileSync(
-			similarTarget,
-			"export function oldFeature() { return 2; }\n",
-		);
-
-		vi.doMock("../clients/bootstrap.js", () => ({
-			loadBootstrapClients: async () => ({
-				metricsClient: { reset: () => {} },
-				todoScanner: {},
-				biomeClient: { isAvailable: () => false },
-				ruffClient: { isAvailable: () => false },
-				knipClient: { isAvailable: () => false },
-				jscpdClient: { isAvailable: () => false },
-				typeCoverageClient: { isAvailable: () => false },
-				depChecker: { isAvailable: () => false },
-				testRunnerClient: { detectRunner: () => null },
-				goClient: { isGoAvailable: () => false },
-				rustClient: { isAvailable: () => false },
-				agentBehaviorClient: {
-					recordToolCall: () => {},
-					formatWarnings: () => "",
-				},
-				complexityClient: {
-					isSupportedFile: () => true,
-					analyzeFile: () => ({
-						maintainabilityIndex: 88,
-						cognitiveComplexity: 3,
-						maxNestingDepth: 1,
-						linesOfCode: 10,
-						maxCyclomaticComplexity: 2,
-						codeEntropy: 1.2,
-					}),
-				},
-			}),
-		}));
-		vi.doMock("../clients/runtime-session.js", () => ({
-			handleSessionStart: async (deps: any) => {
-				deps.runtime.projectRoot = tmpDir;
-				deps.runtime.cachedExports.set("otherExport", similarTarget);
-				deps.runtime.cachedProjectIndex = {
-					entries: new Map([["existing", { id: "existing" }]]),
-				};
-			},
-		}));
-		vi.doMock("../clients/metrics-history.js", () => ({
-			captureSnapshot: captureSnapshotMock,
-		}));
-		vi.doMock("../clients/lsp/index.js", async () => {
-			const actual = await vi.importActual<
-				typeof import("../clients/lsp/index.js")
-			>("../clients/lsp/index.js");
-			return {
-				...actual,
-				getLSPService: () => ({ touchFile: touchFileMock }),
-			};
-		});
-		vi.doMock("../clients/dispatch/runners/similarity.js", async () => {
-			const actual = await vi.importActual<
-				typeof import("../clients/dispatch/runners/similarity.js")
-			>("../clients/dispatch/runners/similarity.js");
-			const ts = await import("typescript");
-			return {
-				...actual,
-				extractFunctions: () => [
-					{
-						name: "freshFeature",
-						transitionCount: 42,
-						matrix: [[1]],
-						kind: ts.SyntaxKind.FunctionDeclaration,
-					},
-				],
-			};
-		});
-		vi.doMock("../clients/project-index.js", async () => {
-			const actual = await vi.importActual<
-				typeof import("../clients/project-index.js")
-			>("../clients/project-index.js");
-			return {
-				...actual,
-				findSimilarFunctions: () => [
-					{
-						targetId: `src/existing.ts:oldFeature`,
-						targetName: "oldFeature",
-						targetLocation: similarTarget + ":1",
-						similarity: 0.95,
-						signature: "() => number",
-						targetTransitionCount: 42,
-					},
-				],
-			};
-		});
-
-		const { default: registerExtension } = await import("../index.ts");
-		const { pi, handlers } = createMockPi({
-			"lens-lsp": true,
-			"no-lsp": false,
-		});
-		registerExtension(pi as any);
-
-		const notify = vi.fn();
-		await handlers.session_start?.[0]?.({}, { cwd: tmpDir, ui: { notify } });
-
-		const toolCall = handlers.tool_call?.[0];
-		expect(toolCall).toBeTypeOf("function");
-
-		const result = await toolCall?.(
-			{
-				toolName: "write",
-				input: {
-					path: sourceFile,
-					content: "export function freshFeature() { return 1; }\n",
-				},
-			},
-			{ cwd: tmpDir },
-		);
-
-		expect(captureSnapshotMock).toHaveBeenCalledTimes(1);
-		expect(captureSnapshotMock).toHaveBeenCalledWith(
-			sourceFile,
-			expect.objectContaining({
-				maintainabilityIndex: 88,
-				cognitiveComplexity: 3,
-				maxNestingDepth: 1,
-				linesOfCode: 10,
-				maxCyclomatic: 2,
-				entropy: 1.2,
-			}),
-		);
-		expect(touchFileMock).toHaveBeenCalled();
-		expect(result).toEqual(
-			expect.objectContaining({
-				block: false,
-				reason: expect.stringContaining("Potential structural similarity"),
-			}),
-		);
-	}, 15_000);
-
 	it("tool_call records full-file reads from read.path with full line coverage", async () => {
 		const recordRead = vi.fn();
 		const mockReadGuard = {
@@ -407,7 +260,6 @@ describe("index.ts integration", () => {
 				turnIndex = 0;
 				complexityBaselines = new Map();
 				cachedExports = new Map();
-				cachedProjectIndex = null;
 				readGuard = mockReadGuard;
 				shouldWarmLspOnRead() {
 					return true;
@@ -492,7 +344,6 @@ describe("index.ts integration", () => {
 				turnIndex = 0;
 				complexityBaselines = new Map();
 				cachedExports = new Map();
-				cachedProjectIndex = null;
 				readGuard = {
 					recordRead: () => {},
 					getReadHistory: () => [],
@@ -589,7 +440,6 @@ describe("index.ts integration", () => {
 				turnIndex = 0;
 				complexityBaselines = new Map();
 				cachedExports = new Map();
-				cachedProjectIndex = null;
 				readGuard = {
 					recordRead: () => {},
 					getReadHistory: () => [],
@@ -701,7 +551,6 @@ describe("index.ts integration", () => {
 				turnIndex = 0;
 				complexityBaselines = new Map();
 				cachedExports = new Map();
-				cachedProjectIndex = null;
 				readGuard = {
 					recordRead: () => {},
 					getReadHistory: () => [],
@@ -793,7 +642,6 @@ describe("index.ts integration", () => {
 				turnIndex = 0;
 				complexityBaselines = new Map();
 				cachedExports = new Map();
-				cachedProjectIndex = null;
 				readGuard = {
 					recordRead: () => {},
 					getReadHistory: () => [],
@@ -880,7 +728,6 @@ describe("index.ts integration", () => {
 				turnIndex = 0;
 				complexityBaselines = new Map();
 				cachedExports = new Map();
-				cachedProjectIndex = null;
 				readGuard = {
 					recordRead: () => {},
 					getReadHistory: () => [],
@@ -966,7 +813,6 @@ describe("index.ts integration", () => {
 				complexityBaselines = new Map();
 				projectRulesScan = { hasCustomRules: false, rules: [] };
 				cachedExports = new Map();
-				cachedProjectIndex = null;
 				errorDebtBaseline = null;
 				sessionStartedAt = Date.now() - 5 * 60_000;
 				readGuard = {

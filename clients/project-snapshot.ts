@@ -3,7 +3,6 @@ import * as path from "node:path";
 import { getProjectDataDir } from "./file-utils.js";
 import { normalizeMapKey } from "./path-utils.js";
 import type { ProjectLanguageProfile } from "./language-policy.js";
-import type { ProjectIndex } from "./project-index.js";
 import {
 	detectProjectConventions,
 	type ProjectConventions,
@@ -44,9 +43,6 @@ export interface ProjectSnapshot {
 	reverseDeps: Record<string, string[]>;
 	cachedExports: Array<[name: string, filePath: string]>;
 	projectRulesScan?: RuleScanResult;
-	projectIndex?: {
-		entryCount: number;
-	};
 	startupScan?: StartupScanContext;
 	languageProfile?: ProjectLanguageProfile;
 	conventions?: ProjectConventions;
@@ -98,7 +94,6 @@ function parseSnapshot(value: unknown): ProjectSnapshot | null {
 				typeof entry[1] === "string",
 		),
 		projectRulesScan: snapshot.projectRulesScan,
-		projectIndex: snapshot.projectIndex,
 		startupScan: snapshot.startupScan,
 		languageProfile: snapshot.languageProfile,
 		conventions: snapshot.conventions,
@@ -143,10 +138,6 @@ export function buildProjectSnapshotFromRuntime(args: {
 	languageProfile?: ProjectLanguageProfile;
 	conventions?: ProjectConventions;
 }): ProjectSnapshot {
-	const runtimeWithOptionalIndex = args.runtime as RuntimeCoordinator & {
-		cachedProjectIndex?: ProjectIndex | null;
-	};
-	const cachedProjectIndex = runtimeWithOptionalIndex.cachedProjectIndex;
 	return {
 		version: PROJECT_SNAPSHOT_VERSION,
 		projectRoot: normalizeMapKey(path.resolve(args.cwd)),
@@ -159,9 +150,6 @@ export function buildProjectSnapshotFromRuntime(args: {
 			a[0].localeCompare(b[0]),
 		),
 		projectRulesScan: args.runtime.projectRulesScan,
-		projectIndex: cachedProjectIndex
-			? { entryCount: cachedProjectIndex.entries.size }
-			: undefined,
 		startupScan: args.startupScan,
 		languageProfile: args.languageProfile,
 		conventions: args.conventions,

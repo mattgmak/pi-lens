@@ -1003,9 +1003,7 @@ export async function runPipeline(
 				d.column || 0,
 			].join("|");
 		const inlineKeys = new Set(
-			[...dispatchResult.blockers, ...dispatchResult.fixed]
-				.filter((d) => d.tool !== "similarity")
-				.map(toKey),
+			[...dispatchResult.blockers, ...dispatchResult.fixed].map(toKey),
 		);
 		for (const d of dispatchResult.diagnostics) {
 			logger.logCaught(

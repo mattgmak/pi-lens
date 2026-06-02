@@ -409,12 +409,11 @@ function buildCoverageNotice(
 			.filter((runnerId) => !primary.runnerIds.includes(runnerId)),
 	);
 
-	// Structural-only runners (tree-sitter, ast-grep, similarity) are not
-	// substitutes for real linters — don't suppress the notice if only they ran.
+	// Structural-only runners (tree-sitter, ast-grep) are not substitutes
+	// for real linters — don't suppress the notice if only they ran.
 	const STRUCTURAL_RUNNERS = new Set([
 		"tree-sitter",
 		"ast-grep-napi",
-		"similarity",
 		"spellcheck",
 		"fact-rules",
 		"semgrep",
@@ -785,8 +784,8 @@ export async function dispatchForFile(
 			.catch(() => {});
 	}
 
-	const inlineBlockers = blockers.filter((d) => d.tool !== "similarity");
-	const inlineFixed = fixedItems.filter((d) => d.tool !== "similarity");
+	const inlineBlockers = blockers;
+	const inlineFixed = fixedItems;
 	const coverageNotice = buildCoverageNotice(ctx, runnerLatencies);
 
 	// Format output — only blocking issues shown inline
