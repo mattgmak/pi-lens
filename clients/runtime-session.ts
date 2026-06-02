@@ -338,20 +338,38 @@ function scheduleStartupScans(
 	runTask("jscpd", async () => {
 		if (await jscpdClient.ensureAvailable()) {
 			if (!runtime.isCurrentSession(sessionGeneration)) return;
+			// Detect TS projects by tsconfig.json at the analysis root. When
+			// set, JscpdClient.scan adds **/*.js and **/*.jsx to its ignore
+			// pattern so compiled artifacts under dist/ aren't flagged as
+			// duplicates of their TypeScript sources (closes #126's latent
+			// dist/-as-duplicate bug). Cache scanner key varies by this flag
+			// so a stale cache built with the wrong setting invalidates on
+			// first read.
+			const isTsProject = nodeFs.existsSync(
+				path.join(analysisRoot, "tsconfig.json"),
+			);
+			const scannerKey = isTsProject ? "jscpd-ts" : "jscpd";
 			const cached = cacheManager.readCache<
 				Awaited<ReturnType<JscpdClient["scan"]>>
-			>("jscpd", analysisRoot);
+			>(scannerKey, analysisRoot);
 			if (cached) {
 				if (!runtime.isCurrentSession(sessionGeneration)) return;
-				dbg("session_start jscpd: cache hit");
+				dbg(`session_start jscpd: cache hit (${scannerKey})`);
 			} else {
 				const startMs = Date.now();
-				const jscpdResult = await jscpdClient.scan(analysisRoot);
+				const jscpdResult = await jscpdClient.scan(
+					analysisRoot,
+					undefined,
+					undefined,
+					isTsProject,
+				);
 				if (!runtime.isCurrentSession(sessionGeneration)) return;
-				cacheManager.writeCache("jscpd", jscpdResult, analysisRoot, {
+				cacheManager.writeCache(scannerKey, jscpdResult, analysisRoot, {
 					scanDurationMs: Date.now() - startMs,
 				});
-				dbg(`session_start jscpd scan done (${Date.now() - startMs}ms)`);
+				dbg(
+					`session_start jscpd scan done (${Date.now() - startMs}ms, isTsProject=${isTsProject})`,
+				);
 			}
 		} else {
 			if (!runtime.isCurrentSession(sessionGeneration)) return;
