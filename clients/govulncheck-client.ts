@@ -18,6 +18,7 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { safeSpawnAsync } from "./safe-spawn.js";
 
@@ -95,6 +96,7 @@ export class GovulncheckClient {
 	private available: boolean | null = null;
 	private ensureInFlight: Promise<boolean> | null = null;
 	private inFlight = new Map<string, Promise<GovulncheckResult>>();
+	private binaryPath: string | null = null;
 	private log: (msg: string) => void;
 
 	constructor(verbose = false) {
@@ -133,18 +135,87 @@ export class GovulncheckClient {
 	}
 
 	private async doEnsureAvailable(): Promise<boolean> {
-		const result = await safeSpawnAsync("govulncheck", ["-version"], {
+		// PATH probe first.
+		const probe = await safeSpawnAsync("govulncheck", ["-version"], {
 			timeout: 5000,
 		});
-		this.available = !result.error && result.status === 0;
-		if (this.available) {
-			this.log(`govulncheck found: ${result.stdout.trim().split("\n")[0]}`);
-		} else {
-			this.log(
-				"govulncheck not found — install via: go install golang.org/x/vuln/cmd/govulncheck@latest",
-			);
+		if (!probe.error && probe.status === 0) {
+			this.log(`govulncheck found: ${probe.stdout.trim().split("\n")[0]}`);
+			this.available = true;
+			return true;
 		}
-		return this.available;
+
+		// Not on PATH — auto-install via `go install`. This is safe to assume
+		// here because the only path reaching `ensureAvailable()` is the
+		// session_start task gated on `hasGoModule(analysisRoot)`; if the
+		// project has a go.mod the user has the Go toolchain by definition.
+		// Same shape as rust-clippy / cargo: lean on the language's own
+		// install mechanism rather than adding a new installer strategy.
+		const goOnPath = await safeSpawnAsync("go", ["version"], {
+			timeout: 5000,
+		});
+		if (goOnPath.error || goOnPath.status !== 0) {
+			this.log("go binary not on PATH — cannot auto-install govulncheck");
+			this.available = false;
+			return false;
+		}
+
+		this.log("govulncheck not found, attempting auto-install via go install");
+		const install = await safeSpawnAsync(
+			"go",
+			["install", "golang.org/x/vuln/cmd/govulncheck@latest"],
+			{ timeout: 60_000 },
+		);
+		if (install.error || install.status !== 0) {
+			this.log(
+				`govulncheck auto-install failed: ${(install.stderr ?? "").slice(0, 200)}`,
+			);
+			this.available = false;
+			return false;
+		}
+
+		// `go install` writes to `$GOBIN` or `$GOPATH/bin`. The user may not
+		// have that on `$PATH`. Re-probe by name (works when it is on PATH)
+		// then fall back to the canonical bin dirs.
+		const reprobe = await safeSpawnAsync("govulncheck", ["-version"], {
+			timeout: 5000,
+		});
+		if (!reprobe.error && reprobe.status === 0) {
+			this.log("govulncheck auto-installed and found on PATH");
+			this.available = true;
+			return true;
+		}
+
+		// Look in the canonical install locations and remember the absolute
+		// path so subsequent invocations spawn against it directly.
+		const homeDir = os.homedir();
+		const isWin = process.platform === "win32";
+		const ext = isWin ? ".exe" : "";
+		const candidates = [
+			process.env.GOBIN,
+			process.env.GOPATH ? path.join(process.env.GOPATH, "bin") : undefined,
+			path.join(homeDir, "go", "bin"),
+		]
+			.filter((d): d is string => Boolean(d))
+			.map((d) => path.join(d, `govulncheck${ext}`));
+		for (const candidate of candidates) {
+			try {
+				if (fs.existsSync(candidate)) {
+					this.binaryPath = candidate;
+					this.available = true;
+					this.log(`govulncheck auto-installed at ${candidate}`);
+					return true;
+				}
+			} catch {
+				// fall through to next candidate
+			}
+		}
+
+		this.log(
+			"govulncheck auto-install succeeded but binary not locatable — check $GOBIN / $GOPATH",
+		);
+		this.available = false;
+		return false;
 	}
 
 	/**
@@ -189,9 +260,10 @@ export class GovulncheckClient {
 
 	private async runScan(cwd: string): Promise<GovulncheckResult> {
 		const scannedAt = new Date().toISOString();
+		const bin = this.binaryPath ?? "govulncheck";
 		try {
 			const result = await safeSpawnAsync(
-				"govulncheck",
+				bin,
 				["-mode=source", "-format=json", "./..."],
 				{ cwd, timeout: SCAN_TIMEOUT_MS },
 			);
