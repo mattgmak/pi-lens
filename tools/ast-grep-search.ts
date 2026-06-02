@@ -6,7 +6,21 @@
 
 import { Type } from "typebox";
 import type { AstGrepClient } from "../clients/ast-grep-client.js";
+import {
+	classifyAstGrepError,
+	logAstGrepToolEvent,
+	type AstGrepToolOutcome,
+} from "../clients/ast-grep-tool-logger.js";
 import { LANGUAGES } from "./shared.js";
+
+function lineCount(value: string): number {
+	if (!value) return 0;
+	let lines = 1;
+	for (let i = 0; i < value.length; i++) {
+		if (value.charCodeAt(i) === 10) lines++;
+	}
+	return lines;
+}
 
 function looksLikeRuleYamlOrPlainText(pattern: string): boolean {
 	const text = pattern.trim();
@@ -150,7 +164,54 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 			_onUpdate: unknown,
 			ctx: { cwd?: string },
 		) {
+			const startedAt = Date.now();
+			const { pattern, paths, selector, context } = params as {
+				pattern: string;
+				lang: string;
+				paths?: string[];
+				selector?: string;
+				context?: number;
+			};
+			const lang = ((params as { lang: string }).lang ?? "").replace(
+				/^"|"$/g,
+				"",
+			);
+			const searchPathsCount = paths?.length ?? 1;
+
+			function logOutcome(
+				outcome: AstGrepToolOutcome,
+				details: {
+					matchCount?: number;
+					truncated?: boolean;
+					errorRaw?: string;
+				} = {},
+			): void {
+				try {
+					logAstGrepToolEvent({
+						tool: "ast_grep_search",
+						lang,
+						pattern,
+						patternLineCount: lineCount(pattern),
+						pathsCount: searchPathsCount,
+						outcome,
+						errorKind:
+							outcome === "error"
+								? classifyAstGrepError(details.errorRaw)
+								: undefined,
+						errorRaw: details.errorRaw,
+						matchCount: details.matchCount ?? 0,
+						truncated: details.truncated ?? false,
+						durationMs: Date.now() - startedAt,
+					});
+				} catch {
+					// Telemetry must never break the tool path.
+				}
+			}
+
 			if (!(await astGrepClient.ensureAvailable())) {
+				logOutcome("error", {
+					errorRaw: "ast-grep CLI not found",
+				});
 				return {
 					content: [
 						{
@@ -163,20 +224,11 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 				};
 			}
 
-			const { pattern, paths, selector, context } = params as {
-				pattern: string;
-				lang: string;
-				paths?: string[];
-				selector?: string;
-				context?: number;
-			};
-			// Strip surrounding quotes if the LLM over-quoted the value (e.g. '"typescript"')
-			const lang = ((params as { lang: string }).lang ?? "").replace(
-				/^"|"$/g,
-				"",
-			);
-
 			if (looksLikeRuleYamlOrPlainText(pattern)) {
+				logOutcome("error", {
+					errorRaw:
+						"pattern looks like rule YAML or plain text (rejected pre-spawn)",
+				});
 				return {
 					content: [
 						{
@@ -196,6 +248,7 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 			});
 
 			if (result.error) {
+				logOutcome("error", { errorRaw: result.error });
 				return {
 					content: [{ type: "text" as const, text: `Error: ${result.error}` }],
 					isError: true,
@@ -209,6 +262,10 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 					? getPatternHint(pattern, lang, selector)
 					: undefined;
 			const finalOutput = hint ? `${output}\n\n${hint}` : output;
+			logOutcome(result.matches.length === 0 ? "no_matches" : "success", {
+				matchCount: result.matches.length,
+				truncated: result.truncated,
+			});
 			return {
 				content: [{ type: "text" as const, text: finalOutput }],
 				details: {

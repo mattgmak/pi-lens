@@ -6,7 +6,21 @@
 
 import { Type } from "typebox";
 import type { AstGrepClient } from "../clients/ast-grep-client.js";
+import {
+	classifyAstGrepError,
+	logAstGrepToolEvent,
+	type AstGrepToolOutcome,
+} from "../clients/ast-grep-tool-logger.js";
 import { LANGUAGES } from "./shared.js";
+
+function lineCount(value: string): number {
+	if (!value) return 0;
+	let lines = 1;
+	for (let i = 0; i < value.length; i++) {
+		if (value.charCodeAt(i) === 10) lines++;
+	}
+	return lines;
+}
 
 export function createAstGrepReplaceTool(astGrepClient: AstGrepClient) {
 	return {
@@ -49,7 +63,56 @@ export function createAstGrepReplaceTool(astGrepClient: AstGrepClient) {
 			_onUpdate: unknown,
 			ctx: { cwd?: string },
 		) {
+			const startedAt = Date.now();
+			const { pattern, rewrite, paths, apply } = params as {
+				pattern: string;
+				rewrite: string;
+				lang: string;
+				paths?: string[];
+				apply?: boolean;
+			};
+			const lang = ((params as { lang: string }).lang ?? "").replace(
+				/^"|"$/g,
+				"",
+			);
+			const pathsCount = paths?.length ?? 1;
+			const applyFlag = apply ?? false;
+
+			function logOutcome(
+				outcome: AstGrepToolOutcome,
+				details: {
+					matchCount?: number;
+					truncated?: boolean;
+					errorRaw?: string;
+				} = {},
+			): void {
+				try {
+					logAstGrepToolEvent({
+						tool: "ast_grep_replace",
+						lang,
+						pattern,
+						patternLineCount: lineCount(pattern),
+						rewrite,
+						rewriteLineCount: lineCount(rewrite ?? ""),
+						pathsCount,
+						applied: applyFlag,
+						outcome,
+						errorKind:
+							outcome === "error"
+								? classifyAstGrepError(details.errorRaw)
+								: undefined,
+						errorRaw: details.errorRaw,
+						matchCount: details.matchCount ?? 0,
+						truncated: details.truncated ?? false,
+						durationMs: Date.now() - startedAt,
+					});
+				} catch {
+					// Telemetry must never break the tool path.
+				}
+			}
+
 			if (!(await astGrepClient.ensureAvailable())) {
+				logOutcome("error", { errorRaw: "ast-grep CLI not found" });
 				return {
 					content: [
 						{
@@ -61,29 +124,17 @@ export function createAstGrepReplaceTool(astGrepClient: AstGrepClient) {
 					details: {},
 				};
 			}
-
-			const { pattern, rewrite, paths, apply } = params as {
-				pattern: string;
-				rewrite: string;
-				lang: string;
-				paths?: string[];
-				apply?: boolean;
-			};
-			// Strip surrounding quotes if the LLM over-quoted the value (e.g. '"typescript"')
-			const lang = ((params as { lang: string }).lang ?? "").replace(
-				/^"|"$/g,
-				"",
-			);
 			const searchPaths = paths?.length ? paths : [ctx.cwd || "."];
 			const result = await astGrepClient.replace(
 				pattern,
 				rewrite,
 				lang,
 				searchPaths,
-				apply ?? false,
+				applyFlag,
 			);
 
 			if (result.error) {
+				logOutcome("error", { errorRaw: result.error });
 				return {
 					content: [{ type: "text" as const, text: `Error: ${result.error}` }],
 					isError: true,
@@ -91,12 +142,17 @@ export function createAstGrepReplaceTool(astGrepClient: AstGrepClient) {
 				};
 			}
 
-			const isDryRun = !apply;
+			const isDryRun = !applyFlag;
 			const output = astGrepClient.formatMatches(
 				result.matches,
 				isDryRun,
 				true, // showModeIndicator
 			);
+
+			logOutcome(result.matches.length === 0 ? "no_matches" : "success", {
+				matchCount: result.matches.length,
+				truncated: result.truncated,
+			});
 
 			return {
 				content: [{ type: "text" as const, text: output }],
@@ -104,7 +160,7 @@ export function createAstGrepReplaceTool(astGrepClient: AstGrepClient) {
 					matchCount: result.matches.length,
 					totalMatches: result.totalMatches,
 					truncated: result.truncated,
-					applied: apply ?? false,
+					applied: applyFlag,
 				},
 			};
 		},
