@@ -997,10 +997,21 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// --- Tools (extracted to tools/) ---
-	pi.registerTool(createAstGrepSearchTool(astGrepClient) as any);
-	pi.registerTool(createAstGrepReplaceTool(astGrepClient) as any);
-	pi.registerTool(createLspDiagnosticsTool() as any);
-	pi.registerTool(createLspNavigationTool((name) => getLensFlag(name)) as any);
+	// Guard each registration: if another extension (e.g. @narumitw/pi-lsp) already
+	// owns the same tool name, registerTool throws and would abort extension load.
+	// Catch the collision silently so both extensions can coexist.
+	for (const tool of [
+		createAstGrepSearchTool(astGrepClient),
+		createAstGrepReplaceTool(astGrepClient),
+		createLspDiagnosticsTool(),
+		createLspNavigationTool((name) => getLensFlag(name)),
+	]) {
+		try {
+			pi.registerTool(tool as any);
+		} catch {
+			// another extension already registered a tool with this name
+		}
+	}
 
 	// REMOVED: ~450 lines of inline tool definitions moved to tools/
 	// See tools/ast-grep-search.ts, tools/ast-grep-replace.ts, tools/lsp-navigation.ts
