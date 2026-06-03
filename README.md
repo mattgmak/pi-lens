@@ -256,10 +256,15 @@ Hide the diagnostics widget by default, run formatting immediately after write/e
 ## Environment Variables
 
 - `PILENS_DATA_DIR` — redirect per-project state (scanner caches,
-  turn-state.json) out of the project directory. By default pi-lens writes
-  `<cwd>/.pi-lens/`; if set, it writes to
-  `<PILENS_DATA_DIR>/<sanitized-cwd-slug>/` instead. Useful for keeping repos
-  clean or for mounted/ephemeral setups. Tool binaries always live in
+  turn-state.json) to a base directory outside the project. By default
+  pi-lens writes to `~/.pi-lens/projects/<sanitized-cwd-slug>/`. The one
+  exception is a legacy `<cwd>/.pi-lens/` directory: if that already exists
+  in the project, pi-lens continues to use it. Set `PILENS_DATA_DIR` to
+  permanently override both cases and write to
+  `<PILENS_DATA_DIR>/<sanitized-cwd-slug>/` instead. Particularly useful
+  when running pi with a local model server (llama.cpp, Ollama, etc.) that
+  monitors the project directory — cache-file churn inside the workspace can
+  disrupt the model's context scoring. Tool binaries always live in
   `~/.pi-lens/bin/` regardless.
 - `PI_LENS_STARTUP_MODE` — `full` | `minimal` | `quick`. Override the
   auto-selected startup path. One-shot `pi --print` sessions auto-use `quick`
