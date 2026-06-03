@@ -204,6 +204,10 @@ Mixing different capture names in one `[...]` block causes tree-sitter to silent
 ## Current version / state
 v3.8.45 is the package version. Master includes unreleased work: read-guard autopatch improvements (trailing empty lines, `out_of_range` downgrade, repeat-failure escalation), actionable/code-quality warning reports with sequence metadata, project/file sequencing plus append-only change logs, project snapshot hydration, reverse-dependency snapshot cache/query helpers, structured NDJSON telemetry for the actionable-warnings pipeline (`actionable-warnings-logger.ts`), and async/fast lifecycle consistency (jscpd/Madge/formatters use `safeSpawnAsync`; LSP teardown uses fast/unref paths). CI runs `npm ci` + tsc lint + vitest.
 
+## Commit conventions
+- Always include the GitHub issue number in the commit subject line: `(closes #NNN)` or `(refs #NNN)`.
+- Use `closes` when the commit fully resolves the issue; `refs` when it is partial work.
+
 ## Conventions
 - TypeScript ESM throughout (`"type": "module"`)
 - Edit the `.ts` sources only. Do **not** hand-edit sibling/generated `.js` files in this repo; pi loads TS via on-the-fly jiti transpilation and JS files are generated artifacts. If tests/runtime could see stale `.js`, run `npm run build` to regenerate from TS before testing.
