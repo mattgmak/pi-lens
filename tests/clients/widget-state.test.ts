@@ -1,12 +1,15 @@
+import * as path from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+	__testing,
 	clearWidgetState,
 	recordDiagnostics,
 	recordFormatter,
 	recordLsp,
 	recordRunner,
 	renderWidget,
+	setRenderCallback,
 	setSessionLanguages,
 } from "../../clients/widget-state.ts";
 
@@ -262,6 +265,7 @@ describe("widget-state renderWidget", () => {
 			{ severity: "warning", message: "advisory", rule: "Y" },
 		]);
 		recordRunner(c, "tsc", "succeeded", 0);
+		recordDiagnostics(c, []);
 
 		const lines = renderWidget(120, theme);
 		const fileRow = lines.find(
@@ -284,7 +288,9 @@ describe("widget-state renderWidget", () => {
 		const a = `${process.cwd()}/foo.ts`;
 		const b = `${process.cwd()}/bar.ts`;
 		recordRunner(a, "tsc", "succeeded", 0);
+		recordDiagnostics(a, []);
 		recordRunner(b, "tsc", "succeeded", 0);
+		recordDiagnostics(b, []);
 
 		const lines = renderWidget(50, theme);
 		// Vertical: each file on its own line, no packed row contains both.
@@ -298,6 +304,7 @@ describe("widget-state renderWidget", () => {
 	it("truncates basenames preserving the extension", () => {
 		const filePath = `${process.cwd()}/extremely-very-much-too-long-component-name-that-clearly-overflows-the-budget.tsx`;
 		recordRunner(filePath, "tsc", "succeeded", 0);
+		recordDiagnostics(filePath, []);
 
 		const lines = renderWidget(70, theme);
 		const allLines = lines.join("\n");
@@ -325,10 +332,72 @@ describe("widget-state renderWidget", () => {
 		for (let i = 0; i < 5; i++) {
 			const filePath = `${process.cwd()}/this-is-a-fairly-long-name-${i}.ts`;
 			recordRunner(filePath, "tsc", "succeeded", 0);
+			recordDiagnostics(filePath, []);
 		}
 
 		const lines = renderWidget(70, theme);
 		const allLines = lines.join("\n");
 		expect(allLines).toMatch(/\+\d+/);
+	});
+
+	it("caps stored widget diagnostics per file while preserving warning counts", () => {
+		const filePath = path.join(process.cwd(), "warning-storm.cpp");
+		recordRunner(filePath, "lsp", "succeeded", 40);
+		recordDiagnostics(
+			filePath,
+			Array.from({ length: 40 }, (_, i) => ({
+				severity: "warning",
+				message: `warning ${i + 1}`,
+				rule: "clangd:unused",
+				line: i + 1,
+			})),
+		);
+
+		const snapshot = __testing.getWidgetStateSnapshot();
+		expect(snapshot.files).toHaveLength(1);
+		expect(snapshot.files[0]).toMatchObject({
+			filePath,
+			storedDiagnostics: 12,
+			warnings: 40,
+			errors: 0,
+			blocking: 0,
+		});
+
+		const lines = renderWidget(120, theme);
+		expect(lines.join("\n")).toContain("40W");
+	});
+
+	it("does not churn through transient clean frames during warning-only cxx analysis", () => {
+		const frames: string[] = [];
+		setRenderCallback(() => {
+			frames.push(renderWidget(120, theme).join("\n"));
+		});
+
+		setSessionLanguages(["cpp"]);
+		const filePath = path.join(process.cwd(), "warning-storm.cpp");
+
+		recordLsp("cpp", process.cwd(), "spawn_start");
+		recordLsp("cpp", process.cwd(), "spawn_success", 50);
+		recordRunner(filePath, "lsp", "succeeded", 40, 50);
+		recordRunner(filePath, "cpp-check", "succeeded", 40, 80);
+		recordRunner(filePath, "tree-sitter", "succeeded", 0, 10);
+		recordDiagnostics(
+			filePath,
+			Array.from({ length: 40 }, (_, i) => ({
+				severity: "warning",
+				message: `warning ${i + 1}`,
+				rule: "clangd:unused",
+				line: i + 1,
+			})),
+		);
+
+		const nonEmptyFrames = frames.filter((frame) => frame.trim().length > 0);
+		const finalFrame = nonEmptyFrames.at(-1) ?? "";
+		const intermediateFrames = nonEmptyFrames.slice(0, -1);
+
+		expect(finalFrame).toContain("!40W");
+		expect(finalFrame).toContain("warning-storm.cpp");
+		expect(intermediateFrames.join("\n")).not.toContain("✓ clean");
+		expect(new Set(nonEmptyFrames).size).toBeLessThanOrEqual(3);
 	});
 });

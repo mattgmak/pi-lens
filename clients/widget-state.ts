@@ -32,6 +32,12 @@ interface FileRecord {
 	runners: Map<string, { status: string; count: number; durationMs?: number }>;
 	formatters: Map<string, { changed: boolean; success: boolean }>;
 	diagnostics: WidgetDiagnostic[];
+	diagnosticCounts: {
+		blocking: number;
+		errors: number;
+		warnings: number;
+	};
+	hasFinalDiagnosticsSnapshot: boolean;
 	touchedAt: number;
 }
 
@@ -49,6 +55,8 @@ const lspServers = new Map<string, LspRecord>();
 let sessionLanguages: string[] = [];
 let requestRenderFn: (() => void) | null = null;
 
+const MAX_STORED_DIAGNOSTICS_PER_FILE = 12;
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 export function setRenderCallback(fn: () => void): void {
@@ -59,6 +67,7 @@ export function clearWidgetState(): void {
 	files.clear();
 	lspServers.clear();
 	sessionLanguages = [];
+	requestRenderFn = null;
 }
 
 export function setSessionLanguages(langs: string[]): void {
@@ -88,6 +97,7 @@ export function recordRunner(
 ): void {
 	const rec = getOrCreate(filePath);
 	rec.runners.set(runnerId, { status, count: diagnosticCount, durationMs });
+	rec.hasFinalDiagnosticsSnapshot = false;
 	rec.touchedAt = Date.now();
 	files.set(filePath, rec);
 	requestRender();
@@ -108,7 +118,7 @@ export function recordDiagnostics(
 ): void {
 	const rec = getOrCreate(filePath);
 	const base = pathToFileURL(filePath).href;
-	rec.diagnostics = diagnostics.map((d) => {
+	const normalized = diagnostics.map((d) => {
 		const rule = d.rule ?? d.id;
 		const uri =
 			d.line != null
@@ -123,12 +133,48 @@ export function recordDiagnostics(
 			rule,
 			tool: d.tool,
 			uri,
-		};
+		} satisfies WidgetDiagnostic;
 	});
+
+	let blocking = 0;
+	let errors = 0;
+	let warnings = 0;
+	for (const diagnostic of normalized) {
+		if (isBlocking(diagnostic)) blocking++;
+		if (diagnostic.severity === "error") errors++;
+		else if (diagnostic.severity === "warning") warnings++;
+	}
+
+	rec.diagnosticCounts = { blocking, errors, warnings };
+	rec.diagnostics = capStoredDiagnostics(normalized);
+	rec.hasFinalDiagnosticsSnapshot = true;
 	rec.touchedAt = Date.now();
 	files.set(filePath, rec);
 	requestRender();
 }
+
+/** @internal Test-only helpers. Do not use in production code. */
+export const __testing = {
+	getWidgetStateSnapshot(): {
+		files: Array<{
+			filePath: string;
+			storedDiagnostics: number;
+			blocking: number;
+			errors: number;
+			warnings: number;
+		}>;
+	} {
+		return {
+			files: [...files.values()].map((rec) => ({
+				filePath: rec.filePath,
+				storedDiagnostics: rec.diagnostics.length,
+				blocking: rec.diagnosticCounts.blocking,
+				errors: rec.diagnosticCounts.errors,
+				warnings: rec.diagnosticCounts.warnings,
+			})),
+		};
+	},
+};
 
 export function recordLsp(
 	serverId: string,
@@ -171,11 +217,12 @@ export function renderWidget(
 
 	// Header — counts from deduplicated files only
 	const deduped = dedupeByBasename([...files.values()]);
-	const recencySorted = deduped.slice(0, 5);
+	const recencySorted = deduped.filter(shouldRenderFile).slice(0, 5);
 	const langStr = sessionLanguages.slice(0, 6).join(" ");
 	const totalBlocking = countBlockingIn(deduped);
 	const totalErrors = countTotalIn("error", deduped);
 	const totalWarnings = countTotalIn("warning", deduped);
+	const hasPendingAnalysis = deduped.some(isPendingAnalysis);
 	const errorChunk =
 		totalErrors > 0
 			? (totalBlocking > 0 ? red : yellow)(`●${totalErrors}E`)
@@ -185,7 +232,7 @@ export function renderWidget(
 		? errorChunk + (warningChunk ? " " + warningChunk : "")
 		: warningChunk
 			? warningChunk
-			: files.size > 0
+			: files.size > 0 && !hasPendingAnalysis
 				? green("✓ clean")
 				: "";
 
@@ -247,19 +294,19 @@ export function renderWidget(
 type FileTier = "blocking" | "warning" | "clean";
 
 function classifyFileTier(rec: FileRecord): FileTier {
-	if (rec.diagnostics.some(isBlocking)) return "blocking";
-	if (
-		rec.diagnostics.some(
-			(d) => d.severity === "error" || d.severity === "warning",
-		)
-	) {
+	if (rec.diagnosticCounts.blocking > 0) return "blocking";
+	if (rec.diagnosticCounts.errors > 0 || rec.diagnosticCounts.warnings > 0) {
 		return "warning";
 	}
 	return "clean";
 }
 
 function sortByTierThenRecency(recs: FileRecord[]): FileRecord[] {
-	const order: Record<FileTier, number> = { blocking: 0, warning: 1, clean: 2 };
+	const order: Record<FileTier, number> = {
+		blocking: 0,
+		warning: 1,
+		clean: 2,
+	};
 	return [...recs].sort((a, b) => {
 		const ta = order[classifyFileTier(a)];
 		const tb = order[classifyFileTier(b)];
@@ -278,11 +325,9 @@ function formatFileRowVertical(
 	const green = (s: string) => theme.fg("success", s);
 
 	const base = path.basename(rec.filePath);
-	const blocking = rec.diagnostics.filter(isBlocking).length;
-	const errors = rec.diagnostics.filter((d) => d.severity === "error").length;
-	const warnings = rec.diagnostics.filter(
-		(d) => d.severity === "warning",
-	).length;
+	const blocking = rec.diagnosticCounts.blocking;
+	const errors = rec.diagnosticCounts.errors;
+	const warnings = rec.diagnosticCounts.warnings;
 	const dot =
 		blocking > 0
 			? red("●")
@@ -382,12 +427,10 @@ function formatFileTokenHorizontal(
 	const red = (s: string) => theme.fg("error", s);
 	const yellow = (s: string) => theme.fg("warning", s);
 
-	const blocking = rec.diagnostics.filter(isBlocking).length;
-	const errors = rec.diagnostics.filter((d) => d.severity === "error").length;
-	const warnings = rec.diagnostics.filter(
-		(d) => d.severity === "warning",
-	).length;
-	const formatterChanged = [...rec.formatters.values()].some((f) => f.changed);
+	const blocking = rec.diagnosticCounts.blocking;
+	const errors = rec.diagnosticCounts.errors;
+	const warnings = rec.diagnosticCounts.warnings;
+	const formatterChanged = hasChangedFormatter(rec);
 
 	let dotChar: string;
 	if (blocking > 0) dotChar = red("●");
@@ -437,21 +480,55 @@ function getOrCreate(filePath: string): FileRecord {
 			runners: new Map(),
 			formatters: new Map(),
 			diagnostics: [],
+			diagnosticCounts: { blocking: 0, errors: 0, warnings: 0 },
+			hasFinalDiagnosticsSnapshot: false,
 			touchedAt: Date.now(),
 		}
 	);
 }
 
-function countTotalIn(severity: string, recs: FileRecord[]): number {
+function hasChangedFormatter(rec: FileRecord): boolean {
+	return [...rec.formatters.values()].some((f) => f.changed);
+}
+
+function shouldRenderFile(rec: FileRecord): boolean {
+	return rec.hasFinalDiagnosticsSnapshot || hasChangedFormatter(rec);
+}
+
+function isPendingAnalysis(rec: FileRecord): boolean {
+	return rec.runners.size > 0 && !rec.hasFinalDiagnosticsSnapshot;
+}
+
+function capStoredDiagnostics(
+	diagnostics: WidgetDiagnostic[],
+): WidgetDiagnostic[] {
+	if (diagnostics.length <= MAX_STORED_DIAGNOSTICS_PER_FILE) return diagnostics;
+	const blockers = diagnostics.filter(isBlocking);
+	if (blockers.length >= MAX_STORED_DIAGNOSTICS_PER_FILE) {
+		return blockers.slice(0, MAX_STORED_DIAGNOSTICS_PER_FILE);
+	}
+	const rest = diagnostics.filter((d) => !isBlocking(d));
+	return [
+		...blockers,
+		...rest.slice(0, MAX_STORED_DIAGNOSTICS_PER_FILE - blockers.length),
+	];
+}
+
+function countTotalIn(
+	severity: "error" | "warning",
+	recs: FileRecord[],
+): number {
 	let n = 0;
-	for (const rec of recs)
-		n += rec.diagnostics.filter((d) => d.severity === severity).length;
+	for (const rec of recs) {
+		if (severity === "error") n += rec.diagnosticCounts.errors;
+		else n += rec.diagnosticCounts.warnings;
+	}
 	return n;
 }
 
 function countBlockingIn(recs: FileRecord[]): number {
 	let n = 0;
-	for (const rec of recs) n += rec.diagnostics.filter(isBlocking).length;
+	for (const rec of recs) n += rec.diagnosticCounts.blocking;
 	return n;
 }
 
