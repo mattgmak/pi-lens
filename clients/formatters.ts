@@ -412,29 +412,53 @@ export const prettierFormatter: FormatterInfo = {
 };
 
 export const oxfmtFormatter: FormatterInfo = {
-	name: "oxfmt",
-	command: ["oxfmt", "$FILE"],
-	async resolveCommand(filePath, cwd) {
-		if (hasVitePlusConfig(cwd)) {
-			const localVp = await findInNodeModules("vp", cwd);
-			if (localVp) return [localVp, "fmt", filePath, "--write"];
-			const globalVp = await which("vp");
-			if (globalVp) return [globalVp, "fmt", filePath, "--write"];
-		}
-		const local = await findInNodeModules("oxfmt", cwd);
-		if (local) return [local, filePath];
-		const found = await which("oxfmt");
-		if (found) return [found, filePath];
-		return null;
-	},
-	extensions: [".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"],
-	async detect(cwd: string) {
-		return (
-			hasOxfmtConfig(cwd) ||
-			hasVitePlusConfig(cwd) ||
-			hasNearestPackageJsonDependency(cwd, "@oxc-project/oxfmt")
-		);
-	},
+  name: "oxfmt",
+  command: ["oxfmt", "$FILE"],
+  async resolveCommand(filePath, cwd) {
+    if (hasVitePlusConfig(cwd)) {
+      const localVp = await findInNodeModules("vp", cwd);
+      if (localVp) return [localVp, "fmt", filePath, "--write"];
+      const globalVp = await which("vp");
+      if (globalVp) return [globalVp, "fmt", filePath, "--write"];
+    }
+    const local = await findInNodeModules("oxfmt", cwd);
+    if (local) return [local, filePath];
+    const found = await which("oxfmt");
+    if (found) return [found, filePath];
+    return null;
+  },
+  extensions: [
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".ts",
+    ".tsx",
+    ".mts",
+    ".cts",
+    ".vue",
+    ".css",
+    ".scss",
+    ".less",
+    ".html",
+    ".htm",
+    ".json",
+    ".jsonc",
+    ".yaml",
+    ".yml",
+    ".md",
+    ".mdx",
+    ".graphql",
+    ".gql",
+    ".toml",
+  ],
+  async detect(cwd: string) {
+    return (
+      hasOxfmtConfig(cwd) ||
+      hasVitePlusConfig(cwd) ||
+      hasNearestPackageJsonDependency(cwd, "@oxc-project/oxfmt")
+    );
+  },
 };
 
 export const ruffFormatter: FormatterInfo = {

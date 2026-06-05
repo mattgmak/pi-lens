@@ -108,7 +108,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 	[
 		".json",
 		{
-			formatterNames: ["biome", "prettier"],
+			formatterNames: ["biome", "prettier", "oxfmt"],
 			defaultFormatter: "biome",
 			defaultWhenUnconfigured: false,
 			gate: "mixed",
@@ -117,7 +117,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 	[
 		".jsonc",
 		{
-			formatterNames: ["biome", "prettier"],
+			formatterNames: ["biome", "prettier", "oxfmt"],
 			defaultFormatter: "biome",
 			defaultWhenUnconfigured: false,
 			gate: "mixed",
@@ -153,7 +153,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 	[
 		".less",
 		{
-			formatterNames: ["prettier"],
+			formatterNames: ["prettier", "oxfmt"],
 			defaultFormatter: "prettier",
 			defaultWhenUnconfigured: true,
 			gate: "smart-default",
@@ -162,7 +162,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 	[
 		".html",
 		{
-			formatterNames: ["prettier"],
+			formatterNames: ["prettier", "oxfmt"],
 			defaultFormatter: "prettier",
 			defaultWhenUnconfigured: true,
 			gate: "smart-default",
@@ -171,7 +171,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 	[
 		".htm",
 		{
-			formatterNames: ["prettier"],
+			formatterNames: ["prettier", "oxfmt"],
 			defaultFormatter: "prettier",
 			defaultWhenUnconfigured: true,
 			gate: "smart-default",
@@ -180,7 +180,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 	[
 		".yaml",
 		{
-			formatterNames: ["prettier"],
+			formatterNames: ["prettier", "oxfmt"],
 			defaultFormatter: "prettier",
 			defaultWhenUnconfigured: true,
 			gate: "smart-default",
@@ -189,7 +189,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 	[
 		".yml",
 		{
-			formatterNames: ["prettier"],
+			formatterNames: ["prettier", "oxfmt"],
 			defaultFormatter: "prettier",
 			defaultWhenUnconfigured: true,
 			gate: "smart-default",
@@ -198,7 +198,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 	[
 		".md",
 		{
-			formatterNames: ["prettier"],
+			formatterNames: ["prettier", "oxfmt"],
 			defaultFormatter: "prettier",
 			// Prettier's markdown defaults reflow lines, normalize emphasis (* -> _),
 			// and restyle lists. Opt-in via project prettier config; do not run by default.
@@ -209,7 +209,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 	[
 		".mdx",
 		{
-			formatterNames: ["prettier"],
+			formatterNames: ["prettier", "oxfmt"],
 			defaultFormatter: "prettier",
 			defaultWhenUnconfigured: false,
 			gate: "smart-default",
@@ -218,7 +218,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 	[
 		".graphql",
 		{
-			formatterNames: ["prettier"],
+			formatterNames: ["prettier", "oxfmt"],
 			defaultFormatter: "prettier",
 			defaultWhenUnconfigured: true,
 			gate: "smart-default",
@@ -227,7 +227,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 	[
 		".gql",
 		{
-			formatterNames: ["prettier"],
+			formatterNames: ["prettier", "oxfmt"],
 			defaultFormatter: "prettier",
 			defaultWhenUnconfigured: true,
 			gate: "smart-default",
@@ -524,7 +524,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 	[
 		".toml",
 		{
-			formatterNames: ["taplo"],
+			formatterNames: ["taplo", "oxfmt"],
 			defaultFormatter: "taplo",
 			defaultWhenUnconfigured: true,
 			gate: "smart-default",

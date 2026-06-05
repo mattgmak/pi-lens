@@ -931,4 +931,43 @@ describe("oxfmt formatter — detection and policy selection", () => {
 		const cmd = await oxfmtFormatter.resolveCommand!(filePath, tmpDir);
 		expect(cmd).toEqual([vp, "fmt", filePath, "--write"]);
 	});
+
+	const oxfmtExtensionFiles = [
+		"style.css",
+		"style.scss",
+		"app.vue",
+		"data.json",
+		"config.jsonc",
+		"config.yaml",
+		"config.yml",
+		"README.md",
+		"page.mdx",
+		"query.graphql",
+		"query.gql",
+		"config.toml",
+		"style.less",
+		"page.html",
+	];
+
+	it.each(
+		oxfmtExtensionFiles,
+	)("selects oxfmt for %s when oxfmt.toml is present", async (fileName) => {
+		createTempFile(tmpDir, "oxfmt.toml", "# oxfmt config\n");
+		const formatters = await getFormattersForFile(
+			fileIn(tmpDir, fileName),
+			tmpDir,
+		);
+		expect(formatters.map((f) => f.name)).toEqual(["oxfmt"]);
+	});
+
+	it.each(
+		oxfmtExtensionFiles,
+	)("selects oxfmt for %s when .oxfmtrc.json is present", async (fileName) => {
+		createTempFile(tmpDir, ".oxfmtrc.json", "{}\n");
+		const formatters = await getFormattersForFile(
+			fileIn(tmpDir, fileName),
+			tmpDir,
+		);
+		expect(formatters.map((f) => f.name)).toEqual(["oxfmt"]);
+	});
 });
