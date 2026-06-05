@@ -16,19 +16,20 @@ function loadRule() {
 	return rule;
 }
 
-// Regex literal patterns that SHOULD be flagged (inner + outer both unbounded).
+// Regex literal patterns that SHOULD be flagged: a SINGLE quantified atom (char,
+// class, escape, or dot) nested inside another unbounded repetition.
 const VULNERABLE = [
 	"(a+)+$", // classic exponential — S5852 sensitive example
 	"(a*)*$",
-	"([a-z]+)*",
-	"(\\d+){2,}", // unbounded outer via {n,}
-	"(?:ab+)+x", // non-capturing group
+	"([a-z]+)*", // char-class atom
+	"(\\d+){2,}", // escaped atom, unbounded outer via {n,}
 	"(a{2,})+", // unbounded inner via {n,}
-	"(.*)+",
-	"((x*))+", // double-nested closing parens
+	"(.*)+", // dot atom
+	"(?:.*)*", // non-capturing group
+	"(\\w+)*$",
 ];
 
-// Patterns that must NOT be flagged (linear, or bounded quantifiers).
+// Patterns that must NOT be flagged (linear, bounded, or unique-partition).
 const SAFE = [
 	"a+b+", // separate, non-nested
 	"(ab)+", // group body has no quantifier
@@ -38,6 +39,13 @@ const SAFE = [
 	"(foo|bar)",
 	"(a+)(b)+", // two separate quantified groups, not nested
 	"\\s*,", // single quantifier
+	// Mandatory-prefix groups: partition is unique, so no backtracking
+	// (S5852 explicitly calls (ba+)+ safe).
+	"(ba+)+",
+	"(ab+)+",
+	"(?:ab+)+x",
+	"(-[a-z0-9]+){3,}",
+	"^[a-z][a-z0-9]*(-[a-z0-9]+){3,}$", // real codebase pattern (quality-rules.ts)
 ];
 
 describe("redos-nested-quantifier rule", () => {
