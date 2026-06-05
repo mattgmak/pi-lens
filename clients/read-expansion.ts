@@ -11,7 +11,7 @@ import * as fs from "node:fs";
 import type { TreeSitterClient } from "./tree-sitter-client.js";
 
 /** Only expand reads smaller than this (lines). Larger reads don't benefit. */
-export const EXPANSION_LIMIT_LINES = 60;
+export const EXPANSION_LIMIT_LINES = 100;
 
 /** Don't expand to a symbol larger than this. */
 const EXPANDED_SIZE_CAP_LINES = 300;
@@ -114,6 +114,12 @@ const ENCLOSING_TYPES: Record<string, string[]> = {
 	bash: ["function_definition"],
 };
 
+export interface AncestorSymbol {
+	name: string;
+	kind: string;
+	startLine: number;
+}
+
 export interface ExpandedRead {
 	newOffset: number;
 	newLimit: number;
@@ -123,6 +129,12 @@ export interface ExpandedRead {
 		startLine: number;
 		endLine: number;
 	};
+	/**
+	 * Ancestor symbols from outermost to innermost, not including
+	 * enclosingSymbol itself. Example: [ClassDecl, MethodDecl] when
+	 * the immediate enclosing symbol is an arrow function inside a method.
+	 */
+	ancestry?: AncestorSymbol[];
 	durationMs: number;
 }
 
@@ -160,6 +172,28 @@ function getSymbolName(node: any): string {
 		}
 	}
 	return node.type as string;
+}
+
+/**
+ * Walk parent nodes from `node` upward, collecting every ancestor that is
+ * one of the enclosing symbol types. Returns them outermost-first.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: tree-sitter AST node
+function buildAncestryChain(node: any, types: string[]): AncestorSymbol[] {
+	const chain: AncestorSymbol[] = [];
+	// biome-ignore lint/suspicious/noExplicitAny: tree-sitter parent node
+	let current: any = node.parent;
+	while (current) {
+		if (types.includes(current.type as string)) {
+			chain.push({
+				name: getSymbolName(current),
+				kind: current.type as string,
+				startLine: (current.startPosition?.row ?? 0) + 1,
+			});
+		}
+		current = current.parent;
+	}
+	return chain.reverse(); // outermost first
 }
 
 function withBudget<T>(
@@ -316,6 +350,7 @@ export async function tryExpandRead(
 		if (expandedSize > EXPANDED_SIZE_CAP_LINES) return undefined;
 		if (expandedSize <= requestedLimit) return undefined;
 
+		const ancestry = buildAncestryChain(enclosing, enclosingTypes);
 		return {
 			newOffset: expandedStart,
 			newLimit: expandedSize,
@@ -325,6 +360,7 @@ export async function tryExpandRead(
 				startLine: symbolStart,
 				endLine: symbolEnd,
 			},
+			ancestry: ancestry.length > 0 ? ancestry : undefined,
 			durationMs: Date.now() - startedAt,
 		};
 	} catch {

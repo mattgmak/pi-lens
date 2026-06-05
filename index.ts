@@ -1300,10 +1300,14 @@ export default function (pi: ExtensionAPI) {
 							budgetMs: EXPANSION_BUDGET_MS,
 						},
 					});
+					const symbolPath = [
+						...(expansion.ancestry ?? []).map((a) => a.name),
+						expansion.enclosingSymbol.name,
+					].join(" → ");
 					dbg(
 						`ts expanded read: ${path.basename(filePath)} ` +
 							`lines ${requestedReadOffset}–${requestedReadOffset + requestedReadLimit - 1} ` +
-							`→ ${expansion.enclosingSymbol.name} ` +
+							`→ ${symbolPath} ` +
 							`(${expansion.newOffset}–${expansion.newOffset + expansion.newLimit - 1})`,
 					);
 				}

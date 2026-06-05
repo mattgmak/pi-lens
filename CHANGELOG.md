@@ -4,6 +4,56 @@ All notable changes to pi-lens will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`ast_grep_search` / `ast_grep_replace` structural-intent parameters — `insideKind`, `hasKind`, `follows`, `precedes` (closes #125 Phase 3)** — agents can now express cross-context queries without writing YAML. `insideKind: "function_declaration"` restricts matches to nodes inside that ancestor kind (searches all ancestors via `stopBy: end`); `hasKind` restricts to nodes containing a descendant; `follows`/`precedes` restrict by sibling pattern. Parameters synthesize a YAML rule via `clients/ast-grep-yaml-synth.ts` and route through `sg scan --config`. For `ast_grep_replace`, a `fix:` field is added to the synthesized rule so `sg scan --update-all` applies the rewrite. When `rule:` (Phase 4) is also provided, it takes precedence. 22 new tests covering synthesizer output, constraint combinations, language canonicalisation, routing, and YAML content assertions.
+
+- **`ast_grep_search` raw YAML rule passthrough — `rule` parameter (closes #125 Phase 4)** — passing a complete ast-grep YAML rule bypasses `sg run -p` entirely and routes through `sg scan --config`, unlocking `all`/`any`/`not`, `nthChild`, `regex`, field constraints, and multi-pattern rules. Each path is scanned independently and results are merged. Pagination (`skip`) works the same as the pattern path.
+
+- **`ast_grep_search` and `ast_grep_replace` metavariable captures in output (refs #125)** — named captures (`$VAR`, `$$$ARGS`) from `sg --json=compact` appear below each match. Language field (`[TypeScript]`) surfaced per match.
+
+- **`ast_dump` tool — expose raw tree-sitter AST for pattern debugging (closes #156)** — parses a source snippet with `sg --debug-query=ast|cst` and returns an indented AST tree with 1-indexed line:col positions. Use when `ast_grep_search` returns zero matches and the correct node kind is unknown.
+
+- **`lsp_navigation` symbol-to-column resolution (closes #147)** — omitting `character` and supplying `symbol` resolves the column automatically via word-boundary regex with `symbol#N` occurrence selectors and case-insensitive fallback.
+
+- **`lsp_navigation` `rename_file` operation (closes #148)** — sends `willRenameFiles`, merges workspace edits with primary-server priority and overlap detection, renames on disk, sends `didRenameFiles`.
+
+- **`lsp_navigation` `capabilities` operation (closes #149)** — shows cached server feature map from post-`initialize` state; no LSP round-trip.
+
+- **tree-sitter WASM grammar coverage expanded from 13 to 26 languages (refs #152)** — bash, c_sharp, css, html, json, lua, ocaml, php, swift, toml, vue, yaml, zig added to download script and LANG_MAP. C#, PHP, CSS dispatch rules now active. Read expansion and symbol extraction wired for Java, Kotlin, Dart, Elixir, C, C++, C#, PHP, Swift, Lua, OCaml, Zig, Bash.
+
+- **SgRunner binary resolution extended with platform package and Homebrew fallback (refs #153)** — probes `@ast-grep/cli-{os}-{arch}` npm packages (walking up 5 directory levels) and Homebrew (`brew --prefix ast-grep`) before falling back to auto-install.
+
+- **`ast_grep_search` / `ast_grep_replace` `strictness` parameter** — `smart`/`relaxed`/`ast`/`cst`/`signature`/`template` passed to `sg --strictness`. `relaxed` is the most useful for patterns that miss matches due to optional trailing commas.
+
+- **`ast_grep_search` `skip` pagination** — offsets into large result sets; truncated results include a next-page hint.
+
+- **Read expansion ancestry chain (refs #153)** — `ExpandedRead` now includes `ancestry?: AncestorSymbol[]` (outermost first) so the full structural path is available (e.g. `ReviewManager → runSynthesis`). The session-start debug log now shows the full path instead of just the immediate enclosing symbol.
+
+### Fixed
+
+- **`ast_grep_replace` stale-preview detection** — re-validates pattern before writing; returns `stalePreview` error if files changed since the preview.
+
+- **`oldtext_not_found` messages distinguish content-drift from indentation mismatch (refs #144)** — states explicitly when indentation autopatch already ran and did not fix it.
+
+- **LSP diagnostics version guard (refs #150)** — `waitForDiagnostics` captures a baseline version before `refreshFile`; only accepts a newer `publishDiagnostics`, preventing stale results from prior edits.
+
+- **Lazy `codeAction/resolve` (refs #150)** — resolves lightweight code action objects before applying; falls back silently if server does not support resolve.
+
+- **Workspace edit ordering and overlap detection (refs #150)** — text edits flushed before resource operations; overlapping edits throw a descriptive error.
+
+- **Windows subprocess encoding (garbled tool output)** — `safeSpawnAsync` prefixes Windows shell commands with `chcp 65001 >nul 2>&1 &&` to force UTF-8 code page, eliminating garbled characters in `sg`/`biome`/`ruff` error messages.
+
+- **Thrashing warning scoped to same tool+file pair** — consecutive counter resets when either the tool name or the file path changes; editing different files no longer triggers the warning.
+
+- **Regex S5852 backtracking eliminated** — replaced `(.*?)` with `([^(]*)` and `/\r?\n/` with `/\r\n|\n/` in ast-grep-client and lsp-navigation.
+
+- **`@earendil-works/pi-coding-agent` declared as optional peer dependency** — `devDependencies` retains the explicit version for local dev; install test updated to exclude host-provided peer from the `ERR_MODULE_NOT_FOUND` gate.
+
+### Performance
+
+- **Read expansion limit raised from 60 to 100 lines** — expansion now fires for reads up to 100 lines, making it useful for the typical 80-100 line agent reads that previously fell outside the threshold.
+
 ## [3.8.48] - 2026-06-05
 
 ### Added
