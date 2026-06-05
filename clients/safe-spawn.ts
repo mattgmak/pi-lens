@@ -88,8 +88,12 @@ export async function safeSpawnAsync(
 		// On Windows, use shell mode for .cmd files (like pyright, biome).
 		// Bake args into the command string when shell:true to avoid DEP0190.
 		const isWindows = process.platform === "win32";
+		// On Windows, prefix with `chcp 65001` to force UTF-8 code page for the
+		// cmd.exe session. Without this, tools that output UTF-8 (sg, biome, ruff,
+		// etc.) have their bytes decoded as the system code page (CP850/CP1252/
+		// CP936/CP932), producing garbled characters in stderr error messages.
 		const spawnCmd = isWindows
-			? [command, ...args.map(cmdEscapeArg)].join(" ")
+			? `chcp 65001 >nul 2>&1 && ${[command, ...args.map(cmdEscapeArg)].join(" ")}`
 			: command;
 		const spawnArgs = isWindows ? [] : args;
 		const child = spawn(spawnCmd, spawnArgs, {

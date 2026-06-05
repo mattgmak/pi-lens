@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CacheManager } from "../clients/cache-manager.js";
+import { createMockPi } from "./support/mock-pi.js";
 
 // Mock read-guard for integration tests to avoid dynamic require issues
 vi.mock("../clients/read-guard.js", () => ({
@@ -63,53 +64,6 @@ vi.mock("../clients/read-guard.js", () => ({
 		})(),
 }));
 
-type Handler = (event: any, ctx: any) => unknown;
-
-interface MockPi {
-	registerTool: ReturnType<typeof vi.fn>;
-	registerCommand: ReturnType<typeof vi.fn>;
-	registerFlag: ReturnType<typeof vi.fn>;
-	on: ReturnType<typeof vi.fn>;
-	getFlag: ReturnType<typeof vi.fn>;
-}
-
-function createMockPi(flagOverrides: Record<string, boolean> = {}): {
-	pi: MockPi;
-	handlers: Record<string, Handler[]>;
-	commands: Map<string, { handler?: Handler; description?: string }>;
-} {
-	const handlers: Record<string, Handler[]> = {};
-	const commands = new Map<
-		string,
-		{ handler?: Handler; description?: string }
-	>();
-	const flags = new Map<string, boolean>([
-		["lens-lsp", true],
-		["no-lsp", false],
-		["lens-guard", false],
-		...Object.entries(flagOverrides),
-	]);
-
-	const pi: MockPi = {
-		registerTool: vi.fn(),
-		registerCommand: vi.fn(
-			(name: string, config: { handler?: Handler; description?: string }) => {
-				commands.set(name, config);
-			},
-		),
-		registerFlag: vi.fn((name: string, config: { default?: boolean }) => {
-			if (!flags.has(name) && typeof config?.default === "boolean") {
-				flags.set(name, config.default);
-			}
-		}),
-		on: vi.fn((event: string, handler: Handler) => {
-			(handlers[event] ??= []).push(handler);
-		}),
-		getFlag: vi.fn((name: string) => flags.get(name) ?? false),
-	};
-
-	return { pi, handlers, commands };
-}
 
 describe("index.ts integration", () => {
 	let tmpDir: string;

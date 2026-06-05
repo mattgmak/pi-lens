@@ -13,6 +13,8 @@
 		"lint": "tsc --project tsconfig.json",
 		"watch": "tsc --watch",
 		"test": "vitest run",
+		"test:unit": "vitest run --ignore tests/index-integration.test.ts --ignore tests/clients/lsp/integration.test.ts",
+		"test:integration": "vitest run tests/index-integration.test.ts tests/clients/lsp/integration.test.ts",
 		"test:watch": "vitest",
 		"check": "node scripts/check-extensions.mjs",
 		"audit:tree-sitter": "node scripts/audit-tree-sitter-rules.mjs",
