@@ -494,6 +494,20 @@ function scheduleStartupScans(
 		dbg(`session_start call-graph: built ${callGraph.edges.length} edges, ${callGraph.callers.size} callee entries (${Date.now() - startMs}ms)`);
 	});
 
+	// codebase-model — build mental model from call graph (internal-only until validated)
+	runTask("codebase-model", async () => {
+		if (!runtime.isCurrentSession(sessionGeneration)) return;
+		if (!runtime.callGraph) return; // call-graph task may not have completed yet
+		const { buildCodebaseModel, saveCodebaseModel } = await import("./codebase-model.js");
+		const model = buildCodebaseModel(runtime.callGraph, analysisRoot);
+		saveCodebaseModel(snapshotRoot, model);
+		const top3 = model.entries.slice(0, 3).map((e) => e.name).join(", ");
+		dbg(
+			`session_start codebase-model: ${model.entries.length} entries, ` +
+			`${model.totalTokens} tokens, top symbols: ${top3 || "(none)"}`,
+		);
+	});
+
 	// ast-grep — export scan for duplicate detection
 	runTask("ast-grep-exports", async () => {
 		if (await astGrepClient.ensureAvailable()) {
