@@ -87,6 +87,54 @@ describe("ast_grep_search tool", () => {
 		expect(search).not.toHaveBeenCalled();
 	});
 
+	describe("structural-intent parameters (Phase 3)", () => {
+		it("routes to searchWithRule when insideKind is set", async () => {
+			const searchWithRule = vi.fn().mockResolvedValue({ matches: [], totalMatches: 0 });
+			const search = vi.fn();
+			const tool = createAstGrepSearchTool(makeClient({ searchWithRule, search }));
+			await tool.execute(
+				"s1",
+				{ pattern: "console.log($MSG)", lang: "typescript", insideKind: "function_declaration" },
+				new AbortController().signal,
+				null,
+				{ cwd: "." },
+			);
+			expect(searchWithRule).toHaveBeenCalledOnce();
+			expect(search).not.toHaveBeenCalled();
+		});
+
+		it("synthesized YAML contains insideKind", async () => {
+			const searchWithRule = vi.fn().mockResolvedValue({ matches: [], totalMatches: 0 });
+			const tool = createAstGrepSearchTool(makeClient({ searchWithRule }));
+			await tool.execute(
+				"s2",
+				{ pattern: "foo($X)", lang: "typescript", insideKind: "method_definition" },
+				new AbortController().signal,
+				null,
+				{ cwd: "." },
+			);
+			const calledYaml = searchWithRule.mock.calls[0][0] as string;
+			expect(calledYaml).toContain("inside:");
+			expect(calledYaml).toContain("method_definition");
+			expect(calledYaml).toContain("stopBy: end");
+		});
+
+		it("routes to normal search when no structural params", async () => {
+			const searchWithRule = vi.fn();
+			const search = vi.fn().mockResolvedValue({ matches: [] });
+			const tool = createAstGrepSearchTool(makeClient({ searchWithRule, search }));
+			await tool.execute(
+				"s3",
+				{ pattern: "foo($X)", lang: "typescript" },
+				new AbortController().signal,
+				null,
+				{ cwd: "." },
+			);
+			expect(search).toHaveBeenCalledOnce();
+			expect(searchWithRule).not.toHaveBeenCalled();
+		});
+	});
+
 	describe("rule parameter (Phase 4 YAML passthrough)", () => {
 		it("routes to searchWithRule when rule is provided", async () => {
 			const searchWithRule = vi.fn().mockResolvedValue({ matches: [], totalMatches: 0 });

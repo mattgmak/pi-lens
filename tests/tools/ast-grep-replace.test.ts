@@ -5,6 +5,7 @@ function makeClient(overrides: Partial<Parameters<typeof createAstGrepReplaceToo
 	return {
 		ensureAvailable: async () => true,
 		replace: vi.fn().mockResolvedValue({ matches: [] }),
+		replaceWithRule: vi.fn().mockResolvedValue({ matches: [], totalMatches: 0, applied: false }),
 		formatMatches: () => "",
 		...overrides,
 	} as Parameters<typeof createAstGrepReplaceTool>[0];
@@ -90,6 +91,54 @@ describe("ast_grep_replace tool", () => {
 			false,
 			expect.anything(),
 		);
+	});
+
+	describe("structural-intent parameters (Phase 3)", () => {
+		it("routes to replaceWithRule when insideKind is set", async () => {
+			const replaceWithRule = vi.fn().mockResolvedValue({ matches: [], totalMatches: 0, applied: false });
+			const replace = vi.fn();
+			const tool = createAstGrepReplaceTool(makeClient({ replaceWithRule, replace }));
+			await tool.execute(
+				"r1",
+				{ pattern: "var $X", rewrite: "let $X", lang: "typescript", insideKind: "function_declaration" },
+				new AbortController().signal,
+				null,
+				{ cwd: "." },
+			);
+			expect(replaceWithRule).toHaveBeenCalledOnce();
+			expect(replace).not.toHaveBeenCalled();
+		});
+
+		it("synthesized YAML includes fix field", async () => {
+			const replaceWithRule = vi.fn().mockResolvedValue({ matches: [], totalMatches: 0, applied: false });
+			const tool = createAstGrepReplaceTool(makeClient({ replaceWithRule }));
+			await tool.execute(
+				"r2",
+				{ pattern: "var $X", rewrite: "let $X", lang: "javascript", insideKind: "function_declaration" },
+				new AbortController().signal,
+				null,
+				{ cwd: "." },
+			);
+			const calledYaml = replaceWithRule.mock.calls[0][0] as string;
+			expect(calledYaml).toContain("fix:");
+			expect(calledYaml).toContain("let $X");
+			expect(calledYaml).toContain("inside:");
+		});
+
+		it("routes to normal replace when no structural params", async () => {
+			const replaceWithRule = vi.fn();
+			const replace = vi.fn().mockResolvedValue({ matches: [] });
+			const tool = createAstGrepReplaceTool(makeClient({ replaceWithRule, replace }));
+			await tool.execute(
+				"r3",
+				{ pattern: "var $X", rewrite: "let $X", lang: "typescript" },
+				new AbortController().signal,
+				null,
+				{ cwd: "." },
+			);
+			expect(replace).toHaveBeenCalledOnce();
+			expect(replaceWithRule).not.toHaveBeenCalled();
+		});
 	});
 
 	it("applies changes when apply=true", async () => {

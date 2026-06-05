@@ -46,7 +46,28 @@ Use `$$$` when you don't need the captured value; `$$$NAME` when you do.
 | `import { $NAMES } from $PATH` | named import (no quotes on path) |
 | `const $X = $Y` | variable declaration |
 
-### Composite (has/inside)
+### Structural-intent parameters (preferred for cross-context queries)
+
+Use these instead of writing raw YAML:
+
+| Parameter | What it does |
+|---|---|
+| `insideKind` | Only match inside an ancestor of this node kind |
+| `hasKind` | Only match nodes that contain a descendant of this kind |
+| `follows` | Only match nodes preceded by a sibling matching this pattern |
+| `precedes` | Only match nodes followed by a sibling matching this pattern |
+
+```
+# console.log only inside functions
+ast_grep_search pattern="console.log($MSG)" lang="typescript" insideKind="function_declaration"
+
+# replace var with let, scoped to functions only
+ast_grep_replace pattern="var $X" rewrite="let $X" lang="javascript" insideKind="function_declaration"
+```
+
+These synthesize a YAML rule automatically. Use `rule:` for the full DSL when you need `all`/`any`/`not`, `nthChild`, `regex`, or other advanced constraints.
+
+### Composite (has/inside) in raw YAML
 
 ```yaml
 # console.log inside a class method

@@ -11,6 +11,7 @@ import {
 	logAstGrepToolEvent,
 	type AstGrepToolOutcome,
 } from "../clients/ast-grep-tool-logger.js";
+import { hasStructuralIntent, synthesizeRule } from "../clients/ast-grep-yaml-synth.js";
 import { LANGUAGES } from "./shared.js";
 
 function lineCount(value: string): number {
@@ -156,10 +157,34 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 					description: "Show N lines before/after each match for context",
 				}),
 			),
+			insideKind: Type.Optional(
+				Type.String({
+					description:
+						"Restrict matches to nodes inside an ancestor of this AST node kind. Example: `insideKind: \"function_declaration\"` finds the pattern only when it appears inside a function body. Searches all ancestors (stopBy: end), not just the immediate parent. Synthesizes a YAML rule — takes precedence over `selector` and `strictness`.",
+				}),
+			),
+			hasKind: Type.Optional(
+				Type.String({
+					description:
+						"Restrict matches to nodes that contain a descendant of this AST node kind. Example: `hasKind: \"await_expression\"` finds the pattern only when it contains an await inside it.",
+				}),
+			),
+			follows: Type.Optional(
+				Type.String({
+					description:
+						"Restrict matches to nodes that immediately follow a sibling matching this pattern. Example: `follows: \"return $X\"` finds the pattern only when preceded by a return statement.",
+				}),
+			),
+			precedes: Type.Optional(
+				Type.String({
+					description:
+						"Restrict matches to nodes that immediately precede a sibling matching this pattern.",
+				}),
+			),
 			rule: Type.Optional(
 				Type.String({
 					description:
-						"Raw ast-grep YAML rule. When provided, routes through `sg scan --config` instead of `sg run -p`, unlocking the full rule DSL: `inside`, `has`, `follows`, `precedes`, `stopBy`, constraints, and multi-pattern rules. Takes precedence over `pattern`. The YAML must include `id` and `language` fields. `selector`, `context`, and `strictness` are ignored when `rule` is set.",
+						"Raw ast-grep YAML rule. When provided, routes through `sg scan --config` instead of `sg run -p`, unlocking the full rule DSL. Takes precedence over `pattern` and structural-intent params. The YAML must include `id` and `language` fields.",
 				}),
 			),
 			skip: Type.Optional(
@@ -184,7 +209,8 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 			ctx: { cwd?: string },
 		) {
 			const startedAt = Date.now();
-			const { pattern, paths, selector, context, skip, strictness, rule } = params as {
+			const { pattern, paths, selector, context, skip, strictness, rule,
+				insideKind, hasKind, follows, precedes } = params as {
 				pattern: string;
 				lang: string;
 				paths?: string[];
@@ -193,6 +219,10 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 				skip?: number;
 				strictness?: string;
 				rule?: string;
+				insideKind?: string;
+				hasKind?: string;
+				follows?: string;
+				precedes?: string;
 			};
 			const skipOffset = Math.max(0, Math.floor(skip ?? 0));
 			const lang = ((params as { lang: string }).lang ?? "").replace(
@@ -267,9 +297,24 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 			const searchPaths = paths?.length ? paths : [ctx.cwd || "."];
 			const PAGE_SIZE = 50;
 
+			// Phase 3: synthesize YAML from structural-intent params
+			let effectiveRule = rule;
+			if (!effectiveRule && hasStructuralIntent({ insideKind, hasKind, follows, precedes })) {
+				try {
+					effectiveRule = synthesizeRule({ pattern, lang, insideKind, hasKind, follows, precedes });
+				} catch (err) {
+					logOutcome("error", { errorRaw: String(err) });
+					return {
+						content: [{ type: "text" as const, text: `Error synthesizing rule: ${err}` }],
+						isError: true,
+						details: {},
+					};
+				}
+			}
+
 			// Phase 4: raw YAML rule passthrough — routes through sg scan --config
-			if (rule && rule.trim().length > 0) {
-				const ruleResult = await astGrepClient.searchWithRule(rule, searchPaths);
+			if (effectiveRule && effectiveRule.trim().length > 0) {
+				const ruleResult = await astGrepClient.searchWithRule(effectiveRule, searchPaths);
 				if (ruleResult.error) {
 					logOutcome("error", { errorRaw: ruleResult.error });
 					return {

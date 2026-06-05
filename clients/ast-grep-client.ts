@@ -108,6 +108,41 @@ export class AstGrepClient {
 	}
 
 	/**
+	 * Replace using a raw YAML rule that includes a `fix:` field (Phase 3/4 of #125).
+	 * Dry-run returns matches for preview; apply writes fixes to disk.
+	 */
+	async replaceWithRule(
+		ruleYaml: string,
+		paths: string[],
+		apply: boolean,
+	): Promise<{
+		matches: AstGrepMatch[];
+		totalMatches: number;
+		applied: boolean;
+		stalePreview?: boolean;
+		error?: string;
+	}> {
+		const allMatches: AstGrepMatch[] = [];
+		for (const scanPath of paths) {
+			if (apply) {
+				// Stale-preview check: dry-run first
+				const preCheck = await this.runner.tempScanAsync(scanPath, "agent-rule", ruleYaml);
+				if (preCheck.length === 0) {
+					return { matches: [], totalMatches: 0, applied: false, stalePreview: true };
+				}
+			}
+			const result = await this.runner.tempScanWithFixAsync(
+				scanPath, "agent-rule", ruleYaml, apply,
+			);
+			if (result.error) {
+				return { matches: allMatches, totalMatches: allMatches.length, applied: false, error: result.error };
+			}
+			allMatches.push(...result.matches);
+		}
+		return { matches: allMatches, totalMatches: allMatches.length, applied: apply };
+	}
+
+	/**
 	 * Search using a raw YAML rule (Phase 4 of #125).
 	 * Routes through sg scan --config rather than sg run -p.
 	 * Each path is scanned independently; results are merged.

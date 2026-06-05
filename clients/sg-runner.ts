@@ -491,6 +491,54 @@ export class SgRunner {
 	}
 
 	/**
+	 * Run a rule scan with optional fix application.
+	 * Dry-run: --json (returns matches for preview).
+	 * Apply:   --update-all (writes fixes defined in the YAML `fix:` field).
+	 */
+	async tempScanWithFixAsync(
+		dir: string,
+		ruleId: string,
+		ruleYaml: string,
+		applyFixes: boolean,
+		timeout = 30000,
+	): Promise<{ matches: SgMatch[]; error?: string }> {
+		const { sessionDir, configFile } = this.prepareTempScan(ruleId, ruleYaml);
+		try {
+			const { cmd: sgCmd, args: sgPre } = getSgCommand();
+			if (!applyFixes) {
+				const result = await safeSpawnAsync(
+					sgCmd,
+					[...sgPre, "scan", "--config", configFile, "--json",
+						...sgExcludeArgsForProject(dir), dir],
+					{ timeout },
+				);
+				return { matches: this.parseScanOutput(result.stdout || result.stderr || "") };
+			}
+			// Apply: write fixes then collect what changed via a second json pass
+			const applyResult = await safeSpawnAsync(
+				sgCmd,
+				[...sgPre, "scan", "--config", configFile, "--update-all",
+					...sgExcludeArgsForProject(dir), dir],
+				{ timeout },
+			);
+			if (applyResult.error) {
+				return { matches: [], error: applyResult.error.message };
+			}
+			const jsonResult = await safeSpawnAsync(
+				sgCmd,
+				[...sgPre, "scan", "--config", configFile, "--json",
+					...sgExcludeArgsForProject(dir), dir],
+				{ timeout },
+			);
+			return { matches: this.parseScanOutput(jsonResult.stdout || jsonResult.stderr || "") };
+		} catch (err) {
+			return { matches: [], error: String(err) };
+		} finally {
+			this.cleanupTempScan(sessionDir);
+		}
+	}
+
+	/**
 	 * Format matches for display
 	 */
 	formatMatches(
