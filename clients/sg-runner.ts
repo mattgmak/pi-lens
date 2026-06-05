@@ -138,8 +138,8 @@ export class SgRunner {
 	}
 
 	private async doEnsureAvailable(): Promise<boolean> {
-		// Check PATH first. Prefer the canonical ast-grep binary; on Linux,
-		// /usr/bin/sg is the util-linux group-switch command and is not ast-grep.
+		// Step 1: PATH — canonical binary names + npx fallback.
+		// Prefer ast-grep over sg on Linux: /usr/bin/sg is util-linux, not ast-grep.
 		const pathCommand = await this.probeCommandCandidates([
 			{ cmd: "ast-grep", argsPrefix: [] },
 			{ cmd: "sg", argsPrefix: [] },
@@ -149,11 +149,35 @@ export class SgRunner {
 			this.sgPath = pathCommand.cmd;
 			this.sgArgsPrefix = pathCommand.argsPrefix;
 			this.available = true;
-			this.log(`ast-grep found: ${pathCommand.cmd}`);
+			this.log(`ast-grep found on PATH: ${pathCommand.cmd}`);
 			return true;
 		}
 
-		// Auto-install via pi-lens installer
+		// Step 2: platform-specific npm package binaries.
+		// Covers setups where @ast-grep/cli-{os}-{arch} is installed but the binary
+		// directory is not on PATH (common with pnpm, Yarn PnP, or isolated installs).
+		const platformBinary = await this.probePlatformPackageBinary();
+		if (platformBinary) {
+			this.sgPath = platformBinary;
+			this.sgArgsPrefix = [];
+			this.available = true;
+			this.log(`ast-grep found via platform package: ${platformBinary}`);
+			return true;
+		}
+
+		// Step 3: Homebrew (macOS only).
+		if (process.platform === "darwin") {
+			const brewBinary = await this.probeHomebrew();
+			if (brewBinary) {
+				this.sgPath = brewBinary;
+				this.sgArgsPrefix = [];
+				this.available = true;
+				this.log(`ast-grep found via Homebrew: ${brewBinary}`);
+				return true;
+			}
+		}
+
+		// Step 4: auto-install via pi-lens installer.
 		this.log("ast-grep not found, attempting auto-install...");
 		const { ensureTool } = await import("./installer/index.js");
 		const installedPath = await ensureTool("ast-grep");
@@ -168,6 +192,73 @@ export class SgRunner {
 
 		this.available = false;
 		return false;
+	}
+
+	/**
+	 * Probe platform-specific @ast-grep/cli-{os}-{arch} npm packages.
+	 * These ship the binary at the package root (sg / sg.exe).
+	 */
+	private async probePlatformPackageBinary(): Promise<string | undefined> {
+		const { platform, arch } = process;
+		const exeName = platform === "win32" ? "sg.exe" : "sg";
+
+		// Map Node.js platform/arch to @ast-grep/cli package suffix.
+		const pkgSuffixes: string[] = [];
+		if (platform === "linux" && arch === "x64") pkgSuffixes.push("linux-x64-gnu");
+		if (platform === "linux" && arch === "arm64") pkgSuffixes.push("linux-arm64-gnu");
+		if (platform === "darwin" && arch === "arm64") pkgSuffixes.push("darwin-arm64");
+		if (platform === "darwin" && arch === "x64") pkgSuffixes.push("darwin-x64");
+		if (platform === "win32" && arch === "x64") pkgSuffixes.push("win32-x64-msvc");
+		if (platform === "win32" && arch === "arm64") pkgSuffixes.push("win32-arm64-msvc");
+
+		// Search roots: local node_modules and any parent node_modules directories.
+		const searchRoots: string[] = [];
+		let dir = process.cwd();
+		for (let depth = 0; depth < 5; depth++) {
+			searchRoots.push(path.join(dir, "node_modules"));
+			const parent = path.dirname(dir);
+			if (parent === dir) break;
+			dir = parent;
+		}
+
+		for (const suffix of pkgSuffixes) {
+			const pkgName = `@ast-grep/cli-${suffix}`;
+			for (const root of searchRoots) {
+				const candidate = path.join(root, pkgName, exeName);
+				try {
+					if (fs.existsSync(candidate) && (await this.probeCommand(candidate, []))) {
+						return candidate;
+					}
+				} catch {
+					// not found or not executable — try next
+				}
+			}
+		}
+		return undefined;
+	}
+
+	/**
+	 * Probe Homebrew installation (macOS only).
+	 * Runs `brew --prefix ast-grep` and checks the resulting bin directory.
+	 */
+	private async probeHomebrew(): Promise<string | undefined> {
+		try {
+			const result = await safeSpawnAsync("brew", ["--prefix", "ast-grep"], {
+				timeout: 3000,
+			});
+			if (result.error || result.status !== 0) return undefined;
+			const prefix = result.stdout.trim();
+			if (!prefix) return undefined;
+			for (const name of ["ast-grep", "sg"]) {
+				const candidate = path.join(prefix, "bin", name);
+				if (fs.existsSync(candidate) && (await this.probeCommand(candidate, []))) {
+					return candidate;
+				}
+			}
+		} catch {
+			// brew not installed or timed out
+		}
+		return undefined;
 	}
 
 	/**
