@@ -951,23 +951,25 @@ describe("oxfmt formatter — detection and policy selection", () => {
 
 	it.each(
 		oxfmtExtensionFiles,
-	)("selects oxfmt for %s when oxfmt.toml is present", async (fileName) => {
+	)("includes oxfmt for %s when oxfmt.toml is present", async (fileName) => {
 		createTempFile(tmpDir, "oxfmt.toml", "# oxfmt config\n");
 		const formatters = await getFormattersForFile(
 			fileIn(tmpDir, fileName),
 			tmpDir,
 		);
-		expect(formatters.map((f) => f.name)).toEqual(["oxfmt"]);
+		// Some extensions also have other formatters with defaultWhenUnconfigured:true
+		// (e.g. prettier for yaml/html/graphql). Assert oxfmt is included, not sole.
+		expect(formatters.map((f) => f.name)).toContain("oxfmt");
 	});
 
 	it.each(
 		oxfmtExtensionFiles,
-	)("selects oxfmt for %s when .oxfmtrc.json is present", async (fileName) => {
+	)("includes oxfmt for %s when .oxfmtrc.json is present", async (fileName) => {
 		createTempFile(tmpDir, ".oxfmtrc.json", "{}\n");
 		const formatters = await getFormattersForFile(
 			fileIn(tmpDir, fileName),
 			tmpDir,
 		);
-		expect(formatters.map((f) => f.name)).toEqual(["oxfmt"]);
+		expect(formatters.map((f) => f.name)).toContain("oxfmt");
 	});
 });

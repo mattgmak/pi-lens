@@ -151,6 +151,15 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		},
 	],
 	[
+		".vue",
+		{
+			formatterNames: ["prettier", "oxfmt"],
+			defaultFormatter: "prettier",
+			defaultWhenUnconfigured: false,
+			gate: "config-first",
+		},
+	],
+	[
 		".less",
 		{
 			formatterNames: ["prettier", "oxfmt"],
