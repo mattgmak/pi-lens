@@ -429,7 +429,9 @@ function pickLocalSymbolLocation(
 
 function workspaceSymbolDedupeKey(symbol: SymbolNode): string {
 	const location = symbol.location;
-	const start = rangeStart(location?.range ?? symbol.range ?? symbol.selectionRange);
+	const start = rangeStart(
+		location?.range ?? symbol.range ?? symbol.selectionRange,
+	);
 	return [
 		symbol.name ?? "",
 		symbol.detail ?? "",
@@ -480,7 +482,9 @@ function formatCapabilities(
 			: "No active LSP servers in this session.";
 	}
 
-	const rows: Array<[string, (snapshot: CapabilitySnapshot) => boolean, string?]> = [
+	const rows: Array<
+		[string, (snapshot: CapabilitySnapshot) => boolean, string?]
+	> = [
 		["definition", (s) => !!s.operationSupport.definition],
 		["references", (s) => !!s.operationSupport.references],
 		["hover", (s) => !!s.operationSupport.hover],
@@ -507,7 +511,9 @@ function formatCapabilities(
 		lines.push(label);
 		for (const [name, supported, note] of rows) {
 			const suffix = note ? `  (${note})` : "";
-			lines.push(`  ${name.padEnd(22)} ${supported(snapshot) ? "✓" : "✗"}${suffix}`);
+			lines.push(
+				`  ${name.padEnd(22)} ${supported(snapshot) ? "✓" : "✗"}${suffix}`,
+			);
 		}
 	}
 	return lines.join("\n");
@@ -1198,10 +1204,11 @@ export function createLspNavigationTool(
 									query ?? "",
 									filePath,
 								);
-								const retrySymbols = (Array.isArray(retryRaw)
-									? retryRaw
-									: [retryRaw]
-								).filter((s) => typeof s === "object" && s !== null) as SymbolNode[];
+								const retrySymbols = (
+									Array.isArray(retryRaw) ? retryRaw : [retryRaw]
+								).filter(
+									(s) => typeof s === "object" && s !== null,
+								) as SymbolNode[];
 								return dedupeWorkspaceSymbols(retrySymbols);
 							}
 							throw err;

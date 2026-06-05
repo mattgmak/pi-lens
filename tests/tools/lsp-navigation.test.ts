@@ -82,10 +82,18 @@ describe("lsp_navigation tool", () => {
 		);
 
 		expect(result.isError).toBeUndefined();
-		expect(String(result.content[0]?.text)).toContain("typescript (/workspace)");
-		expect(String(result.content[0]?.text)).toContain("definition             ✓");
-		expect(String(result.content[0]?.text)).toContain("signatureHelp          ✗");
-		expect(String(result.content[0]?.text)).toContain("rename_file            ✗  (not implemented yet (#148))");
+		expect(String(result.content[0]?.text)).toContain(
+			"typescript (/workspace)",
+		);
+		expect(String(result.content[0]?.text)).toContain(
+			"definition             ✓",
+		);
+		expect(String(result.content[0]?.text)).toContain(
+			"signatureHelp          ✗",
+		);
+		expect(String(result.content[0]?.text)).toContain(
+			"rename_file            ✗  (not implemented yet (#148))",
+		);
 		expect(result.details?.servers).toEqual(["typescript"]);
 	});
 

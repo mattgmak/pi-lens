@@ -442,10 +442,14 @@ export function stripDiagnosticNoiseLines(message: string): string {
 
 function normalizeLspDiagnostic(diagnostic: LSPDiagnostic): LSPDiagnostic {
 	const message = stripDiagnosticNoiseLines(diagnostic.message);
-	return message === diagnostic.message ? diagnostic : { ...diagnostic, message };
+	return message === diagnostic.message
+		? diagnostic
+		: { ...diagnostic, message };
 }
 
-function normalizeLspDiagnostics(diagnostics: LSPDiagnostic[]): LSPDiagnostic[] {
+function normalizeLspDiagnostics(
+	diagnostics: LSPDiagnostic[],
+): LSPDiagnostic[] {
 	return diagnostics.map(normalizeLspDiagnostic);
 }
 
