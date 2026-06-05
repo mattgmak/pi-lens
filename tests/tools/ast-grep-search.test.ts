@@ -5,6 +5,7 @@ function makeClient(overrides: Partial<Parameters<typeof createAstGrepSearchTool
 	return {
 		ensureAvailable: async () => true,
 		search: vi.fn().mockResolvedValue({ matches: [] }),
+		searchWithRule: vi.fn().mockResolvedValue({ matches: [], totalMatches: 0 }),
 		formatMatches: () => "",
 		...overrides,
 	} as Parameters<typeof createAstGrepSearchTool>[0];
@@ -84,6 +85,74 @@ describe("ast_grep_search tool", () => {
 			"expects a valid AST code pattern",
 		);
 		expect(search).not.toHaveBeenCalled();
+	});
+
+	describe("rule parameter (Phase 4 YAML passthrough)", () => {
+		it("routes to searchWithRule when rule is provided", async () => {
+			const searchWithRule = vi.fn().mockResolvedValue({ matches: [], totalMatches: 0 });
+			const search = vi.fn();
+			const tool = createAstGrepSearchTool(makeClient({ searchWithRule, search }));
+			await tool.execute(
+				"r1",
+				{
+					pattern: "ignored",
+					lang: "typescript",
+					rule: "id: my-rule\nlanguage: TypeScript\nrule:\n  kind: call_expression",
+				},
+				new AbortController().signal,
+				null,
+				{ cwd: "." },
+			);
+			expect(searchWithRule).toHaveBeenCalledOnce();
+			expect(search).not.toHaveBeenCalled();
+		});
+
+		it("rule takes precedence over pattern when both are supplied", async () => {
+			const searchWithRule = vi.fn().mockResolvedValue({ matches: [], totalMatches: 0 });
+			const search = vi.fn();
+			const tool = createAstGrepSearchTool(makeClient({ searchWithRule, search }));
+			await tool.execute(
+				"r2",
+				{ pattern: "console.log($X)", lang: "typescript", rule: "id: r\nlanguage: TypeScript\nrule:\n  kind: call_expression" },
+				new AbortController().signal,
+				null,
+				{ cwd: "." },
+			);
+			expect(searchWithRule).toHaveBeenCalledOnce();
+			expect(search).not.toHaveBeenCalled();
+		});
+
+		it("surfaces searchWithRule errors as isError result", async () => {
+			const tool = createAstGrepSearchTool(
+				makeClient({ searchWithRule: vi.fn().mockResolvedValue({ matches: [], totalMatches: 0, error: "invalid yaml" }) }),
+			);
+			const result = await tool.execute(
+				"r3",
+				// pattern must pass the YAML-guard; rule takes precedence afterward
+				{ pattern: "foo($X)", lang: "typescript", rule: "bad yaml {{{" },
+				new AbortController().signal,
+				null,
+				{ cwd: "." },
+			);
+			expect(result.isError).toBe(true);
+			expect(String(result.content[0].text)).toContain("invalid yaml");
+		});
+
+		it("passes paths to searchWithRule", async () => {
+			const searchWithRule = vi.fn().mockResolvedValue({ matches: [], totalMatches: 0 });
+			const tool = createAstGrepSearchTool(makeClient({ searchWithRule }));
+			await tool.execute(
+				"r4",
+				{ pattern: "foo($X)", lang: "typescript", rule: "id: r\nlanguage: TypeScript\nrule:\n  kind: call_expression", paths: ["src/"] },
+				new AbortController().signal,
+				null,
+				{ cwd: "." },
+			);
+			expect(searchWithRule).toHaveBeenCalledWith(
+				expect.any(String),
+				["src/"],
+			);
+		});
 	});
 
 	it("runs ast-grep for valid AST patterns", async () => {

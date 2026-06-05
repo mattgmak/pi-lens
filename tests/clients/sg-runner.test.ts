@@ -221,6 +221,57 @@ describe("SgRunner", () => {
 			expect(result.output).toBe("");
 		});
 
+		it("includes [Language] suffix in formatMatches when language field is present", async () => {
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const runner = new SgRunner();
+			const matches = [
+				{
+					file: "src/foo.ts",
+					range: { start: { line: 0, column: 0 }, end: { line: 0, column: 10 } },
+					text: "console.log(x)",
+					language: "TypeScript",
+				},
+			];
+			const output = runner.formatMatches(matches as any);
+			expect(output).toContain("[TypeScript]");
+			expect(output).toContain("src/foo.ts:1:1");
+		});
+
+		it("omits language suffix when language field is absent", async () => {
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const runner = new SgRunner();
+			const matches = [
+				{
+					file: "src/foo.ts",
+					range: { start: { line: 0, column: 0 }, end: { line: 0, column: 10 } },
+					text: "console.log(x)",
+				},
+			];
+			const output = runner.formatMatches(matches as any);
+			expect(output).not.toContain("[");
+		});
+
+		it("shows metavar captures below match line", async () => {
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const runner = new SgRunner();
+			const matches = [
+				{
+					file: "src/foo.ts",
+					range: { start: { line: 0, column: 0 }, end: { line: 0, column: 20 } },
+					text: "console.log(msg)",
+					language: "TypeScript",
+					metaVariables: {
+						single: { MSG: { text: "msg", range: { start: { line: 0, column: 12 }, end: { line: 0, column: 15 } } } },
+						multi: {},
+						transformed: {},
+					},
+				},
+			];
+			const output = runner.formatMatches(matches as any);
+			expect(output).toContain("[TypeScript]");
+			expect(output).toContain("$MSG=msg");
+		});
+
 		it("passes command args through to safeSpawn", async () => {
 			safeSpawn.mockReturnValue({
 				status: 0,
