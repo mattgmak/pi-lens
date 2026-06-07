@@ -202,6 +202,46 @@ function resolveToolCallFilePath(
 	return path.resolve(cwd ?? projectRoot, rawFilePath);
 }
 
+/**
+ * Extract file paths that were explicitly read by bash/grep/find commands.
+ * Only returns paths that exist on disk and are not directories.
+ * Conservative: only handles unambiguous read-only patterns.
+ */
+export function extractReadPathsFromCommand(
+	command: string,
+	cwd: string,
+): string[] {
+	const results = new Set<string>();
+
+	const resolve = (p: string) => {
+		const abs = path.isAbsolute(p) ? p : path.resolve(cwd, p);
+		try {
+			const stat = nodeFs.statSync(abs);
+			if (stat.isFile()) results.add(abs);
+		} catch {
+			// ignore non-existent / non-accessible
+		}
+	};
+
+	// cat / head / tail / sed -n / awk — positional file args
+	// Matches: cat foo.ts, head -20 foo.ts, tail -n 10 foo.ts, sed -n '1,50p' foo.ts
+	const catLike =
+		/\b(?:cat|head|tail|sed|awk)(?:\s+(?:-[^\s]+\s+)*)(\S+\.(?:ts|tsx|js|jsx|py|sh|rs|go|cs|java|kt|rb|php|c|cpp|h|json|yaml|yml|toml|md|txt|env|cfg|conf|ini|html|css|scss|xml|sql))\b/g;
+	for (const m of command.matchAll(catLike)) resolve(m[1]);
+
+	// grep -n pattern file / grep -rn ... file — last non-flag, non-pattern arg
+	// Only handles single-file grep (not recursive -r without explicit path, to avoid false positives)
+	const grepSingle =
+		/\bgrep\b(?:\s+-[^\s]+)*\s+(?:'[^']*'|"[^"]*"|\S+)\s+(\S+\.(?:ts|tsx|js|jsx|py|sh|rs|go|cs|java|kt|rb|php|c|cpp|h|json|yaml|yml|toml|md|txt|env|cfg|conf|ini|html|css|scss|xml|sql))(?:\s|$)/g;
+	for (const m of command.matchAll(grepSingle)) resolve(m[1]);
+
+	// Absolute paths referenced in any command (e.g. sed -n '1p' /abs/path/file.ts)
+	const absPaths = /(\/[\w./-]+\.(?:ts|tsx|js|jsx|py|sh|rs|go|cs|java|kt|rb|php|c|cpp|h|json|yaml|yml|toml|md|txt|env|cfg|conf|ini|html|css|scss|xml|sql))\b/g;
+	for (const m of command.matchAll(absPaths)) resolve(m[1]);
+
+	return Array.from(results);
+}
+
 type ReadToolInput = {
 	path?: string;
 	filePath?: string;
@@ -1381,6 +1421,39 @@ export default function (pi: ExtensionAPI) {
 				writeIndex: runtime.peekWriteIndex(),
 				timestamp: Date.now(),
 			});
+		}
+
+		// --- Read-Before-Edit Guard: register bash/grep/find/sed reads ---
+		if (
+			(toolName === "bash" || toolName === "grep" || toolName === "find") &&
+			!getLensFlag("no-read-guard")
+		) {
+			const cmd =
+				typeof (event.input as Record<string, unknown>)?.command === "string"
+					? ((event.input as Record<string, unknown>).command as string)
+					: typeof (event.input as Record<string, unknown>)?.pattern === "string"
+						? ((event.input as Record<string, unknown>).pattern as string)
+						: "";
+			if (cmd) {
+				const effectiveCwd = ctx.cwd ?? runtime.projectRoot ?? process.cwd();
+				const readPaths = extractReadPathsFromCommand(cmd, effectiveCwd);
+				for (const rp of readPaths) {
+					if (isPathIgnoredByProject(rp, runtime.projectRoot, false)) continue;
+					if (isExternalOrVendorFile(rp, runtime.projectRoot)) continue;
+					const lineCount = countFileLines(rp);
+					runtime.readGuard.recordRead({
+						filePath: rp,
+						requestedOffset: 1,
+						requestedLimit: lineCount,
+						effectiveOffset: 1,
+						effectiveLimit: lineCount,
+						expandedByLsp: false,
+						turnIndex: runtime.turnIndex,
+						writeIndex: runtime.peekWriteIndex(),
+						timestamp: Date.now(),
+					});
+				}
+			}
 		}
 
 		const { complexityClient } = await loadBootstrapClients();
