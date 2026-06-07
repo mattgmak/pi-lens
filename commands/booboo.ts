@@ -570,6 +570,9 @@ export async function handleBooboo(
 		return { findings: 0, status: "done" };
 	});
 
+	// TODO(#173): migrate this tree-sitter/fact-rule project scan to consume
+	// clients/project-diagnostics/scanner.ts once the Markdown report renderer can
+	// group normalized ProjectDiagnostic records into the richer booboo sections.
 	// Runner 4: Tree-sitter patterns — language-aware, driven by .yml rule files
 	// Uses the same queryLoader + singleton client as the per-write dispatch runner.
 	// Covers all languages: TypeScript, JavaScript, Python, Go, Rust, Ruby.
@@ -1711,4 +1714,3 @@ ${fullReport.join("\n")}`;
 		ctx.ui.notify(summaryLines.join("\n"), "info");
 	}
 }
-

@@ -14,6 +14,12 @@ import { Type } from "typebox";
 import { getLSPService } from "../clients/lsp/index.js";
 import type { LSPDiagnostic } from "../clients/lsp/client.js";
 import type { CacheManager } from "../clients/cache-manager.js";
+import { loadProjectDiagnosticsSnapshot } from "../clients/project-diagnostics/cache.js";
+import { scanProjectDiagnostics } from "../clients/project-diagnostics/scanner.js";
+import type {
+	ProjectDiagnostic,
+	ProjectDiagnosticsSnapshot,
+} from "../clients/project-diagnostics/types.js";
 import type { ActionableWarningsReport } from "../clients/actionable-warnings.js";
 import type { CodeQualityWarningsReport } from "../clients/code-quality-warnings.js";
 import {
@@ -64,8 +70,10 @@ export function createLensDiagnosticsTool(
 			"errors from earlier turns are visible even if they dropped from turn-end context.\n\n" +
 			"mode=full: EXPENSIVE active scan. Runs project-wide LSP diagnostics for " +
 			"all supported files (including unedited files), then merges/deduplicates " +
-			"that with mode=all cached runner state.",
-		promptSnippet: "Use lens_diagnostics mode=all to verify no blocking errors remain; use mode=full for expensive project-wide checks",
+			"that with mode=all cached runner state. Optional refreshRunners=cheap " +
+			"also scans cheap project runners (tree-sitter + fact-rules) and caches them.",
+		promptSnippet:
+			"Use lens_diagnostics mode=all to verify no blocking errors remain; use mode=full for expensive project-wide checks",
 		parameters: Type.Object({
 			mode: Type.Optional(
 				Type.String({
@@ -74,6 +82,24 @@ export function createLensDiagnosticsTool(
 						"delta = current turn's fixable warnings (default). " +
 						"all = session diagnostics for edited/dispatched files. " +
 						"full = expensive active project-wide LSP scan plus cached runner diagnostics.",
+				}),
+			),
+			refreshRunners: Type.Optional(
+				Type.Union(
+					[
+						Type.Boolean(),
+						Type.String({ enum: ["cached", "cheap", "all", "none"] }),
+					],
+					{
+						description:
+							"mode=full only: false/none = LSP + widget state only. cached = include cached project-runner snapshot. cheap = refresh tree-sitter + fact-rules first. all currently aliases cheap and is reserved for future heavyweight runners.",
+					},
+				),
+			),
+			maxProjectFiles: Type.Optional(
+				Type.Number({
+					description:
+						"mode=full refreshRunners=cheap/all only: cap project files scanned by cheap runners.",
 				}),
 			),
 			severity: Type.Optional(
@@ -92,13 +118,23 @@ export function createLensDiagnosticsTool(
 		) {
 			const mode = (params.mode as string | undefined) ?? "delta";
 			const severity = (params.severity as string | undefined) ?? "all";
+			const refreshRunners = params.refreshRunners;
+			const maxProjectFiles =
+				typeof params.maxProjectFiles === "number" &&
+				Number.isFinite(params.maxProjectFiles) &&
+				params.maxProjectFiles > 0
+					? Math.floor(params.maxProjectFiles)
+					: undefined;
 			const cwd = ctx.cwd ?? getCwd();
 
 			if (mode === "all") {
 				return formatAllMode(cwd, severity);
 			}
 			if (mode === "full") {
-				return formatFullMode(cwd, severity, getLspService());
+				return formatFullMode(cwd, severity, getLspService(), {
+					refreshRunners,
+					maxProjectFiles,
+				});
 			}
 			return formatDeltaMode(cacheManager, cwd, severity);
 		},
@@ -126,12 +162,18 @@ function formatDeltaMode(
 	const lines: string[] = [];
 
 	// Fixable warnings from actionable-warnings
-	if (actionable?.files && actionable.files.length > 0 && severity !== "error") {
+	if (
+		actionable?.files &&
+		actionable.files.length > 0 &&
+		severity !== "error"
+	) {
 		for (const file of actionable.files) {
 			const rel = path.relative(cwd, file.filePath);
 			lines.push(`${rel}`);
 			for (const w of file.warnings ?? []) {
-				lines.push(`  ⚠ L${w.line ?? "?"}  ${w.rule ?? w.code ?? w.tool}  ${w.message}`);
+				lines.push(
+					`  ⚠ L${w.line ?? "?"}  ${w.rule ?? w.code ?? w.tool}  ${w.message}`,
+				);
 			}
 		}
 	}
@@ -142,7 +184,9 @@ function formatDeltaMode(
 			const rel = path.relative(cwd, file.filePath);
 			if (!lines.includes(rel)) lines.push(rel);
 			for (const w of file.warnings ?? []) {
-				lines.push(`  ℹ L${w.line ?? "?"}  ${w.rule ?? w.code ?? w.tool}  ${w.message}`);
+				lines.push(
+					`  ℹ L${w.line ?? "?"}  ${w.rule ?? w.code ?? w.tool}  ${w.message}`,
+				);
 			}
 		}
 	}
@@ -152,7 +196,10 @@ function formatDeltaMode(
 
 	if (lines.length === 0) {
 		const text = `No ${severity === "all" ? "" : severity + " "}issues in the current turn delta.`;
-		return { content: [{ type: "text" as const, text }], details: { mode: "delta", warnings: 0 } };
+		return {
+			content: [{ type: "text" as const, text }],
+			details: { mode: "delta", warnings: 0 },
+		};
 	}
 
 	const summary = `\nSummary (turn delta): ${aw} actionable warning${aw === 1 ? "" : "s"} · ${cq} quality issue${cq === 1 ? "" : "s"}`;
@@ -195,7 +242,8 @@ function lspSeverityName(severity: LSPDiagnostic["severity"]): string {
 }
 
 function lspRuleId(diagnostic: LSPDiagnostic): string {
-	const code = diagnostic.code === undefined ? undefined : String(diagnostic.code);
+	const code =
+		diagnostic.code === undefined ? undefined : String(diagnostic.code);
 	if (diagnostic.source && code) return `${diagnostic.source}:${code}`;
 	return diagnostic.source ?? code ?? "lsp";
 }
@@ -214,7 +262,24 @@ function lspDiagnosticToWidget(diagnostic: LSPDiagnostic): WidgetDiagnostic {
 	};
 }
 
-function diagnosticDedupKey(filePath: string, diagnostic: WidgetDiagnostic): string {
+function projectDiagnosticToWidget(
+	diagnostic: ProjectDiagnostic,
+): WidgetDiagnostic {
+	return {
+		severity: diagnostic.severity,
+		semantic: diagnostic.semantic,
+		message: diagnostic.message,
+		line: diagnostic.line,
+		col: diagnostic.column,
+		rule: diagnostic.rule ?? diagnostic.code,
+		tool: diagnostic.runner || diagnostic.tool,
+	};
+}
+
+function diagnosticDedupKey(
+	filePath: string,
+	diagnostic: WidgetDiagnostic,
+): string {
 	const ruleId = diagnostic.rule ?? diagnostic.tool ?? "";
 	return [path.resolve(filePath), diagnostic.line ?? "?", ruleId].join(":");
 }
@@ -232,12 +297,20 @@ function summarizeDiagnostics(
 		if (diagnostic.severity === "error") errors++;
 		else if (diagnostic.severity === "warning") warnings++;
 	}
-	return { filePath, blocking, errors, warnings, hasFinalSnapshot, diagnostics };
+	return {
+		filePath,
+		blocking,
+		errors,
+		warnings,
+		hasFinalSnapshot,
+		diagnostics,
+	};
 }
 
-function mergeLspWithWidgetSummaries(
+function mergeDiagnosticsWithWidgetSummaries(
 	widgetSummaries: FileDiagnosticSummary[],
 	lspResults: WorkspaceLspDiagnosticResult[],
+	projectSnapshot?: ProjectDiagnosticsSnapshot,
 ): FileDiagnosticSummary[] {
 	const byFile = new Map<string, FileDiagnosticSummary>();
 	const seen = new Set<string>();
@@ -251,17 +324,16 @@ function mergeLspWithWidgetSummaries(
 		}
 	}
 
-	for (const result of lspResults) {
-		const filePath = path.resolve(result.filePath);
+	const addDiagnostic = (
+		filePath: string,
+		widgetDiagnostic: WidgetDiagnostic,
+	) => {
 		const existing = byFile.get(filePath);
 		const diagnostics = existing ? [...existing.diagnostics] : [];
-		for (const diagnostic of result.diagnostics ?? []) {
-			const widgetDiagnostic = lspDiagnosticToWidget(diagnostic);
-			const key = diagnosticDedupKey(filePath, widgetDiagnostic);
-			if (seen.has(key)) continue;
-			seen.add(key);
-			diagnostics.push(widgetDiagnostic);
-		}
+		const key = diagnosticDedupKey(filePath, widgetDiagnostic);
+		if (seen.has(key)) return;
+		seen.add(key);
+		diagnostics.push(widgetDiagnostic);
 		byFile.set(
 			filePath,
 			summarizeDiagnostics(
@@ -270,15 +342,55 @@ function mergeLspWithWidgetSummaries(
 				existing?.hasFinalSnapshot ?? true,
 			),
 		);
+	};
+
+	for (const result of lspResults) {
+		const filePath = path.resolve(result.filePath);
+		for (const diagnostic of result.diagnostics ?? []) {
+			addDiagnostic(filePath, lspDiagnosticToWidget(diagnostic));
+		}
+	}
+
+	for (const diagnostic of projectSnapshot?.diagnostics ?? []) {
+		addDiagnostic(
+			path.resolve(diagnostic.filePath),
+			projectDiagnosticToWidget(diagnostic),
+		);
 	}
 
 	return [...byFile.values()];
+}
+
+function shouldUseCachedProjectDiagnostics(value: unknown): boolean {
+	return value === "cached";
+}
+
+function shouldRefreshProjectDiagnostics(value: unknown): boolean {
+	return value === "cheap" || value === "all";
+}
+
+async function getProjectDiagnosticsSnapshotForFullMode(
+	cwd: string,
+	options: { refreshRunners?: unknown; maxProjectFiles?: number },
+): Promise<ProjectDiagnosticsSnapshot | undefined> {
+	if (shouldRefreshProjectDiagnostics(options.refreshRunners)) {
+		return await scanProjectDiagnostics({
+			cwd,
+			tier: "cheap",
+			maxFiles: options.maxProjectFiles,
+		});
+	}
+	if (shouldUseCachedProjectDiagnostics(options.refreshRunners)) {
+		return loadProjectDiagnosticsSnapshot(cwd);
+	}
+	return undefined;
 }
 
 async function formatFullMode(
 	cwd: string,
 	severity: string,
 	lspService: LSPServiceLike,
+	options: { refreshRunners?: unknown; maxProjectFiles?: number } = {},
 ): Promise<{ content: [{ type: "text"; text: string }]; details: object }> {
 	const runWorkspaceDiagnostics = lspService.runWorkspaceDiagnostics;
 	if (typeof runWorkspaceDiagnostics !== "function") {
@@ -292,14 +404,27 @@ async function formatFullMode(
 			details: { mode: "full", filesChecked: 0, lspUnavailable: true },
 		};
 	}
-	const lspResults = await runWorkspaceDiagnostics.call(lspService, cwd);
-	const summaries = mergeLspWithWidgetSummaries(
+	const [lspResults, projectSnapshot] = await Promise.all([
+		runWorkspaceDiagnostics.call(lspService, cwd),
+		getProjectDiagnosticsSnapshotForFullMode(cwd, options),
+	]);
+	const summaries = mergeDiagnosticsWithWidgetSummaries(
 		getFileDiagnosticSummaries(),
 		lspResults,
+		projectSnapshot,
 	);
 	return formatAllMode(cwd, severity, summaries, {
 		mode: "full",
 		lspFilesChecked: lspResults.length,
+		projectDiagnostics:
+			projectSnapshot === undefined
+				? undefined
+				: {
+						tier: projectSnapshot.tier,
+						filesScanned: projectSnapshot.filesScanned,
+						diagnostics: projectSnapshot.diagnostics.length,
+						runners: projectSnapshot.runners,
+					},
 	});
 }
 
@@ -309,7 +434,6 @@ function formatAllMode(
 	summaries: FileDiagnosticSummary[] = getFileDiagnosticSummaries(),
 	detailOverrides: Record<string, unknown> = { mode: "all" },
 ): { content: [{ type: "text"; text: string }]; details: object } {
-
 	// Filter to files with actual issues
 	const withIssues = summaries.filter((s) => {
 		if (severity === "error") return s.blocking > 0 || s.errors > 0;
@@ -318,9 +442,10 @@ function formatAllMode(
 	});
 
 	if (withIssues.length === 0) {
-		const text = summaries.length === 0
-			? "No files diagnosed yet this session."
-			: `No ${severity === "all" ? "" : severity + " "}issues across ${summaries.length} file${summaries.length === 1 ? "" : "s"} diagnosed this session. ✓`;
+		const text =
+			summaries.length === 0
+				? "No files diagnosed yet this session."
+				: `No ${severity === "all" ? "" : severity + " "}issues across ${summaries.length} file${summaries.length === 1 ? "" : "s"} diagnosed this session. ✓`;
 		return {
 			content: [{ type: "text" as const, text }],
 			details: { ...detailOverrides, filesChecked: summaries.length },
@@ -330,9 +455,7 @@ function formatAllMode(
 	// Sort: blocking first, then errors, then warnings
 	const sorted = withIssues.sort(
 		(a, b) =>
-			b.blocking - a.blocking ||
-			b.errors - a.errors ||
-			b.warnings - a.warnings,
+			b.blocking - a.blocking || b.errors - a.errors || b.warnings - a.warnings,
 	);
 
 	const lines: string[] = [];
@@ -359,7 +482,11 @@ function formatAllMode(
 			.sort(bySeverityThenLine);
 		const shown = matching.slice(0, MAX_DIAGNOSTICS_PER_FILE);
 		for (const d of shown) {
-			const marker = isErrorLike(d) ? (d.semantic === "blocking" ? "🔴 " : "") : "";
+			const marker = isErrorLike(d)
+				? d.semantic === "blocking"
+					? "🔴 "
+					: ""
+				: "";
 			const label = d.rule ?? d.tool;
 			const tag = label ? ` [${label}]` : "";
 			const msg = d.message.replace(/\s+/g, " ").trim();
@@ -378,10 +505,18 @@ function formatAllMode(
 
 	const summary = [
 		`\nSummary (${summaries.length} files diagnosed this session):`,
-		totalBlocking > 0 ? `  🔴 ${totalBlocking} blocking error${totalBlocking === 1 ? "" : "s"}` : null,
-		totalErrors > 0 ? `  ${totalErrors} error${totalErrors === 1 ? "" : "s"}` : null,
-		totalWarnings > 0 ? `  ${totalWarnings} warning${totalWarnings === 1 ? "" : "s"}` : null,
-	].filter(Boolean).join("\n");
+		totalBlocking > 0
+			? `  🔴 ${totalBlocking} blocking error${totalBlocking === 1 ? "" : "s"}`
+			: null,
+		totalErrors > 0
+			? `  ${totalErrors} error${totalErrors === 1 ? "" : "s"}`
+			: null,
+		totalWarnings > 0
+			? `  ${totalWarnings} warning${totalWarnings === 1 ? "" : "s"}`
+			: null,
+	]
+		.filter(Boolean)
+		.join("\n");
 
 	return {
 		content: [{ type: "text" as const, text: lines.join("\n") + summary }],

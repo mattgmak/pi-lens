@@ -8,10 +8,7 @@ import type { DependencyChecker } from "./dependency-checker.js";
 import { getDiagnosticTracker } from "./diagnostic-tracker.js";
 import { clearAllSessions as clearFileTimeSessions } from "./file-time.js";
 import { getKnipIgnorePatterns } from "./file-utils.js";
-import {
-	GitleaksClient,
-	type GitleaksResult,
-} from "./gitleaks-client.js";
+import { GitleaksClient, type GitleaksResult } from "./gitleaks-client.js";
 import type { GoClient } from "./go-client.js";
 import {
 	GovulncheckClient,
@@ -410,8 +407,10 @@ function scheduleStartupScans(
 			return;
 		}
 		if (!runtime.isCurrentSession(sessionGeneration)) return;
-		const cached =
-			cacheManager.readCache<GovulncheckResult>("govulncheck", analysisRoot);
+		const cached = cacheManager.readCache<GovulncheckResult>(
+			"govulncheck",
+			analysisRoot,
+		);
 		if (cached) {
 			if (!runtime.isCurrentSession(sessionGeneration)) return;
 			dbg(
@@ -444,8 +443,10 @@ function scheduleStartupScans(
 			return;
 		}
 		if (!runtime.isCurrentSession(sessionGeneration)) return;
-		const cached =
-			cacheManager.readCache<GitleaksResult>("gitleaks", analysisRoot);
+		const cached = cacheManager.readCache<GitleaksResult>(
+			"gitleaks",
+			analysisRoot,
+		);
 		if (cached) {
 			if (!runtime.isCurrentSession(sessionGeneration)) return;
 			dbg(
@@ -467,8 +468,16 @@ function scheduleStartupScans(
 	// call-graph — build function-level call graph from review graph data
 	runTask("call-graph", async () => {
 		const { FactStore } = await import("./dispatch/fact-store.js");
-		const { buildOrUpdateGraph, extractSymbolsAndRefsFromGraph } = await import("./review-graph/builder.js");
-		const { buildCallGraph, saveCallGraph, loadCallGraph, staleFiles, readMtimes } = await import("./call-graph.js");
+		const { buildOrUpdateGraph, extractSymbolsAndRefsFromGraph } = await import(
+			"./review-graph/builder.js"
+		);
+		const {
+			buildCallGraph,
+			saveCallGraph,
+			loadCallGraph,
+			staleFiles,
+			readMtimes,
+		} = await import("./call-graph.js");
 		if (!runtime.isCurrentSession(sessionGeneration)) return;
 		const startMs = Date.now();
 		// Try loading from cache first
@@ -478,7 +487,9 @@ function scheduleStartupScans(
 			const stale = staleFiles(cached.fileMtimes, cachedFiles);
 			if (stale.length === 0 && cachedFiles.length > 0) {
 				runtime.callGraph = cached.graph;
-				dbg(`session_start call-graph: loaded from cache (${cached.graph.edges.length} edges, ${Date.now() - startMs}ms)`);
+				dbg(
+					`session_start call-graph: loaded from cache (${cached.graph.edges.length} edges, ${Date.now() - startMs}ms)`,
+				);
 				return;
 			}
 		}
@@ -491,20 +502,27 @@ function scheduleStartupScans(
 		runtime.callGraph = callGraph;
 		const mtimes = readMtimes([...allSymbols.keys()]);
 		saveCallGraph(snapshotRoot, callGraph, mtimes);
-		dbg(`session_start call-graph: built ${callGraph.edges.length} edges, ${callGraph.callers.size} callee entries (${Date.now() - startMs}ms)`);
+		dbg(
+			`session_start call-graph: built ${callGraph.edges.length} edges, ${callGraph.callers.size} callee entries (${Date.now() - startMs}ms)`,
+		);
 	});
 
 	// codebase-model — build mental model from call graph (internal-only until validated)
 	runTask("codebase-model", async () => {
 		if (!runtime.isCurrentSession(sessionGeneration)) return;
 		if (!runtime.callGraph) return; // call-graph task may not have completed yet
-		const { buildCodebaseModel, saveCodebaseModel } = await import("./codebase-model.js");
+		const { buildCodebaseModel, saveCodebaseModel } = await import(
+			"./codebase-model.js"
+		);
 		const model = buildCodebaseModel(runtime.callGraph, analysisRoot);
 		saveCodebaseModel(snapshotRoot, model);
-		const top3 = model.entries.slice(0, 3).map((e) => e.name).join(", ");
+		const top3 = model.entries
+			.slice(0, 3)
+			.map((e) => e.name)
+			.join(", ");
 		dbg(
 			`session_start codebase-model: ${model.entries.length} entries, ` +
-			`${model.totalTokens} tokens, top symbols: ${top3 || "(none)"}`,
+				`${model.totalTokens} tokens, top symbols: ${top3 || "(none)"}`,
 		);
 	});
 
@@ -524,7 +542,6 @@ function scheduleStartupScans(
 			saveRuntimeProjectSnapshot({ cwd: snapshotRoot, runtime, dbg });
 		}
 	});
-
 }
 
 function scheduleDeferredToolProbes(
@@ -804,7 +821,7 @@ export async function handleSessionStart(
 	const agentStartupGuidance = [
 		"📌 pi-lens active — automated checks run on your edits and writes. Blocking errors will be shown inline; you must fix all errors including pre-existing ones.\n" +
 			"Key pi-lens tools:\n" +
-			"• lens_diagnostics mode=all — diagnostic state for every file EDITED this session (all runners: LSP + tree-sitter + ast-grep + linters). Stale blocking errors from earlier turns appear here even if they dropped from turn-end context. mode=delta (default) shows all warnings for the current turn only. mode=full is expensive: actively scans project-wide LSP diagnostics for unedited files too, then merges with cached runner state.\n" +
+			"• lens_diagnostics mode=all — diagnostic state for every file EDITED this session (all runners: LSP + tree-sitter + ast-grep + linters). Stale blocking errors from earlier turns appear here even if they dropped from turn-end context. mode=delta (default) shows all warnings for the current turn only. mode=full is expensive: actively scans project-wide LSP diagnostics for unedited files too, then merges with cached runner state; add refreshRunners=cheap to refresh project-wide tree-sitter/fact-rule diagnostics.\n" +
 			"• lsp_diagnostics — actively probe LSP for errors in a specific file, folder, or workspace (LSP only, triggers a fresh server check).\n" +
 			"• lsp_navigation — definitions, references, symbols, rename_file, capabilities.\n" +
 			"• ast_grep_search / ast_grep_replace — structural code patterns. Cross-context queries: use insideKind/hasKind/follows/precedes params (synthesises YAML automatically). Full DSL: use rule= param with raw YAML for all/any/not/nthChild/regex. ast_dump to discover node kinds before writing patterns.",

@@ -1,25 +1,51 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createLensDiagnosticsTool } from "../../tools/lens-diagnostics.js";
+
+const projectDiagnosticsMocks = vi.hoisted(() => ({
+	scanProjectDiagnostics: vi.fn(),
+	loadProjectDiagnosticsSnapshot: vi.fn(),
+}));
+
+vi.mock("../../clients/project-diagnostics/scanner.js", () => ({
+	scanProjectDiagnostics: projectDiagnosticsMocks.scanProjectDiagnostics,
+}));
+
+vi.mock("../../clients/project-diagnostics/cache.js", () => ({
+	loadProjectDiagnosticsSnapshot:
+		projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot,
+}));
 
 // ── Mock widget state ─────────────────────────────────────────────────────────
 
-const mockSummaries: ReturnType<typeof import("../../clients/widget-state.js")["getFileDiagnosticSummaries"]> = [];
+const mockSummaries: ReturnType<
+	typeof import("../../clients/widget-state.js")["getFileDiagnosticSummaries"]
+> = [];
 
 vi.mock("../../clients/widget-state.js", () => ({
 	getFileDiagnosticSummaries: () => mockSummaries,
 }));
+
+beforeEach(() => {
+	projectDiagnosticsMocks.scanProjectDiagnostics.mockReset();
+	projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot.mockReset();
+});
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function makeCacheManager(data: Record<string, unknown> = {}) {
 	return {
 		readCache: vi.fn((key: string) =>
-			data[key] ? { data: data[key], meta: { savedAt: "", scanner: key } } : undefined,
+			data[key]
+				? { data: data[key], meta: { savedAt: "", scanner: key } }
+				: undefined,
 		),
 	};
 }
 
-function makeTool(cacheData: Record<string, unknown> = {}, lspService?: unknown) {
+function makeTool(
+	cacheData: Record<string, unknown> = {},
+	lspService?: unknown,
+) {
 	return createLensDiagnosticsTool(
 		makeCacheManager(cacheData) as any,
 		() => "/proj",
@@ -27,8 +53,13 @@ function makeTool(cacheData: Record<string, unknown> = {}, lspService?: unknown)
 	);
 }
 
-async function run(tool: ReturnType<typeof makeTool>, params: Record<string, unknown> = {}) {
-	return tool.execute("1", params, new AbortController().signal, null, { cwd: "/proj" });
+async function run(
+	tool: ReturnType<typeof makeTool>,
+	params: Record<string, unknown> = {},
+) {
+	return tool.execute("1", params, new AbortController().signal, null, {
+		cwd: "/proj",
+	});
 }
 
 // ── schema ────────────────────────────────────────────────────────────────────
@@ -36,15 +67,19 @@ async function run(tool: ReturnType<typeof makeTool>, params: Record<string, unk
 describe("lens_diagnostics schema", () => {
 	it("exposes mode and severity parameters", () => {
 		const tool = makeTool();
-		const props = (tool.parameters as { properties: Record<string, unknown> }).properties;
+		const props = (tool.parameters as { properties: Record<string, unknown> })
+			.properties;
 		expect(props.mode).toBeDefined();
 		expect(props.severity).toBeDefined();
+		expect(props.refreshRunners).toBeDefined();
 	});
 
 	it("defaults to delta mode when no params supplied", async () => {
 		const cm = makeCacheManager({});
 		const tool = createLensDiagnosticsTool(cm as any, () => "/proj");
-		await tool.execute("1", {}, new AbortController().signal, null, { cwd: "/proj" });
+		await tool.execute("1", {}, new AbortController().signal, null, {
+			cwd: "/proj",
+		});
 		// readCache should have been called (delta path)
 		expect(cm.readCache).toHaveBeenCalled();
 	});
@@ -58,7 +93,8 @@ describe("lens_diagnostics schema", () => {
 
 	it("exposes full mode in the schema", () => {
 		const tool = makeTool();
-		const props = (tool.parameters as { properties: Record<string, any> }).properties;
+		const props = (tool.parameters as { properties: Record<string, any> })
+			.properties;
 		expect(props.mode.enum).toContain("full");
 	});
 });
@@ -79,7 +115,13 @@ describe("lens_diagnostics mode=delta", () => {
 					{
 						filePath: "/proj/src/foo.ts",
 						warnings: [
-							{ line: 10, rule: "no-unused-vars", tool: "eslint", code: undefined, message: "x is unused" },
+							{
+								line: 10,
+								rule: "no-unused-vars",
+								tool: "eslint",
+								code: undefined,
+								message: "x is unused",
+							},
 						],
 					},
 				],
@@ -100,7 +142,13 @@ describe("lens_diagnostics mode=delta", () => {
 					{
 						filePath: "/proj/src/bar.ts",
 						warnings: [
-							{ line: 5, rule: "high-complexity", tool: "complexity", code: undefined, message: "cyclomatic complexity 20" },
+							{
+								line: 5,
+								rule: "high-complexity",
+								tool: "complexity",
+								code: undefined,
+								message: "cyclomatic complexity 20",
+							},
 						],
 					},
 				],
@@ -116,11 +164,21 @@ describe("lens_diagnostics mode=delta", () => {
 	it("combines actionable and quality warnings from both caches", async () => {
 		const tool = makeTool({
 			"actionable-warnings": {
-				files: [{ filePath: "/proj/src/foo.ts", warnings: [{ line: 1, rule: "r1", tool: "t", message: "fixable" }] }],
+				files: [
+					{
+						filePath: "/proj/src/foo.ts",
+						warnings: [{ line: 1, rule: "r1", tool: "t", message: "fixable" }],
+					},
+				],
 				summary: { warnings: 1 },
 			},
 			"code-quality-warnings": {
-				files: [{ filePath: "/proj/src/foo.ts", warnings: [{ line: 2, rule: "r2", tool: "t", message: "quality" }] }],
+				files: [
+					{
+						filePath: "/proj/src/foo.ts",
+						warnings: [{ line: 2, rule: "r2", tool: "t", message: "quality" }],
+					},
+				],
 				summary: { warnings: 1 },
 			},
 		});
@@ -133,7 +191,12 @@ describe("lens_diagnostics mode=delta", () => {
 	it("severity=error excludes warnings in delta mode", async () => {
 		const tool = makeTool({
 			"actionable-warnings": {
-				files: [{ filePath: "/proj/src/foo.ts", warnings: [{ line: 1, rule: "r", tool: "t", message: "warn" }] }],
+				files: [
+					{
+						filePath: "/proj/src/foo.ts",
+						warnings: [{ line: 1, rule: "r", tool: "t", message: "warn" }],
+					},
+				],
 				summary: { warnings: 1 },
 			},
 		});
@@ -221,6 +284,101 @@ describe("lens_diagnostics mode=full", () => {
 		});
 	});
 
+	it("refreshRunners=cheap scans cheap project runners and merges their cached snapshot", async () => {
+		mockSummaries.length = 0;
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+		};
+		projectDiagnosticsMocks.scanProjectDiagnostics.mockResolvedValue({
+			version: 1,
+			cwd: "/proj",
+			tier: "cheap",
+			scannedAt: "2026-01-01T00:00:00.000Z",
+			filesScanned: 2,
+			runners: ["tree-sitter", "fact-rules"],
+			diagnostics: [
+				{
+					filePath: "/proj/src/project.ts",
+					line: 4,
+					column: 2,
+					severity: "warning",
+					semantic: "warning",
+					tool: "tree-sitter",
+					runner: "tree-sitter",
+					rule: "project-rule",
+					message: "project runner warning",
+					source: "project-scan",
+				},
+			],
+		});
+
+		const result = await run(makeTool({}, lspService), {
+			mode: "full",
+			refreshRunners: "cheap",
+			maxProjectFiles: 2,
+		});
+		const text = String(result.content[0].text);
+		expect(projectDiagnosticsMocks.scanProjectDiagnostics).toHaveBeenCalledWith(
+			{
+				cwd: "/proj",
+				tier: "cheap",
+				maxFiles: 2,
+			},
+		);
+		expect(text).toContain("project.ts");
+		expect(text).toContain("project runner warning");
+		expect(result.details).toMatchObject({
+			mode: "full",
+			projectDiagnostics: {
+				tier: "cheap",
+				filesScanned: 2,
+				diagnostics: 1,
+			},
+		});
+	});
+
+	it("refreshRunners=cached includes the stored project runner snapshot without scanning", async () => {
+		mockSummaries.length = 0;
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+		};
+		projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot.mockReturnValue({
+			version: 1,
+			cwd: "/proj",
+			tier: "cheap",
+			scannedAt: "2026-01-01T00:00:00.000Z",
+			filesScanned: 1,
+			runners: ["fact-rules"],
+			diagnostics: [
+				{
+					filePath: "/proj/src/cached.ts",
+					line: 8,
+					severity: "error",
+					semantic: "blocking",
+					tool: "fact-rules",
+					runner: "fact-rules",
+					rule: "cached-rule",
+					message: "cached project blocker",
+					source: "project-scan",
+				},
+			],
+		});
+
+		const result = await run(makeTool({}, lspService), {
+			mode: "full",
+			refreshRunners: "cached",
+		});
+		const text = String(result.content[0].text);
+		expect(
+			projectDiagnosticsMocks.scanProjectDiagnostics,
+		).not.toHaveBeenCalled();
+		expect(
+			projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot,
+		).toHaveBeenCalledWith("/proj");
+		expect(text).toContain("cached project blocker");
+		expect(result.details).toMatchObject({ totalBlocking: 1 });
+	});
+
 	it("deduplicates LSP diagnostics already present in widget state by file line and rule", async () => {
 		mockSummaries.length = 0;
 		mockSummaries.push(
@@ -306,7 +464,9 @@ describe("lens_diagnostics mode=all", () => {
 
 	it("shows pending indicator for files without final snapshot", async () => {
 		mockSummaries.length = 0;
-		mockSummaries.push(sum("/proj/src/pending.ts", { errors: 1 }, { hasFinalSnapshot: false }));
+		mockSummaries.push(
+			sum("/proj/src/pending.ts", { errors: 1 }, { hasFinalSnapshot: false }),
+		);
 		const result = await run(makeTool(), { mode: "all" });
 		expect(String(result.content[0].text)).toContain("pending");
 	});
@@ -332,10 +492,16 @@ describe("lens_diagnostics mode=all", () => {
 
 	it("summary counts total blocking/errors/warnings", async () => {
 		mockSummaries.length = 0;
-		mockSummaries.push(sum("/proj/a.ts", { blocking: 1, errors: 2, warnings: 3 }));
+		mockSummaries.push(
+			sum("/proj/a.ts", { blocking: 1, errors: 2, warnings: 3 }),
+		);
 		mockSummaries.push(sum("/proj/b.ts", { errors: 1, warnings: 1 }));
 		const result = await run(makeTool(), { mode: "all" });
-		expect(result.details).toMatchObject({ totalBlocking: 1, totalErrors: 3, totalWarnings: 4 });
+		expect(result.details).toMatchObject({
+			totalBlocking: 1,
+			totalErrors: 3,
+			totalWarnings: 4,
+		});
 	});
 
 	// ── actual-message exposure (the point of the tool) ───────────────────────────
@@ -348,8 +514,21 @@ describe("lens_diagnostics mode=all", () => {
 				{ blocking: 1, warnings: 1 },
 				{
 					diagnostics: [
-						{ severity: "error", semantic: "blocking", message: "Type 'string' is not assignable to 'number'", line: 12, rule: "ts2322", tool: "tsc" },
-						{ severity: "warning", message: "Unexpected console statement", line: 30, rule: "no-console", tool: "eslint" },
+						{
+							severity: "error",
+							semantic: "blocking",
+							message: "Type 'string' is not assignable to 'number'",
+							line: 12,
+							rule: "ts2322",
+							tool: "tsc",
+						},
+						{
+							severity: "warning",
+							message: "Unexpected console statement",
+							line: 30,
+							rule: "no-console",
+							tool: "eslint",
+						},
 					],
 				},
 			),
@@ -377,7 +556,9 @@ describe("lens_diagnostics mode=all", () => {
 				},
 			),
 		);
-		const text = String((await run(makeTool(), { mode: "all" })).content[0].text);
+		const text = String(
+			(await run(makeTool(), { mode: "all" })).content[0].text,
+		);
 		expect(text).toContain("w1");
 		expect(text).toContain("w2");
 		expect(text).not.toMatch(/more in this file/);
@@ -391,8 +572,12 @@ describe("lens_diagnostics mode=all", () => {
 			line: i + 1,
 			rule: "r",
 		}));
-		mockSummaries.push(sum("/proj/src/big.ts", { warnings: 60 }, { diagnostics: many }));
-		const text = String((await run(makeTool(), { mode: "all" })).content[0].text);
+		mockSummaries.push(
+			sum("/proj/src/big.ts", { warnings: 60 }, { diagnostics: many }),
+		);
+		const text = String(
+			(await run(makeTool(), { mode: "all" })).content[0].text,
+		);
 		expect(text).toContain("w0");
 		expect(text).toContain("w49"); // 50th shown
 		expect(text).not.toContain("w50"); // 51st truncated
@@ -409,10 +594,20 @@ describe("lens_diagnostics mode=all", () => {
 				line: i + 1,
 				rule: "r",
 			})),
-			{ severity: "error", semantic: "blocking", message: "MUSTFIX", line: 999, rule: "e" },
+			{
+				severity: "error",
+				semantic: "blocking",
+				message: "MUSTFIX",
+				line: 999,
+				rule: "e",
+			},
 		];
-		mockSummaries.push(sum("/proj/x.ts", { blocking: 1, warnings: 50 }, { diagnostics: diags }));
-		const text = String((await run(makeTool(), { mode: "all" })).content[0].text);
+		mockSummaries.push(
+			sum("/proj/x.ts", { blocking: 1, warnings: 50 }, { diagnostics: diags }),
+		);
+		const text = String(
+			(await run(makeTool(), { mode: "all" })).content[0].text,
+		);
 		// The blocker is not truncated by the 50-budget and is listed before the warnings.
 		expect(text).toContain("MUSTFIX");
 		expect(text.indexOf("MUSTFIX")).toBeLessThan(text.indexOf("w0"));
@@ -426,8 +621,19 @@ describe("lens_diagnostics mode=all", () => {
 				{ blocking: 1, warnings: 1 },
 				{
 					diagnostics: [
-						{ severity: "error", semantic: "blocking", message: "BOOM error here", line: 1, rule: "e" },
-						{ severity: "warning", message: "minor warning here", line: 2, rule: "w" },
+						{
+							severity: "error",
+							semantic: "blocking",
+							message: "BOOM error here",
+							line: 1,
+							rule: "e",
+						},
+						{
+							severity: "warning",
+							message: "minor warning here",
+							line: 2,
+							rule: "w",
+						},
 					],
 				},
 			),
