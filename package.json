@@ -17,6 +17,7 @@
 		"test:integration": "vitest run tests/index-integration.test.ts tests/clients/lsp/integration.test.ts",
 		"test:watch": "vitest",
 		"check": "node scripts/check-extensions.mjs",
+		"check:lockfile": "node scripts/check-lockfile-sync.mjs",
 		"audit:tree-sitter": "node scripts/audit-tree-sitter-rules.mjs",
 		"audit:rule-catalog": "node scripts/validate-rule-catalog.mjs",
 		"logs:smells": "node scripts/analyze-pi-lens-logs.mjs",

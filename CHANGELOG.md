@@ -14,7 +14,7 @@ All notable changes to pi-lens will be documented in this file.
 
 - **`js-yaml` moved from `devDependencies` to `dependencies`** — `clients/ast-grep-yaml-synth.ts` imports it at runtime, but it was declared dev-only, so a production (`--omit=dev`) install left it missing and the extension failed to load with `Cannot find package 'js-yaml'`. (`@types/js-yaml` stays dev-only.) The CI install-test (production tarball install + `tsx` load) now exercises this path so misplaced runtime deps are caught before release.
 
-- **Hardening: `package-lock.json` removed and git-ignored** — a committed lockfile that drifted from `package.json` (e.g. the exact `web-tree-sitter` pin recorded as `^0.25.10` in the lock) makes `npm ci` delete `node_modules` then hard-fail on the desync. Extensions now install via self-healing `npm install`; exact pins in `package.json` still enforce ABI-critical versions. CI/release switched from `npm ci` to `npm install` (and dropped `setup-node`'s `cache: npm`, which requires a lockfile).
+- **Lockfile kept committed and guarded against drift** — `package-lock.json` had silently drifted from `package.json` (the exact `web-tree-sitter` pin was recorded as `^0.25.10` in the lock), which makes `npm ci` delete `node_modules` then hard-fail. The lock is now regenerated in sync, and a new `npm run check:lockfile` guard (run in CI) fails the build if any declared dependency spec diverges from the lock — so the drift that started this can't recur. CI/release also switched from `npm ci` to `npm install` so a future desync degrades (self-heals) instead of hard-failing.
 
 ### Changed
 
