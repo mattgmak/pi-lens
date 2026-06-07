@@ -558,7 +558,9 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			projectSeqStart: runtime.turnStartProjectSeq,
 			projectSeqEnd: runtime.projectSeq,
 			diagnostics: projectDiagnosticsDelta,
-			sources: [...projectDiagnosticsSources].sort(),
+			sources: [...projectDiagnosticsSources].sort((a, b) =>
+				a.localeCompare(b),
+			),
 		});
 	}
 
