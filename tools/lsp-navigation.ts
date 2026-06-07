@@ -6,7 +6,7 @@
 
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { Type } from "typebox";
 import { logLatency } from "../clients/latency-logger.js";
 import type { LSPCallHierarchyItem } from "../clients/lsp/client.js";
@@ -15,6 +15,7 @@ import {
 	summarizeWorkspaceEdit,
 } from "../clients/lsp/edits.js";
 import { getLSPService } from "../clients/lsp/index.js";
+import type { SearchReadLocation } from "../clients/search-read-registration.js";
 
 const VALID_OPERATIONS = [
 	"definition",
@@ -456,6 +457,128 @@ function dedupeWorkspaceSymbols<T extends SymbolNode>(symbols: T[]): T[] {
 	return out;
 }
 
+type RangeLike = {
+	start?: { line?: unknown };
+	end?: { line?: unknown };
+};
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+	return typeof value === "object" && value !== null
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+function searchReadFromUriRange(
+	uri: unknown,
+	range: unknown,
+): SearchReadLocation | undefined {
+	if (typeof uri !== "string" || !uri.startsWith("file:")) return undefined;
+	const rangeLike = asRecord(range) as RangeLike | undefined;
+	const startLine = rangeLike?.start?.line;
+	if (typeof startLine !== "number" || !Number.isFinite(startLine)) {
+		return undefined;
+	}
+	const endLine = rangeLike?.end?.line;
+	try {
+		return {
+			file: fileURLToPath(uri),
+			startLine: Math.max(1, Math.floor(startLine) + 1),
+			endLine:
+				typeof endLine === "number" && Number.isFinite(endLine)
+					? Math.max(1, Math.floor(endLine) + 1)
+					: undefined,
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+function pushSearchRead(
+	out: SearchReadLocation[],
+	uri: unknown,
+	range: unknown,
+): void {
+	const loc = searchReadFromUriRange(uri, range);
+	if (loc) out.push(loc);
+}
+
+function collectLocationSearchReads(result: unknown): SearchReadLocation[] {
+	const out: SearchReadLocation[] = [];
+	for (const entry of Array.isArray(result) ? result : [result]) {
+		const record = asRecord(entry);
+		if (!record) continue;
+		pushSearchRead(out, record.uri, record.range);
+		pushSearchRead(
+			out,
+			record.targetUri,
+			record.targetSelectionRange ?? record.targetRange,
+		);
+	}
+	return out;
+}
+
+function collectWorkspaceSymbolSearchReads(
+	result: unknown,
+): SearchReadLocation[] {
+	const out: SearchReadLocation[] = [];
+	for (const entry of Array.isArray(result) ? result : [result]) {
+		const symbol = asRecord(entry);
+		const location = asRecord(symbol?.location);
+		if (!location) continue;
+		pushSearchRead(out, location.uri, location.range);
+		pushSearchRead(
+			out,
+			location.targetUri,
+			location.targetSelectionRange ?? location.targetRange,
+		);
+	}
+	return out;
+}
+
+function collectCallHierarchySearchReads(
+	result: unknown,
+	operation: "incomingCalls" | "outgoingCalls",
+	callHierarchyItem: LSPCallHierarchyItem | undefined,
+): SearchReadLocation[] {
+	const out: SearchReadLocation[] = [];
+	for (const entry of Array.isArray(result) ? result : [result]) {
+		const record = asRecord(entry);
+		if (!record) continue;
+		const item = asRecord(
+			operation === "incomingCalls" ? record.from : record.to,
+		);
+		pushSearchRead(out, item?.uri, item?.selectionRange ?? item?.range);
+		const rangeUri =
+			operation === "incomingCalls" ? item?.uri : callHierarchyItem?.uri;
+		const fromRanges = record.fromRanges;
+		if (Array.isArray(fromRanges)) {
+			for (const range of fromRanges) pushSearchRead(out, rangeUri, range);
+		}
+	}
+	return out;
+}
+
+function collectSearchReadsForOperation(
+	operation: LspNavigationOperation,
+	result: unknown,
+	callHierarchyItem?: LSPCallHierarchyItem,
+): SearchReadLocation[] {
+	if (["definition", "references", "implementation"].includes(operation)) {
+		return collectLocationSearchReads(result);
+	}
+	if (operation === "workspaceSymbol") {
+		return collectWorkspaceSymbolSearchReads(result);
+	}
+	if (operation === "incomingCalls" || operation === "outgoingCalls") {
+		return collectCallHierarchySearchReads(
+			result,
+			operation,
+			callHierarchyItem,
+		);
+	}
+	return [];
+}
+
 type CapabilitySnapshot = {
 	serverId: string;
 	root: string;
@@ -810,6 +933,7 @@ export function createLspNavigationTool(
 				exactMatch,
 				topLevelOnly,
 				maxResults,
+				callHierarchyItem,
 			} = params as {
 				operation: string;
 				filePath?: string;
@@ -826,6 +950,7 @@ export function createLspNavigationTool(
 				exactMatch?: boolean;
 				topLevelOnly?: boolean;
 				maxResults?: number;
+				callHierarchyItem?: LSPCallHierarchyItem;
 			};
 			const normalizedOperation = normalizeOperation(rawOperation);
 			if (!isValidOperation(normalizedOperation)) {
@@ -1298,26 +1423,20 @@ export function createLspNavigationTool(
 					case "prepareCallHierarchy":
 						return lspService.prepareCallHierarchy(filePath, lspLine, lspChar);
 					case "incomingCalls": {
-						const callItem = (
-							params as { callHierarchyItem?: LSPCallHierarchyItem }
-						).callHierarchyItem;
-						if (!callItem) {
+						if (!callHierarchyItem) {
 							throw new Error(
 								"__BADINPUT__ callHierarchyItem parameter required for incomingCalls",
 							);
 						}
-						return lspService.incomingCalls(callItem);
+						return lspService.incomingCalls(callHierarchyItem);
 					}
 					case "outgoingCalls": {
-						const callItem = (
-							params as { callHierarchyItem?: LSPCallHierarchyItem }
-						).callHierarchyItem;
-						if (!callItem) {
+						if (!callHierarchyItem) {
 							throw new Error(
 								"__BADINPUT__ callHierarchyItem parameter required for outgoingCalls",
 							);
 						}
-						return lspService.outgoingCalls(callItem);
+						return lspService.outgoingCalls(callHierarchyItem);
 					}
 					default:
 						return [];
@@ -1459,12 +1578,18 @@ export function createLspNavigationTool(
 				: result
 					? 1
 					: 0;
+			const searchReads = collectSearchReadsForOperation(
+				operation,
+				result,
+				callHierarchyItem,
+			);
 			return finalize(
 				{
 					content: [{ type: "text" as const, text: output }],
 					details: {
 						operation,
 						supported,
+						searchReads: searchReads.length > 0 ? searchReads : undefined,
 						emptyReason: isEmpty
 							? emptyReasonForOperation(operation)
 							: undefined,

@@ -328,20 +328,22 @@ export const corsWildcardRule: FactRule = {
 		const lines = content.split("\n");
 		for (let i = 0; i < lines.length; i++) {
 			const line = lines[i];
+			if (/^\s*(?:\/\/|\*|#|\/)/.test(line)) continue;
 			const isWildcard =
 				// TS/JS: header assignment or cors() call
-				(/["']Access-Control-Allow-Origin["']/.test(line) && /["']\*["']/.test(line)) ||
+				(/["']Access-Control-Allow-Origin["']/.test(line) &&
+					/["']\*["']/.test(line)) ||
 				/origin\s*:\s*["']\*["']/.test(line) ||
 				(/cors\s*\(/.test(line) && /\*/.test(line)) ||
 				// Python (FastAPI CORSMiddleware / Flask-CORS):
-				// allow_origins="*"  origins="*"
+				// wildcard allow_origins/origins assignment
 				/(?:allow_origins|origins)\s*=\s*["']\*["']/.test(line) ||
-				// allow_origins=["*"]  allow_origins=['*']  origins=["*"]
+				// wildcard allow_origins/origins array assignment
 				/(?:allow_origins|origins)\s*=\s*[[(]["']\*["']/.test(line) ||
 				// Go (gin-cors, chi-cors, gorilla):
-				// AllowAllOrigins: true
+				// AllowAllOrigins enabled
 				/AllowAllOrigins\s*:\s*true/.test(line) ||
-				// AllowOrigins: []string{"*"}  AllowedOrigins: []string{"*"}
+				// wildcard AllowOrigins/AllowedOrigins slice
 				// Use [^*\n]{0,60} instead of .* to prevent super-linear backtracking
 				/Allow(?:ed)?Origins[^*\n]{0,60}\*/.test(line);
 
@@ -366,6 +368,121 @@ export const corsWildcardRule: FactRule = {
 
 // ---------- SN-005: dynamic RegExp ----------
 
+function isEscapeRegExpCall(expr: ts.Expression): boolean {
+	if (!ts.isCallExpression(expr)) return false;
+	const callee = expr.expression;
+	return (
+		(ts.isIdentifier(callee) && callee.text === "escapeRegExp") ||
+		(ts.isPropertyAccessExpression(callee) &&
+			callee.name.text === "escapeRegExp")
+	);
+}
+
+function hasParameterShadow(node: ts.Node, name: string): boolean {
+	for (let current = node.parent; current; current = current.parent) {
+		if (!ts.isFunctionLike(current)) continue;
+		for (const param of current.parameters) {
+			if (ts.isIdentifier(param.name) && param.name.text === name) return true;
+		}
+	}
+	return false;
+}
+
+function isAncestor(ancestor: ts.Node, node: ts.Node): boolean {
+	for (let current = node.parent; current; current = current.parent) {
+		if (current === ancestor) return true;
+	}
+	return false;
+}
+
+function declarationContainer(node: ts.Node): ts.Node {
+	let current: ts.Node = node;
+	while (current.parent) {
+		if (
+			ts.isBlock(current.parent) ||
+			ts.isSourceFile(current.parent) ||
+			ts.isModuleBlock(current.parent) ||
+			ts.isCaseBlock(current.parent)
+		) {
+			return current.parent;
+		}
+		current = current.parent;
+	}
+	return current;
+}
+
+function containerDepth(container: ts.Node): number {
+	let depth = 0;
+	for (let current = container.parent; current; current = current.parent)
+		depth++;
+	return depth;
+}
+
+function findVisibleVariableInitializer(
+	sf: ts.SourceFile,
+	useNode: ts.Node,
+	name: string,
+): ts.Expression | undefined {
+	if (hasParameterShadow(useNode, name)) return undefined;
+	let best: { depth: number; initializer: ts.Expression } | undefined;
+	const useStart = useNode.getStart(sf);
+	const visit = (node: ts.Node): void => {
+		if (
+			ts.isVariableDeclaration(node) &&
+			ts.isIdentifier(node.name) &&
+			node.name.text === name &&
+			node.initializer &&
+			node.getStart(sf) < useStart
+		) {
+			const container = declarationContainer(node);
+			if (container === sf || isAncestor(container, useNode)) {
+				const depth = containerDepth(container);
+				if (!best || depth >= best.depth) {
+					best = { depth, initializer: node.initializer };
+				}
+			}
+		}
+		ts.forEachChild(node, visit);
+	};
+	visit(sf);
+	return best?.initializer;
+}
+
+function isEscapedRegExpArgument(
+	expr: ts.Expression,
+	sf: ts.SourceFile,
+	seen = new Set<string>(),
+): boolean {
+	if (ts.isStringLiteral(expr) || ts.isNoSubstitutionTemplateLiteral(expr)) {
+		return true;
+	}
+	if (ts.isParenthesizedExpression(expr)) {
+		return isEscapedRegExpArgument(expr.expression, sf, seen);
+	}
+	if (isEscapeRegExpCall(expr)) return true;
+	if (ts.isTemplateExpression(expr)) {
+		return expr.templateSpans.every((span) =>
+			isEscapedRegExpArgument(span.expression, sf, seen),
+		);
+	}
+	if (
+		ts.isBinaryExpression(expr) &&
+		expr.operatorToken.kind === ts.SyntaxKind.PlusToken
+	) {
+		return (
+			isEscapedRegExpArgument(expr.left, sf, seen) &&
+			isEscapedRegExpArgument(expr.right, sf, seen)
+		);
+	}
+	if (ts.isIdentifier(expr)) {
+		if (seen.has(expr.text)) return false;
+		seen.add(expr.text);
+		const initializer = findVisibleVariableInitializer(sf, expr, expr.text);
+		return initializer ? isEscapedRegExpArgument(initializer, sf, seen) : false;
+	}
+	return false;
+}
+
 export const dynamicRegexpRule: FactRule = {
 	id: "dynamic-regexp",
 	requires: ["file.content"],
@@ -385,11 +502,8 @@ export const dynamicRegexpRule: FactRule = {
 				node.arguments.length > 0
 			) {
 				const firstArg = node.arguments[0];
-				// Only flag if the argument is NOT a string/template literal (i.e. dynamic)
-				if (
-					!ts.isStringLiteral(firstArg) &&
-					!ts.isNoSubstitutionTemplateLiteral(firstArg)
-				) {
+				// Flag dynamic patterns unless the dynamic pieces are escaped first.
+				if (!isEscapedRegExpArgument(firstArg, sf)) {
 					const { line, character } = sf.getLineAndCharacterOfPosition(
 						node.getStart(sf),
 					);
@@ -462,14 +576,21 @@ const CREDENTIAL_PATTERNS = [
 
 // Files that define credential patterns as code (scanners, test fixtures, etc.) —
 // their own regex literals would otherwise self-trigger this rule.
-const CREDENTIALS_EXEMPT = /[/\\](secrets?[-_]?(scanner|detect|check)|scanner|fixture|mock)[^/\\]*\.(tsx?|ya?ml|json|env)$/i;
+const CREDENTIALS_EXEMPT =
+	/[/\\](secrets?[-_]?(scanner|detect|check)|scanner|fixture|mock)[^/\\]*\.(tsx?|ya?ml|json|env)$/i;
+
+function isCommentLine(line: string): boolean {
+	return line.startsWith("//") || line.startsWith("#") || line.startsWith("*");
+}
 
 export const commentedCredentialsRule: FactRule = {
 	id: "no-commented-credentials",
 	requires: ["file.content"],
 	appliesTo(ctx) {
-		return /\.(tsx?|py|go|rb|ya?ml|json|env)$/.test(ctx.filePath) &&
-			!CREDENTIALS_EXEMPT.test(ctx.filePath);
+		return (
+			/\.(tsx?|py|go|rb|ya?ml|json|env)$/.test(ctx.filePath) &&
+			!CREDENTIALS_EXEMPT.test(ctx.filePath)
+		);
 	},
 	evaluate(ctx, store) {
 		const content = store.getFileFact<string>(ctx.filePath, "file.content");
@@ -479,12 +600,7 @@ export const commentedCredentialsRule: FactRule = {
 		const lines = content.split("\n");
 		for (let i = 0; i < lines.length; i++) {
 			const line = lines[i].trimStart();
-			if (
-				!line.startsWith("//") &&
-				!line.startsWith("#") &&
-				!line.startsWith("*")
-			)
-				continue;
+			if (!isCommentLine(line)) continue;
 			for (const p of CREDENTIAL_PATTERNS) {
 				if (p.test(line)) {
 					diagnostics.push({

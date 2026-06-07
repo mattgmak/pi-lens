@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+	extractGrepSearchReadsFromOutput,
 	extractReadPathsFromCommand,
 	extractWrittenPathsFromCommand,
 	type ReadSpan,
@@ -63,17 +64,22 @@ describe("extractReadPathsFromCommand — full-file viewers", () => {
 	it("resolves a relative path against cwd", () => {
 		const f = touchLines("sub/b.ts", 2);
 		const rel = path.relative(tmp, f);
-		expect(readSpan(extractReadPathsFromCommand(`cat ${rel}`, tmp), f)).toEqual({
-			filePath: f,
-			offset: 1,
-			limit: 2,
-		});
+		expect(readSpan(extractReadPathsFromCommand(`cat ${rel}`, tmp), f)).toEqual(
+			{
+				filePath: f,
+				offset: 1,
+				limit: 2,
+			},
+		);
 	});
 
 	it("registers each file across && / ; segments and dedupes", () => {
 		const a = touchLines("a.ts", 4);
 		const b = touchLines("b.ts", 6);
-		const r = extractReadPathsFromCommand(`cat ${a} && cat ${b} ; cat ${a}`, tmp);
+		const r = extractReadPathsFromCommand(
+			`cat ${a} && cat ${b} ; cat ${a}`,
+			tmp,
+		);
 		expect(readSpan(r, a)).toEqual({ filePath: a, offset: 1, limit: 4 });
 		expect(readSpan(r, b)).toEqual({ filePath: b, offset: 1, limit: 6 });
 		expect(r.filter((s) => s.filePath === a)).toHaveLength(1);
@@ -92,16 +98,16 @@ describe("extractReadPathsFromCommand — partial viewers", () => {
 
 	it("head -N shorthand → lines 1..N", () => {
 		const f = touchLines("a.ts", 100);
-		expect(readSpan(extractReadPathsFromCommand(`head -20 ${f}`, tmp), f)).toEqual(
-			{ filePath: f, offset: 1, limit: 20 },
-		);
+		expect(
+			readSpan(extractReadPathsFromCommand(`head -20 ${f}`, tmp), f),
+		).toEqual({ filePath: f, offset: 1, limit: 20 });
 	});
 
 	it("head clamps when N exceeds the file length", () => {
 		const f = touchLines("a.ts", 5);
-		expect(readSpan(extractReadPathsFromCommand(`head -20 ${f}`, tmp), f)).toEqual(
-			{ filePath: f, offset: 1, limit: 5 },
-		);
+		expect(
+			readSpan(extractReadPathsFromCommand(`head -20 ${f}`, tmp), f),
+		).toEqual({ filePath: f, offset: 1, limit: 5 });
 	});
 
 	it("tail -n N → the LAST N lines", () => {
@@ -116,6 +122,40 @@ describe("extractReadPathsFromCommand — partial viewers", () => {
 		expect(
 			readSpan(extractReadPathsFromCommand(`sed -n '2,40p' ${f}`, tmp), f),
 		).toEqual({ filePath: f, offset: 2, limit: 39 });
+	});
+});
+
+// ── grep output: scattered search results become searchReads at tool_result ─
+
+describe("extractGrepSearchReadsFromOutput", () => {
+	it("parses multi-file grep -n output as file:line matches", () => {
+		const a = touchLines("a.ts", 20);
+		const b = touchLines("sub/b.ts", 30);
+		const relB = path.relative(tmp, b);
+		expect(
+			extractGrepSearchReadsFromOutput(
+				`grep -n foo ${a} ${relB}`,
+				tmp,
+				`${a}:7:foo\n${relB}:12:foo`,
+			),
+		).toEqual([
+			{ file: a, startLine: 7, endLine: 7 },
+			{ file: b, startLine: 12, endLine: 12 },
+		]);
+	});
+
+	it("parses single-file grep -n output using the command file", () => {
+		const a = touchLines("a.ts", 20);
+		expect(
+			extractGrepSearchReadsFromOutput(`grep -n foo ${a}`, tmp, "9:foo here"),
+		).toEqual([{ file: a, startLine: 9, endLine: 9 }]);
+	});
+
+	it("ignores grep output when -n is absent", () => {
+		const a = touchLines("a.ts", 20);
+		expect(
+			extractGrepSearchReadsFromOutput(`grep foo ${a}`, tmp, `${a}:9:foo`),
+		).toHaveLength(0);
 	});
 });
 
@@ -156,12 +196,22 @@ describe("extractWrittenPathsFromCommand — bash writes", () => {
 	it("whole-tree / non-content git ops are NOT registered (can't enumerate files)", () => {
 		const f = pathIn("a.ts");
 		// branch switch (no `--`), hard reset, status, diff, add, stash pop
-		expect(extractWrittenPathsFromCommand(`git checkout main`, tmp)).toHaveLength(0);
-		expect(extractWrittenPathsFromCommand(`git reset --hard`, tmp)).toHaveLength(0);
+		expect(
+			extractWrittenPathsFromCommand(`git checkout main`, tmp),
+		).toHaveLength(0);
+		expect(
+			extractWrittenPathsFromCommand(`git reset --hard`, tmp),
+		).toHaveLength(0);
 		expect(extractWrittenPathsFromCommand(`git status`, tmp)).toHaveLength(0);
-		expect(extractWrittenPathsFromCommand(`git diff ${f}`, tmp)).not.toContain(f);
-		expect(extractWrittenPathsFromCommand(`git add ${f}`, tmp)).not.toContain(f);
-		expect(extractWrittenPathsFromCommand(`git stash pop`, tmp)).toHaveLength(0);
+		expect(extractWrittenPathsFromCommand(`git diff ${f}`, tmp)).not.toContain(
+			f,
+		);
+		expect(extractWrittenPathsFromCommand(`git add ${f}`, tmp)).not.toContain(
+			f,
+		);
+		expect(extractWrittenPathsFromCommand(`git stash pop`, tmp)).toHaveLength(
+			0,
+		);
 	});
 });
 
@@ -178,7 +228,9 @@ describe("commands with no file content are not registered at all", () => {
 	for (const [label, build] of noops) {
 		it(`${label} → no read and no write`, () => {
 			const f = touchLines("a.ts", 5);
-			expect(readSpan(extractReadPathsFromCommand(build(f), tmp), f)).toBeUndefined();
+			expect(
+				readSpan(extractReadPathsFromCommand(build(f), tmp), f),
+			).toBeUndefined();
 			expect(extractWrittenPathsFromCommand(build(f), tmp)).not.toContain(f);
 		});
 	}
@@ -199,13 +251,19 @@ describe("edge cases", () => {
 
 	it("unsupported extension is not registered (read or write)", () => {
 		const f = touchLines("package.lock", 3);
-		expect(readSpan(extractReadPathsFromCommand(`cat ${f}`, tmp), f)).toBeUndefined();
-		expect(extractWrittenPathsFromCommand(`echo x > ${f}`, tmp)).not.toContain(f);
+		expect(
+			readSpan(extractReadPathsFromCommand(`cat ${f}`, tmp), f),
+		).toBeUndefined();
+		expect(extractWrittenPathsFromCommand(`echo x > ${f}`, tmp)).not.toContain(
+			f,
+		);
 	});
 
 	it("empty / fileless commands return []", () => {
 		expect(extractReadPathsFromCommand("", tmp)).toHaveLength(0);
-		expect(extractWrittenPathsFromCommand("echo hello world", tmp)).toHaveLength(0);
+		expect(
+			extractWrittenPathsFromCommand("echo hello world", tmp),
+		).toHaveLength(0);
 	});
 
 	it("does not throw on paths with spaces", () => {

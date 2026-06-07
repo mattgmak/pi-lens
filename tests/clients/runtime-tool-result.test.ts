@@ -11,6 +11,54 @@ vi.mock("../../clients/pipeline.js", () => ({
 	runPipeline: vi.fn(),
 }));
 
+describe("bash grep searchReads registration", () => {
+	it("records grep -n output lines as read-guard search reads", async () => {
+		const env = setupTestEnvironment("pi-lens-grep-search-reads-");
+		try {
+			const filePath = path.join(env.tmpDir, "sample.ts");
+			fs.writeFileSync(
+				filePath,
+				Array.from({ length: 20 }, (_, i) => `line${i + 1}`).join("\n"),
+			);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			runtime.beginTurn();
+			const recordRead = vi.fn();
+
+			await handleToolResult({
+				event: {
+					toolName: "bash",
+					input: { command: `grep -n line9 ${filePath}` },
+					details: {},
+					content: [{ type: "text", text: "9:line9" }],
+				},
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager: new CacheManager(false),
+				biomeClient: {},
+				ruffClient: {},
+				testRunnerClient: {},
+				metricsClient: {},
+				resetLSPService: () => {},
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+				readGuard: { recordRead },
+			} as any);
+
+			expect(recordRead).toHaveBeenCalledWith(
+				expect.objectContaining({
+					filePath,
+					effectiveOffset: 7,
+					effectiveLimit: 5,
+				}),
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
 describe("monorepo turn-state cwd alignment", () => {
 	beforeEach(async () => {
 		const pipeline = await import("../../clients/pipeline.js");
@@ -32,11 +80,20 @@ describe("monorepo turn-state cwd alignment", () => {
 		try {
 			// Simulate a monorepo: workspace root with a nested Go module
 			const workspaceRoot = path.join(env.tmpDir, "workspace");
-			const goModuleDir = path.join(workspaceRoot, "platform", "svc", "go", "daemon");
+			const goModuleDir = path.join(
+				workspaceRoot,
+				"platform",
+				"svc",
+				"go",
+				"daemon",
+			);
 			const filePath = path.join(goModuleDir, "main.go");
 			fs.mkdirSync(goModuleDir, { recursive: true });
-			fs.writeFileSync(path.join(goModuleDir, "go.mod"), "module daemon\n\ngo 1.22\n");
-			fs.writeFileSync(filePath, 'package main\n\nfunc main() {}\n');
+			fs.writeFileSync(
+				path.join(goModuleDir, "go.mod"),
+				"module daemon\n\ngo 1.22\n",
+			);
+			fs.writeFileSync(filePath, "package main\n\nfunc main() {}\n");
 
 			const cacheManager = new CacheManager(false);
 			const runtime = new RuntimeCoordinator();
@@ -105,11 +162,20 @@ describe("monorepo turn-state cwd alignment", () => {
 		const env = setupTestEnvironment("pi-lens-monorepo-dispatch-");
 		try {
 			const workspaceRoot = path.join(env.tmpDir, "workspace");
-			const goModuleDir = path.join(workspaceRoot, "platform", "svc", "go", "daemon");
+			const goModuleDir = path.join(
+				workspaceRoot,
+				"platform",
+				"svc",
+				"go",
+				"daemon",
+			);
 			const filePath = path.join(goModuleDir, "main.go");
 			fs.mkdirSync(goModuleDir, { recursive: true });
-			fs.writeFileSync(path.join(goModuleDir, "go.mod"), "module daemon\n\ngo 1.22\n");
-			fs.writeFileSync(filePath, 'package main\n\nfunc main() {}\n');
+			fs.writeFileSync(
+				path.join(goModuleDir, "go.mod"),
+				"module daemon\n\ngo 1.22\n",
+			);
+			fs.writeFileSync(filePath, "package main\n\nfunc main() {}\n");
 
 			const runtime = new RuntimeCoordinator();
 			runtime.projectRoot = workspaceRoot;

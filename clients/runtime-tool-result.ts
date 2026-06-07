@@ -1,7 +1,10 @@
 import * as nodeCrypto from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
-import { extractWrittenPathsFromCommand } from "./bash-file-access.js";
+import {
+	extractGrepSearchReadsFromOutput,
+	extractWrittenPathsFromCommand,
+} from "./bash-file-access.js";
 import type { BiomeClient } from "./biome-client.js";
 import {
 	registerSearchReads,
@@ -106,9 +109,10 @@ export function clearLastAnalyzedStateCache(): void {
 
 // ── Coalesce sequential edits via debounce window (#115) ────────────────────
 
-type ToolResultReturn =
-	| { content: Array<{ type: string; text?: string }>; isError?: boolean }
-	| void;
+type ToolResultReturn = {
+	content: Array<{ type: string; text?: string }>;
+	isError?: boolean;
+} | void;
 
 interface DebouncedEntry {
 	timer: NodeJS.Timeout;
@@ -141,11 +145,16 @@ function getDebounceMs(): number {
  *
  * Passing a filePath flushes only that entry; omitting it flushes all.
  */
-export async function flushDebouncedToolResults(filePath?: string): Promise<void> {
+export async function flushDebouncedToolResults(
+	filePath?: string,
+): Promise<void> {
 	const entries = filePath
 		? debouncedPipelines.has(filePath)
 			? [
-					[filePath, debouncedPipelines.get(filePath) as DebouncedEntry] as const,
+					[
+						filePath,
+						debouncedPipelines.get(filePath) as DebouncedEntry,
+					] as const,
 				]
 			: []
 		: [...debouncedPipelines.entries()];
@@ -161,7 +170,9 @@ export async function flushDebouncedToolResults(filePath?: string): Promise<void
 	}
 	if (entries.length > 0) {
 		// Allow microtasks to settle so awaiting callers see the latest state.
-		await Promise.all(entries.map(([, entry]) => entry.promise.catch(() => undefined)));
+		await Promise.all(
+			entries.map(([, entry]) => entry.promise.catch(() => undefined)),
+		);
 	}
 }
 
@@ -314,7 +325,10 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		typeof (event.input as { command?: unknown }).command === "string"
 	) {
 		const command = (event.input as { command: string }).command;
-		const written = extractWrittenPathsFromCommand(command, workspaceRoot).filter(
+		const written = extractWrittenPathsFromCommand(
+			command,
+			workspaceRoot,
+		).filter(
 			(wp) =>
 				!isExternalOrVendorFile(wp, workspaceRoot) &&
 				!isPathIgnoredByProject(wp, workspaceRoot, false),
@@ -331,12 +345,28 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 
 	// Search tools reveal specific lines (file:line) the agent then edits — register
 	// those shown lines (± context) as reads so the follow-up edit isn't blocked (#169).
-	// Our tools attach the locations as `details.searchReads`; grep parsing is wired
-	// separately. Only the shown lines are registered, never the whole file.
+	// Our tools attach locations as `details.searchReads`; bash grep is parsed from
+	// `grep -n` output. Only shown lines are registered, never the whole file.
 	if (deps.readGuard && !getFlag("no-read-guard")) {
-		const searchReads = (event.details as { searchReads?: SearchReadLocation[] })
-			?.searchReads;
-		if (Array.isArray(searchReads) && searchReads.length > 0) {
+		const searchReads: SearchReadLocation[] = [];
+		const detailSearchReads = (
+			event.details as { searchReads?: SearchReadLocation[] }
+		)?.searchReads;
+		if (Array.isArray(detailSearchReads))
+			searchReads.push(...detailSearchReads);
+		if (
+			event.toolName === "bash" &&
+			typeof (event.input as { command?: unknown }).command === "string"
+		) {
+			const command = (event.input as { command: string }).command;
+			const output = event.content
+				.map((part) => (typeof part.text === "string" ? part.text : ""))
+				.join("\n");
+			searchReads.push(
+				...extractGrepSearchReadsFromOutput(command, workspaceRoot, output),
+			);
+		}
+		if (searchReads.length > 0) {
 			registerSearchReads(deps.readGuard, searchReads, {
 				projectRoot: workspaceRoot,
 				turnIndex: runtime.turnIndex,
@@ -449,7 +479,9 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 
 	const dispatchCwd = resolveLanguageRootForFile(filePath, workspaceRoot);
 	const turnStateCwd = path.resolve(workspaceRoot);
-	dbg(`tool_result: resolved dispatch cwd ${dispatchCwd} for ${filePath} (turnState cwd ${turnStateCwd})`);
+	dbg(
+		`tool_result: resolved dispatch cwd ${dispatchCwd} for ${filePath} (turnState cwd ${turnStateCwd})`,
+	);
 	if (event.model || event.provider || event.sessionId || event.session?.id) {
 		runtime.setTelemetryIdentity({
 			model: event.model,

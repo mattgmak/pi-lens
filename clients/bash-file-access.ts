@@ -16,6 +16,7 @@
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import { countFileLines } from "./read-guard-tool-lines.js";
+import type { SearchReadLocation } from "./search-read-registration.js";
 
 /** A contiguous range of lines a bash command showed the agent. */
 export interface ReadSpan {
@@ -40,6 +41,15 @@ function stripQuotes(token: string): string {
 		}
 	}
 	return token;
+}
+
+function stripAnsi(value: string): string {
+	return value.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
+}
+
+function tokenizeSegment(segment: string): string[] {
+	const matches = segment.match(/'[^']*'|"(?:[^"\\]|\\.)*"|\S+/g);
+	return matches ?? [];
 }
 
 /** Resolve a token to an absolute path if it looks like a source file. */
@@ -150,11 +160,162 @@ export function extractReadPathsFromCommand(
 				}
 			}
 			if (!range) continue;
-			for (const a of args) addSpan(a, range.start, range.end - range.start + 1);
+			for (const a of args)
+				addSpan(a, range.start, range.end - range.start + 1);
 		}
 	}
 
 	return spans;
+}
+
+function grepHasLineNumbers(args: string[]): boolean {
+	return args.some((arg) => {
+		const token = stripQuotes(arg);
+		return token === "--line-number" || /^-[A-Za-z]*n[A-Za-z]*$/.test(token);
+	});
+}
+
+const GREP_OPTIONS_WITH_VALUE = new Set([
+	"-e",
+	"-f",
+	"-m",
+	"-A",
+	"-B",
+	"-C",
+	"--regexp",
+	"--file",
+	"--max-count",
+	"--after-context",
+	"--before-context",
+	"--context",
+]);
+
+function extractGrepSearchFiles(args: string[], cwd: string): string[] {
+	const files: string[] = [];
+	let patternSeen = false;
+	let endOfOptions = false;
+	for (let i = 0; i < args.length; i++) {
+		const token = stripQuotes(args[i]);
+		if (!endOfOptions && token === "--") {
+			endOfOptions = true;
+			continue;
+		}
+		if (!endOfOptions && GREP_OPTIONS_WITH_VALUE.has(token)) {
+			i++;
+			continue;
+		}
+		if (!endOfOptions && /^-[ef].+/.test(token)) continue;
+		if (!endOfOptions && token.startsWith("-")) continue;
+		if (!patternSeen) {
+			patternSeen = true;
+			continue;
+		}
+		const abs = resolveCandidate(token, cwd);
+		if (!abs) continue;
+		try {
+			if (!nodeFs.statSync(abs).isFile()) continue;
+		} catch {
+			continue;
+		}
+		files.push(abs);
+	}
+	return files;
+}
+
+function parseGrepLineWithFile(
+	line: string,
+	cwd: string,
+): SearchReadLocation | undefined {
+	const match = /^(.*?):(\d+):/.exec(stripAnsi(line));
+	if (!match) return undefined;
+	const lineNumber = Number.parseInt(match[2], 10);
+	if (!Number.isFinite(lineNumber) || lineNumber < 1) return undefined;
+	const abs = resolveCandidate(match[1], cwd);
+	if (!abs) return undefined;
+	try {
+		if (!nodeFs.statSync(abs).isFile()) return undefined;
+	} catch {
+		return undefined;
+	}
+	return { file: abs, startLine: lineNumber, endLine: lineNumber };
+}
+
+function parseGrepLineWithoutFile(
+	line: string,
+	file: string,
+): SearchReadLocation | undefined {
+	const match = /^(\d+):/.exec(stripAnsi(line));
+	if (!match) return undefined;
+	const lineNumber = Number.parseInt(match[1], 10);
+	if (!Number.isFinite(lineNumber) || lineNumber < 1) return undefined;
+	return { file, startLine: lineNumber, endLine: lineNumber };
+}
+
+function collectGrepCommandFiles(
+	command: string,
+	cwd: string,
+): { hasLineNumberGrep: boolean; files: Set<string> } {
+	const files = new Set<string>();
+	let hasLineNumberGrep = false;
+	for (const rawSegment of splitSegments(command)) {
+		const tokens = tokenizeSegment(rawSegment.trim());
+		const verb = path.basename(stripQuotes(tokens[0] ?? ""));
+		if (verb !== "grep" && verb !== "egrep" && verb !== "fgrep") continue;
+		const args = tokens.slice(1);
+		if (!grepHasLineNumbers(args)) continue;
+		hasLineNumberGrep = true;
+		for (const file of extractGrepSearchFiles(args, cwd)) files.add(file);
+	}
+	return { hasLineNumberGrep, files };
+}
+
+function dedupePushSearchRead(
+	out: SearchReadLocation[],
+	seen: Set<string>,
+	loc: SearchReadLocation | undefined,
+): void {
+	if (!loc) return;
+	const key = `${loc.file}:${loc.startLine}:${loc.endLine ?? loc.startLine}`;
+	if (seen.has(key)) return;
+	seen.add(key);
+	out.push(loc);
+}
+
+function parseGrepOutputSearchReads(
+	output: string,
+	cwd: string,
+	singleFile?: string,
+): SearchReadLocation[] {
+	const out: SearchReadLocation[] = [];
+	const seen = new Set<string>();
+	for (const rawLine of output.split(/\r?\n/)) {
+		if (!rawLine) continue;
+		dedupePushSearchRead(out, seen, parseGrepLineWithFile(rawLine, cwd));
+		if (singleFile) {
+			dedupePushSearchRead(
+				out,
+				seen,
+				parseGrepLineWithoutFile(rawLine, singleFile),
+			);
+		}
+	}
+	return out;
+}
+
+/**
+ * Parse `grep -n` output into the specific lines shown to the agent (#169).
+ * Multi-file grep prints `file:line:text`; single-file grep prints `line:text`,
+ * so the latter is only accepted when the command names exactly one source file.
+ */
+export function extractGrepSearchReadsFromOutput(
+	command: string,
+	cwd: string,
+	output: string,
+): SearchReadLocation[] {
+	const { hasLineNumberGrep, files } = collectGrepCommandFiles(command, cwd);
+	if (!hasLineNumberGrep) return [];
+	const singleFile = files.size === 1 ? [...files][0] : undefined;
+	return parseGrepOutputSearchReads(output, cwd, singleFile);
 }
 
 /**

@@ -14,6 +14,9 @@ vi.mock("../../clients/lsp/index.js", () => ({
 
 import { createLspNavigationTool } from "../../tools/lsp-navigation.js";
 
+const tmpPath = (name: string): string => path.join(os.tmpdir(), name);
+const tmpFileUrl = (name: string): string => pathToFileURL(tmpPath(name)).href;
+
 describe("lsp_navigation tool", () => {
 	beforeEach(() => {
 		mocked.service = {
@@ -40,7 +43,7 @@ describe("lsp_navigation tool", () => {
 			}),
 			references: vi.fn().mockResolvedValue([
 				{
-					uri: "file:///tmp/sample.ts",
+					uri: tmpFileUrl("sample.ts"),
 					range: {
 						start: { line: 1, character: 1 },
 						end: { line: 1, character: 5 },
@@ -174,6 +177,32 @@ describe("lsp_navigation tool", () => {
 		).toHaveBeenCalledWith("ReportProcessor", undefined);
 	});
 
+	it("attaches searchReads for reference locations", async () => {
+		const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
+
+		const result = await tool.execute(
+			"references-search-reads",
+			{
+				operation: "references",
+				filePath: path.resolve("tests/tools/lsp-navigation.test.ts"),
+				line: 1,
+				character: 1,
+			},
+			new AbortController().signal,
+			null,
+			{ cwd: "." },
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(result.details?.searchReads).toEqual([
+			{
+				file: tmpPath("sample.ts"),
+				startLine: 2,
+				endLine: 2,
+			},
+		]);
+	});
+
 	it("deduplicates workspaceSymbol results", async () => {
 		const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
 		(
@@ -213,6 +242,148 @@ describe("lsp_navigation tool", () => {
 
 		expect(result.isError).toBeUndefined();
 		expect(result.details?.resultCount).toBe(1);
+	});
+
+	it("attaches searchReads for workspaceSymbol locations", async () => {
+		const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
+		(
+			mocked.service as { workspaceSymbol: ReturnType<typeof vi.fn> }
+		).workspaceSymbol = vi.fn().mockResolvedValue([
+			{
+				name: "ReportProcessor",
+				kind: 12,
+				location: {
+					uri: tmpFileUrl("report.ts"),
+					range: {
+						start: { line: 4, character: 2 },
+						end: { line: 6, character: 17 },
+					},
+				},
+			},
+		]);
+
+		const result = await tool.execute(
+			"workspace-symbol-search-reads",
+			{ operation: "workspaceSymbol", query: "ReportProcessor" },
+			new AbortController().signal,
+			null,
+			{ cwd: "." },
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(result.details?.searchReads).toEqual([
+			{
+				file: tmpPath("report.ts"),
+				startLine: 5,
+				endLine: 7,
+			},
+		]);
+	});
+
+	it("attaches searchReads for call hierarchy incoming and outgoing ranges", async () => {
+		const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
+		const sourceItem = {
+			name: "source",
+			kind: 12,
+			uri: tmpFileUrl("source.ts"),
+			range: {
+				start: { line: 1, character: 0 },
+				end: { line: 1, character: 6 },
+			},
+			selectionRange: {
+				start: { line: 1, character: 0 },
+				end: { line: 1, character: 6 },
+			},
+		};
+		(
+			mocked.service as { incomingCalls: ReturnType<typeof vi.fn> }
+		).incomingCalls = vi.fn().mockResolvedValue([
+			{
+				from: {
+					name: "caller",
+					kind: 12,
+					uri: tmpFileUrl("caller.ts"),
+					range: {
+						start: { line: 9, character: 0 },
+						end: { line: 9, character: 6 },
+					},
+					selectionRange: {
+						start: { line: 9, character: 0 },
+						end: { line: 9, character: 6 },
+					},
+				},
+				fromRanges: [
+					{
+						start: { line: 12, character: 2 },
+						end: { line: 12, character: 8 },
+					},
+				],
+			},
+		]);
+
+		const incoming = await tool.execute(
+			"incoming-search-reads",
+			{ operation: "incomingCalls", callHierarchyItem: sourceItem },
+			new AbortController().signal,
+			null,
+			{ cwd: "." },
+		);
+
+		expect(incoming.details?.searchReads).toEqual([
+			{
+				file: tmpPath("caller.ts"),
+				startLine: 10,
+				endLine: 10,
+			},
+			{
+				file: tmpPath("caller.ts"),
+				startLine: 13,
+				endLine: 13,
+			},
+		]);
+
+		(
+			mocked.service as { outgoingCalls: ReturnType<typeof vi.fn> }
+		).outgoingCalls = vi.fn().mockResolvedValue([
+			{
+				to: {
+					name: "callee",
+					kind: 12,
+					uri: tmpFileUrl("callee.ts"),
+					range: {
+						start: { line: 19, character: 0 },
+						end: { line: 19, character: 6 },
+					},
+				},
+				fromRanges: [
+					{
+						start: { line: 3, character: 2 },
+						end: { line: 3, character: 8 },
+					},
+				],
+			},
+		]);
+
+		const outgoing = await tool.execute(
+			"outgoing-search-reads",
+			{ operation: "outgoingCalls", callHierarchyItem: sourceItem },
+			new AbortController().signal,
+			null,
+			{ cwd: "." },
+		);
+
+		expect(outgoing.details?.searchReads).toEqual([
+			{
+				file: tmpPath("callee.ts"),
+				startLine: 20,
+				endLine: 20,
+			},
+			{
+				file: tmpPath("source.ts"),
+				startLine: 4,
+				endLine: 4,
+			},
+		]);
 	});
 
 	it("opens scoped file before workspaceSymbol query", async () => {
