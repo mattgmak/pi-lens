@@ -369,7 +369,10 @@ export default function (pi: ExtensionAPI) {
 	function updateLspStatus(
 		setStatus: (id: string, text: string | undefined) => void,
 		theme: {
-			fg: (color: "accent" | "success" | "error", text: string) => string;
+			fg: (
+				color: "accent" | "success" | "error" | "warning" | "dim",
+				text: string,
+			) => string;
 		},
 	) {
 		try {
@@ -377,7 +380,10 @@ export default function (pi: ExtensionAPI) {
 			if (count > 0) {
 				setStatus("pi-lens-lsp", theme.fg("success", `LSP Active (${count})`));
 			} else {
-				setStatus("pi-lens-lsp", theme.fg("error", "LSP Inactive"));
+				// Inactive is a passive state (no server running for this file, or the
+				// idle timer released them) — not a fault. Render it neutral/grey, not
+				// red. Surfacing genuine LSP *failures* in red is tracked separately.
+				setStatus("pi-lens-lsp", theme.fg("dim", "LSP Inactive"));
 			}
 		} catch {
 			// Theme may not be fully initialized during early session startup.

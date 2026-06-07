@@ -10,6 +10,8 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Fixed
 
+- **`LSP Inactive` footer status no longer rendered in red (closes #167)** — having no LSP server running for the current file (or after the idle timer releases them) is a passive state, not a fault, but it was painted in the `error` (red) color, implying something was broken. It now uses the neutral `dim` (grey) color; `LSP Active (n)` stays green. Surfacing genuine LSP *failures* in red is tracked in #170.
+
 - **Extension load no longer requires the host coding-agent package in `node_modules`** — `index.ts` and `clients/read-guard-tool-lines.ts` imported a *runtime* value (`isToolCallEventType`) from `@earendil-works/pi-coding-agent`. pi installs extension deps with `npm install --omit=dev`, so that package isn't present at runtime; and pulling it in drags a huge transitive tree (LLM provider SDKs) whose deeply nested paths exceed Windows' `MAX_PATH`, breaking `git clean -fdx` on `pi update` (→ a half-deleted `node_modules` → `Cannot find module 'vscode-jsonrpc/node.js'`). The one-line discriminant is now inlined in `clients/tool-event.ts`, so every `@earendil-works/pi-coding-agent` import is type-only (erased at runtime) — matching the established pi-extension pattern (e.g. `nicobailon/pi-subagents`).
 
 - **`js-yaml` moved from `devDependencies` to `dependencies`** — `clients/ast-grep-yaml-synth.ts` imports it at runtime, but it was declared dev-only, so a production (`--omit=dev`) install left it missing and the extension failed to load with `Cannot find package 'js-yaml'`. (`@types/js-yaml` stays dev-only.) The CI install-test (production tarball install + `tsx` load) now exercises this path so misplaced runtime deps are caught before release.
