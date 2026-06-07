@@ -202,44 +202,148 @@ function resolveToolCallFilePath(
 	return path.resolve(cwd ?? projectRoot, rawFilePath);
 }
 
+/** A contiguous range of lines a bash command showed the agent. */
+export interface ReadSpan {
+	filePath: string;
+	/** 1-based first line read. */
+	offset: number;
+	/** Number of lines read. */
+	limit: number;
+}
+
+// Source-ish extensions worth registering a read for. Anchored end-check so it
+// is linear (no catastrophic backtracking).
+const READABLE_EXT_RE =
+	/\.(?:ts|tsx|js|jsx|mjs|cjs|py|sh|rs|go|cs|java|kt|rb|php|c|cpp|cc|h|hpp|json|jsonc|yaml|yml|toml|md|txt|env|cfg|conf|ini|html|css|scss|less|xml|sql|vue|svelte)$/i;
+
+function stripQuotes(token: string): string {
+	if (token.length >= 2) {
+		const first = token[0];
+		const last = token[token.length - 1];
+		if ((first === "'" && last === "'") || (first === '"' && last === '"')) {
+			return token.slice(1, -1);
+		}
+	}
+	return token;
+}
+
+/** Parse a count flag value like `-20`, `-n20`, or the `20` following `-n`. */
+function parseCountFlag(token: string): number | undefined {
+	const digits = token.replace(/^-n?/, "").replace(/[^0-9]/g, "");
+	if (!digits) return undefined;
+	const n = Number.parseInt(digits, 10);
+	return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
 /**
- * Extract file paths that were explicitly read by bash/grep/find commands.
- * Only returns paths that exist on disk and are not directories.
- * Conservative: only handles unambiguous read-only patterns.
+ * Extract the line ranges a bash command explicitly showed the agent, so the
+ * read-guard can treat those lines as read and not block a follow-up edit.
+ *
+ * Deliberately conservative — only file-VIEWING commands (`cat`/`head`/`tail`/
+ * `sed -n A,Bp`), and only the exact lines shown:
+ *   - `cat`/`bat`/`less`/`more`/`nl FILE`  → whole file
+ *   - `head [-n N] FILE`                    → lines 1..N (default 10)
+ *   - `tail [-n N] FILE`                    → last N lines (default 10)
+ *   - `sed -n 'A,Bp' FILE`                  → lines A..B
+ *
+ * It does NOT register: writes (`>`, `>>`, `tee`, `sed -i`, `cp`, `mv`), `grep`
+ * (scattered matches, not a contiguous view), `find` (names, no content), or
+ * bare path mentions in arbitrary commands. Registering any of those would let
+ * an edit through for content the agent never actually saw.
  */
 export function extractReadPathsFromCommand(
 	command: string,
 	cwd: string,
-): string[] {
-	const results = new Set<string>();
+): ReadSpan[] {
+	const spans: ReadSpan[] = [];
+	const seen = new Set<string>();
 
-	const resolve = (p: string) => {
-		const abs = path.isAbsolute(p) ? p : path.resolve(cwd, p);
-		try {
-			const stat = nodeFs.statSync(abs);
-			if (stat.isFile()) results.add(abs);
-		} catch {
-			// ignore non-existent / non-accessible
+	const resolveFile = (token: string): { abs: string; total: number } | null => {
+		const cleaned = stripQuotes(token);
+		if (!cleaned || cleaned.startsWith("-") || !READABLE_EXT_RE.test(cleaned)) {
+			return null;
 		}
+		const abs = path.isAbsolute(cleaned)
+			? cleaned
+			: path.resolve(cwd, cleaned);
+		try {
+			if (!nodeFs.statSync(abs).isFile()) return null;
+		} catch {
+			return null;
+		}
+		return { abs, total: countFileLines(abs) };
 	};
 
-	// cat / head / tail / sed -n / awk — positional file args
-	// Matches: cat foo.ts, head -20 foo.ts, tail -n 10 foo.ts, sed -n '1,50p' foo.ts
-	const catLike =
-		/\b(?:cat|head|tail|sed|awk)(?:\s+(?:-[^\s]+\s+)*)(\S+\.(?:ts|tsx|js|jsx|py|sh|rs|go|cs|java|kt|rb|php|c|cpp|h|json|yaml|yml|toml|md|txt|env|cfg|conf|ini|html|css|scss|xml|sql))\b/g;
-	for (const m of command.matchAll(catLike)) resolve(m[1]);
+	const addSpan = (token: string, start: number, count: number) => {
+		const file = resolveFile(token);
+		if (!file) return;
+		const offset = Math.min(Math.max(1, start), file.total);
+		const limit = Math.min(count, file.total - offset + 1);
+		if (limit < 1) return;
+		const key = `${file.abs}:${offset}:${limit}`;
+		if (seen.has(key)) return;
+		seen.add(key);
+		spans.push({ filePath: file.abs, offset, limit });
+	};
 
-	// grep -n pattern file / grep -rn ... file — last non-flag, non-pattern arg
-	// Only handles single-file grep (not recursive -r without explicit path, to avoid false positives)
-	const grepSingle =
-		/\bgrep\b(?:\s+-[^\s]+)*\s+(?:'[^']*'|"[^"]*"|\S+)\s+(\S+\.(?:ts|tsx|js|jsx|py|sh|rs|go|cs|java|kt|rb|php|c|cpp|h|json|yaml|yml|toml|md|txt|env|cfg|conf|ini|html|css|scss|xml|sql))(?:\s|$)/g;
-	for (const m of command.matchAll(grepSingle)) resolve(m[1]);
+	// Split on shell sequencing/pipe operators so each segment has its own verb.
+	for (const rawSegment of command.split(/&&|\|\||[;|\n]/)) {
+		const segment = rawSegment.trim();
+		if (!segment) continue;
+		const tokens = segment.split(/\s+/);
+		const verb = path.basename(tokens[0] ?? "");
+		const args = tokens.slice(1);
 
-	// Absolute paths referenced in any command (e.g. sed -n '1p' /abs/path/file.ts)
-	const absPaths = /(\/[\w./-]+\.(?:ts|tsx|js|jsx|py|sh|rs|go|cs|java|kt|rb|php|c|cpp|h|json|yaml|yml|toml|md|txt|env|cfg|conf|ini|html|css|scss|xml|sql))\b/g;
-	for (const m of command.matchAll(absPaths)) resolve(m[1]);
+		if (["cat", "bat", "less", "more", "nl"].includes(verb)) {
+			for (const a of args) addSpan(a, 1, Number.MAX_SAFE_INTEGER);
+		} else if (verb === "head" || verb === "tail") {
+			let count: number | undefined;
+			const files: string[] = [];
+			for (let i = 0; i < args.length; i++) {
+				const a = args[i];
+				if (a === "-n" || a === "-c") {
+					const next = args[i + 1];
+					if (next !== undefined) {
+						count = parseCountFlag(next) ?? count;
+						i++;
+					}
+				} else if (/^-n?\d+$/.test(a)) {
+					count = parseCountFlag(a) ?? count;
+				} else if (a.startsWith("-")) {
+					// other flag — ignore
+				} else {
+					files.push(a);
+				}
+			}
+			const n = count ?? 10; // GNU head/tail default
+			for (const f of files) {
+				const file = resolveFile(f);
+				if (!file) continue;
+				if (verb === "head") addSpan(f, 1, n);
+				else addSpan(f, file.total - n + 1, n); // tail: last n lines
+			}
+		} else if (verb === "sed") {
+			// Only the read-only `sed -n 'A,Bp'` form (NOT `sed -i`, which writes).
+			if (args.includes("-i")) continue;
+			let range: { start: number; end: number } | undefined;
+			for (const a of args) {
+				const m = stripQuotes(a).match(/^(\d+),(\d+)p$/);
+				if (m) {
+					range = {
+						start: Number.parseInt(m[1], 10),
+						end: Number.parseInt(m[2], 10),
+					};
+					break;
+				}
+			}
+			if (!range) continue;
+			for (const a of args) {
+				addSpan(a, range.start, range.end - range.start + 1);
+			}
+		}
+	}
 
-	return Array.from(results);
+	return spans;
 }
 
 type ReadToolInput = {
@@ -1423,30 +1527,25 @@ export default function (pi: ExtensionAPI) {
 			});
 		}
 
-		// --- Read-Before-Edit Guard: register bash/grep/find/sed reads ---
-		if (
-			(toolName === "bash" || toolName === "grep" || toolName === "find") &&
-			!getLensFlag("no-read-guard")
-		) {
-			const cmd =
-				typeof (event.input as Record<string, unknown>)?.command === "string"
-					? ((event.input as Record<string, unknown>).command as string)
-					: typeof (event.input as Record<string, unknown>)?.pattern === "string"
-						? ((event.input as Record<string, unknown>).pattern as string)
-						: "";
-			if (cmd) {
+		// --- Read-Before-Edit Guard: register file views done via `bash` ---
+		// Only the bash tool — grep/find tools (and their patterns) are not
+		// contiguous file reads. extractReadPathsFromCommand handles read-only
+		// view commands (cat/head/tail/sed -n) and the exact line ranges shown.
+		if (toolName === "bash" && !getLensFlag("no-read-guard")) {
+			const cmd = (event.input as Record<string, unknown>)?.command;
+			if (typeof cmd === "string" && cmd) {
 				const effectiveCwd = ctx.cwd ?? runtime.projectRoot ?? process.cwd();
-				const readPaths = extractReadPathsFromCommand(cmd, effectiveCwd);
-				for (const rp of readPaths) {
-					if (isPathIgnoredByProject(rp, runtime.projectRoot, false)) continue;
-					if (isExternalOrVendorFile(rp, runtime.projectRoot)) continue;
-					const lineCount = countFileLines(rp);
+				for (const span of extractReadPathsFromCommand(cmd, effectiveCwd)) {
+					if (isPathIgnoredByProject(span.filePath, runtime.projectRoot, false))
+						continue;
+					if (isExternalOrVendorFile(span.filePath, runtime.projectRoot))
+						continue;
 					runtime.readGuard.recordRead({
-						filePath: rp,
-						requestedOffset: 1,
-						requestedLimit: lineCount,
-						effectiveOffset: 1,
-						effectiveLimit: lineCount,
+						filePath: span.filePath,
+						requestedOffset: span.offset,
+						requestedLimit: span.limit,
+						effectiveOffset: span.offset,
+						effectiveLimit: span.limit,
 						expandedByLsp: false,
 						turnIndex: runtime.turnIndex,
 						writeIndex: runtime.peekWriteIndex(),

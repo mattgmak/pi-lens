@@ -2,16 +2,23 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { extractReadPathsFromCommand } from "../../index.js";
+import { extractReadPathsFromCommand, type ReadSpan } from "../../index.js";
 
 let tmp: string;
 
-// Helpers
-function touch(name: string, content = "x"): string {
+/** Write a file with `lines` newline-separated lines; returns its absolute path. */
+function touchLines(name: string, lines = 1): string {
 	const p = path.join(tmp, name);
 	fs.mkdirSync(path.dirname(p), { recursive: true });
-	fs.writeFileSync(p, content);
+	fs.writeFileSync(
+		p,
+		Array.from({ length: lines }, (_, i) => `line${i + 1}`).join("\n"),
+	);
 	return p;
+}
+
+function spanFor(result: ReadSpan[], file: string): ReadSpan | undefined {
+	return result.find((s) => s.filePath === file);
 }
 
 beforeEach(() => {
@@ -22,207 +29,139 @@ afterEach(() => {
 	fs.rmSync(tmp, { recursive: true, force: true });
 });
 
-// ── catLike branch ────────────────────────────────────────────────────────────
+// ── full-file viewers ───────────────────────────────────────────────────────
 
-describe("catLike branch (cat/head/tail/sed/awk)", () => {
-	it("cat <file>", () => {
-		const f = touch("a.ts");
-		expect(extractReadPathsFromCommand(`cat ${f}`, tmp)).toContain(f);
+describe("full-file view commands", () => {
+	it("cat FILE registers the whole file", () => {
+		const f = touchLines("a.ts", 5);
+		const s = spanFor(extractReadPathsFromCommand(`cat ${f}`, tmp), f);
+		expect(s).toEqual({ filePath: f, offset: 1, limit: 5 });
 	});
 
-	it("head -20 <file>", () => {
-		const f = touch("a.ts");
-		expect(extractReadPathsFromCommand(`head -20 ${f}`, tmp)).toContain(f);
-	});
-
-	it("tail -n 10 <file>", () => {
-		const f = touch("a.ts");
-		expect(extractReadPathsFromCommand(`tail -n 10 ${f}`, tmp)).toContain(f);
-	});
-
-	it("sed -n '1,50p' <file>", () => {
-		const f = touch("a.ts");
-		expect(
-			extractReadPathsFromCommand(`sed -n '1,50p' ${f}`, tmp),
-		).toContain(f);
-	});
-
-	it("awk '{print}' <file>", () => {
-		const f = touch("a.py");
-		expect(
-			extractReadPathsFromCommand(`awk '{print}' ${f}`, tmp),
-		).toContain(f);
-	});
-
-	it("all supported extensions are matched", () => {
-		const exts = [
-			"ts", "tsx", "js", "jsx", "py", "sh", "rs", "go", "cs", "java",
-			"kt", "rb", "php", "c", "cpp", "h", "json", "yaml", "yml", "toml",
-			"md", "txt", "env", "cfg", "conf", "ini", "html", "css", "scss",
-			"xml", "sql",
-		];
-		for (const ext of exts) {
-			const f = touch(`file.${ext}`);
-			const result = extractReadPathsFromCommand(`cat ${f}`, tmp);
-			expect(result, `ext=${ext}`).toContain(f);
+	it("less / more / bat / nl also register full reads", () => {
+		const f = touchLines("a.ts", 3);
+		for (const verb of ["less", "more", "bat", "nl"]) {
+			const s = spanFor(extractReadPathsFromCommand(`${verb} ${f}`, tmp), f);
+			expect(s, verb).toEqual({ filePath: f, offset: 1, limit: 3 });
 		}
 	});
 
-	it("unsupported extension is NOT matched by catLike", () => {
-		// .lock is not in the list; absolute path branch would also not match it
-		const f = touch("package.lock");
-		const result = extractReadPathsFromCommand(`cat ${f}`, tmp);
-		expect(result).not.toContain(f);
-	});
-
-	it("multiple flags before file", () => {
-		const f = touch("a.ts");
-		expect(
-			extractReadPathsFromCommand(`head -n -5 ${f}`, tmp),
-		).toContain(f);
-	});
-
-	it("relative path resolved against cwd", () => {
-		const f = touch("sub/b.ts");
+	it("resolves a relative path against cwd", () => {
+		const f = touchLines("sub/b.ts", 2);
 		const rel = path.relative(tmp, f);
-		expect(
-			extractReadPathsFromCommand(`cat ${rel}`, tmp),
-		).toContain(f);
+		const s = spanFor(extractReadPathsFromCommand(`cat ${rel}`, tmp), f);
+		expect(s).toEqual({ filePath: f, offset: 1, limit: 2 });
+	});
+
+	it("registers each file across && / ; segments", () => {
+		const a = touchLines("a.ts", 4);
+		const b = touchLines("b.ts", 6);
+		const r = extractReadPathsFromCommand(`cat ${a} && cat ${b}`, tmp);
+		expect(spanFor(r, a)).toEqual({ filePath: a, offset: 1, limit: 4 });
+		expect(spanFor(r, b)).toEqual({ filePath: b, offset: 1, limit: 6 });
+	});
+
+	it("deduplicates the same file+range mentioned twice", () => {
+		const f = touchLines("a.ts", 3);
+		const r = extractReadPathsFromCommand(`cat ${f} ; cat ${f}`, tmp);
+		expect(r.filter((s) => s.filePath === f)).toHaveLength(1);
 	});
 });
 
-// ── grepSingle branch ─────────────────────────────────────────────────────────
+// ── partial viewers register the EXACT range shown ──────────────────────────
 
-describe("grepSingle branch", () => {
-	it("grep -n pattern <file> (double-quoted pattern)", () => {
-		const f = touch("a.ts");
+describe("partial view commands register the shown range only", () => {
+	it("head -n N → lines 1..N", () => {
+		const f = touchLines("a.ts", 100);
 		expect(
-			extractReadPathsFromCommand(`grep -n "foo" ${f}`, tmp),
-		).toContain(f);
+			spanFor(extractReadPathsFromCommand(`head -n 20 ${f}`, tmp), f),
+		).toEqual({ filePath: f, offset: 1, limit: 20 });
 	});
 
-	it("grep -n pattern <file> (single-quoted pattern)", () => {
-		const f = touch("a.ts");
-		expect(
-			extractReadPathsFromCommand(`grep -n 'foo' ${f}`, tmp),
-		).toContain(f);
+	it("head -N shorthand → lines 1..N", () => {
+		const f = touchLines("a.ts", 100);
+		expect(spanFor(extractReadPathsFromCommand(`head -20 ${f}`, tmp), f)).toEqual({
+			filePath: f,
+			offset: 1,
+			limit: 20,
+		});
 	});
 
-	it("grep -n pattern <file> (unquoted pattern)", () => {
-		const f = touch("a.ts");
-		expect(
-			extractReadPathsFromCommand(`grep -n foo ${f}`, tmp),
-		).toContain(f);
+	it("head clamps when N exceeds the file length", () => {
+		const f = touchLines("a.ts", 5);
+		expect(spanFor(extractReadPathsFromCommand(`head -20 ${f}`, tmp), f)).toEqual({
+			filePath: f,
+			offset: 1,
+			limit: 5,
+		});
 	});
 
-	it("grep with multiple flags", () => {
-		const f = touch("a.ts");
+	it("tail -n N → the LAST N lines", () => {
+		const f = touchLines("a.ts", 100);
 		expect(
-			extractReadPathsFromCommand(`grep -rn "bar" ${f}`, tmp),
-		).toContain(f);
+			spanFor(extractReadPathsFromCommand(`tail -n 10 ${f}`, tmp), f),
+		).toEqual({ filePath: f, offset: 91, limit: 10 });
 	});
 
-	it("grep without flags", () => {
-		const f = touch("a.sh");
+	it("sed -n 'A,Bp' → lines A..B", () => {
+		const f = touchLines("a.ts", 100);
 		expect(
-			extractReadPathsFromCommand(`grep "thing" ${f}`, tmp),
-		).toContain(f);
-	});
-
-	it("recursive grep without explicit file is NOT matched", () => {
-		// 'grep -r pattern dir/' — no explicit .ext file; should not match
-		const result = extractReadPathsFromCommand(
-			`grep -r "foo" ${tmp}/`,
-			tmp,
-		);
-		// tmp itself is a directory, resolve() rejects directories
-		expect(result).toHaveLength(0);
+			spanFor(extractReadPathsFromCommand(`sed -n '2,40p' ${f}`, tmp), f),
+		).toEqual({ filePath: f, offset: 2, limit: 39 });
 	});
 });
 
-// ── absPaths branch ───────────────────────────────────────────────────────────
+// ── safety: writes / non-reads must NOT be registered ───────────────────────
 
-describe("absPaths branch (absolute path in any command)", () => {
-	it("absolute path embedded in bun -e", () => {
-		const f = touch("a.ts");
-		expect(
-			extractReadPathsFromCommand(`bun -e "const x = require('${f}')"`, tmp),
-		).toContain(f);
-	});
+describe("writes and non-content commands are NOT registered (guard safety)", () => {
+	const cases: Array<[string, (f: string) => string]> = [
+		["echo redirect (>)", (f) => `echo "x" > ${f}`],
+		["append redirect (>>)", (f) => `echo "x" >> ${f}`],
+		["sed -i (in-place edit)", (f) => `sed -i 's/a/b/' ${f}`],
+		["tee", (f) => `echo x | tee ${f}`],
+		["cp destination", (f) => `cp /other/src.ts ${f}`],
+		["mv destination", (f) => `mv /other/src.ts ${f}`],
+		["ls (no content)", (f) => `ls -l ${f}`],
+		["grep (scattered matches)", (f) => `grep -n "foo" ${f}`],
+		["find (names only)", (f) => `find . -name ${path.basename(f)}`],
+		["bare mention in unrelated cmd", (f) => `echo building ${f} now`],
+	];
 
-	it("absolute path in python script string", () => {
-		const f = touch("cfg.json");
-		expect(
-			extractReadPathsFromCommand(`python3 -c "open('${f}')"`, tmp),
-		).toContain(f);
-	});
-
-	it("multiple absolute paths in one command", () => {
-		const a = touch("a.ts");
-		const b = touch("b.ts");
-		const result = extractReadPathsFromCommand(`diff ${a} ${b}`, tmp);
-		expect(result).toContain(a);
-		expect(result).toContain(b);
-	});
+	for (const [label, build] of cases) {
+		it(`${label} does not register a read`, () => {
+			const f = touchLines("a.ts", 5);
+			const r = extractReadPathsFromCommand(build(f), tmp);
+			expect(spanFor(r, f)).toBeUndefined();
+		});
+	}
 });
 
-// ── edge cases / correctness ──────────────────────────────────────────────────
+// ── edge cases ──────────────────────────────────────────────────────────────
 
 describe("edge cases", () => {
-	it("non-existent file yields empty", () => {
+	it("non-existent file yields no span", () => {
 		expect(
 			extractReadPathsFromCommand(`cat /does/not/exist.ts`, tmp),
 		).toHaveLength(0);
 	});
 
-	it("directory path is rejected", () => {
-		const result = extractReadPathsFromCommand(`cat ${tmp}`, tmp);
-		expect(result).not.toContain(tmp);
+	it("directory argument is rejected", () => {
+		expect(extractReadPathsFromCommand(`cat ${tmp}`, tmp)).toHaveLength(0);
 	});
 
-	it("deduplicates when same file appears in multiple branches", () => {
-		const f = touch("a.ts");
-		// catLike picks it up AND absPaths picks it up (absolute path)
-		const result = extractReadPathsFromCommand(`cat ${f}`, tmp);
-		expect(result.filter((p) => p === f)).toHaveLength(1);
-	});
-
-	it("deduplicates same path mentioned twice in command", () => {
-		const f = touch("a.ts");
-		const result = extractReadPathsFromCommand(
-			`cat ${f} && cat ${f}`,
-			tmp,
-		);
-		expect(result.filter((p) => p === f)).toHaveLength(1);
-	});
-
-	it("empty command returns empty array", () => {
-		expect(extractReadPathsFromCommand("", tmp)).toHaveLength(0);
-	});
-
-	it("command with no file references returns empty array", () => {
+	it("unsupported extension is not registered", () => {
+		const f = touchLines("package.lock", 3);
 		expect(
-			extractReadPathsFromCommand("echo hello world", tmp),
-		).toHaveLength(0);
+			spanFor(extractReadPathsFromCommand(`cat ${f}`, tmp), f),
+		).toBeUndefined();
 	});
 
-	it("write command (echo redirect) does NOT register as read", () => {
-		const f = touch("a.ts");
-		// echo ... > file.ts is a write, not a read — our regex matches cat/head/tail/sed/awk
-		// so 'echo' is not in the catLike list
-		const result = extractReadPathsFromCommand(`echo "x" > ${f}`, tmp);
-		// absPaths would still pick up the absolute path — that's acceptable
-		// but the key test is that 'echo' itself isn't treated as a read tool
-		const catLikeHit = result.some(
-			(p) => p === f && /\becho\b/.test(`echo "x" > ${f}`),
-		);
-		// just verify we don't crash and result is an array
-		expect(Array.isArray(result)).toBe(true);
+	it("empty / fileless commands return []", () => {
+		expect(extractReadPathsFromCommand("", tmp)).toHaveLength(0);
+		expect(extractReadPathsFromCommand("echo hello world", tmp)).toHaveLength(0);
 	});
 
-	it("path with spaces is handled gracefully (no crash)", () => {
-		// Paths with spaces break simple shell splitting; we don't support them
-		// but must not throw
+	it("does not throw on paths with spaces (unsupported, must not crash)", () => {
 		expect(() =>
 			extractReadPathsFromCommand(`cat '/tmp/my file.ts'`, tmp),
 		).not.toThrow();
