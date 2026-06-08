@@ -76,7 +76,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --dry-run
 
-      # The dry-run above runs prepack (tsc → dist/), so the compiled entry now
+      # The dry-run above runs prepare (tsc → dist/), so the compiled entry now
       # exists in the working tree. Load it to catch a broken/missing-dep entry
       # before we tag and publish (#182).
       - name: Smoke-load compiled entry
@@ -132,9 +132,10 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      # Required: `npm publish` runs the `prepack` script (tsc → dist/), which
-      # needs node_modules (typescript + @types/node). Without this install the
-      # build, and therefore the publish, fails.
+      # Required: the `prepare` script builds dist/ (tsc), which needs
+      # node_modules. `npm install` runs prepare here, and `npm publish` runs it
+      # again before packing. Without the install the build — and the publish —
+      # fails.
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 

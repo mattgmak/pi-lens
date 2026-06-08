@@ -43,8 +43,10 @@ describe("published package entry points (dist mode, #182)", () => {
 		}
 	});
 
-	it("prepack builds dist so the tarball is always compiled", () => {
-		expect(pkg.scripts?.prepack ?? "").toContain("build:dist");
+	it("prepare builds dist on install (incl. git) and before publish", () => {
+		// `prepare` (not `prepack`) is required so a `git:` install — which runs
+		// `npm install`, not `npm pack` — also gets the compiled dist (#182).
+		expect(pkg.scripts?.prepare ?? "").toContain("build:dist");
 		expect(pkg.scripts?.["build:dist"] ?? "").toContain("tsconfig.dist.json");
 	});
 

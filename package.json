@@ -10,8 +10,8 @@
 	"main": "./dist/index.js",
 	"scripts": {
 		"build": "tsc --project tsconfig.build.json",
-		"build:dist": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc --project tsconfig.dist.json",
-		"prepack": "npm run build:dist",
+		"build:dist": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc --project tsconfig.dist.json --noCheck",
+		"prepare": "npm run build:dist",
 		"lint": "tsc --project tsconfig.json",
 		"watch": "tsc --watch",
 		"test": "vitest run",
