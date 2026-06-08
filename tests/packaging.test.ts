@@ -15,7 +15,7 @@ const pkg = JSON.parse(
 	main?: string;
 	files?: string[];
 	scripts?: Record<string, string>;
-	pi?: { extensions?: string[] };
+	pi?: { extensions?: string[]; skills?: string[] };
 };
 
 describe("published package entry points (dist mode, #182)", () => {
@@ -48,6 +48,14 @@ describe("published package entry points (dist mode, #182)", () => {
 		// `npm install`, not `npm pack` — also gets the compiled dist (#182).
 		expect(pkg.scripts?.prepare ?? "").toContain("build:dist");
 		expect(pkg.scripts?.["build:dist"] ?? "").toContain("tsconfig.dist.json");
+	});
+
+	it("build:dist copies skills into dist/ (pi resolves pi.skills entry-relative)", () => {
+		// pi resolves pi.skills relative to the extension entry's dir (dist/), so
+		// `pi.skills: ["./skills"]` → dist/skills, which must exist. The build
+		// copies skills/ into dist/ to keep the entry + its resources together.
+		expect(pkg.pi?.skills ?? []).toContain("./skills");
+		expect(pkg.scripts?.["build:dist"] ?? "").toContain("dist/skills");
 	});
 
 	it("retains the postinstall grammar download (shipped as .js)", () => {
