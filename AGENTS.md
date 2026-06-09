@@ -154,6 +154,27 @@ pi installs git extensions with **`npm install --omit=dev`** (and omits peers). 
 - **`package-lock.json` IS committed and must stay in sync** with `package.json`. `npm run check:lockfile` (CI) fails on drift; after any dep change run `npm install` and commit the lock. CI/release use `npm install` (not `npm ci`) so a desync self-heals instead of wiping `node_modules`.
 - The CI **install-test** (production tarball install + `tsx` load on 3 OSes) is the guard that catches misplaced runtime deps — keep it green.
 
+## Build & packaging: precompiled dist + resource resolution (hard-won — #182)
+
+pi-lens ships **precompiled JS**, not TypeScript source, so pi doesn't jiti-transpile ~200 files on every cold start (~3.5s → ~1.5s; the load cost is logged as `pi-lens loaded: <ms>ms … (from dist|source)` in `sessionstart.log` + `extension_loaded` in `latency.log`).
+
+- `main` and `pi.extensions` → **`./dist/index.js`**. The published package ships `dist/` (compiled) + non-TS assets; it does **not** ship `.ts` source.
+- **`prepare` (NOT `prepack`) builds `dist/`** via `build:dist` (`tsc -p tsconfig.dist.json --noCheck`). `prepare` runs on **every `npm install`, including `git:` installs (pi's install method)**, and before publish; `prepack` only fires on pack/publish, so a git install would get `main → ./dist/index.js` pointing at a file that was never built. `--noCheck` keeps the install-time build robust even when `@types/node` is absent.
+- **Two builds, don't confuse them:** `npm run build` (`tsconfig.build.json`) compiles **in place** next to the `.ts` — this is what the dev/test loop loads (vitest resolves `./x.js` to the in-place output, so stale in-place `.js` can shadow edits — rebuild). `build:dist` produces the shipped/loaded `dist/`.
+- pi-lens's **own** assets are depth-robust: `rules/`, `config/`, grammars resolve via `getPackageRoot()` (`clients/package-root.ts`, walks up to `package.json`), so moving the entry into `dist/` doesn't break them.
+- **GOTCHA — pi resolves `pi.skills` relative to the EXTENSION ENTRY's directory, not the package root.** With the entry at `./dist/index.js`, `pi.skills` must be **`["../skills"]`** (resolves from `dist/` back to the real root `skills/`). `"./skills"` → `dist/skills` (missing → warning); copying skills into `dist/skills` → the same skill found at both root and dist → **`[Skill conflicts]`**. Keep skills in one place (root `skills/`) and point `pi.skills` up.
+- Guarded by `tests/packaging.test.ts` + the CI install-test (tarball ships `dist/index.js` + root `skills/`, no `.ts`, compiled entry loads "from dist").
+
+## Performance: the hot-path / event-loop discipline (hard-won — #188)
+
+pi-lens's lifecycle hooks (`session_start`, `tool_call`, `tool_result`, `context`, `turn_end`, `agent_end`) run on the **same event loop as pi's TUI**. Any synchronous burst on a hook **blocks the user's keystrokes**. Slop accumulates because it's invisible on small repos and catastrophic on large (2k-file) ones. Invariants:
+
+- **No hook's synchronous burst should block > ~50ms.** Heavy work is async + **chunked-yield** (`await new Promise(setImmediate)` every N items) or **deferred past the typing window** (a few-second `setTimeout`, not `setImmediate`).
+- **Per-file / per-event work must be O(1) amortized** — memoize expensive derivations keyed by an invalidation signal (`.gitignore` mtime, `fileSeq`, content hash); never recompute-from-scratch on repeat (e.g. `ignoreMatcher.isIgnored` was recomputed per file per scan — now memoized).
+- **Expensive scans run once, cache (process memo + disk), reuse across sessions/turns.** Cold start does the minimum (forced "quick" mode), then a deferred background warmup fills caches.
+- **No `readdirSync`/`statSync`/`readFileSync` or regex-over-all-files on a hook path** unless bounded and yielding.
+- **Measure, don't guess:** `~/.pi-lens/latency.log` logs per-phase/`tool_result` durations + `session_start total`; `npm run logs:smells`. Validate on a real ≥1500-file repo. Add a budget-guard test in the style of `tests/clients/startup-overhead.test.ts` for any hot path you touch. PR #188 is the worked template.
+
 ## Internal edit substrate direction
 
 Phase 6 in `implementation.md` is intentionally **not** a public `lens_edit` tool. It should be an internal mutation substrate to reduce failed edits in pi-lens-owned paths while preserving the native agent edit lifecycle:
@@ -229,6 +250,7 @@ Every commit that adds or changes logic **must** include relevant tests before p
 - New tool parameters → tool-level routing tests verifying the parameter reaches the right handler.
 - Bug fixes → a regression test that would have caught the bug.
 - Run `npm test` (or `npm run build && npm test` if `.js` artifacts may be stale) and confirm all tests pass before committing.
+- **Also run `npm run lint` before pushing — especially for test-file changes.** `npm run lint` (`tsc -p tsconfig.json`) is the strict CI gate and type-checks the `tests/` tree; `npm run build` (`tsconfig.build.json`) **excludes tests** and `build:dist` uses `--noCheck`, so a type error in a test compiles clean locally but fails CI lint. (This has bitten us — build passing ≠ lint passing.)
 
 ### Testing extension wiring (#171)
 For anything that goes through the `index.ts` entry — flag/command/tool/hook registration, the `context` injection toggle, `tool_call`/`tool_result` read-guard wiring, `session_start` registrations — use the shared harness in `tests/support/pi-mock.ts` instead of hand-rolling an `ExtensionAPI`/ctx mock:
