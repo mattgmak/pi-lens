@@ -50,12 +50,15 @@ describe("published package entry points (dist mode, #182)", () => {
 		expect(pkg.scripts?.["build:dist"] ?? "").toContain("tsconfig.dist.json");
 	});
 
-	it("build:dist copies skills into dist/ (pi resolves pi.skills entry-relative)", () => {
-		// pi resolves pi.skills relative to the extension entry's dir (dist/), so
-		// `pi.skills: ["./skills"]` → dist/skills, which must exist. The build
-		// copies skills/ into dist/ to keep the entry + its resources together.
-		expect(pkg.pi?.skills ?? []).toContain("./skills");
-		expect(pkg.scripts?.["build:dist"] ?? "").toContain("dist/skills");
+	it("pi.skills resolves (from the dist entry) back to the real root skills/", () => {
+		// pi resolves pi.skills relative to the extension entry's directory
+		// (`dist/`). With `pi.extensions: ["./dist/index.js"]`, `pi.skills` must be
+		// "../skills" so it points at the package's real root skills/ dir — not
+		// "./skills" (→ dist/skills, which doesn't exist and collides) and not a
+		// copy into dist/ (which created a duplicate source → skill collision).
+		expect(pkg.pi?.skills ?? []).toContain("../skills");
+		expect(pkg.scripts?.["build:dist"] ?? "").not.toContain("dist/skills");
+		expect(pkg.files ?? []).toContain("skills/");
 	});
 
 	it("retains the postinstall grammar download (shipped as .js)", () => {

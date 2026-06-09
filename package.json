@@ -10,7 +10,7 @@
 	"main": "./dist/index.js",
 	"scripts": {
 		"build": "tsc --project tsconfig.build.json",
-		"build:dist": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc --project tsconfig.dist.json --noCheck && node -e \"require('fs').cpSync('skills','dist/skills',{recursive:true})\"",
+		"build:dist": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc --project tsconfig.dist.json --noCheck",
 		"prepare": "npm run build:dist",
 		"lint": "tsc --project tsconfig.json",
 		"watch": "tsc --watch",
@@ -96,7 +96,7 @@
 			"./dist/index.js"
 		],
 		"skills": [
-			"./skills"
+			"../skills"
 		]
 	},
 	"knip": {
