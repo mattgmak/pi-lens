@@ -3,6 +3,7 @@ import {
 	_stopEventLoopMonitorForTest,
 	getEventLoopStats,
 	resetEventLoopMonitor,
+	shouldLogWorstBlock,
 	startEventLoopMonitor,
 } from "../../clients/event-loop-monitor.js";
 
@@ -52,5 +53,23 @@ describe("event-loop-monitor", () => {
 		expect(getEventLoopStats()).toBeDefined();
 		_stopEventLoopMonitorForTest();
 		expect(getEventLoopStats()).toBeUndefined();
+	});
+});
+
+describe("shouldLogWorstBlock", () => {
+	it("logs a new worst block above the floor", () => {
+		expect(shouldLogWorstBlock(200, 0)).toBe(true);
+	});
+
+	it("does not log a block below the floor", () => {
+		expect(shouldLogWorstBlock(40, 0)).toBe(false);
+	});
+
+	it("does not re-log a block within delta of the last logged max", () => {
+		expect(shouldLogWorstBlock(210, 200)).toBe(false); // 210 ≤ 200+25
+	});
+
+	it("logs a clearly worse block beyond the delta", () => {
+		expect(shouldLogWorstBlock(300, 200)).toBe(true); // 300 > 225
 	});
 });

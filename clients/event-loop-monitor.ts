@@ -55,6 +55,22 @@ export function resetEventLoopMonitor(): void {
 	histogram?.reset();
 }
 
+/**
+ * Decide whether a freeze is worth persisting to `latency.log`. Pure so the
+ * threshold logic is testable without the (vitest-flaky) native histogram.
+ * Logs only a *new* worst block (`maxMs > lastLoggedMs + deltaMs`) above a
+ * floor (`minMs`), so a turn that froze worse than ever before is recorded
+ * once — not the same growing max every turn.
+ */
+export function shouldLogWorstBlock(
+	maxMs: number,
+	lastLoggedMs: number,
+	minMs = 60,
+	deltaMs = 25,
+): boolean {
+	return maxMs >= minMs && maxMs > lastLoggedMs + deltaMs;
+}
+
 /** Test-only: stop and clear the monitor so cases don't leak into each other. */
 export function _stopEventLoopMonitorForTest(): void {
 	histogram?.disable();
