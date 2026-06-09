@@ -279,8 +279,8 @@ function buildProjectIgnoreMatcher(
 	// `getProjectIgnoreMatcher` keyed on `.gitignore` mtime, so this Map's
 	// lifetime is bounded to a single set of ignore rules — when any
 	// `.gitignore` changes, the matcher is rebuilt and the memo is dropped
-	// with it. Without this memo, every background scan (todo, knip, jscpd,
-	// call-graph, source-filter, pipeline) recomputes O(ancestorDirs ×
+	// with it. Without this memo, every background scan (comment scan, knip,
+	// jscpd, call-graph, source-filter, pipeline) recomputes O(ancestorDirs ×
 	// patterns) per file, multiplying into 2-3s of pure CPU on a 2k-file
 	// project. With it, the second visitor of the same path is O(1).
 	const isIgnoredMemo = new Map<string, boolean>();

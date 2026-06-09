@@ -247,6 +247,59 @@ async function probePrettierInstall(
 	}
 }
 
+/** A todo scanner that may expose a per-file API (newer) or only the
+ * directory walk (older / mocked). `scanFile` returns the items array directly
+ * (`TodoItem[]`); `scanDirectory` returns a `{ items }` result. */
+type TodoScannerLike = {
+	scanDirectory: (root: string) => { items: unknown[] };
+	scanFile?: (filePath: string) => unknown[];
+};
+
+/** Scan one file via the per-file API, pushing any items. Tolerates an
+ * unreadable file and a scanner without `scanFile` (no-op). */
+function scanOneTodoFile(
+	scanner: TodoScannerLike,
+	filePath: string,
+	items: unknown[],
+): void {
+	if (typeof scanner.scanFile !== "function") return;
+	try {
+		// scanFile returns TodoItem[] directly (not a { items } result).
+		const result = scanner.scanFile(filePath);
+		if (Array.isArray(result)) items.push(...result);
+	} catch {
+		// Per-file error: skip and continue (matches scanDirectory's tolerance).
+	}
+}
+
+/** Collect the TODO baseline without blocking: enumerate source files and scan
+ * them per-file, yielding to the event loop every 30 files. Falls back to the
+ * blocking `scanDirectory` if the chunked path can't run (import error or a
+ * scanner without `scanFile`). */
+async function collectTodoBaselineItems(
+	scanner: TodoScannerLike,
+	analysisRoot: string,
+	stillCurrent: () => boolean,
+): Promise<unknown[]> {
+	const items: unknown[] = [];
+	try {
+		const { getSourceFiles } = await import("./scan-utils.js");
+		const files = getSourceFiles(analysisRoot, true);
+		let processedSinceYield = 0;
+		for (const file of files) {
+			if (!stillCurrent()) return items;
+			scanOneTodoFile(scanner, file, items);
+			if (++processedSinceYield % 30 === 0) {
+				await new Promise<void>((resolve) => setImmediate(resolve));
+			}
+		}
+	} catch {
+		const todoResult = scanner.scanDirectory(analysisRoot);
+		items.push(...todoResult.items);
+	}
+	return items;
+}
+
 // Fire off heavy scans as background tasks — don't block session start.
 // Each consumer already handles the "not ready yet" case gracefully
 // (cachedExports.size > 0, cache miss paths).
@@ -323,51 +376,17 @@ function scheduleStartupScans(
 
 	runTask("todo", async () => {
 		if (!runtime.isCurrentSession(sessionGeneration)) return;
-		// The original implementation called todoScanner.scanDirectory(),
-		// which walks the project synchronously, reading and regex-scanning
-		// every source file in one uninterrupted burst. On a 2k-file project
-		// this freezes the TUI for ~3s. We re-implement the walk in async
-		// chunks: enumerate files via the shared source-filter, call the
-		// scanner's per-file API, and yield to the event loop every 30
-		// files. The scanner exposes a public `scanFile(path)` method on
-		// every supported language; we narrow to it via a typed cast and
-		// fall back to the sync path if it's missing (defensive, in case a
-		// future scanner removes it).
-		const items: unknown[] = [];
-		try {
-			const perFileScanner = todoScanner as unknown as {
-				scanFile?: (filePath: string) => { items: unknown[] };
-			};
-			const { getSourceFiles } = await import("./scan-utils.js");
-			const files = getSourceFiles(analysisRoot, true);
-			let processedSinceYield = 0;
-			for (const file of files) {
-				if (!runtime.isCurrentSession(sessionGeneration)) return;
-				if (typeof perFileScanner.scanFile === "function") {
-					try {
-						const result = perFileScanner.scanFile(file);
-						if (result && Array.isArray(result.items)) {
-							items.push(...result.items);
-						}
-					} catch {
-						// Per-file error: skip and continue, matching the sync
-						// scanner's tolerance for unreadable files.
-					}
-				}
-				if (++processedSinceYield % 30 === 0) {
-					await new Promise<void>((resolve) => setImmediate(resolve));
-				}
-			}
-		} catch {
-			// Fall back to the original blocking scan if the chunked path
-			// fails for any reason (import error, scanner shape change).
-			const todoResult = todoScanner.scanDirectory(analysisRoot);
-			items.push(...todoResult.items);
-		}
-		if (!runtime.isCurrentSession(sessionGeneration)) return;
-		dbg(
-			`session_start TODO scan: ${items.length} items (baseline stored)`,
+		// The original implementation called todoScanner.scanDirectory(), which
+		// walks the project synchronously and freezes the TUI for ~3s on a 2k-file
+		// project. collectTodoBaselineItems re-implements the walk in async chunks
+		// (per-file scan, yielding every 30 files), falling back to scanDirectory.
+		const items = await collectTodoBaselineItems(
+			todoScanner as TodoScannerLike,
+			analysisRoot,
+			() => runtime.isCurrentSession(sessionGeneration),
 		);
+		if (!runtime.isCurrentSession(sessionGeneration)) return;
+		dbg(`session_start TODO scan: ${items.length} items (baseline stored)`);
 		cacheManager.writeCache("todo-baseline", { items }, analysisRoot);
 	});
 
