@@ -97,6 +97,21 @@ function hasGeneratedArtifactContent(content: string): boolean {
 	return GENERATED_HEADER_PATTERNS.some((pattern) => pattern.test(header));
 }
 
+// Memoize the generated-banner verdict per (path, mtimeMs, size, maxBytes).
+// The 4 KB header read (openSync + readSync + closeSync) is ~70% of the
+// per-file cost in `collectSourceFiles`, and the same files are re-scanned by
+// multiple background scanners (todo, project-diagnostics, language-profile)
+// every session/turn. Keying on mtime+size makes the memo self-invalidating:
+// an edited file misses the cache and is re-read. A single stat replaces the
+// open/read/close on a hit. Bounded to avoid unbounded growth on giant repos.
+const HEADER_VERDICT_MEMO_CAP = 50_000;
+const headerVerdictMemo = new Map<string, boolean>();
+
+/** Test-only: drop the header-verdict memo so fixtures don't leak across cases. */
+export function _resetGeneratedArtifactCaches(): void {
+	headerVerdictMemo.clear();
+}
+
 function readFileHeader(
 	filePath: string,
 	maxBytes = DEFAULT_HEADER_BYTES,
@@ -120,6 +135,31 @@ function readFileHeader(
 	}
 }
 
+/**
+ * Memoized form of "does this file's header contain a generated-code banner?".
+ * Returns `false` when the file cannot be stat'd/read (same fallback as the
+ * inline read path). Keyed on path + mtime + size so edits invalidate it.
+ */
+function fileHeaderLooksGenerated(filePath: string, maxBytes: number): boolean {
+	let key: string;
+	try {
+		const st = fs.statSync(filePath);
+		key = `${st.mtimeMs}:${st.size}:${maxBytes}:${filePath}`;
+	} catch {
+		return false;
+	}
+	const cached = headerVerdictMemo.get(key);
+	if (cached !== undefined) return cached;
+	const header = readFileHeader(filePath, maxBytes);
+	const verdict =
+		header !== undefined && hasGeneratedArtifactContent(header);
+	if (headerVerdictMemo.size >= HEADER_VERDICT_MEMO_CAP) {
+		headerVerdictMemo.clear();
+	}
+	headerVerdictMemo.set(key, verdict);
+	return verdict;
+}
+
 export function isGeneratedOrArtifact(
 	filePath: string,
 	options: GeneratedArtifactOptions = {},
@@ -132,8 +172,10 @@ export function isGeneratedOrArtifact(
 	}
 
 	if (options.readContentHeader) {
-		const header = readFileHeader(filePath, options.maxHeaderBytes);
-		return header !== undefined && hasGeneratedArtifactContent(header);
+		return fileHeaderLooksGenerated(
+			filePath,
+			options.maxHeaderBytes ?? DEFAULT_HEADER_BYTES,
+		);
 	}
 
 	return false;

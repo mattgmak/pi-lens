@@ -283,8 +283,12 @@ async function collectTodoBaselineItems(
 ): Promise<unknown[]> {
 	const items: unknown[] = [];
 	try {
-		const { getSourceFiles } = await import("./scan-utils.js");
-		const files = getSourceFiles(analysisRoot, true);
+		const { getSourceFilesAsync } = await import("./scan-utils.js");
+		// Enumerate with the chunked-yield walker so the file collection itself
+		// (the previously-synchronous ~1.5s burst on a 2k-file tree) no longer
+		// blocks the event loop before the per-file scan loop below even starts.
+		const files = await getSourceFilesAsync(analysisRoot, true);
+		if (!stillCurrent()) return items;
 		let processedSinceYield = 0;
 		for (const file of files) {
 			if (!stillCurrent()) return items;
