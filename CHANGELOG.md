@@ -20,6 +20,8 @@ All notable changes to pi-lens will be documented in this file.
 
 - **Reliable alphabetical sort of project-diagnostic sources** — `[...sources].sort()` relied on default UTF-16 ordering, which SonarCloud flags as unreliable (`typescript:S2871`); now uses an explicit `String.localeCompare` comparator.
 
+- **Multi-line diagnostic messages no longer break TUI rendering (closes #189)** — diagnostics with multi-line messages (e.g. TS2769 "no overload matches this call") spilled across several widget rows and broke the layout (and the `L<line>: <message>` inline-blocker format), because `fitLine` clips by visible width but embedded newlines survive. `recordDiagnostics` now collapses whitespace runs to a single space at storage, so the widget, `lens_diagnostics`, and summaries all get single-line messages.
+
 - **`session_start` no longer freezes TUI input on cold boot / `/new` (closes #188)** — the synchronous `session_start` walks (scan-context, language profile, todo / call-graph scheduling) ran O(N) without yielding, starving the stdin macrotask queue for 3–6s on large projects. Fixed with an `ignoreMatcher` path-memo (mtime-invalidated), process-lifetime memos for scan-context and language-profile, async chunked-yield walk variants, background scans deferred past the typing window, a per-file chunked todo scan, and a cold-start forced-quick + delayed-warmup. `session_start` total drops from 3000–6000ms to ~3ms on a 1832-file project. Env knobs: `PI_LENS_COLD_START_QUICK`, `PI_LENS_WARMUP_DELAY_MS`, `PI_LENS_STARTUP_MODE`. Together with #182 this fixes both halves of startup latency (jiti transpile + scan). Thanks @amit-gshe.
 
 ## [3.8.50] - 2026-06-07
