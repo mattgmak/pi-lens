@@ -50,12 +50,32 @@ describe("published package entry points (dist mode, #182)", () => {
 		expect(pkg.scripts?.["build:dist"] ?? "").toContain("tsconfig.dist.json");
 	});
 
-	it("build:dist copies skills into dist/ (pi resolves pi.skills entry-relative)", () => {
-		// pi resolves pi.skills relative to the extension entry's dir (dist/), so
-		// `pi.skills: ["./skills"]` → dist/skills, which must exist. The build
-		// copies skills/ into dist/ to keep the entry + its resources together.
-		expect(pkg.pi?.skills ?? []).toContain("./skills");
-		expect(pkg.scripts?.["build:dist"] ?? "").toContain("dist/skills");
+	it("pi.skills resolves (from the dist entry FILE) back to the real root skills/", () => {
+		// pi resolves each `pi.skills` entry relative to the extension entry's
+		// **file path** (`dist/index.js`), via `path.resolve(entryFile, skill)` —
+		// NOT relative to the entry's directory. So a leading `../` only cancels
+		// `index.js` and stays inside `dist/`; reaching the real root `skills/`
+		// from `dist/index.js` needs to climb TWO levels: `../../skills`. Getting
+		// this wrong (`../skills` → `dist/skills`, missing) silently stops skills
+		// from loading and emits pi's "skill path does not exist" warning — and the
+		// tarball `skills/` check below does NOT catch it (the dir ships fine; pi
+		// just resolves to the wrong place). Verified against pi's resolver. #199.
+		expect(pkg.pi?.skills ?? []).toContain("../../skills");
+		expect(pkg.scripts?.["build:dist"] ?? "").not.toContain("dist/skills");
+		expect(pkg.files ?? []).toContain("skills/");
+
+		// Static guard replicating pi's resolution: joining each pi.skills entry to
+		// the extension entry FILE must land on the package's own root skills/ dir.
+		const entry = pkg.pi?.extensions?.[0];
+		expect(entry, "pi.extensions[0] must exist").toBeTruthy();
+		const entryFile = path.resolve(root, entry as string);
+		const rootSkills = path.resolve(root, "skills");
+		for (const skill of pkg.pi?.skills ?? []) {
+			expect(
+				path.resolve(entryFile, skill),
+				`pi.skills "${skill}" must resolve (entry-file-relative) to the root skills/ dir`,
+			).toBe(rootSkills);
+		}
 	});
 
 	it("retains the postinstall grammar download (shipped as .js)", () => {
@@ -67,7 +87,10 @@ describe("published package entry points (dist mode, #182)", () => {
 describe("tsconfig.dist.json", () => {
 	const dist = JSON.parse(
 		fs.readFileSync(path.join(root, "tsconfig.dist.json"), "utf8"),
-	) as { compilerOptions?: { outDir?: string }; exclude?: string[] };
+	) as {
+		compilerOptions?: { outDir?: string; types?: string[] };
+		exclude?: string[];
+	};
 
 	it("emits to ./dist", () => {
 		expect(dist.compilerOptions?.outDir).toBe("./dist");
@@ -76,5 +99,12 @@ describe("tsconfig.dist.json", () => {
 	it("excludes tests from the published build", () => {
 		const ex = dist.exclude ?? [];
 		expect(ex.some((e) => e.includes("test"))).toBe(true);
+	});
+
+	it("does not require @types/node during production install-time dist builds", () => {
+		// pi installs git extensions with `npm install --omit=dev`, then npm runs
+		// `prepare`. In that environment dev-only @types/node is absent, so the
+		// dist config must not inherit the base config's `types: ["node"]` entry.
+		expect(dist.compilerOptions?.types).toEqual([]);
 	});
 });

@@ -17,6 +17,7 @@ import { getGlobalPiLensDir } from "../file-utils.js";
 import { KIND_EXTENSIONS } from "../file-kinds.js";
 import { ensureTool, getToolEnvironment } from "../installer/index.js";
 import { logLatency } from "../latency-logger.js";
+import { isCommandAvailableAsync } from "../safe-spawn.js";
 import { type LSPProcess, launchLSP } from "./launch.js";
 import { normalizeMapKey } from "./path-utils.js";
 
@@ -381,7 +382,7 @@ async function resolveAndLaunch(
 	}
 
 	// Step 4 — language-native runtime install (go install, gem install, …)
-	if (spec.runtimeInstall && isOnPath(spec.runtimeInstall.runtimeCommand)) {
+	if (spec.runtimeInstall && (await isOnPath(spec.runtimeInstall.runtimeCommand))) {
 		const ok = await spec.runtimeInstall.install();
 		if (ok) {
 			const retry = spec.runtimeInstall.retryCandidates ?? spec.candidates;
@@ -781,15 +782,16 @@ export const createRootDetector = NearestRoot;
 // --- Runtime Tool Helpers ---
 
 /**
- * Check if a command is available on system PATH (synchronous, no process spawn overhead).
+ * Check if a command is available on system PATH.
+ *
+ * Async (was a blocking `spawnSync("where"/"which")`): runs on the spawn
+ * fall-through path (Step 4, runtime-install gate). The shared
+ * `isCommandAvailableAsync` spawns the same finder via `safeSpawnAsync` with a
+ * 5s timeout, so a stalled finder can no longer freeze the loop. Semantics are
+ * preserved: true iff the finder exits 0.
  */
-function isOnPath(command: string): boolean {
-	const isWindows = process.platform === "win32";
-	const result = spawnSync(isWindows ? "where" : "which", [command], {
-		stdio: "ignore",
-		shell: false,
-	});
-	return result.status === 0;
+function isOnPath(command: string): Promise<boolean> {
+	return isCommandAvailableAsync(command);
 }
 
 /**
@@ -1353,7 +1355,14 @@ export const RustServer: LSPServerInfo = {
 	id: "rust",
 	name: "rust-analyzer",
 	extensions: KIND_EXTENSIONS["rust"],
-	root: RootWithFallback(RustWorkspaceRoot()),
+	// No FileDirRoot fallback (#201): rust-analyzer is a heavy workspace server
+	// that is useless without a Cargo manifest. With the fallback, every .rs file
+	// written before a Cargo.toml exists resolved to its OWN directory as the
+	// root, and since clients dedup by `${serverId}:${root}`, each directory
+	// spawned a separate rust-analyzer (one per file/dir during scaffolding).
+	// Returning undefined here skips the spawn until a Cargo.toml gives a stable,
+	// shared crate root — then all files share one server.
+	root: RustWorkspaceRoot(),
 	async spawn(root, options) {
 		// Prefer rustup-installed rust-analyzer; fall back to GitHub-downloaded managed copy
 		const result = await resolveAndLaunch(
@@ -1480,6 +1489,12 @@ export const CSharpServer: LSPServerInfo = {
 	id: "csharp",
 	name: "csharp-ls",
 	extensions: KIND_EXTENSIONS["csharp"],
+	// NOTE (#201): this has the same per-file-dir fallback trap as rust did, but
+	// can't be fixed the same way yet — `createRootDetector` matches markers by
+	// EXACT filename (`stat(dir/.csproj)`), so `.sln`/`.csproj`/`.slnx` never
+	// match a real `Foo.csproj`/`Foo.sln`. C# root detection therefore relies
+	// entirely on the FileDirRoot fallback today; removing it would disable C#.
+	// Fixing this needs extension/glob marker support first (tracked on #201).
 	root: RootWithFallback(createRootDetector([".sln", ".csproj", ".slnx"])),
 	async spawn(root, options) {
 		const candidates = dotnetToolCandidates("csharp-ls");

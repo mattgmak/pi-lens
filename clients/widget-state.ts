@@ -111,6 +111,17 @@ export function recordRunner(
 	requestRender();
 }
 
+/**
+ * Collapse a (possibly multi-line) diagnostic message to a single line.
+ * TS2769 / "no overload matches" and many compiler errors are multi-line;
+ * embedded newlines/tabs would otherwise render across several widget rows
+ * (and break the `L<line>: <message>` inline-blocker format), so flatten all
+ * whitespace runs to a single space before storing.
+ */
+function toSingleLineMessage(message: string | undefined): string {
+	return (message ?? "").replace(/\s+/g, " ").trim();
+}
+
 export function recordDiagnostics(
 	filePath: string,
 	diagnostics: Array<{
@@ -135,7 +146,7 @@ export function recordDiagnostics(
 		return {
 			severity: d.severity ?? "info",
 			semantic: d.semantic,
-			message: d.message ?? "",
+			message: toSingleLineMessage(d.message),
 			line: d.line,
 			col: d.column,
 			rule,

@@ -98,10 +98,21 @@ import {
 	markPiLensLoaded,
 	PI_LENS_LOADED_FROM,
 } from "./clients/startup-timing.js";
+import {
+	getEventLoopStats,
+	shouldLogWorstBlock,
+	startEventLoopMonitor,
+} from "./clients/event-loop-monitor.js";
 
 // First executable statement: every import above has been evaluated, so the
 // full load/transpile cost has been paid. Capture it now.
 const PI_LENS_LOAD_MS = markPiLensLoaded();
+// Start the event-loop occupancy monitor as early as possible so startup
+// blocks are captured. Native histogram — no per-event overhead. (#192)
+startEventLoopMonitor();
+// Worst event-loop block already persisted to latency.log (so we only log a
+// *new* worst freeze per turn, not the same growing max). (#192)
+let lastLoggedLoopWorstMs = 0;
 
 const DEBUG_LOG_DIR = path.join(os.homedir(), ".pi-lens");
 const DEBUG_LOG = path.join(DEBUG_LOG_DIR, "sessionstart.log");
@@ -878,6 +889,21 @@ export default function (pi: ExtensionAPI) {
 					count: diagStats.totalUnresolved,
 				}),
 			);
+
+			// Event-loop occupancy — the dimension our duration logs were blind to
+			// (#192). `maxMs` ≈ the worst synchronous block (TUI stall) this session.
+			const elStats = getEventLoopStats();
+			if (elStats) {
+				lines.push(
+					"",
+					`Event loop (session): worst block ${elStats.maxMs}ms · p99 ${elStats.p99Ms}ms · mean ${elStats.meanMs}ms`,
+				);
+				if (elStats.maxMs > 100) {
+					lines.push(
+						"  ⚠ a >100ms synchronous block can stutter the TUI — check latency.log (#192)",
+					);
+				}
+			}
 
 			if (diagStats.repeatOffenders.length > 0) {
 				lines.push(t("lens.health.repeatOffenders", "Repeat offenders:"));
@@ -1978,6 +2004,20 @@ export default function (pi: ExtensionAPI) {
 	pi.on("turn_end", async (_event: any, ctx) => {
 		if (!lensEnabled) return;
 		try {
+			// Persist a new worst event-loop block to latency.log, attributed to
+			// this turn, so freezes are queryable across sessions (#192).
+			const loopMaxMs = getEventLoopStats()?.maxMs ?? 0;
+			if (shouldLogWorstBlock(loopMaxMs, lastLoggedLoopWorstMs)) {
+				logLatency({
+					type: "phase",
+					filePath: "<pi-lens>",
+					phase: "loop_block",
+					durationMs: Math.round(loopMaxMs),
+					metadata: { worstSoFar: true, turnIndex: runtime.turnIndex },
+				});
+				lastLoggedLoopWorstMs = loopMaxMs;
+			}
+
 			// Drain any tool_result still in the debounce window so turn_end
 			// reads consistent state (cache, modified ranges, change-log).
 			await flushDebouncedToolResults();

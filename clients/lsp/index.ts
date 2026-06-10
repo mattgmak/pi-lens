@@ -217,12 +217,24 @@ const WORKSPACE_DIAGNOSTICS_SKIP_DIRS = new Set([
 
 const WORKSPACE_DIAGNOSTICS_CONCURRENCY = 8;
 
-function collectWorkspaceDiagnosticFiles(root: string): string[] {
+/**
+ * Async, event-loop-yielding walk of the workspace to find LSP-supported source
+ * files. Uses `fs.promises.readdir` so each directory read hands control back to
+ * the loop — a synchronous `readdirSync` recursion blocks the loop for the whole
+ * O(N) enumeration (~44ms at 1.4k files, scaling linearly on monorepos). The
+ * file set, skip-dirs, symlink handling and server-config filter are identical
+ * to the previous synchronous version — only the I/O is async now.
+ */
+async function collectWorkspaceDiagnosticFiles(
+	root: string,
+): Promise<string[]> {
 	const files: string[] = [];
-	function walk(current: string): void {
+	async function walk(current: string): Promise<void> {
 		let entries: nodeFs.Dirent[];
 		try {
-			entries = nodeFs.readdirSync(current, { withFileTypes: true });
+			entries = await nodeFs.promises.readdir(current, {
+				withFileTypes: true,
+			});
 		} catch {
 			return;
 		}
@@ -230,7 +242,7 @@ function collectWorkspaceDiagnosticFiles(root: string): string[] {
 			if (entry.isSymbolicLink()) continue;
 			const full = path.join(current, entry.name);
 			if (entry.isDirectory()) {
-				if (!WORKSPACE_DIAGNOSTICS_SKIP_DIRS.has(entry.name)) walk(full);
+				if (!WORKSPACE_DIAGNOSTICS_SKIP_DIRS.has(entry.name)) await walk(full);
 			} else if (
 				entry.isFile() &&
 				getServersForFileWithConfig(full).length > 0
@@ -239,7 +251,7 @@ function collectWorkspaceDiagnosticFiles(root: string): string[] {
 			}
 		}
 	}
-	walk(root);
+	await walk(root);
 	return files;
 }
 
@@ -1587,7 +1599,7 @@ export class LSPService {
 	): Promise<LSPWorkspaceDiagnosticResult[]> {
 		const startedAt = Date.now();
 		const root = path.resolve(cwd);
-		const files = collectWorkspaceDiagnosticFiles(root);
+		const files = await collectWorkspaceDiagnosticFiles(root);
 		const results: LSPWorkspaceDiagnosticResult[] = new Array(files.length);
 		let nextIndex = 0;
 		const workers = Math.min(WORKSPACE_DIAGNOSTICS_CONCURRENCY, files.length);
@@ -1599,7 +1611,7 @@ export class LSPService {
 					if (index >= files.length) return;
 					const filePath = files[index];
 					try {
-						const content = nodeFs.readFileSync(filePath, "utf-8");
+						const content = await nodeFs.promises.readFile(filePath, "utf-8");
 						const diagnostics = await this.touchFile(filePath, content, {
 							diagnostics: "document",
 							collectDiagnostics: true,
@@ -1653,9 +1665,25 @@ export class LSPService {
 		>();
 		const now = Date.now();
 		for (const [_key, client] of this.state.clients) {
+			// Resolve existence asynchronously (was a blocking existsSync per tracked
+			// file inside the prune predicate) so this cascade-checking path doesn't
+			// hold the event loop; then prune with a synchronous, in-memory predicate.
+			const trackedPaths = client.getTrackedDiagnosticPaths();
+			const existingPaths = new Set<string>();
+			await Promise.all(
+				trackedPaths.map(async (filePath) => {
+					try {
+						await nodeFs.promises.access(filePath);
+						existingPaths.add(filePath);
+					} catch {
+						/* missing → will be pruned */
+					}
+				}),
+			);
 			client.pruneDiagnostics(
 				(filePath, ts) =>
-					!nodeFs.existsSync(filePath) || now - ts > CASCADE_DIAGNOSTICS_TTL_MS,
+					!existingPaths.has(filePath) ||
+					now - ts > CASCADE_DIAGNOSTICS_TTL_MS,
 			);
 			const clientDiags = client.getAllDiagnostics();
 			for (const [filePath, entry] of clientDiags) {
@@ -1762,4 +1790,15 @@ export function resetLSPService(options: LSPShutdownOptions = {}): void {
 		globalLSPService.shutdown(options).catch(() => {});
 	}
 	globalLSPService = null;
+}
+
+/**
+ * Test-only: exposes the async workspace-diagnostics file walk so its
+ * event-loop occupancy can be guarded (see workspace-diagnostics-occupancy
+ * test). Not part of the public API.
+ */
+export function __collectWorkspaceDiagnosticFilesForTest(
+	root: string,
+): Promise<string[]> {
+	return collectWorkspaceDiagnosticFiles(path.resolve(root));
 }

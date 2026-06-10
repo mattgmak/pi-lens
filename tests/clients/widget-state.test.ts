@@ -57,6 +57,29 @@ describe("getFileDiagnosticSummaries", () => {
 		);
 	});
 
+	it("collapses multi-line messages to a single line (TUI render + inline-blocker safety)", () => {
+		const filePath = `${process.cwd()}/overload.ts`;
+		recordDiagnostics(filePath, [
+			{
+				severity: "error",
+				semantic: "blocking",
+				line: 162,
+				rule: "typescript:2769",
+				message:
+					"No overload matches this call.\n  The last overload gave the following error.\n    Argument of type 'X' is not assignable to parameter of type 'Y'.",
+			},
+		]);
+		const entry = getFileDiagnosticSummaries().find(
+			(s) => s.filePath === filePath,
+		);
+		const msg = entry?.diagnostics[0].message ?? "";
+		expect(msg).not.toContain("\n");
+		expect(msg).not.toContain("\t");
+		expect(msg).toBe(
+			"No overload matches this call. The last overload gave the following error. Argument of type 'X' is not assignable to parameter of type 'Y'.",
+		);
+	});
+
 	it("returns a defensive copy — mutating the result does not corrupt state", () => {
 		const filePath = `${process.cwd()}/bar.ts`;
 		recordDiagnostics(filePath, [

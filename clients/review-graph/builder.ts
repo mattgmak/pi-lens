@@ -16,7 +16,7 @@ import { detectFileKind } from "../file-kinds.js";
 import { detectFileRole } from "../file-role.js";
 import { getProjectDataDir } from "../file-utils.js";
 import { normalizeMapKey } from "../path-utils.js";
-import { collectProjectSourceFiles } from "../project-scan-policy.js";
+import { collectProjectSourceFilesAsync } from "../project-scan-policy.js";
 import { RUNTIME_CONFIG } from "../runtime-config.js";
 import { TreeSitterClient } from "../tree-sitter-client.js";
 import {
@@ -148,10 +148,34 @@ function sourceSignatureEntry(file: string): string {
 	}
 }
 
-function sourceSignatureMap(files: string[]): Map<string, string> {
+// Chunked-yield budget for the per-edit signature/stat loops. 100 stat calls
+// per chunk keeps each synchronous burst well under pi's typing window while
+// adding negligible scheduling overhead. The work and its output are identical
+// to a tight synchronous loop — only the loop yields the event loop between
+// chunks so a large project's cascade graph rebuild can't freeze the TUI.
+const STAT_YIELD_EVERY = 100;
+
+const yieldToLoop = (): Promise<void> =>
+	new Promise<void>((resolve) => setImmediate(resolve));
+
+/**
+ * Async, chunked-yield twin of the per-file source-signature map. Produces the
+ * exact same `file -> "size:mtimeMs"` map as a synchronous loop, but yields to
+ * the event loop every {@link STAT_YIELD_EVERY} stats. Used on the per-edit
+ * cascade path where statting every project file synchronously would otherwise
+ * block the loop for hundreds of ms on a large repo.
+ */
+async function sourceSignatureMapAsync(
+	files: string[],
+): Promise<Map<string, string>> {
 	const signatures = new Map<string, string>();
+	let sinceYield = 0;
 	for (const file of files) {
 		signatures.set(file, sourceSignatureEntry(file));
+		if (++sinceYield >= STAT_YIELD_EVERY) {
+			sinceYield = 0;
+			await yieldToLoop();
+		}
 	}
 	return signatures;
 }
@@ -205,15 +229,26 @@ function isWithinReviewGraphSizeLimit(file: string): boolean {
 	}
 }
 
-function getGraphSourceFiles(cwd: string): string[] {
-	return collectProjectSourceFiles(cwd)
-		.map((file) => normalizeMapKey(file))
-		.filter((file) => {
-			const kind = detectFileKind(file);
-			return (
-				!!kind && MAIN_KINDS.has(kind) && isWithinReviewGraphSizeLimit(file)
-			);
-		});
+async function getGraphSourceFiles(cwd: string): Promise<string[]> {
+	// Async, chunked-yield walk (identical output to the sync collector) so the
+	// per-edit cascade graph rebuild doesn't block the event loop on a large repo.
+	const collected = await collectProjectSourceFilesAsync(cwd);
+	const result: string[] = [];
+	let sinceYield = 0;
+	for (const raw of collected) {
+		const file = normalizeMapKey(raw);
+		const kind = detectFileKind(file);
+		// isWithinReviewGraphSizeLimit does a statSync per file — yield periodically
+		// so the size-limit filter (one stat each) can't hold the loop in one burst.
+		if (!!kind && MAIN_KINDS.has(kind) && isWithinReviewGraphSizeLimit(file)) {
+			result.push(file);
+		}
+		if (++sinceYield >= STAT_YIELD_EVERY) {
+			sinceYield = 0;
+			await yieldToLoop();
+		}
+	}
+	return result;
 }
 
 function addNode(graph: ReviewGraph, node: ReviewGraphNode): void {
@@ -810,7 +845,7 @@ async function _doBuildGraph(
 	const normalizedCwd = normalizeMapKey(cwd);
 	const normalizedChanged = changedFiles.map((file) => normalizeMapKey(file));
 	const normalizedChangedSet = new Set(normalizedChanged);
-	const filesToBuild = getGraphSourceFiles(cwd);
+	const filesToBuild = await getGraphSourceFiles(cwd);
 	const maxGraphFiles = getReviewGraphMaxFiles();
 	if (filesToBuild.length > maxGraphFiles) {
 		const graph = createEmptyGraph();
@@ -829,7 +864,7 @@ async function _doBuildGraph(
 		facts.setSessionFact("session.reviewGraph", graph);
 		return graph;
 	}
-	const fileSignatures = sourceSignatureMap(filesToBuild);
+	const fileSignatures = await sourceSignatureMapAsync(filesToBuild);
 	const signature = sourceSignatureFromMap(fileSignatures);
 
 	// Tier 1: in-memory cache (hot path — same process, already built this session)

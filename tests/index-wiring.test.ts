@@ -125,4 +125,18 @@ describe("index.ts extension wiring", () => {
 			expect(on?.messages.at(-1)).toEqual({ role: "system", content: "orig" });
 		});
 	});
+
+	describe("/lens-health surfaces event-loop occupancy (#192)", () => {
+		it("includes the event-loop line in the health report", async () => {
+			const pi = createPiMock();
+			extension(pi.asExtensionAPI());
+			const ctx = makeCtx();
+
+			await pi.runCommand("lens-health", "", ctx);
+
+			const out = ctx.notifications.map((n) => n.message).join("\n");
+			expect(out).toContain("🩺 PI-LENS HEALTH");
+			expect(out).toContain("Event loop (session):");
+		});
+	});
 });

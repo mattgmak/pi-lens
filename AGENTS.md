@@ -1,5 +1,11 @@
 # pi-lens — agent context
 
+## Maintaining this file (do this on every commit)
+AGENTS.md is the durable context handed to every agent that works on pi-lens. **Update it as part of the same commit that changes the world it describes** — never as a follow-up:
+- **Kill staleness.** If a commit changes behavior, structure, commands, conventions, or invariants documented here, fix the affected lines now. A stale claim is worse than none — agents act on it as fact.
+- **Capture decisions & patterns.** When a commit establishes a non-obvious decision, gotcha, convention, or architectural pattern the next agent would otherwise relearn the hard way, add it here with the *why* and *how-to-apply* (recent examples: the dist/packaging + `pi.skills` resolution gotcha, the event-loop/hot-path discipline, the build-vs-lint gate).
+- **Keep it high-signal.** Prune what's no longer true; prefer concise, load-bearing notes over exhaustive prose.
+
 ## What it is
 A pi coding-agent extension that runs automated checks on every file write/edit. Dispatches async parallel runners (LSP, biome, ruff, ast-grep, tree-sitter, type coverage, jscpd, knip, Madge, and language-specific linters/build checks) and injects findings as context injections at turn-end and session-start.
 
@@ -34,6 +40,7 @@ Because many test imports use `.js` specifiers while the source of truth is `.ts
 ```
 npm run build && npm test
 ```
+**This is now enforced (#198):** a vitest `globalSetup` (`tests/support/check-build-freshness.ts`) fails fast — for *any* launch (`npm test`, `npx vitest run`, watch start) — if a compiled-source `.ts` under `clients/`/`commands/`/`tools/` (or root `index.ts`/`i18n.ts`) is newer than its in-place `.js` (or has none). If you see `⛔ Stale build …`, run `npm run build` and re-run. (CI's `test` job builds first, so it passes.)
 Do not hand-edit generated `.js`; regenerate it from the corresponding `.ts`. This includes `scripts/download-grammars.js`, which is the runtime/postinstall artifact generated from `scripts/download-grammars.ts` and must stay in sync for published installs.
 
 ## Data directory conventions
@@ -154,6 +161,29 @@ pi installs git extensions with **`npm install --omit=dev`** (and omits peers). 
 - **`package-lock.json` IS committed and must stay in sync** with `package.json`. `npm run check:lockfile` (CI) fails on drift; after any dep change run `npm install` and commit the lock. CI/release use `npm install` (not `npm ci`) so a desync self-heals instead of wiping `node_modules`.
 - The CI **install-test** (production tarball install + `tsx` load on 3 OSes) is the guard that catches misplaced runtime deps — keep it green.
 
+## Build & packaging: precompiled dist + resource resolution (hard-won — #182)
+
+pi-lens ships **precompiled JS**, not TypeScript source, so pi doesn't jiti-transpile ~200 files on every cold start (~3.5s → ~1.5s; the load cost is logged as `pi-lens loaded: <ms>ms … (from dist|source)` in `sessionstart.log` + `extension_loaded` in `latency.log`).
+
+- `main` and `pi.extensions` → **`./dist/index.js`**. The published package ships `dist/` (compiled) + non-TS assets; it does **not** ship `.ts` source.
+- **`prepare` (NOT `prepack`) builds `dist/`** via `build:dist` (`tsc -p tsconfig.dist.json --noCheck`). `prepare` runs on **every `npm install`, including `git:` installs (pi's install method)**, and before publish; `prepack` only fires on pack/publish, so a git install would get `main → ./dist/index.js` pointing at a file that was never built. `tsconfig.dist.json` overrides the inherited Node type library with `"types": []`, and `--noCheck` keeps the install-time build robust when dev-only `@types/node` is absent under `npm install --omit=dev`.
+- **Two builds, don't confuse them:** `npm run build` (`tsconfig.build.json`) compiles **in place** next to the `.ts` — this is what the dev/test loop loads (vitest resolves `./x.js` to the in-place output, so stale in-place `.js` can shadow edits — rebuild). `build:dist` produces the shipped/loaded `dist/`.
+- pi-lens's **own** assets are depth-robust: `rules/`, `config/`, grammars resolve via `getPackageRoot()` (`clients/package-root.ts`, walks up to `package.json`), so moving the entry into `dist/` doesn't break them.
+- **GOTCHA — pi resolves each `pi.skills` entry relative to the extension entry's FILE PATH, not its directory and not the package root.** pi does `path.resolve(entryFile, skillEntry)` (verified in `@earendil-works/pi-coding-agent` `core/skills.js` + `package-manager.js`). With the entry at `./dist/index.js`, a leading `../` only cancels `index.js` and stays inside `dist/`, so `pi.skills` must climb **two** levels: **`["../../skills"]`** → `dist/index.js` → `../` (=`dist/`) → `../` (=root) → `skills/`. `"../skills"` resolves to `dist/skills` (missing) → skills silently don't load + `[Skill conflicts] skill path does not exist` (this regressed when the entry moved to `dist/` in #182 — the value was left at `../skills`, off by one; fixed in #199). `"./skills"` → `dist/index.js/skills` (missing); copying skills into `dist/skills` → same skill at root and dist → collision. Keep ONE skills dir (root `skills/`) and point `pi.skills` up two levels. **The tarball `skills/` ship-check does NOT validate this** — `tests/packaging.test.ts` now statically replicates `resolve(entryFile, skillEntry)` and asserts it lands on root `skills/`.
+- Guarded by `tests/packaging.test.ts` + the CI install-test (tarball ships `dist/index.js` + root `skills/`, no `.ts`, compiled entry loads "from dist").
+
+## Performance: the hot-path / event-loop discipline (hard-won — #188)
+
+pi-lens's lifecycle hooks (`session_start`, `tool_call`, `tool_result`, `context`, `turn_end`, `agent_end`) run on the **same event loop as pi's TUI**. Any synchronous burst on a hook **blocks the user's keystrokes**. Slop accumulates because it's invisible on small repos and catastrophic on large (2k-file) ones. Invariants:
+
+- **No hook's synchronous burst should block > ~50ms.** Heavy work is async + **chunked-yield** (`await new Promise(setImmediate)` every N items) or **deferred past the typing window** (a few-second `setTimeout`, not `setImmediate`).
+- **Per-file / per-event work must be O(1) amortized** — memoize expensive derivations keyed by an invalidation signal (`.gitignore` mtime, `fileSeq`, content hash); never recompute-from-scratch on repeat (e.g. `ignoreMatcher.isIgnored` was recomputed per file per scan — now memoized).
+- **Expensive scans run once, cache (process memo + disk), reuse across sessions/turns.** Cold start does the minimum (forced "quick" mode), then a deferred background warmup fills caches.
+- **No `readdirSync`/`statSync`/`readFileSync` or regex-over-all-files on a hook path** unless bounded and yielding.
+- **Measure, don't guess:** `~/.pi-lens/latency.log` logs per-phase/`tool_result` durations + `session_start total`; `npm run logs:smells`. PR #188 is the worked template.
+- **Guard occupancy, not duration, at scale (#192):** use `tests/support/perf-harness.ts` — `measureMaxSyncBlockMs(work)` measures the longest synchronous stretch the work held the event loop (an independent loop-lag sampler, so it catches a *fully non-yielding* regression, which a duration timer or wrapping the code's own `setImmediate` would miss), and `generateSourceTree(dir, n)` builds a scaled fixture (the burst is O(files) and hides at pi-lens's ~300). New hot-path budget guards (see `tests/clients/source-walk-occupancy.test.ts`) assert `measureMaxSyncBlockMs(...) < ~300ms` on a ~1k+ fixture, with `{ retry: 2 }` to soak ambient parallel-suite load. Keep the fixture light enough not to starve the parallel suite.
+- **Runtime occupancy monitor:** `clients/event-loop-monitor.ts` wraps Node's native `monitorEventLoopDelay` (enabled at extension load, zero per-event overhead). `getEventLoopStats()` (worst block / p99 / mean since session) is surfaced in `/lens-health`. Caveat: the native histogram's *capture* is unreliable inside vitest's worker, so test the wrapper contract (lifecycle/finite conversion), not block magnitude — block magnitude is what `measureMaxSyncBlockMs` (test-side, setImmediate sampler) is for.
+
 ## Internal edit substrate direction
 
 Phase 6 in `implementation.md` is intentionally **not** a public `lens_edit` tool. It should be an internal mutation substrate to reduce failed edits in pi-lens-owned paths while preserving the native agent edit lifecycle:
@@ -221,7 +251,7 @@ Mixing different capture names in one `[...]` block causes tree-sitter to silent
 **Post-filters** (`post_filter` in YAML, `applyPostFilter` in `clients/tree-sitter-client.ts`): evaluated after query matching to reject false positives. Key ones: `count_params` (long-param-list: excludes optional/defaulted params), `ts_ssrf_sink` (requires URL to look like external input), `check_secret_pattern` (variable name must match secret-sounding pattern).
 
 ## Current version / state
-v3.8.48 is the package version. Master includes unreleased work: read-guard autopatch improvements (trailing empty lines, `out_of_range` downgrade, repeat-failure escalation), actionable/code-quality warning reports with sequence metadata, project/file sequencing plus append-only change logs, project snapshot hydration, reverse-dependency snapshot cache/query helpers, structured NDJSON telemetry for the actionable-warnings pipeline (`actionable-warnings-logger.ts`), async/fast lifecycle consistency (jscpd/Madge/formatters use `safeSpawnAsync`; LSP teardown uses fast/unref paths), expanded tree-sitter language coverage/read expansion/symbol extraction for issue #152, and ast-grep tool hardening for issue #125/#151 (strictness, skip pagination, stale-preview detection, metavariable captures). CI runs `npm install` + tsc lint + vitest + a lockfile-sync guard (`npm run check:lockfile`). `package-lock.json` IS committed and must stay in sync with `package.json` — after any dependency change run `npm install` and commit the updated lock (the guard fails CI on drift). Runtime deps must live in `dependencies`, never `devDependencies`: pi installs extensions with `npm install --omit=dev`, so a runtime import of a dev-only package fails to load at user sites. The host SDK (`@earendil-works/pi-coding-agent`) must be imported type-only — it is not present under `--omit=dev`, and pulling it in drags a huge tree with Windows-illegal long paths that breaks `git clean` on update.
+v3.8.50 is the package version. Master includes unreleased work: read-guard autopatch improvements (trailing empty lines, `out_of_range` downgrade, repeat-failure escalation), actionable/code-quality warning reports with sequence metadata, project/file sequencing plus append-only change logs, project snapshot hydration, reverse-dependency snapshot cache/query helpers, structured NDJSON telemetry for the actionable-warnings pipeline (`actionable-warnings-logger.ts`), async/fast lifecycle consistency (jscpd/Madge/formatters use `safeSpawnAsync`; LSP teardown uses fast/unref paths), expanded tree-sitter language coverage/read expansion/symbol extraction for issue #152, and ast-grep tool hardening for issue #125/#151 (strictness, skip pagination, stale-preview detection, metavariable captures). CI runs `npm install` + tsc lint + vitest + a lockfile-sync guard (`npm run check:lockfile`). `package-lock.json` IS committed and must stay in sync with `package.json` — after any dependency change run `npm install` and commit the updated lock (the guard fails CI on drift). Runtime deps must live in `dependencies`, never `devDependencies`: pi installs extensions with `npm install --omit=dev`, so a runtime import of a dev-only package fails to load at user sites. The host SDK (`@earendil-works/pi-coding-agent`) must be imported type-only — it is not present under `--omit=dev`, and pulling it in drags a huge tree with Windows-illegal long paths that breaks `git clean` on update.
 
 ## Test requirements
 Every commit that adds or changes logic **must** include relevant tests before pushing. No exceptions:
@@ -229,6 +259,7 @@ Every commit that adds or changes logic **must** include relevant tests before p
 - New tool parameters → tool-level routing tests verifying the parameter reaches the right handler.
 - Bug fixes → a regression test that would have caught the bug.
 - Run `npm test` (or `npm run build && npm test` if `.js` artifacts may be stale) and confirm all tests pass before committing.
+- **Also run `npm run lint` before pushing — especially for test-file changes.** `npm run lint` (`tsc -p tsconfig.json`) is the strict CI gate and type-checks the `tests/` tree; `npm run build` (`tsconfig.build.json`) **excludes tests** and `build:dist` uses `--noCheck`, so a type error in a test compiles clean locally but fails CI lint. (This has bitten us — build passing ≠ lint passing.)
 
 ### Testing extension wiring (#171)
 For anything that goes through the `index.ts` entry — flag/command/tool/hook registration, the `context` injection toggle, `tool_call`/`tool_result` read-guard wiring, `session_start` registrations — use the shared harness in `tests/support/pi-mock.ts` instead of hand-rolling an `ExtensionAPI`/ctx mock:

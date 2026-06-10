@@ -51,6 +51,47 @@ jobs:
       - name: Run tests
         run: npm test
 
+  # Simulates pi's real install path: a `git:` install runs `npm install
+  # --omit=dev`, which triggers `prepare` → `build:dist` FROM SOURCE with the
+  # dev-only @types/node ABSENT. That's the path that broke with TS2688 (#193)
+  # and that the tarball-based install-test never exercises (#194) — the tarball
+  # ships pre-built dist/, so it never re-runs the build under --omit=dev.
+  prod-install-build:
+    name: Production install build (--omit=dev, from source)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      # --omit=dev omits @types/node (a devDep); typescript is a runtime dep so
+      # tsc is present. This is the exact environment pi builds dist in.
+      - name: Install without devDeps (--omit=dev)
+        run: npm install --omit=dev --no-audit --no-fund
+
+      - name: Build dist from source under --omit=dev (the prepare path)
+        run: npm run build:dist
+
+      - name: Verify dist built and the compiled entry loads
+        run: |
+          test -f dist/index.js || \
+            (echo "ERROR: dist/index.js not built under --omit=dev (TS2688? prepare/build:dist failed)" && exit 1)
+          node dist/index.js 2>&1 | tee /tmp/load.txt || true
+          # ERR_MODULE_NOT_FOUND = a runtime dep was wrongly in devDependencies.
+          # pi-coding-agent is a host-provided peer; its absence is expected here.
+          if grep -q "ERR_MODULE_NOT_FOUND\|Cannot find module" /tmp/load.txt \
+             && ! grep -q "pi-coding-agent" /tmp/load.txt; then
+            echo "FAILED: missing runtime module under --omit=dev"
+            cat /tmp/load.txt
+            exit 1
+          fi
+          echo "Production --omit=dev build + load OK"
+
   install-test:
     name: Install test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -91,10 +132,10 @@ jobs:
           # directly instead of jiti-transpiling source on every startup (#182).
           tar -tzf "$TARBALL" | grep "package/dist/index.js" || \
             (echo "ERROR: dist/index.js missing from tarball (prepare build failed?)" && exit 1)
-          # pi resolves pi.skills relative to the extension entry's dir (dist/),
-          # so the skills must travel inside dist/ alongside the compiled entry.
-          tar -tzf "$TARBALL" | grep "package/dist/skills/" || \
-            (echo "ERROR: dist/skills missing from tarball (build:dist skills copy failed?)" && exit 1)
+          # Skills ship at the package root (skills/); pi.skills is "../../skills",
+          # resolved relative to the dist entry FILE (dist/index.js) back to root.
+          tar -tzf "$TARBALL" | grep "package/skills/" || \
+            (echo "ERROR: skills/ missing from tarball" && exit 1)
           # Guard against accidentally shipping TS source again (reintroduces the
           # jiti transpile-on-startup cost).
           if tar -tzf "$TARBALL" | grep -E "package/(index\.ts|clients/.*\.ts)"; then

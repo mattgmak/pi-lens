@@ -10,7 +10,7 @@
 
 import { spawn as nodeSpawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { existsSync } from "node:fs";
+import { access } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import type { MessageConnection } from "vscode-jsonrpc";
 import { logLatency } from "../latency-logger.js";
@@ -180,6 +180,13 @@ export interface LSPClientInfo {
 			diags: LSPDiagnostic[],
 		) => boolean,
 	): number;
+	/**
+	 * Paths of every file with tracked diagnostics. Lets callers resolve
+	 * file existence asynchronously (off the event loop) and then prune with a
+	 * synchronous, in-memory predicate — instead of a blocking `existsSync` per
+	 * file inside `pruneDiagnostics`.
+	 */
+	getTrackedDiagnosticPaths(): string[];
 	/** Capability snapshot for workspace diagnostics support */
 	getWorkspaceDiagnosticsSupport(): LSPWorkspaceDiagnosticsSupport;
 	/** Capability snapshot for navigation/edit operations */
@@ -827,10 +834,20 @@ export async function handleNotifyOpen(
 	// not reporting a real filesystem change. Avoids N project-wide
 	// rechecks on push-diagnostics LSPs (TypeScript, Python) per CR-1.
 	if (!silent) {
+		// Async existence probe (was a synchronous existsSync on the document-open
+		// path — a stat that blocks the loop during first-read/warm). The notify
+		// type is unchanged: 2 (Changed) when the file exists on disk, else 1
+		// (Created). access() rejects when absent.
+		let fileExists = true;
+		try {
+			await access(filePath);
+		} catch {
+			fileExists = false;
+		}
 		await safeSendNotification(
 			state.connection,
 			"workspace/didChangeWatchedFiles",
-			{ changes: [{ uri, type: existsSync(filePath) ? 2 : 1 }] },
+			{ changes: [{ uri, type: fileExists ? 2 : 1 }] },
 		);
 	}
 
@@ -1234,6 +1251,15 @@ export async function createLSPClient(options: {
 				});
 			}
 			return result;
+		},
+
+		getTrackedDiagnosticPaths() {
+			return [
+				...new Set([
+					...state.pushDiagnostics.keys(),
+					...state.documentPullDiagnostics.keys(),
+				]),
+			];
 		},
 
 		pruneDiagnostics(predicate) {

@@ -5,7 +5,7 @@ import { runProviders } from "../dispatch/fact-runner.js";
 import { FactStore } from "../dispatch/fact-store.js";
 import type { Diagnostic } from "../dispatch/types.js";
 import { isTestFile } from "../file-utils.js";
-import { collectSourceFiles } from "../source-filter.js";
+import { collectSourceFilesAsync } from "../source-filter.js";
 import { TreeSitterClient } from "../tree-sitter-client.js";
 import { TreeSitterQueryLoader } from "../tree-sitter-query-loader.js";
 import {
@@ -169,7 +169,7 @@ export async function scanProjectDiagnostics(
 ): Promise<ProjectDiagnosticsSnapshot> {
 	const cwd = path.resolve(options.cwd);
 	const maxFiles = Math.max(1, options.maxFiles ?? DEFAULT_MAX_FILES);
-	const files = collectSourceFiles(cwd).slice(0, maxFiles);
+	const files = (await collectSourceFilesAsync(cwd)).slice(0, maxFiles);
 	const diagnostics = [
 		...(await scanTreeSitter(cwd, files)),
 		...(await scanFactRules(cwd, files)),
