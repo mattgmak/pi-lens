@@ -1,0 +1,81 @@
+/**
+ * Per-session diagnostic state persistence (#190 Phase 1).
+ *
+ * pi-lens's widget/diagnostic state was in-memory only, so quitting and resuming
+ * a session (`pi --session <id>`) started "fresh" — `lens_diagnostics` returned
+ * nothing. This store persists the widget snapshot to disk keyed by pi's STABLE
+ * session id (`ctx.sessionManager.getSessionId()`), so a resumed session can
+ * rehydrate its prior findings. Best-effort: every read/write swallows errors
+ * (a missing or corrupt file just means "start clean").
+ */
+
+import { promises as fs } from "node:fs";
+import * as path from "node:path";
+import { getProjectDataDir } from "./file-utils.js";
+import type { PersistedWidgetState } from "./widget-state.js";
+
+const STATE_VERSION = 1;
+
+export interface PersistedSessionState {
+	version: number;
+	sessionId: string;
+	savedAt: number;
+	widget: PersistedWidgetState;
+}
+
+function sessionsDir(cwd: string): string {
+	return path.join(getProjectDataDir(cwd), "sessions");
+}
+
+/** Session ids are pi uuids, but sanitize defensively before using as a filename. */
+function sessionFilePath(cwd: string, sessionId: string): string {
+	const safe = sessionId.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 200);
+	return path.join(sessionsDir(cwd), `${safe}.json`);
+}
+
+/**
+ * Persist the widget snapshot for `sessionId` (atomic write via tmp+rename).
+ * No-op on a missing id or any I/O error — persistence must never break a turn.
+ */
+export async function saveSessionState(
+	cwd: string,
+	sessionId: string | undefined,
+	widget: PersistedWidgetState,
+): Promise<void> {
+	if (!sessionId || !sessionId.trim()) return;
+	try {
+		const dir = sessionsDir(cwd);
+		await fs.mkdir(dir, { recursive: true });
+		const payload: PersistedSessionState = {
+			version: STATE_VERSION,
+			sessionId,
+			savedAt: Date.now(),
+			widget,
+		};
+		const file = sessionFilePath(cwd, sessionId);
+		const tmp = `${file}.${process.pid}.tmp`;
+		await fs.writeFile(tmp, JSON.stringify(payload), "utf8");
+		await fs.rename(tmp, file);
+	} catch {
+		/* best-effort */
+	}
+}
+
+/**
+ * Load the persisted widget snapshot for `sessionId`, or undefined if none /
+ * unreadable / version mismatch.
+ */
+export async function loadSessionState(
+	cwd: string,
+	sessionId: string | undefined,
+): Promise<PersistedSessionState | undefined> {
+	if (!sessionId || !sessionId.trim()) return undefined;
+	try {
+		const raw = await fs.readFile(sessionFilePath(cwd, sessionId), "utf8");
+		const parsed = JSON.parse(raw) as PersistedSessionState;
+		if (parsed?.version !== STATE_VERSION || !parsed.widget) return undefined;
+		return parsed;
+	} catch {
+		return undefined;
+	}
+}

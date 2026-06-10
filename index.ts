@@ -9,9 +9,15 @@ import { loadBootstrapClients } from "./clients/bootstrap.js";
 import { CacheManager } from "./clients/cache-manager.js";
 import {
 	clearWidgetState,
+	exportWidgetState,
+	importWidgetState,
 	renderWidget,
 	setRenderCallback,
 } from "./clients/widget-state.js";
+import {
+	loadSessionState,
+	saveSessionState,
+} from "./clients/session-state-store.js";
 import { getDiagnosticTracker } from "./clients/diagnostic-tracker.js";
 import {
 	getCascadeSessionStats,
@@ -1127,6 +1133,19 @@ export default function (pi: ExtensionAPI) {
 		try {
 			dbg("session_start fired");
 			updateRuntimeIdentityFromEvent(event);
+			// #190: pi's session lifecycle. `reason` distinguishes new/resume/fork/
+			// reload/startup; the STABLE session id comes from the session manager
+			// (the event carries none), and is what lets a resumed session rehydrate.
+			const sessionReason = (event as { reason?: string }).reason;
+			const stableSessionId = (() => {
+				try {
+					return (
+						ctx as { sessionManager?: { getSessionId?: () => string } }
+					)?.sessionManager?.getSessionId?.();
+				} catch {
+					return undefined;
+				}
+			})();
 			try {
 				await ensureLSPConfigInitialized(ctx.cwd ?? process.cwd());
 			} catch (cfgErr) {
@@ -1177,7 +1196,36 @@ export default function (pi: ExtensionAPI) {
 				resetLSPService,
 			});
 			ctx.ui && updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
-			clearWidgetState();
+
+			// Pin the stable identity + reason AFTER handleSessionStart (which ran
+			// resetForSession → a fresh random id); the stable id now wins (#190).
+			runtime.setSessionLifecycle({
+				sessionId: stableSessionId,
+				reason: sessionReason,
+			});
+
+			// Reason-aware widget state (#190): resume rehydrates the persisted
+			// findings; reload keeps the in-memory state; everything else (new /
+			// startup / fork — fork branching is Phase 2) starts clean.
+			if (sessionReason === "resume" && stableSessionId) {
+				clearWidgetState();
+				const persisted = await loadSessionState(
+					ctx.cwd ?? process.cwd(),
+					stableSessionId,
+				);
+				if (persisted?.widget && importWidgetState(persisted.widget)) {
+					dbg(
+						`session_start: resumed ${stableSessionId} — rehydrated ${persisted.widget.files.length} file(s)`,
+					);
+				} else {
+					dbg(`session_start: resumed ${stableSessionId} — no persisted state`);
+				}
+			} else if (sessionReason === "reload") {
+				dbg("session_start: reload — keeping widget state");
+			} else {
+				clearWidgetState();
+			}
+
 			if (lensWidgetVisible) {
 				mountLensWidget(ctx.ui);
 			}
@@ -2036,6 +2084,18 @@ export default function (pi: ExtensionAPI) {
 				resetFormatService,
 			});
 			ctx.ui && updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
+
+			// #190: persist this session's settled widget diagnostics so a later
+			// resume (`pi --session <id>`) can rehydrate them. Only when pi gave us
+			// a stable session id (else the file would be orphaned, never loaded).
+			// Fire-and-forget — persistence must never delay or break a turn.
+			if (runtime.hasStableSessionId) {
+				void saveSessionState(
+					ctx.cwd ?? process.cwd(),
+					runtime.telemetrySessionId,
+					exportWidgetState(),
+				);
+			}
 		} catch (turnEndErr) {
 			dbg(`turn_end crashed: ${turnEndErr}`);
 			dbg(`turn_end crash stack: ${(turnEndErr as Error).stack}`);

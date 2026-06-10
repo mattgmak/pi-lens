@@ -78,6 +78,77 @@ export function clearWidgetState(): void {
 	requestRenderFn = null;
 }
 
+const WIDGET_STATE_VERSION = 1;
+
+/** Serializable snapshot of the per-file diagnostic state (#190). */
+export interface PersistedWidgetState {
+	version: number;
+	sessionLanguages: string[];
+	files: Array<{
+		filePath: string;
+		runners: Array<
+			[string, { status: string; count: number; durationMs?: number }]
+		>;
+		formatters: Array<[string, { changed: boolean; success: boolean }]>;
+		diagnostics: WidgetDiagnostic[];
+		allDiagnostics: WidgetDiagnostic[];
+		diagnosticCounts: { blocking: number; errors: number; warnings: number };
+		hasFinalDiagnosticsSnapshot: boolean;
+		touchedAt: number;
+	}>;
+}
+
+/**
+ * Snapshot the per-file widget diagnostics for persistence (#190). Excludes
+ * `lspServers` — those are process-bound (servers re-spawn fresh on the next
+ * launch), so restoring their "ready" status would be misleading.
+ */
+export function exportWidgetState(): PersistedWidgetState {
+	return {
+		version: WIDGET_STATE_VERSION,
+		sessionLanguages: [...sessionLanguages],
+		files: [...files.values()].map((rec) => ({
+			filePath: rec.filePath,
+			runners: [...rec.runners.entries()],
+			formatters: [...rec.formatters.entries()],
+			diagnostics: rec.diagnostics,
+			allDiagnostics: rec.allDiagnostics,
+			diagnosticCounts: rec.diagnosticCounts,
+			hasFinalDiagnosticsSnapshot: rec.hasFinalDiagnosticsSnapshot,
+			touchedAt: rec.touchedAt,
+		})),
+	};
+}
+
+/**
+ * Restore a {@link PersistedWidgetState} snapshot (#190 resume rehydration).
+ * Replaces the in-memory `files` map; ignores snapshots from a different
+ * version. Triggers a re-render if a callback is registered.
+ */
+export function importWidgetState(state: PersistedWidgetState | undefined): boolean {
+	if (!state || state.version !== WIDGET_STATE_VERSION) return false;
+	files.clear();
+	for (const f of state.files ?? []) {
+		files.set(f.filePath, {
+			filePath: f.filePath,
+			runners: new Map(f.runners ?? []),
+			formatters: new Map(f.formatters ?? []),
+			diagnostics: f.diagnostics ?? [],
+			allDiagnostics: f.allDiagnostics ?? [],
+			diagnosticCounts: f.diagnosticCounts ?? {
+				blocking: 0,
+				errors: 0,
+				warnings: 0,
+			},
+			hasFinalDiagnosticsSnapshot: f.hasFinalDiagnosticsSnapshot ?? false,
+			touchedAt: f.touchedAt ?? Date.now(),
+		});
+	}
+	sessionLanguages = state.sessionLanguages ?? [];
+	requestRenderFn?.();
+	return true;
+}
+
 export function setSessionLanguages(langs: string[]): void {
 	sessionLanguages = langs;
 	requestRender();
