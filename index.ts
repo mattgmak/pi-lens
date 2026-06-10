@@ -19,6 +19,7 @@ import {
 	dropStaleFiles,
 	loadSessionState,
 	saveSessionState,
+	sessionStartMode,
 } from "./clients/session-state-store.js";
 import { getDiagnosticTracker } from "./clients/diagnostic-tracker.js";
 import {
@@ -1218,34 +1219,18 @@ export default function (pi: ExtensionAPI) {
 				reason: sessionReason,
 			});
 
-			// Reason-aware widget state (#190): resume rehydrates the persisted
-			// findings (reconciled against the current FS so files edited between
-			// sessions aren't shown stale); fork branches from the source session's
-			// snapshot; reload keeps in-memory state; new/startup start clean.
-			if (sessionReason === "resume" && stableSessionId) {
-				clearWidgetState();
-				pendingForkSnapshot = undefined;
-				const persisted = await loadSessionState(
-					ctx.cwd ?? process.cwd(),
-					stableSessionId,
-				);
-				if (persisted?.widget) {
-					// #180/#190: drop files changed on disk since the snapshot so a
-					// resume never surfaces stale diagnostics; they re-scan on edit.
-					const fresh = await dropStaleFiles(
-						persisted.widget,
-						persisted.savedAt,
-					);
-					const dropped = persisted.widget.files.length - fresh.files.length;
-					importWidgetState(fresh);
-					dbg(
-						`session_start: resumed ${stableSessionId} — rehydrated ${fresh.files.length} file(s)` +
-							(dropped > 0 ? `, dropped ${dropped} stale` : ""),
-					);
-				} else {
-					dbg(`session_start: resumed ${stableSessionId} — no persisted state`);
-				}
-			} else if (sessionReason === "fork" && pendingForkSnapshot) {
+			// Lifecycle-aware widget state (#190). The "should I rehydrate" signal is
+			// NOT the reason — it's whether a persisted snapshot exists for this
+			// STABLE session id. A `pi --session <id>` launch fires reason="startup"
+			// (not "resume" — that's only an in-process switchSession), so gating on
+			// "resume" alone missed the common resume path. So: fork branches from
+			// the in-memory stash; reload keeps state; new starts clean; everything
+			// else (resume / startup / default) rehydrates IFF a snapshot exists —
+			// a brand-new session has a fresh id with no file (→ clean), a
+			// resumed/launched one has its prior file (→ rehydrate).
+			const reasonLabel = sessionReason ?? "startup";
+			const startMode = sessionStartMode(sessionReason, !!pendingForkSnapshot);
+			if (startMode === "fork" && pendingForkSnapshot) {
 				// Branch the forked session from the source's in-memory snapshot, then
 				// persist it under the new session id so the fork owns its own copy.
 				clearWidgetState();
@@ -1262,11 +1247,45 @@ export default function (pi: ExtensionAPI) {
 				dbg(
 					`session_start: fork — branched ${forkedFileCount} file(s) from source`,
 				);
-			} else if (sessionReason === "reload") {
+			} else if (startMode === "keep") {
 				dbg("session_start: reload — keeping widget state");
-			} else {
+			} else if (startMode === "clean") {
 				pendingForkSnapshot = undefined;
 				clearWidgetState();
+				dbg("session_start: new — clean widget");
+			} else {
+				// maybe-rehydrate: covers resume AND startup (e.g. `pi --session <id>`)
+				pendingForkSnapshot = undefined;
+				clearWidgetState();
+				if (stableSessionId) {
+					const persisted = await loadSessionState(
+						ctx.cwd ?? process.cwd(),
+						stableSessionId,
+					);
+					if (persisted?.widget) {
+						// #180/#190: drop files changed on disk since the snapshot so a
+						// resume never surfaces stale diagnostics; they re-scan on edit.
+						const fresh = await dropStaleFiles(
+							persisted.widget,
+							persisted.savedAt,
+						);
+						const dropped =
+							persisted.widget.files.length - fresh.files.length;
+						importWidgetState(fresh);
+						dbg(
+							`session_start: ${reasonLabel} ${stableSessionId} — rehydrated ${fresh.files.length} file(s)` +
+								(dropped > 0 ? `, dropped ${dropped} stale` : ""),
+						);
+					} else {
+						dbg(
+							`session_start: ${reasonLabel} ${stableSessionId} — no persisted state (clean)`,
+						);
+					}
+				} else {
+					dbg(
+						`session_start: ${reasonLabel} — no stable session id (clean)`,
+					);
+				}
 			}
 
 			if (lensWidgetVisible) {

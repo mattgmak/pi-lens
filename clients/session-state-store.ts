@@ -23,6 +23,32 @@ export interface PersistedSessionState {
 	widget: PersistedWidgetState;
 }
 
+/**
+ * What `session_start` should do with the widget state, decided from the
+ * lifecycle reason (#190). Extracted + pure so the reason→action mapping is
+ * unit-tested — the original Phase 1 gated rehydration on `reason === "resume"`
+ * and so missed the common case: a `pi --session <id>` LAUNCH fires
+ * `reason: "startup"` (not "resume" — that's only an in-process `switchSession`).
+ *
+ * - `fork`   — adopt the in-memory fork stash (only when one is pending).
+ * - `keep`   — `reload` keeps the live in-memory state.
+ * - `clean`  — an explicit `new` session starts empty.
+ * - `maybe-rehydrate` — `resume`/`startup`/anything else: rehydrate IFF a
+ *   persisted snapshot exists for the stable id (a brand-new session has a fresh
+ *   id with no file → clean; a resumed/launched one has its prior file → load).
+ */
+export type SessionStartMode = "fork" | "keep" | "clean" | "maybe-rehydrate";
+
+export function sessionStartMode(
+	reason: string | undefined,
+	hasPendingForkSnapshot: boolean,
+): SessionStartMode {
+	if (reason === "fork" && hasPendingForkSnapshot) return "fork";
+	if (reason === "reload") return "keep";
+	if (reason === "new") return "clean";
+	return "maybe-rehydrate";
+}
+
 function sessionsDir(cwd: string): string {
 	return path.join(getProjectDataDir(cwd), "sessions");
 }

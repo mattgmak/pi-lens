@@ -11,6 +11,7 @@ import {
 	dropStaleFiles,
 	loadSessionState,
 	saveSessionState,
+	sessionStartMode,
 } from "../../clients/session-state-store.js";
 import {
 	clearWidgetState,
@@ -159,6 +160,26 @@ describe("session-state-store save/load (#190)", () => {
 		expect(b?.widget.files.map((f) => f.filePath)).toEqual([
 			"/proj/example/c.ts",
 		]);
+	});
+});
+
+describe("sessionStartMode — reason → action mapping (#190)", () => {
+	it("rehydrates on startup, not just resume (the pi --session launch case)", () => {
+		// The original Phase 1 bug: a `pi --session <id>` LAUNCH fires
+		// reason="startup", not "resume", so gating on "resume" missed it.
+		expect(sessionStartMode("startup", false)).toBe("maybe-rehydrate");
+		expect(sessionStartMode("resume", false)).toBe("maybe-rehydrate");
+		expect(sessionStartMode(undefined, false)).toBe("maybe-rehydrate");
+	});
+
+	it("keeps state on reload, cleans on new", () => {
+		expect(sessionStartMode("reload", false)).toBe("keep");
+		expect(sessionStartMode("new", false)).toBe("clean");
+	});
+
+	it("forks only when a stash is pending, else falls through to rehydrate", () => {
+		expect(sessionStartMode("fork", true)).toBe("fork");
+		expect(sessionStartMode("fork", false)).toBe("maybe-rehydrate");
 	});
 });
 
