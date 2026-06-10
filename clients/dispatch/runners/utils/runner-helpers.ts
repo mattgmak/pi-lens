@@ -542,28 +542,6 @@ export function getSgCommand(): { cmd: string; args: string[] } {
  *
  * Returns: { cmd, args } where args may include ["npx", toolName] preamble.
  */
-export function resolveLocalFirst(
-	toolName: string,
-	cwd: string,
-	windowsExt = ".cmd",
-): { cmd: string; args: string[] } {
-	const isWin = process.platform === "win32";
-	const binName = isWin ? `${toolName}${windowsExt}` : toolName;
-
-	// 1. Local node_modules/.bin (project-installed)
-	const local = path.join(cwd, "node_modules", ".bin", binName);
-	if (fs.existsSync(local)) return { cmd: local, args: [] };
-
-	// 2. Global PATH (already installed system-wide)
-	const globalCheck = safeSpawn(toolName, ["--version"], { timeout: 3000 });
-	if (!globalCheck.error && globalCheck.status === 0) {
-		return { cmd: toolName, args: [] };
-	}
-
-	// 3. npx fallback — only for already-cached packages (no silent download)
-	return { cmd: "npx", args: ["--no", toolName] };
-}
-
 export async function resolveLocalFirstAsync(
 	toolName: string,
 	cwd: string,
