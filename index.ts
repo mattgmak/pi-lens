@@ -9,9 +9,18 @@ import { loadBootstrapClients } from "./clients/bootstrap.js";
 import { CacheManager } from "./clients/cache-manager.js";
 import {
 	clearWidgetState,
+	exportWidgetState,
+	importWidgetState,
+	type PersistedWidgetState,
 	renderWidget,
 	setRenderCallback,
 } from "./clients/widget-state.js";
+import {
+	dropStaleFiles,
+	loadSessionState,
+	saveSessionState,
+	sessionStartMode,
+} from "./clients/session-state-store.js";
 import { getDiagnosticTracker } from "./clients/diagnostic-tracker.js";
 import {
 	getCascadeSessionStats,
@@ -529,6 +538,11 @@ export default function (pi: ExtensionAPI) {
 		process.env.PI_LENS_NO_CONTEXT_INJECTION !== "1" &&
 		!getLensFlag("no-lens-context");
 	let lensWidgetVisible = globalConfig?.widget?.visible !== false;
+	// #190 Phase 2: snapshot of the source session's diagnostics, captured at
+	// `session_before_fork` and adopted by the forked session at the subsequent
+	// `session_start` (reason="fork"). In-memory hand-off (same process) — avoids
+	// deriving the source id from a file path (the id lives in the file header).
+	let pendingForkSnapshot: PersistedWidgetState | undefined;
 	type LensWidgetTui = { requestRender: () => void };
 	type LensWidgetTheme = { fg: (color: string, s: string) => string };
 	type LensWidgetComponent = {
@@ -1092,7 +1106,14 @@ export default function (pi: ExtensionAPI) {
 		createAstGrepSearchTool(astGrepClient),
 		createAstGrepReplaceTool(astGrepClient),
 		createAstDumpTool(astGrepClient),
-		createLensDiagnosticsTool(cacheManager, () => runtime.projectRoot),
+		createLensDiagnosticsTool(
+			cacheManager,
+			() => runtime.projectRoot,
+			undefined,
+			// Flush pending per-edit dispatches before reporting so fixes made
+			// earlier this turn are reflected (not the stale pre-fix state) (#190).
+			() => flushDebouncedToolResults(),
+		),
 		createLspDiagnosticsTool(),
 		createLspNavigationTool((name) => getLensFlag(name)),
 	]) {
@@ -1127,6 +1148,19 @@ export default function (pi: ExtensionAPI) {
 		try {
 			dbg("session_start fired");
 			updateRuntimeIdentityFromEvent(event);
+			// #190: pi's session lifecycle. `reason` distinguishes new/resume/fork/
+			// reload/startup; the STABLE session id comes from the session manager
+			// (the event carries none), and is what lets a resumed session rehydrate.
+			const sessionReason = (event as { reason?: string }).reason;
+			const stableSessionId = (() => {
+				try {
+					return (
+						ctx as { sessionManager?: { getSessionId?: () => string } }
+					)?.sessionManager?.getSessionId?.();
+				} catch {
+					return undefined;
+				}
+			})();
 			try {
 				await ensureLSPConfigInitialized(ctx.cwd ?? process.cwd());
 			} catch (cfgErr) {
@@ -1177,13 +1211,104 @@ export default function (pi: ExtensionAPI) {
 				resetLSPService,
 			});
 			ctx.ui && updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
-			clearWidgetState();
+
+			// Pin the stable identity + reason AFTER handleSessionStart (which ran
+			// resetForSession → a fresh random id); the stable id now wins (#190).
+			runtime.setSessionLifecycle({
+				sessionId: stableSessionId,
+				reason: sessionReason,
+			});
+
+			// Lifecycle-aware widget state (#190). The "should I rehydrate" signal is
+			// NOT the reason — it's whether a persisted snapshot exists for this
+			// STABLE session id. A `pi --session <id>` launch fires reason="startup"
+			// (not "resume" — that's only an in-process switchSession), so gating on
+			// "resume" alone missed the common resume path. So: fork branches from
+			// the in-memory stash; reload keeps state; new starts clean; everything
+			// else (resume / startup / default) rehydrates IFF a snapshot exists —
+			// a brand-new session has a fresh id with no file (→ clean), a
+			// resumed/launched one has its prior file (→ rehydrate).
+			const reasonLabel = sessionReason ?? "startup";
+			const startMode = sessionStartMode(sessionReason, !!pendingForkSnapshot);
+			if (startMode === "fork" && pendingForkSnapshot) {
+				// Branch the forked session from the source's in-memory snapshot, then
+				// persist it under the new session id so the fork owns its own copy.
+				clearWidgetState();
+				importWidgetState(pendingForkSnapshot);
+				const forkedFileCount = pendingForkSnapshot.files.length;
+				pendingForkSnapshot = undefined;
+				if (stableSessionId) {
+					void saveSessionState(
+						ctx.cwd ?? process.cwd(),
+						stableSessionId,
+						exportWidgetState(),
+					);
+				}
+				dbg(
+					`session_start: fork — branched ${forkedFileCount} file(s) from source`,
+				);
+			} else if (startMode === "keep") {
+				dbg("session_start: reload — keeping widget state");
+			} else if (startMode === "clean") {
+				pendingForkSnapshot = undefined;
+				clearWidgetState();
+				dbg("session_start: new — clean widget");
+			} else {
+				// maybe-rehydrate: covers resume AND startup (e.g. `pi --session <id>`)
+				pendingForkSnapshot = undefined;
+				clearWidgetState();
+				if (stableSessionId) {
+					const persisted = await loadSessionState(
+						ctx.cwd ?? process.cwd(),
+						stableSessionId,
+					);
+					if (persisted?.widget) {
+						// #180/#190: drop files changed on disk since the snapshot so a
+						// resume never surfaces stale diagnostics; they re-scan on edit.
+						const fresh = await dropStaleFiles(
+							persisted.widget,
+							persisted.savedAt,
+						);
+						const dropped =
+							persisted.widget.files.length - fresh.files.length;
+						importWidgetState(fresh);
+						dbg(
+							`session_start: ${reasonLabel} ${stableSessionId} — rehydrated ${fresh.files.length} file(s)` +
+								(dropped > 0 ? `, dropped ${dropped} stale` : ""),
+						);
+					} else {
+						dbg(
+							`session_start: ${reasonLabel} ${stableSessionId} — no persisted state (clean)`,
+						);
+					}
+				} else {
+					dbg(
+						`session_start: ${reasonLabel} — no stable session id (clean)`,
+					);
+				}
+			}
+
 			if (lensWidgetVisible) {
 				mountLensWidget(ctx.ui);
 			}
 		} catch (sessionErr) {
 			dbg(`session_start crashed: ${sessionErr}`);
 			dbg(`session_start crash stack: ${(sessionErr as Error).stack}`);
+		}
+	});
+
+	// #190 Phase 2: capture the source session's diagnostics just before a fork,
+	// so the forked session (its `session_start` fires with reason="fork") can
+	// branch from them instead of starting empty. In-memory hand-off within the
+	// same process; cleared once adopted (or on any non-fork start).
+	(pi as any).on("session_before_fork", () => {
+		try {
+			pendingForkSnapshot = exportWidgetState();
+			dbg(
+				`session_before_fork: stashed ${pendingForkSnapshot.files.length} file(s) for the fork`,
+			);
+		} catch (forkErr) {
+			dbg(`session_before_fork crashed: ${forkErr}`);
 		}
 	});
 
@@ -2036,6 +2161,18 @@ export default function (pi: ExtensionAPI) {
 				resetFormatService,
 			});
 			ctx.ui && updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
+
+			// #190: persist this session's settled widget diagnostics so a later
+			// resume (`pi --session <id>`) can rehydrate them. Only when pi gave us
+			// a stable session id (else the file would be orphaned, never loaded).
+			// Fire-and-forget — persistence must never delay or break a turn.
+			if (runtime.hasStableSessionId) {
+				void saveSessionState(
+					ctx.cwd ?? process.cwd(),
+					runtime.telemetrySessionId,
+					exportWidgetState(),
+				);
+			}
 		} catch (turnEndErr) {
 			dbg(`turn_end crashed: ${turnEndErr}`);
 			dbg(`turn_end crash stack: ${(turnEndErr as Error).stack}`);
