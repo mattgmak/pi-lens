@@ -17,6 +17,7 @@ import { getGlobalPiLensDir } from "../file-utils.js";
 import { KIND_EXTENSIONS } from "../file-kinds.js";
 import { ensureTool, getToolEnvironment } from "../installer/index.js";
 import { logLatency } from "../latency-logger.js";
+import { isCommandAvailableAsync } from "../safe-spawn.js";
 import { type LSPProcess, launchLSP } from "./launch.js";
 import { normalizeMapKey } from "./path-utils.js";
 
@@ -381,7 +382,7 @@ async function resolveAndLaunch(
 	}
 
 	// Step 4 — language-native runtime install (go install, gem install, …)
-	if (spec.runtimeInstall && isOnPath(spec.runtimeInstall.runtimeCommand)) {
+	if (spec.runtimeInstall && (await isOnPath(spec.runtimeInstall.runtimeCommand))) {
 		const ok = await spec.runtimeInstall.install();
 		if (ok) {
 			const retry = spec.runtimeInstall.retryCandidates ?? spec.candidates;
@@ -781,15 +782,16 @@ export const createRootDetector = NearestRoot;
 // --- Runtime Tool Helpers ---
 
 /**
- * Check if a command is available on system PATH (synchronous, no process spawn overhead).
+ * Check if a command is available on system PATH.
+ *
+ * Async (was a blocking `spawnSync("where"/"which")`): runs on the spawn
+ * fall-through path (Step 4, runtime-install gate). The shared
+ * `isCommandAvailableAsync` spawns the same finder via `safeSpawnAsync` with a
+ * 5s timeout, so a stalled finder can no longer freeze the loop. Semantics are
+ * preserved: true iff the finder exits 0.
  */
-function isOnPath(command: string): boolean {
-	const isWindows = process.platform === "win32";
-	const result = spawnSync(isWindows ? "where" : "which", [command], {
-		stdio: "ignore",
-		shell: false,
-	});
-	return result.status === 0;
+function isOnPath(command: string): Promise<boolean> {
+	return isCommandAvailableAsync(command);
 }
 
 /**
