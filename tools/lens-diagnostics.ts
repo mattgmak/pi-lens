@@ -242,10 +242,23 @@ function formatDeltaMode(
 	const cq = quality?.summary?.warnings ?? 0;
 
 	if (lines.length === 0) {
-		const text = `No ${severity === "all" ? "" : severity + " "}issues in the current turn delta.`;
+		let text = `No ${severity === "all" ? "" : severity + " "}issues in the current turn delta.`;
+		// Discoverability (#190): `delta` is current-turn-scoped, so it's empty
+		// right after a resume even when prior findings were rehydrated into the
+		// session-wide view. Point the agent at `mode=all` when that's the case.
+		const carried = getFileDiagnosticSummaries().filter(
+			(f) => f.diagnostics.length > 0,
+		);
+		const carriedIssues = carried.reduce(
+			(n, f) => n + f.diagnostics.length,
+			0,
+		);
+		if (carried.length > 0) {
+			text += ` ${carriedIssues} finding${carriedIssues === 1 ? "" : "s"} across ${carried.length} file${carried.length === 1 ? "" : "s"} carried over from earlier this session — use mode=all to see them.`;
+		}
 		return {
 			content: [{ type: "text" as const, text }],
-			details: { mode: "delta", warnings: 0 },
+			details: { mode: "delta", warnings: 0, carriedOverFiles: carried.length },
 		};
 	}
 

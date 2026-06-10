@@ -32,6 +32,7 @@ beforeEach(() => {
 	projectDiagnosticsMocks.scanProjectDiagnostics.mockReset();
 	projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot.mockReset();
 	projectDiagnosticsMocks.loadProjectDiagnosticsDeltaReport.mockReset();
+	mockSummaries.length = 0;
 });
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -110,6 +111,34 @@ describe("lens_diagnostics mode=delta", () => {
 		const result = await run(makeTool());
 		expect(String(result.content[0].text)).toContain("No");
 		expect(result.details).toMatchObject({ mode: "delta" });
+		// No carried-over findings → no mode=all hint.
+		expect(String(result.content[0].text)).not.toContain("mode=all");
+	});
+
+	it("hints at mode=all when delta is empty but findings carried over (#190)", async () => {
+		// Simulate a resume: no current-turn delta, but the session-wide view has
+		// rehydrated findings.
+		mockSummaries.push({
+			filePath: "/proj/a.ts",
+			blocking: 1,
+			errors: 1,
+			warnings: 1,
+			hasFinalSnapshot: true,
+			diagnostics: [
+				{ severity: "error", message: "boom", line: 5 },
+				{ severity: "warning", message: "meh", line: 9 },
+			],
+		});
+
+		const result = await run(makeTool(), { mode: "delta" });
+		const text = String(result.content[0].text);
+		expect(text).toContain("carried over");
+		expect(text).toContain("mode=all");
+		expect(text).toContain("2 findings across 1 file");
+		expect(result.details).toMatchObject({
+			mode: "delta",
+			carriedOverFiles: 1,
+		});
 	});
 
 	it("formats actionable warnings from cache", async () => {
