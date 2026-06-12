@@ -11,8 +11,14 @@ A pi coding-agent extension that runs automated checks on every file write/edit.
 
 ## Key source layout
 ```
-index.ts                  Extension entry point (async factory)
+index.ts                  Extension entry point (async factory) — the pi host adapter
+mcp/                      Second host adapter: MCP server + hook bin (see "MCP mirror")
+  server.ts               Hand-rolled stdio JSON-RPC MCP server (12 tools) + warm IPC listener
+  worker.ts               fresh-mode child (loads freshly-built code from disk)
+  analyze-cli.ts          pi-lens-analyze bin — PostToolUse hook + CLI (warm channel → cold fallback)
 clients/
+  lens-engine.ts          THE internal seam — host adapters import only this for pi-lens functionality
+  mcp/                     host-neutral facades: analyze, session, review, ipc, host-shim
   runtime-session.ts      session_start handler — snapshot hydrate, tool preinstall, background scans, LSP warm
   project-snapshot.ts     Versioned seq-stamped project snapshot cache
   project-changes.ts      Append-only project/file sequence change log
@@ -24,6 +30,60 @@ clients/
 tools/                    ast-grep-search, lsp-navigation tool handlers
 tests/                    Vitest test suite (mirrors clients/ structure)
 ```
+
+## MCP mirror (second host adapter — `mcp/` + `clients/lens-engine.ts`)
+
+pi-lens is also exposed as an **MCP server** so it can be used / live-tested /
+debugged directly in Claude Code (or any MCP client) without running pi. This is
+a *second host adapter* alongside `index.ts`. Design rationale + progress: `mcp.md`.
+
+- **The seam discipline (the maintainability invariant).** Host adapters talk to
+  **`clients/lens-engine.ts` only** — never reach into pi-lens internals from
+  `mcp/server.ts`. A new mirrored capability = **one engine method + one tool
+  route**; the engine is the single place coupled to internals, so a refactor
+  breaks there (TypeScript-loud), not across the adapter. `clients/mcp/*` are the
+  host-neutral facades the engine composes (they're misnamed "mcp" — they're not
+  MCP-specific). The whole host coupling of the dispatch core is **one method**,
+  `PiAgentAPI.getFlag` (`clients/mcp/host-shim.ts` → `createMcpHost`).
+- **Transport is hand-rolled, zero-dep** (newline-delimited JSON-RPC). NO MCP SDK:
+  `npm install --omit=dev` does **not** omit `optionalDependencies` (only
+  `--omit=optional` does, which pi doesn't pass), so even an "optional" SDK would
+  weigh every pi-lens install. ~200 LOC beats a dep for a tools-only server.
+- **12 tools:** `pilens_analyze` (per-edit; `mode: warm|fresh`), `pilens_diagnostics`,
+  `pilens_project_scan`, `pilens_latency`, `pilens_health`, `pilens_rebuild`,
+  `pilens_session_start` / `pilens_turn_end` (drive the REAL lifecycle handlers —
+  not re-implementations — via `clients/mcp/session.ts`), `pilens_ast_grep_search`
+  / `pilens_ast_grep_replace`, `pilens_lsp_navigation` / `pilens_lsp_diagnostics`.
+  Wrapped pi tools emit their typebox `parameters` as the MCP `inputSchema` (via
+  `schemaWithCwd`) — no hand-restated schema to drift.
+- **warm vs fresh review loop.** The server is long-lived (warm LSP, cached code);
+  `fresh` forks a worker that loads freshly-built code from disk → reflects the
+  latest commit. `pilens_rebuild` closes it: commit → rebuild → `mode=fresh`.
+  **`fresh` always cold-spawns the LSP, so it under-reports LSP on large projects
+  within any per-call budget** — surfaced honestly via the `lsp` signal, never a
+  silent "clean" 0. warm + an indexed server is the LSP-complete path.
+- **Push half = the `pi-lens-analyze` bin** wired as a Claude Code `PostToolUse`
+  (Edit|Write) hook. MCP is pull; the hook is the only way to auto-fire on edit.
+  It tries the **warm IPC side-channel first** (`clients/mcp/ipc.ts`: Unix socket /
+  Windows named pipe, hashed per workspace) → analysis runs in the warm server
+  (LSP-complete) and the bin never loads the dispatch graph; falls back to cold
+  no-LSP local analysis. `pilens_analyze` (warm) + the hook auto-register edited
+  files into turn-state (`addModifiedRange`) so `pilens_turn_end` needs no file list.
+- **Auto session on connect:** `PI_LENS_MCP_AUTO_SESSION=1` runs `session_start`
+  when the server boots (a Claude `SessionStart` hook can't warm the server's
+  in-process LSP — separate process). Register: `claude mcp add --scope user
+  pi-lens -e PI_LENS_MCP_AUTO_SESSION=1 -- node <repo>/dist/mcp/server.js`.
+- **The bin target is `dist/`.** After changing MCP/engine/runner code, run
+  `npm run build:dist` so the user-scoped server (`dist/mcp/server.js`) picks it up
+  on the next Claude session. (`bin`: `pi-lens-mcp`, `pi-lens-analyze`.)
+- **Dogfooding found two dormant pi features** (fixed/flagged, not the MCP's fault):
+  the cold-LSP-returns-0 honesty bug (`runners/lsp.ts` — `touched === undefined`
+  now → `skipped`, not a false `succeeded`), and **`runtime.errorDebtBaseline` is
+  never set in production** (the green→red/error-debt machinery is dead plumbing).
+  Before mirroring a pi capability, check it's actually live.
+- Tests: `tests/clients/mcp/*` (units) + `tests/mcp/*` (spawn smokes — real server
+  + bin end-to-end). Live behaviors (warm IPC, real session/turn) are unit-covered;
+  the spawn smokes don't exercise them.
 
 ## Package scope
 All pi packages are `@earendil-works/*` (migrated from `@mariozechner/*` in 0.74.0). Peer dep: `@earendil-works/pi-coding-agent`. Runtime dep: `@earendil-works/pi-tui`.
