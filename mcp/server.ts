@@ -23,23 +23,26 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { AstGrepClient } from "../clients/ast-grep-client.js";
 import { CacheManager } from "../clients/cache-manager.js";
-import { ipcPathForCwd, type WarmAnalyzeRequest } from "../clients/mcp/ipc.js";
-import { analyzeFile, type McpAnalyzeResult } from "../clients/mcp/analyze.js";
 import {
+	analyzeFile,
 	analyzeFileFresh,
+	createMcpHost,
+	diagnosticStats,
+	ensureLspConfig,
+	ipcPathForCwd,
+	lspStatus,
+	type McpAnalyzeResult,
+	projectScan,
+	recentLatency,
 	resolveRebuildScript,
 	runRebuild,
+	runSessionStart,
+	runTurnEnd,
 	summarizeScan,
-} from "../clients/mcp/review.js";
-import { runSessionStart, runTurnEnd } from "../clients/mcp/session.js";
-import { getDiagnosticTracker } from "../clients/diagnostic-tracker.js";
-import { getLatencyReports } from "../clients/dispatch/integration.js";
-import { getLSPService } from "../clients/lsp/index.js";
-import { initLSPConfig } from "../clients/lsp/config.js";
-import { scanProjectDiagnostics } from "../clients/project-diagnostics/scanner.js";
-import { AstGrepClient } from "../clients/ast-grep-client.js";
-import { createMcpHost } from "../clients/mcp/host-shim.js";
+	type WarmAnalyzeRequest,
+} from "../clients/lens-engine.js";
 import { createAstGrepReplaceTool } from "../tools/ast-grep-replace.js";
 import { createAstGrepSearchTool } from "../tools/ast-grep-search.js";
 import { createLensDiagnosticsTool } from "../tools/lens-diagnostics.js";
@@ -103,7 +106,7 @@ async function ensureReady(cwd: string): Promise<void> {
 	const normalized = path.resolve(cwd);
 	if (lspReadyCwds.has(normalized)) return;
 	try {
-		await initLSPConfig(normalized);
+		await ensureLspConfig(normalized);
 	} catch (err) {
 		console.error(`[pi-lens-mcp] initLSPConfig failed for ${normalized}: ${err}`);
 	}
@@ -242,6 +245,27 @@ const astGrepReplaceTool = createAstGrepReplaceTool(astGrepClient);
 const lspNavigationTool = createLspNavigationTool(createMcpHost().getFlag);
 const lspDiagnosticsTool = createLspDiagnosticsTool();
 
+// Wrapped pi tools already declare their params as typebox (which IS JSON
+// Schema). Emit that directly as the MCP inputSchema (+ the MCP-only `cwd`)
+// instead of hand-restating it — no drift between the tool and its schema.
+function schemaWithCwd(parameters: unknown): Record<string, unknown> {
+	const p = parameters as {
+		properties?: Record<string, unknown>;
+		required?: string[];
+	};
+	return {
+		type: "object",
+		properties: {
+			...(p.properties ?? {}),
+			cwd: {
+				type: "string",
+				description: "Project root (defaults to the server workspace).",
+			},
+		},
+		...(p.required ? { required: p.required } : {}),
+	};
+}
+
 const TOOLS = [
 	{
 		name: "pilens_analyze",
@@ -282,14 +306,7 @@ const TOOLS = [
 			"Query pi-lens's diagnostic state across ALL runners (not just LSP). " +
 			"mode=delta (current turn, instant), mode=all (every dispatched file this " +
 			"session), mode=full (expensive project-wide active scan).",
-		inputSchema: {
-			type: "object",
-			properties: {
-				mode: { type: "string", enum: ["delta", "all", "full"] },
-				severity: { type: "string", enum: ["error", "warning", "all"] },
-				cwd: { type: "string" },
-			},
-		},
+		inputSchema: schemaWithCwd(lensDiagnosticsTool.parameters),
 	},
 	{
 		name: "pilens_latency",
@@ -378,30 +395,7 @@ const TOOLS = [
 			"Structural (AST) code search via ast-grep — match by code structure, not " +
 			"text. Use meta-variables ($X) and AST context (e.g. 'console.log($MSG)', " +
 			"'function $NAME() { $$$ }'). Far more precise than grep for code shapes.",
-		inputSchema: {
-			type: "object",
-			properties: {
-				pattern: {
-					type: "string",
-					description: "AST pattern (structural, with $meta-vars), not plain text.",
-				},
-				lang: { type: "string", description: "Target language (e.g. ts, tsx, py, go, rust)." },
-				paths: {
-					type: "array",
-					items: { type: "string" },
-					description: "Files/folders to search (default: whole workspace).",
-				},
-				context: { type: "number", description: "Lines of context around each match." },
-				selector: { type: "string", description: "Restrict to a specific AST node kind." },
-				rule: { type: "string", description: "Raw ast-grep YAML rule (full DSL; overrides pattern)." },
-				strictness: {
-					type: "string",
-					enum: ["smart", "relaxed", "ast", "cst", "signature", "template"],
-				},
-				cwd: { type: "string" },
-			},
-			required: ["pattern", "lang"],
-		},
+		inputSchema: schemaWithCwd(astGrepSearchTool.parameters),
 	},
 	{
 		name: "pilens_ast_grep_replace",
@@ -409,29 +403,7 @@ const TOOLS = [
 			"Structural (AST) find-and-rewrite via ast-grep, e.g. pattern='var $X' " +
 			"rewrite='let $X'. DRY-RUN by default (apply=false shows the diff); set " +
 			"apply=true to write the changes to disk.",
-		inputSchema: {
-			type: "object",
-			properties: {
-				pattern: { type: "string", description: "AST pattern to match." },
-				rewrite: { type: "string", description: "Replacement using the pattern's meta-vars ('' to delete)." },
-				lang: { type: "string", description: "Target language." },
-				paths: {
-					type: "array",
-					items: { type: "string" },
-					description: "Files/folders to rewrite (default: whole workspace).",
-				},
-				apply: {
-					type: "boolean",
-					description: "false (default) = dry-run/diff; true = write changes to disk.",
-				},
-				strictness: {
-					type: "string",
-					enum: ["smart", "relaxed", "ast", "cst", "signature", "template"],
-				},
-				cwd: { type: "string" },
-			},
-			required: ["pattern", "rewrite", "lang"],
-		},
+		inputSchema: schemaWithCwd(astGrepReplaceTool.parameters),
 	},
 	{
 		name: "pilens_lsp_navigation",
@@ -440,68 +412,16 @@ const TOOLS = [
 			"workspaceSymbol, implementation, call hierarchy (prepareCallHierarchy/" +
 			"incomingCalls/outgoingCalls), rename, codeAction — exact + type-aware, " +
 			"~50ms. Use before changing a signature to see every caller.",
-		inputSchema: {
-			type: "object",
-			properties: {
-				operation: {
-					type: "string",
-					enum: [
-						"definition",
-						"references",
-						"hover",
-						"signatureHelp",
-						"documentSymbol",
-						"findSymbol",
-						"workspaceSymbol",
-						"codeAction",
-						"rename",
-						"rename_file",
-						"implementation",
-						"prepareCallHierarchy",
-						"incomingCalls",
-						"outgoingCalls",
-						"workspaceDiagnostics",
-						"capabilities",
-					],
-				},
-				filePath: { type: "string", description: "File path (required for file-scoped ops)." },
-				line: { type: "number", description: "Line (1-based)." },
-				character: { type: "number", description: "Character (1-based)." },
-				symbol: { type: "string", description: "Symbol on the line (auto-resolves character)." },
-				endLine: { type: "number" },
-				endCharacter: { type: "number" },
-				newName: { type: "string", description: "Required for rename." },
-				newFilePath: { type: "string", description: "Required for rename_file." },
-				cwd: { type: "string" },
-			},
-			required: ["operation"],
-		},
+		inputSchema: schemaWithCwd(lspNavigationTool.parameters),
 	},
 	{
 		name: "pilens_lsp_diagnostics",
 		description:
 			"Pure LSP diagnostics for a file, directory, or batch of files (type " +
 			"errors only — narrower than pilens_diagnostics, which spans all runners).",
-		inputSchema: {
-			type: "object",
-			properties: {
-				filePath: { type: "string", description: "File or directory to check." },
-				filePaths: {
-					type: "array",
-					items: { type: "string" },
-					description: "Batch of files to check.",
-				},
-				severity: {
-					type: "string",
-					enum: ["error", "warning", "information", "hint", "all"],
-				},
-				concurrency: { type: "number", description: "Batch concurrency (default 8, max 16)." },
-				waitMs: { type: "number", description: "Per-file LSP wait budget." },
-				cwd: { type: "string" },
-			},
-		},
+		inputSchema: schemaWithCwd(lspDiagnosticsTool.parameters),
 	},
-] as const;
+];
 
 function formatAnalyze(
 	result: McpAnalyzeResult,
@@ -587,7 +507,7 @@ async function callTool(
 			typeof args.maxFiles === "number" && Number.isFinite(args.maxFiles)
 				? Math.max(1, Math.floor(args.maxFiles))
 				: undefined;
-		const snapshot = await scanProjectDiagnostics({ cwd, tier: "cheap", maxFiles });
+		const snapshot = await projectScan(cwd, maxFiles);
 		const { deduped, byRule, byFile } = summarizeScan(snapshot.diagnostics);
 		const topRules = Object.entries(byRule).sort((a, b) => b[1] - a[1]);
 		const topFiles = Object.entries(byFile)
@@ -614,13 +534,11 @@ async function callTool(
 	}
 
 	if (name === "pilens_health") {
-		const lsp = getLSPService();
-		const servers = lsp.getStatus();
-		const reports = getLatencyReports();
-		const last = reports[reports.length - 1];
-		const stats = getDiagnosticTracker().getStats();
+		const { aliveClients, servers } = lspStatus();
+		const last = recentLatency(1)[0];
+		const stats = diagnosticStats();
 		const lines = [
-			`LSP: ${lsp.getAliveClientCount()} alive client(s)`,
+			`LSP: ${aliveClients} alive client(s)`,
 			...servers.map(
 				(server) =>
 					`  ${server.connected ? "✓" : "✗"} ${server.serverId} (${server.root})`,
@@ -631,7 +549,7 @@ async function callTool(
 			`Diagnostics this session: ${stats.totalShown} shown · ${stats.totalAutoFixed} auto-fixed · ${stats.totalUnresolved} unresolved`,
 		];
 		return toolText(lines.join("\n"), {
-			aliveClients: lsp.getAliveClientCount(),
+			aliveClients,
 			servers,
 			lastDispatch: last
 				? {
@@ -667,13 +585,7 @@ async function callTool(
 				? Math.max(1, Math.floor(args.limit))
 				: 5;
 		const fileFilter = typeof args.file === "string" ? args.file : undefined;
-		let reports = getLatencyReports();
-		if (fileFilter) {
-			reports = reports.filter((report) =>
-				report.filePath.replace(/\\/g, "/").endsWith(fileFilter.replace(/\\/g, "/")),
-			);
-		}
-		const recent = reports.slice(-limit).reverse();
+		const recent = recentLatency(limit, fileFilter);
 		const summary =
 			recent.length === 0
 				? "No dispatch latency reports yet."
