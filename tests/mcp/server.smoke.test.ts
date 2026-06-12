@@ -105,6 +105,8 @@ describe("pi-lens MCP server (stdio smoke)", () => {
 		expect(names).toContain("pilens_turn_end");
 		expect(names).toContain("pilens_ast_grep_search");
 		expect(names).toContain("pilens_ast_grep_replace");
+		expect(names).toContain("pilens_lsp_navigation");
+		expect(names).toContain("pilens_lsp_diagnostics");
 		// Each tool advertises an object input schema.
 		for (const tool of tools) {
 			expect(tool.inputSchema.type).toBe("object");
@@ -159,6 +161,19 @@ describe("pi-lens MCP server (stdio smoke)", () => {
 				pattern: "getLSPService()",
 				lang: "ts",
 				paths: [path.join(repoRoot, "clients", "mcp")],
+			},
+		});
+		const result = res.result as { content: { type: string; text: string }[] };
+		expect(result.content[0].type).toBe("text");
+		expect(typeof result.content[0].text).toBe("string");
+	}, 45_000);
+
+	it("answers tools/call pilens_lsp_navigation (documentSymbol)", async () => {
+		const res = await harness.request(9, "tools/call", {
+			name: "pilens_lsp_navigation",
+			arguments: {
+				operation: "documentSymbol",
+				filePath: path.join(repoRoot, "clients", "mcp", "host-shim.ts"),
 			},
 		});
 		const result = res.result as { content: { type: string; text: string }[] };

@@ -39,9 +39,12 @@ import { getLSPService } from "../clients/lsp/index.js";
 import { initLSPConfig } from "../clients/lsp/config.js";
 import { scanProjectDiagnostics } from "../clients/project-diagnostics/scanner.js";
 import { AstGrepClient } from "../clients/ast-grep-client.js";
+import { createMcpHost } from "../clients/mcp/host-shim.js";
 import { createAstGrepReplaceTool } from "../tools/ast-grep-replace.js";
 import { createAstGrepSearchTool } from "../tools/ast-grep-search.js";
 import { createLensDiagnosticsTool } from "../tools/lens-diagnostics.js";
+import { createLspDiagnosticsTool } from "../tools/lsp-diagnostics.js";
+import { createLspNavigationTool } from "../tools/lsp-navigation.js";
 
 // Any stray stdout write corrupts the JSON-RPC stream; force it onto stderr.
 console.log = (...args: unknown[]) => {
@@ -236,6 +239,8 @@ const lensDiagnosticsTool = createLensDiagnosticsTool(
 const astGrepClient = new AstGrepClient();
 const astGrepSearchTool = createAstGrepSearchTool(astGrepClient);
 const astGrepReplaceTool = createAstGrepReplaceTool(astGrepClient);
+const lspNavigationTool = createLspNavigationTool(createMcpHost().getFlag);
+const lspDiagnosticsTool = createLspDiagnosticsTool();
 
 const TOOLS = [
 	{
@@ -426,6 +431,74 @@ const TOOLS = [
 				cwd: { type: "string" },
 			},
 			required: ["pattern", "rewrite", "lang"],
+		},
+	},
+	{
+		name: "pilens_lsp_navigation",
+		description:
+			"LSP code navigation: definition, references, hover, documentSymbol, " +
+			"workspaceSymbol, implementation, call hierarchy (prepareCallHierarchy/" +
+			"incomingCalls/outgoingCalls), rename, codeAction — exact + type-aware, " +
+			"~50ms. Use before changing a signature to see every caller.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				operation: {
+					type: "string",
+					enum: [
+						"definition",
+						"references",
+						"hover",
+						"signatureHelp",
+						"documentSymbol",
+						"findSymbol",
+						"workspaceSymbol",
+						"codeAction",
+						"rename",
+						"rename_file",
+						"implementation",
+						"prepareCallHierarchy",
+						"incomingCalls",
+						"outgoingCalls",
+						"workspaceDiagnostics",
+						"capabilities",
+					],
+				},
+				filePath: { type: "string", description: "File path (required for file-scoped ops)." },
+				line: { type: "number", description: "Line (1-based)." },
+				character: { type: "number", description: "Character (1-based)." },
+				symbol: { type: "string", description: "Symbol on the line (auto-resolves character)." },
+				endLine: { type: "number" },
+				endCharacter: { type: "number" },
+				newName: { type: "string", description: "Required for rename." },
+				newFilePath: { type: "string", description: "Required for rename_file." },
+				cwd: { type: "string" },
+			},
+			required: ["operation"],
+		},
+	},
+	{
+		name: "pilens_lsp_diagnostics",
+		description:
+			"Pure LSP diagnostics for a file, directory, or batch of files (type " +
+			"errors only — narrower than pilens_diagnostics, which spans all runners).",
+		inputSchema: {
+			type: "object",
+			properties: {
+				filePath: { type: "string", description: "File or directory to check." },
+				filePaths: {
+					type: "array",
+					items: { type: "string" },
+					description: "Batch of files to check.",
+				},
+				severity: {
+					type: "string",
+					enum: ["error", "warning", "information", "hint", "all"],
+				},
+				concurrency: { type: "number", description: "Batch concurrency (default 8, max 16)." },
+				waitMs: { type: "number", description: "Per-file LSP wait budget." },
+				cwd: { type: "string" },
+			},
 		},
 	},
 ] as const;
@@ -649,6 +722,21 @@ async function callTool(
 		const cwd = typeof args.cwd === "string" ? args.cwd : DEFAULT_CWD;
 		const tool =
 			name === "pilens_ast_grep_search" ? astGrepSearchTool : astGrepReplaceTool;
+		const out = (await tool.execute(
+			"mcp",
+			args,
+			new AbortController().signal,
+			undefined,
+			{ cwd },
+		)) as { content: { type: "text"; text: string }[] };
+		return { content: out.content };
+	}
+
+	if (name === "pilens_lsp_navigation" || name === "pilens_lsp_diagnostics") {
+		const cwd = typeof args.cwd === "string" ? args.cwd : DEFAULT_CWD;
+		await ensureReady(cwd);
+		const tool =
+			name === "pilens_lsp_navigation" ? lspNavigationTool : lspDiagnosticsTool;
 		const out = (await tool.execute(
 			"mcp",
 			args,
