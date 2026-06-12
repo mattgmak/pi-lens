@@ -114,11 +114,13 @@ Holds: `filePath`, language-root `cwd`, `kind` (`FileKind` — `jsts`, `python`,
 `lsp-config` is deferred via `setImmediate` (not awaited). Startup background task bodies are deferred via `setImmediate` so sync scans cannot inflate the interactive path; logs report both queued and run time. Tool availability probes use the probe cache before spawning binaries. Interactive path target: ~150ms on warm runs.
 
 ## Runner process model
-- Prefer `safeSpawnAsync()` for all subprocess work in hook paths (`session_start`, write/edit `tool_result`, `turn_end`, formatter pipeline, and dispatch runners). `safeSpawn()` is deprecated and blocks the Node event loop.
+- **Use `safeSpawnAsync()` for all subprocess work** in hook/dispatch/install paths. The sync `safeSpawn()` is deprecated, blocks the Node event loop, and (as of #197) is reachable only from `commands/booboo.ts` (user-invoked `/lens-booboo`, where blocking is acceptable) and the cached `TestRunnerClient.detectRunner` `which pytest` probe. Don't add new sync `safeSpawn` callers.
+- **The hot per-edit path is the dispatch runners** (`clients/dispatch/runners/*`), not the legacy per-tool client classes (`biome-client`, `ruff-client`, `rust-client`, `ast-grep-client`, …). Those classes historically carried a *parallel sync surface* (`checkFile`/`fixFile`/`isAvailable`/`findCargoPath`/…) that the async runners superseded; #197 found almost all of it **dead** and deleted ~1600 lines. **Lesson: when you find a sync client method, grep its real callers before "converting" it — the answer is usually "delete," and the live path already has an `*Async` twin** (`fixFileAsync`, `ensureAvailable`, `runTestFileAsync`, `tempScanAsync`, `findGoPathAsync`).
+- **Ambient turn abort signal (#197):** `safeSpawnAsync` defaults its `AbortSignal` to a module-level ambient signal (`setAmbientAbortSignal` in `clients/safe-spawn.ts`). The lifecycle handlers (`tool_result`, `agent_end`, `turn_end`) publish pi's `ctx.signal` at entry and clear it in `finally`, so an Esc/interrupt kills in-flight linter/format/type-check children (process-tree kill on Windows) without threading a signal through every call site. The signal is captured at spawn time, so clearing it only affects future spawns. Pass `ignoreAmbientSignal: true` for **installs** (gem/go/dotnet/rustup) so they run to completion even if the turn is interrupted — matching the old uncancellable sync behaviour; an explicit `options.signal` always wins.
 - Expensive project scans have in-flight guards: Knip by project root, jscpd by project root + scan params, Madge by project root/file or project root scan.
 - Check cheap filesystem/root preconditions before availability probes or auto-install. Example: Knip/jscpd/Madge skip non-project or empty roots before probing/installing tools.
-- `createAvailabilityChecker()` now exposes `isAvailableAsync()`; use it in runners. The sync `isAvailable()` remains only for legacy/test compatibility.
-- Formatter execution (`clients/formatters.ts::formatFile`) uses `safeSpawnAsync()` so timeout wrappers are meaningful.
+- `createAvailabilityChecker()` is **async-only** — returns `{ isAvailableAsync, getCommand }` (cached per-cwd, in-flight-deduped). The sync `isAvailable()` and its `?? x.isAvailable(cwd)` runner fallbacks were removed (#197); runners call `await x.isAvailableAsync(cwd)`. Per-client availability/path probes follow the same `*Async` convention (`RustClient.findCargoPathAsync`/`isAvailableAsync`, `GoClient.findGoPathAsync`/`isGoAvailableAsync`, `TypeCoverageClient.isAvailableAsync`/`scanAsync`, `SgRunner.tempScanAsync`/`exec`, ast-grep `ensureAvailable`).
+- Formatter execution and lazy installs (`clients/formatters.ts`) and the LSP runtime installs (`clients/lsp/server.ts` `tryGoInstallGopls`/`tryDotnetToolInstall`/`tryGemInstall`) all use `safeSpawnAsync`. **Windows note:** prefer `safeSpawnAsync` over raw `spawnSync(…, {shell:false})` for tool launches — `gem`/`dotnet`/`biome` are often `.cmd` shims that only run under shell mode (which `safeSpawnAsync` uses), and it also gives UTF-8 (`chcp 65001`) + `taskkill /F /T` tree-kill. The host SDK's `pi.exec` is **not** a substitute (no Windows UTF-8/tree-kill/batch/`which`).
 - Session replacement, session shutdown, and pipeline crash recovery use fast LSP teardown (`resetLSPService({ fast: true })` / `client.shutdown({ fast: true })`) to skip protocol handshakes and unref process/timer handles.
 - Long-lived debounce timers should call `.unref()` where safe (probe-cache flush, metrics-history save, LSP idle reset) so teardown/short-lived runs are not held open just for best-effort background writes.
 
@@ -198,18 +200,25 @@ seq/hash/range validation → atomic apply → read-guard stamp → seq/change-l
 
 Use it first for partial apply, then LSP workspace edits/actionable autofix. It must not bypass read guard for normal agent edits, replace oldText autopatch, guess stale ranges, or apply project-wide edits by default.
 
+## SDK-reuse boundaries (deliberate — don't naively "simplify")
+A 2026 audit against `@earendil-works/pi-coding-agent` confirmed a few places where pi-lens intentionally does *not* reuse an SDK facility:
+- **Per-session diagnostic persistence** uses our own sidecar store (`clients/session-state-store.ts` → `getProjectDataDir/sessions/<id>.json`, atomic overwrite) rather than the SDK's `pi.appendEntry`/`getEntries`. `appendEntry` is append-only, so writing a fresh widget snapshot every `turn_end` would bloat the session JSONL with superseded copies; overwrite-in-place is the right fit. (The one genuine upside of `appendEntry` — fork/branch inheriting state for free — would let us drop the `session_before_fork` in-memory hand-off; revisit only if that hand-off becomes painful.)
+- **Context injection** prepends a raw `{role:"user"}` message on the `context` hook **on purpose** (keeps the user's prompt as the trailing message). The documented `before_agent_start`/`appendCustomMessageEntry` paths can't satisfy the trailing-message constraint — don't migrate to them.
+- **`safeSpawnAsync` over `pi.exec`** — see Runner process model (Windows UTF-8/tree-kill/`.cmd`/batch that `pi.exec` lacks).
+
 ## Open design TODOs
 
 - **Project-diagnostics adapter backlog (#179)** — turn-end/project runners are normalized into `ProjectDiagnostic` records and surfaced via `lens_diagnostics` delta/full (#175). Only the Knip adapter (`clients/project-diagnostics/runner-adapters/knip.ts`) is done; test-runner, call-graph, Madge, jscpd, type-coverage, compiler checks (`/lens-booboo`), and production-readiness signals still emit advisory text only. Mirror the Knip adapter pattern + wire into `runtime-turn.ts` `projectDiagnosticsDelta`.
 
 - **LSP server preference via project config** — `clients/lsp/config.ts` supports `.pi-lens/lsp.json` with `disabledServers` and custom server entries, but there is no way to express a *preference* between built-in candidates (e.g. prefer `basedpyright` over `pyright` when both are installed). `PythonServer.spawn()` currently uses first-found-wins ordering (`pyright-langserver` before `basedpyright-langserver`). A future `preferredServer` key in `LSPConfig` should let projects override this ordering; the server policy layer (`clients/lsp/server-policy.ts`) is the right place to apply the preference before candidate resolution.
 
-## Legacy async-cleanup TODO
-- Migrate remaining `runner-helpers.ts` sync compatibility paths (`isAvailable()`, `isSgAvailable()`, `resolveLocalFirst()`) to async callers, then remove or clearly quarantine the sync APIs.
-- Add async `sg` availability/command resolution and migrate `python-slop`/other sg CLI consumers away from sync `isSgAvailable()` probes.
-- Convert remaining formatter detection/install helper probes in `clients/formatters.ts` (e.g. rubocop gem install, rustfmt install, Go env checks, csharpier probes) from `safeSpawn()` to `safeSpawnAsync()` or installer-managed async helpers.
-- Audit explicit command flows such as `/lens-booboo` for remaining full-project `safeSpawn()` calls; they are lower priority than hook paths but should not freeze the TUI.
-- Keep tests mocking both `safeSpawn` and `safeSpawnAsync` where legacy compatibility remains; prefer async mocks for new runner tests.
+## Async-spawn migration — DONE (#197, closed)
+The sync→async spawn migration is complete; the patterns above (`safeSpawnAsync`, ambient abort signal, async-only `createAvailabilityChecker`, per-client `*Async` probes) are the steady state. What's intentionally left sync, by design — do **not** "fix" these without a real reason:
+- `commands/booboo.ts` (~30 sync `safeSpawn`) — the user-invoked `/lens-booboo` full-codebase review; blocking is acceptable and converting would ripple through the command for no hot-path benefit.
+- `TestRunnerClient.detectRunner`'s `which pytest` probe — cached per `(cwd, runner)`, fires once for a Python project with no config-file runner; converting it would ripple async through five methods (`findTestFile`/`getTestRunTarget`/`suggestTestFiles`/…) into the per-edit turn path for a one-time stutter.
+- The deprecated `safeSpawn`/`isCommandAvailable`/`findCommand` exports in `clients/safe-spawn.ts` stay only for the two cases above.
+
+For new runner tests, mock `safeSpawnAsync` (async); only mock the sync `safeSpawn` when testing one of the two legacy callers above.
 
 ## Actionable warnings routing
 
