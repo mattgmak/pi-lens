@@ -105,6 +105,24 @@ async function ensureReady(cwd: string): Promise<void> {
 	lspReadyCwds.add(normalized);
 }
 
+// Auto session_start on connect (the "Claude SessionStart hook" the agent can't
+// wire directly): a Claude Code SessionStart hook runs a separate process and
+// can't warm THIS long-lived server's in-process LSP, so the server self-inits.
+// Gated by PI_LENS_MCP_AUTO_SESSION=1 because the full session_start runs project
+// scans (knip/jscpd/dep) — opt-in so it doesn't fire in every repo. Fire-and-
+// forget; the warm/baseline/scan work continues in the background.
+let autoSessionFired = false;
+function maybeAutoSessionStart(): void {
+	if (autoSessionFired || process.env.PI_LENS_MCP_AUTO_SESSION !== "1") return;
+	autoSessionFired = true;
+	void ensureReady(DEFAULT_CWD)
+		.then(() => runSessionStart(DEFAULT_CWD))
+		.then(() => console.error("[pi-lens-mcp] auto session_start complete"))
+		.catch((err) =>
+			console.error(`[pi-lens-mcp] auto session_start failed: ${err}`),
+		);
+}
+
 // --- JSON-RPC plumbing -------------------------------------------------------
 
 type JsonRpcId = string | number | null;
@@ -580,6 +598,7 @@ async function handleRequest(request: JsonRpcRequest): Promise<void> {
 				capabilities: { tools: {} },
 				serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
 			});
+			maybeAutoSessionStart();
 			return;
 		}
 		case "notifications/initialized":
