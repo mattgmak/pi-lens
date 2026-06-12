@@ -930,15 +930,28 @@ export class LSPService {
 
 		let diagnosticsTimedOut = false;
 		if (diagnosticsMode !== "none") {
-			// Resolution: env wins so users can tune the cap without rebuilding,
-			// then the per-call option, then the legacy maxClientWaitMs reuse,
-			// then mode-defaulted floor.
+			// Resolution: env wins so users can tune the cap without rebuilding.
+			// Otherwise, on the single-server hot path (primary scope), use that
+			// server's own strategy budget (server-strategies.ts) so a fast server
+			// (TypeScript ~1s) isn't held to a flat multi-second wait while a slow
+			// one (rust-analyzer 3s) gets the time it needs — bounded by any caller
+			// ceiling that exists to protect the per-edit pipeline budget (#203).
+			// The multi-server "full"/cascade path keeps the flat resolution.
 			const envWait = readEnvDiagnosticsWaitMs();
-			const timeoutMs =
-				envWait ??
-				options.maxDiagnosticsWaitMs ??
-				options.maxClientWaitMs ??
-				(diagnosticsMode === "full" ? 3000 : 1200);
+			const callerCap = options.maxDiagnosticsWaitMs ?? options.maxClientWaitMs;
+			const modeFloor = diagnosticsMode === "full" ? 3000 : 1200;
+			let timeoutMs: number;
+			if (envWait !== undefined) {
+				timeoutMs = envWait;
+			} else if (!useAllClients && spawned.length === 1) {
+				const strategyWait = getStrategy(
+					spawned[0].client.serverId,
+				).aggregateWaitMs;
+				const base = strategyWait > 0 ? strategyWait : (callerCap ?? modeFloor);
+				timeoutMs = callerCap !== undefined ? Math.min(callerCap, base) : base;
+			} else {
+				timeoutMs = callerCap ?? modeFloor;
+			}
 			const waitStartedAt = Date.now();
 			await Promise.all(
 				spawned.map((entry) => {

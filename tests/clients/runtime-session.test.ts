@@ -5,6 +5,18 @@ import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleSessionStart } from "../../clients/runtime-session.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
+// Stub the LSP service so the no-warmFiles dominant-language auto-warm (#203)
+// can't spawn a real language server against the throwaway temp dirs (which the
+// afterEach cleanup would then race). supportsLSP:false short-circuits the warm
+// before it opens any file.
+vi.mock("../../clients/lsp/index.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../../clients/lsp/index.js")>()),
+	getLSPService: vi.fn(() => ({
+		supportsLSP: () => false,
+		touchFile: vi.fn(async () => undefined),
+	})),
+}));
+
 const EMPTY_KNIP_RESULT = {
 	success: true,
 	issues: [],
