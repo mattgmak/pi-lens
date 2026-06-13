@@ -234,6 +234,31 @@ export function searchWordIndex(
 	return results.slice(0, Math.max(0, limit));
 }
 
+/**
+ * Build a centrality map (file → importedBy count) keyed by THIS index's file
+ * paths, from the project snapshot's `reverseDeps` (importedBy). The snapshot
+ * keys are normalized (`normalizeMapKey(resolve(...))`) while the index keys are
+ * the raw scanned paths, so the caller injects a `normalizeKey` bridge; it
+ * defaults to identity for testing. Pass the result to {@link searchWordIndex}
+ * as `centrality` to boost well-connected files. Kept here (not in the engine)
+ * so it stays pure + unit-testable without the normalizer dependency.
+ */
+export function centralityFromReverseDeps(
+	index: WordIndex,
+	reverseDeps: Record<string, string[]> | undefined,
+	normalizeKey: (file: string) => string = (file) => file,
+): Map<string, number> {
+	const centrality = new Map<string, number>();
+	if (!reverseDeps) return centrality;
+	for (const file of index.docLengths.keys()) {
+		const importers = reverseDeps[normalizeKey(file)];
+		if (importers && importers.length > 0) {
+			centrality.set(file, importers.length);
+		}
+	}
+	return centrality;
+}
+
 // --- Persistence (compact JSON for the project snapshot) ---------------------
 
 export interface SerializedWordIndex {

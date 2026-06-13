@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	buildWordIndex,
+	centralityFromReverseDeps,
 	deserializeWordIndex,
 	searchWordIndex,
 	serializeWordIndex,
@@ -135,6 +136,41 @@ describe("searchWordIndex priors", () => {
 			centrality: new Map([["src/b.ts", 25]]),
 		});
 		expect(boosted[0].file).toBe("src/b.ts");
+	});
+});
+
+describe("centralityFromReverseDeps", () => {
+	const index = buildWordIndex([
+		{ path: "src/a.ts", content: "function helper() {}" },
+		{ path: "src/b.ts", content: "function helper() {}" },
+	]);
+
+	it("maps importedBy counts onto the index's own file keys", () => {
+		const centrality = centralityFromReverseDeps(index, {
+			"src/a.ts": ["x.ts", "y.ts", "z.ts"],
+		});
+		expect(centrality.get("src/a.ts")).toBe(3);
+		expect(centrality.has("src/b.ts")).toBe(false); // no importers → omitted
+	});
+
+	it("applies the injected key normalizer to bridge snapshot keys", () => {
+		const centrality = centralityFromReverseDeps(
+			index,
+			{ "SRC/A.TS": ["x.ts"] },
+			(file) => file.toUpperCase(),
+		);
+		expect(centrality.get("src/a.ts")).toBe(1);
+	});
+
+	it("returns empty when reverseDeps is absent", () => {
+		expect(centralityFromReverseDeps(index, undefined).size).toBe(0);
+	});
+
+	it("feeds searchWordIndex to reorder tied files", () => {
+		const ranked = searchWordIndex(index, "helper", {
+			centrality: centralityFromReverseDeps(index, { "src/b.ts": ["a", "b", "c"] }),
+		});
+		expect(ranked[0].file).toBe("src/b.ts");
 	});
 });
 

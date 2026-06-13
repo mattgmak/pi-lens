@@ -23,8 +23,11 @@ import { initLSPConfig } from "./lsp/config.js";
 import { getLSPService } from "./lsp/index.js";
 import { scanProjectDiagnostics } from "./project-diagnostics/scanner.js";
 import type { ProjectDiagnosticsSnapshot } from "./project-diagnostics/types.js";
+import * as path from "node:path";
+import { normalizeMapKey } from "./path-utils.js";
 import { loadProjectSnapshot } from "./project-snapshot.js";
 import {
+	centralityFromReverseDeps,
 	deserializeWordIndex,
 	type RankedFile,
 	searchWordIndex,
@@ -123,11 +126,19 @@ export function symbolSearch(
 	cwd: string,
 	limit = 20,
 ): SymbolSearchResult {
-	const index = deserializeWordIndex(loadProjectSnapshot(cwd)?.wordIndex);
+	const snapshot = loadProjectSnapshot(cwd);
+	const index = deserializeWordIndex(snapshot?.wordIndex);
 	if (!index) return { available: false, query, results: [] };
+	// Boost well-connected files using the snapshot's reverse-dependency
+	// (importedBy) counts; snapshot keys are normalized, index keys are raw.
+	const centrality = centralityFromReverseDeps(
+		index,
+		snapshot?.reverseDeps,
+		(file) => normalizeMapKey(path.resolve(file)),
+	);
 	return {
 		available: true,
 		query,
-		results: searchWordIndex(index, query, { limit }),
+		results: searchWordIndex(index, query, { limit, centrality }),
 	};
 }
