@@ -13,7 +13,7 @@ A pi coding-agent extension that runs automated checks on every file write/edit.
 ```
 index.ts                  Extension entry point (async factory) — the pi host adapter
 mcp/                      Second host adapter: MCP server + hook bin (see "MCP mirror")
-  server.ts               Hand-rolled stdio JSON-RPC MCP server (12 tools) + warm IPC listener
+  server.ts               Hand-rolled stdio JSON-RPC MCP server (14 tools) + warm IPC listener
   worker.ts               fresh-mode child (loads freshly-built code from disk)
   analyze-cli.ts          pi-lens-analyze bin — PostToolUse hook + CLI (warm channel → cold fallback)
 clients/
@@ -23,6 +23,8 @@ clients/
   project-snapshot.ts     Versioned seq-stamped project snapshot cache
   project-changes.ts      Append-only project/file sequence change log
   reverse-deps.ts         Snapshot-backed reverse dependency index/query helpers
+  word-index.ts           Identifier inverted index + BM25 ranking (#162) — built in the session scan, persisted in the snapshot; consumed ONLY by the pilens_symbol_search MCP tool (not yet by pi-lens internals)
+  review-graph/query.ts   Graph queries incl computeImpactCascade (one-hop, used by the cascade) + computeTransitiveImpact (depth-bounded BFS, used ONLY by pilens_impact)
   installer/index.ts      Auto-install + ensureTool; probe-cache.json for fast restarts
   lsp/                    37 LSP server IDs, config, lifecycle
   dispatch/               Pipeline dispatcher + 47 registered runners
@@ -49,13 +51,26 @@ a *second host adapter* alongside `index.ts`. Design rationale + progress: `mcp.
   `npm install --omit=dev` does **not** omit `optionalDependencies` (only
   `--omit=optional` does, which pi doesn't pass), so even an "optional" SDK would
   weigh every pi-lens install. ~200 LOC beats a dep for a tools-only server.
-- **12 tools:** `pilens_analyze` (per-edit; `mode: warm|fresh`), `pilens_diagnostics`,
+- **14 tools:** `pilens_analyze` (per-edit; `mode: warm|fresh`), `pilens_diagnostics`,
   `pilens_project_scan`, `pilens_latency`, `pilens_health`, `pilens_rebuild`,
   `pilens_session_start` / `pilens_turn_end` (drive the REAL lifecycle handlers —
   not re-implementations — via `clients/mcp/session.ts`), `pilens_ast_grep_search`
-  / `pilens_ast_grep_replace`, `pilens_lsp_navigation` / `pilens_lsp_diagnostics`.
-  Wrapped pi tools emit their typebox `parameters` as the MCP `inputSchema` (via
-  `schemaWithCwd`) — no hand-restated schema to drift.
+  / `pilens_ast_grep_replace`, `pilens_lsp_navigation` / `pilens_lsp_diagnostics`,
+  `pilens_symbol_search` (ranked identifier search over the persisted word index —
+  BM25 + priors + reverse-dep centrality), `pilens_impact` (transitive review-graph
+  dependents — blast radius). Wrapped pi tools emit their typebox `parameters` as
+  the MCP `inputSchema` (via `schemaWithCwd`) — no hand-restated schema to drift.
+- **MCP-only vs pi-lens-internal (a real gap to close, not a finished story).**
+  `pilens_symbol_search` and `pilens_impact` are currently **agent-facing queries
+  only**: the word index is built during pi-lens's own session scan (pi pays the
+  cost) but nothing in pi-lens consumes it, and `pilens_impact` uses *transitive*
+  BFS (`computeTransitiveImpact`) while the in-pi **cascade still derives neighbors
+  one-hop** (`computeImpactCascade` in `dispatch/integration.ts`). The higher-value
+  move is to feed the transitive impact (bounded depth/budget) into cascade neighbor
+  derivation — ideally paired with the #202 structural-hash short-circuit so the
+  expansion is *pruned* when a changed file's exported interface is unchanged. When
+  adding a capability via the engine, ask whether pi-lens itself should use it, not
+  just the mirror.
 - **warm vs fresh review loop.** The server is long-lived (warm LSP, cached code);
   `fresh` forks a worker that loads freshly-built code from disk → reflects the
   latest commit. `pilens_rebuild` closes it: commit → rebuild → `mode=fresh`.
