@@ -60,7 +60,7 @@ const STOPWORDS = new Set([
 ]);
 
 const TEST_VENDOR_RE =
-	/(^|[\\/])(?:tests?|__tests__|spec|specs|__mocks__|vendor|node_modules|examples?|fixtures?|\.git|dist|build|coverage)([\\/]|$)|\.(?:test|spec)\.[a-z]+$/i;
+	/(?:(^|[\\/])(?:tests?|__tests__|spec|specs|__mocks__|vendor|node_modules|examples?|fixtures?|\.git|dist|build|coverage)([\\/]|$))|(?:\.(?:test|spec)\.[a-z]+$)/i;
 
 const DOC_FILE_RE = /\.(?:md|mdx|markdown|json|jsonc|txt|rst|lock|ya?ml|toml|csv)$/i;
 

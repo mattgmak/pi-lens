@@ -1,12 +1,12 @@
 import * as nodeFs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "./clients/tool-event.js";
 import { AstGrepClient } from "./clients/ast-grep-client.js";
 import { loadBootstrapClients } from "./clients/bootstrap.js";
 import { CacheManager } from "./clients/cache-manager.js";
+import { resolvePackagePath } from "./clients/package-root.js";
 import {
 	clearWidgetState,
 	exportWidgetState,
@@ -1134,9 +1134,13 @@ export default function (pi: ExtensionAPI) {
 
 	// --- Register skills with pi ---
 	pi.on("resources_discover", async (_event, _ctx) => {
-		// Get the extension directory (where this file is located)
-		const extensionDir = path.dirname(fileURLToPath(import.meta.url));
-		const skillsDir = path.join(extensionDir, "skills");
+		// Resolve skills relative to the package root (nearest package.json), not the
+		// module's own directory — under the compiled dist/ layout (#182) the module
+		// lives in dist/ but skills/ stays at the package root, so a module-relative
+		// join lands on the non-existent dist/skills/ and skills silently fail to load
+		// (#205). resolvePackagePath walks up to package.json, correct for both the
+		// source (index.ts at root) and dist (dist/index.js) layouts.
+		const skillsDir = resolvePackagePath(import.meta.url, "skills");
 
 		return {
 			skillPaths: [skillsDir],

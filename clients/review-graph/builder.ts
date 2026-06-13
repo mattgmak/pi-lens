@@ -195,7 +195,9 @@ function sourceSignatureFromMap(signatures: Map<string, string>): string {
 
 function contentHashEntry(file: string): string {
 	try {
-		return createHash("sha1").update(fs.readFileSync(file)).digest("hex");
+		// sha256, not for security — a content fingerprint for change detection;
+		// avoids SonarCloud's weak-hash (sha1/md5) flag.
+		return createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 	} catch {
 		return "missing";
 	}

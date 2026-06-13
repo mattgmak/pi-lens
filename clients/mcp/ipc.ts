@@ -27,7 +27,13 @@ import type { McpAnalyzeResult } from "./analyze.js";
  */
 export function ipcPathForCwd(cwd: string): string {
 	const root = path.resolve(cwd).toLowerCase();
-	const hash = crypto.createHash("sha1").update(root).digest("hex").slice(0, 16);
+	// sha256 (not for security — just a stable short id for the IPC socket/pipe
+	// name keyed by cwd; sha256 over sha1 keeps SonarCloud's weak-hash check quiet)
+	const hash = crypto
+		.createHash("sha256")
+		.update(root)
+		.digest("hex")
+		.slice(0, 16);
 	if (process.platform === "win32") {
 		return `\\\\.\\pipe\\pi-lens-mcp-${hash}`;
 	}

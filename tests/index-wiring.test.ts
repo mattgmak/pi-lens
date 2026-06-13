@@ -73,6 +73,27 @@ describe("index.ts extension wiring", () => {
 				expect(pi.getHandlers(h).length, `hook: ${h}`).toBeGreaterThan(0);
 			}
 		});
+
+		// #205: resources_discover must point at the real skills/ dir, which lives
+		// at the package root in BOTH the source and the compiled dist/ layouts.
+		// The previous module-relative join landed on dist/skills/ (nonexistent) so
+		// skills silently failed to load.
+		it("resolves skillPaths to an existing skills/ directory at the package root", async () => {
+			const pi = createPiMock();
+			extension(pi.asExtensionAPI());
+
+			const result = (await pi.emit("resources_discover")) as {
+				skillPaths: string[];
+			};
+			expect(result?.skillPaths).toHaveLength(1);
+			const skillsDir = result.skillPaths[0];
+			expect(skillsDir.replace(/\\/g, "/")).toMatch(/\/skills$/);
+			expect(skillsDir.replace(/\\/g, "/")).not.toMatch(/\/dist\/skills$/);
+			expect(fs.existsSync(skillsDir), `skills dir exists: ${skillsDir}`).toBe(
+				true,
+			);
+			expect(fs.existsSync(path.join(skillsDir, "ast-grep"))).toBe(true);
+		});
 	});
 
 	describe("context injection gating + toggle", () => {
