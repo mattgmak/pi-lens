@@ -119,6 +119,34 @@ const READ_HASH_MAX_LINES = Math.max(
 	) || 3000,
 );
 
+// Adaptive relocation window (findRelocation). A globally-unique hash-sequence
+// match always wins; when the content is duplicated elsewhere, we fall back to
+// a match that is unique WITHIN this window of the original position. The window
+// widens with edits already applied to the file (accumulated line drift) —
+// floor + per-edit growth, capped — the analog of pi-hashline-readmap's
+// edits-scaled relocation window.
+const RELOCATION_WINDOW_MIN = Math.max(
+	1,
+	Number.parseInt(
+		process.env.PI_LENS_READ_GUARD_RELOCATION_WINDOW_MIN ?? "40",
+		10,
+	) || 40,
+);
+const RELOCATION_WINDOW_PER_EDIT = Math.max(
+	0,
+	Number.parseInt(
+		process.env.PI_LENS_READ_GUARD_RELOCATION_WINDOW_PER_EDIT ?? "20",
+		10,
+	) || 20,
+);
+const RELOCATION_WINDOW_MAX = Math.max(
+	RELOCATION_WINDOW_MIN,
+	Number.parseInt(
+		process.env.PI_LENS_READ_GUARD_RELOCATION_WINDOW_MAX ?? "400",
+		10,
+	) || 400,
+);
+
 function splitLines(text: string): string[] {
 	return text.split(/\r?\n/);
 }
@@ -915,9 +943,10 @@ export class ReadGuard {
 			return undefined;
 		}
 		const currentHashes = lines.map((line) => lineContentHash(line));
+		const lastStart = currentHashes.length - span; // last valid 0-based start
 
 		const matchStarts: number[] = [];
-		for (let i = 0; i + span <= currentHashes.length; i += 1) {
+		for (let i = 0; i <= lastStart; i += 1) {
 			let ok = true;
 			for (let j = 0; j < span; j += 1) {
 				if (currentHashes[i + j] !== wanted[j]) {
@@ -927,9 +956,36 @@ export class ReadGuard {
 			}
 			if (ok) matchStarts.push(i + 1); // 1-indexed
 		}
-		if (matchStarts.length !== 1) return undefined;
-		const newStart = matchStarts[0];
-		if (newStart === startLine) return undefined; // not actually relocated
+
+		let newStart: number | undefined;
+		if (matchStarts.length === 1) {
+			// Unique across the whole file → certainly the relocated span,
+			// regardless of how far it drifted (e.g. a large refactor moved it).
+			newStart = matchStarts[0];
+		} else if (matchStarts.length > 1) {
+			// Duplicated elsewhere: fall back to locality. Lines rarely teleport,
+			// so accept a match unique WITHIN an adaptive window of the original
+			// position — out-of-window duplicates don't poison a locally
+			// unambiguous relocation. The window widens with the edits already
+			// applied to this file this session (each prior edit shifts line
+			// numbers, so accumulated drift grows).
+			const appliedEdits = (this.edits.get(filePath) ?? []).filter(
+				(record) => record.verdict !== "blocked",
+			).length;
+			const window = Math.min(
+				RELOCATION_WINDOW_MAX,
+				Math.max(
+					RELOCATION_WINDOW_MIN,
+					appliedEdits * RELOCATION_WINDOW_PER_EDIT,
+				),
+			);
+			const lo = startLine - window;
+			const hi = endLine + window;
+			const local = matchStarts.filter((start) => start >= lo && start <= hi);
+			if (local.length === 1) newStart = local[0];
+		}
+
+		if (newStart === undefined || newStart === startLine) return undefined;
 		return { from: [startLine, endLine], to: [newStart, newStart + span - 1] };
 	}
 

@@ -400,6 +400,76 @@ describe("ReadGuard", () => {
 			}
 		});
 
+		it("relocates via the adaptive window when content is duplicated far away but locally unique", () => {
+			const env = setupTestEnvironment("read-guard-relocate-window-");
+			try {
+				const filePath = path.join(env.tmpDir, "api.ts");
+				fs.writeFileSync(
+					filePath,
+					"alpha\nbeta\nneedleOne\nneedleTwo\ngamma\n",
+				);
+				const guard = createReadGuard("test-session");
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 1,
+						effectiveLimit: 5,
+					}),
+				);
+				// Prepend 3 lines (needles shift 3-4 → 6-7) AND add a second copy of
+				// the pair far below (line ~59-60), outside the adaptive window. The
+				// whole-file scan sees two matches; the window fallback keeps the
+				// near, locally-unique one.
+				const filler = Array.from({ length: 50 }, (_, i) => `filler${i}`).join(
+					"\n",
+				);
+				fs.writeFileSync(
+					filePath,
+					`x\ny\nz\nalpha\nbeta\nneedleOne\nneedleTwo\ngamma\n${filler}\nneedleOne\nneedleTwo\n`,
+				);
+				fileTimeState.hasChanged = false;
+
+				const verdict = guard.checkEdit(filePath, [3, 4]);
+				expect(verdict.action).toBe("block");
+				expect(verdict.relocation).toEqual({ from: [3, 4], to: [6, 7] });
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("still relocates a far-shifted edit when the content is globally unique", () => {
+			const env = setupTestEnvironment("read-guard-relocate-far-");
+			try {
+				const filePath = path.join(env.tmpDir, "api.ts");
+				fs.writeFileSync(
+					filePath,
+					"alpha\nbeta\nuniqueOne\nuniqueTwo\ngamma\n",
+				);
+				const guard = createReadGuard("test-session");
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 1,
+						effectiveLimit: 5,
+					}),
+				);
+				// Prepend 60 lines — far beyond the window — but the content stays
+				// unique, so global uniqueness still relocates it (no regression).
+				const filler = Array.from({ length: 60 }, (_, i) => `pad${i}`).join(
+					"\n",
+				);
+				fs.writeFileSync(
+					filePath,
+					`${filler}\nalpha\nbeta\nuniqueOne\nuniqueTwo\ngamma\n`,
+				);
+				fileTimeState.hasChanged = false;
+
+				const verdict = guard.checkEdit(filePath, [3, 4]);
+				expect(verdict.action).toBe("block");
+				expect(verdict.relocation).toEqual({ from: [3, 4], to: [63, 64] });
+			} finally {
+				env.cleanup();
+			}
+		});
+
 		it("skips snapshot check when skipSnapshotCheck is set (content-match validated)", () => {
 			const env = setupTestEnvironment("read-guard-snapshot-skip-");
 			try {
