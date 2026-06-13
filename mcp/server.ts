@@ -41,6 +41,7 @@ import {
 	runSessionStart,
 	runTurnEnd,
 	summarizeScan,
+	symbolSearch,
 	type WarmAnalyzeRequest,
 } from "../clients/lens-engine.js";
 import { createAstGrepReplaceTool } from "../tools/ast-grep-replace.js";
@@ -346,6 +347,30 @@ const TOOLS = [
 		},
 	},
 	{
+		name: "pilens_symbol_search",
+		description:
+			"Ranked identifier search over the persisted word index (BM25 + priors " +
+			"that demote tests/vendor and doc files). Answers 'which files are most " +
+			"relevant to <query>' by identifier — complements grep (raw substrings) " +
+			"and LSP (exact symbols). Requires pilens_session_start to have built the " +
+			"index for this workspace.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				query: {
+					type: "string",
+					description: "Identifier-ish query, e.g. 'authenticate user'.",
+				},
+				cwd: { type: "string" },
+				limit: {
+					type: "number",
+					description: "Max files to return (default 20).",
+				},
+			},
+			required: ["query"],
+		},
+	},
+	{
 		name: "pilens_health",
 		description:
 			"pi-lens runtime health for THIS server: alive LSP servers, last dispatch " +
@@ -530,6 +555,48 @@ async function callTool(
 			byRule,
 			topFiles,
 			sample: deduped.slice(0, 40),
+		});
+	}
+
+	if (name === "pilens_symbol_search") {
+		const query = typeof args.query === "string" ? args.query : "";
+		if (!query.trim()) return toolText("Provide a non-empty `query`.");
+		const cwd = typeof args.cwd === "string" ? args.cwd : DEFAULT_CWD;
+		const limit =
+			typeof args.limit === "number" && Number.isFinite(args.limit)
+				? Math.max(1, Math.floor(args.limit))
+				: 20;
+		const { available, results } = symbolSearch(query, cwd, limit);
+		if (!available) {
+			return toolText(
+				"No word index for this workspace yet — run pilens_session_start first.",
+				{ available: false, query },
+			);
+		}
+		if (results.length === 0) {
+			return toolText(`No files matched "${query}".`, {
+				available: true,
+				query,
+				results: [],
+			});
+		}
+		const lines = [
+			`Top ${results.length} file(s) for "${query}":`,
+			...results.map(
+				(result, i) =>
+					`  ${i + 1}. ${path.relative(cwd, result.file)} ` +
+					`(score ${result.score.toFixed(2)}, ${result.hits} hit(s), lines ` +
+					`${result.lines.slice(0, 5).join(", ")}${result.lines.length > 5 ? "…" : ""})`,
+			),
+		];
+		return toolText(lines.join("\n"), {
+			query,
+			results: results.map((result) => ({
+				file: path.relative(cwd, result.file),
+				score: result.score,
+				hits: result.hits,
+				lines: result.lines,
+			})),
 		});
 	}
 

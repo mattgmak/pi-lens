@@ -1,6 +1,9 @@
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { saveProjectSnapshot } from "../../clients/project-snapshot.js";
+import {
+	PROJECT_SNAPSHOT_VERSION,
+	saveProjectSnapshot,
+} from "../../clients/project-snapshot.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleSessionStart } from "../../clients/runtime-session.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
@@ -167,7 +170,7 @@ describe("runtime-session notifications", () => {
 		const runtime = new RuntimeCoordinator();
 		try {
 			saveProjectSnapshot(env.tmpDir, {
-				version: 1,
+				version: PROJECT_SNAPSHOT_VERSION,
 				projectRoot: env.tmpDir,
 				generatedAt: new Date().toISOString(),
 				seq: 0,
@@ -249,7 +252,7 @@ describe("runtime-session notifications", () => {
 		);
 		try {
 			saveProjectSnapshot(env.tmpDir, {
-				version: 1,
+				version: PROJECT_SNAPSHOT_VERSION,
 				projectRoot: env.tmpDir,
 				generatedAt: new Date().toISOString(),
 				seq: 0,

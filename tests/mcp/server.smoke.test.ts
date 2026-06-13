@@ -107,6 +107,7 @@ describe("pi-lens MCP server (stdio smoke)", () => {
 		expect(names).toContain("pilens_ast_grep_replace");
 		expect(names).toContain("pilens_lsp_navigation");
 		expect(names).toContain("pilens_lsp_diagnostics");
+		expect(names).toContain("pilens_symbol_search");
 		// Each tool advertises an object input schema.
 		for (const tool of tools) {
 			expect(tool.inputSchema.type).toBe("object");

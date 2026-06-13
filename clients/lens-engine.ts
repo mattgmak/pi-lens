@@ -23,6 +23,12 @@ import { initLSPConfig } from "./lsp/config.js";
 import { getLSPService } from "./lsp/index.js";
 import { scanProjectDiagnostics } from "./project-diagnostics/scanner.js";
 import type { ProjectDiagnosticsSnapshot } from "./project-diagnostics/types.js";
+import { loadProjectSnapshot } from "./project-snapshot.js";
+import {
+	deserializeWordIndex,
+	type RankedFile,
+	searchWordIndex,
+} from "./word-index.js";
 
 // --- Facades (re-exported so adapters import only this module) ---------------
 
@@ -97,4 +103,31 @@ export function diagnosticStats(): ReturnType<
 /** Initialise LSP config for a workspace (idempotent at the LSP layer). */
 export function ensureLspConfig(cwd: string): Promise<void> {
 	return initLSPConfig(cwd);
+}
+
+export interface SymbolSearchResult {
+	/** False when no word index has been built/persisted for this workspace yet. */
+	available: boolean;
+	query: string;
+	results: RankedFile[];
+}
+
+/**
+ * Ranked identifier search over the persisted word index (#162). Stateless:
+ * loads the index from the project snapshot (built by the session scan, in
+ * either the pi extension or the MCP session), so it works without a warm
+ * runtime. Returns `available: false` when no index exists yet.
+ */
+export function symbolSearch(
+	query: string,
+	cwd: string,
+	limit = 20,
+): SymbolSearchResult {
+	const index = deserializeWordIndex(loadProjectSnapshot(cwd)?.wordIndex);
+	if (!index) return { available: false, query, results: [] };
+	return {
+		available: true,
+		query,
+		results: searchWordIndex(index, query, { limit }),
+	};
 }

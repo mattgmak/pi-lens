@@ -694,6 +694,43 @@ function scheduleStartupScans(
 			saveRuntimeProjectSnapshot({ cwd: snapshotRoot, runtime, dbg });
 		}
 	});
+
+	// word-index — identifier inverted index + BM25 for ranked symbol search (#162)
+	runTask("word-index", async () => {
+		if (!runtime.isCurrentSession(sessionGeneration)) return;
+		const { collectSourceFilesAsync } = await import("./source-filter.js");
+		const { buildWordIndex } = await import("./word-index.js");
+		const startMs = Date.now();
+		// Bounds keep the build off the critical path on large repos: cap the file
+		// count and skip files too large to be hand-written source (generated /
+		// bundled output the source filter didn't already exclude).
+		const MAX_FILES = 6000;
+		const MAX_BYTES = 512 * 1024;
+		const files = await collectSourceFilesAsync(analysisRoot);
+		if (!runtime.isCurrentSession(sessionGeneration)) return;
+		const docs: Array<{ path: string; content: string }> = [];
+		let processed = 0;
+		for (const file of files.slice(0, MAX_FILES)) {
+			try {
+				const stat = nodeFs.statSync(file);
+				if (stat.size <= MAX_BYTES) {
+					docs.push({ path: file, content: nodeFs.readFileSync(file, "utf-8") });
+				}
+			} catch {
+				// unreadable / vanished file — skip
+			}
+			if (++processed % 100 === 0) {
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				if (!runtime.isCurrentSession(sessionGeneration)) return;
+			}
+		}
+		runtime.wordIndex = buildWordIndex(docs);
+		saveRuntimeProjectSnapshot({ cwd: snapshotRoot, runtime, dbg });
+		dbg(
+			`session_start word-index: ${runtime.wordIndex.docCount} files, ` +
+				`${runtime.wordIndex.postings.size} tokens (${Date.now() - startMs}ms)`,
+		);
+	});
 }
 
 function scheduleDeferredToolProbes(

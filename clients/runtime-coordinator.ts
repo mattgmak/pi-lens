@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import * as path from "node:path";
 import type { ActionableWarningRecord } from "./actionable-warnings.js";
 import type { FunctionCallGraph } from "./call-graph.js";
+import type { WordIndex } from "./word-index.js";
 import type { CascadeRun } from "./cascade-types.js";
 import type { CodeQualityWarningRecord } from "./code-quality-warnings.js";
 import type { FileComplexity } from "./complexity-client.js";
@@ -70,6 +71,7 @@ export class RuntimeCoordinator {
 	private _gitGuardHasBlockers = false;
 	private _gitGuardSummary = "";
 	callGraph: FunctionCallGraph | null = null;
+	wordIndex: WordIndex | null = null;
 	private _readGuard: ReadGuard | null = null;
 	private readonly _pendingDeferredFormatFiles = new Map<
 		string,
@@ -98,6 +100,7 @@ export class RuntimeCoordinator {
 		this._complexityBaselines.clear();
 		this._pipelineCrashCounts.clear();
 		this._cachedExports.clear();
+		this.wordIndex = null;
 		this._startupScansInFlight.clear();
 		this._cascadeRuns = [];
 		this._cascadeSessionStats = {
