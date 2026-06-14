@@ -156,6 +156,22 @@ const FIXTURES = [
 		tools: [],
 		expectDiagnostic: true,
 	},
+	{
+		lang: "rust",
+		dir: "tests/fixtures/tool-smoke/rust",
+		file: "src/main.rs",
+		targets: ["rust-clippy"],
+		tools: [],
+		expectDiagnostic: true,
+	},
+	{
+		lang: "csharp",
+		dir: "tests/fixtures/tool-smoke/csharp",
+		file: "Program.cs",
+		targets: ["dotnet-build"],
+		tools: [],
+		expectDiagnostic: true,
+	},
 ];
 
 /**
@@ -251,7 +267,7 @@ const LSP_FIXTURES = [
 	{
 		lang: "rust",
 		dir: "tests/fixtures/tool-smoke/rust",
-		file: "bad.rs",
+		file: "src/main.rs",
 		serverHint: "rust-analyzer",
 		tools: ["rust-analyzer"],
 	},
