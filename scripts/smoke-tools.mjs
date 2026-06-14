@@ -74,6 +74,14 @@ const FIXTURES = [
 		tools: ["markdownlint"],
 		expectDiagnostic: true,
 	},
+	{
+		lang: "shell",
+		dir: "tests/fixtures/tool-smoke/shell",
+		file: "bad.sh",
+		targets: ["shellcheck", "shfmt"],
+		tools: ["shellcheck", "shfmt"],
+		expectDiagnostic: true,
+	},
 ];
 
 const INFRA_FAILURES = new Set(["timeout", "exception", "server_error"]);
