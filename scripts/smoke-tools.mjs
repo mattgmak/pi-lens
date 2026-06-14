@@ -137,6 +137,25 @@ const FIXTURES = [
 		tools: ["tflint", "terraform-ls"],
 		expectDiagnostic: true,
 	},
+	// Toolchain-dependent (run only where the language toolchain is present —
+	// ⚠ skip otherwise). No installer `tools`: go vet ships with Go, and the
+	// PSScriptAnalyzer module is installed by its own runner.
+	{
+		lang: "go",
+		dir: "tests/fixtures/tool-smoke/go",
+		file: "bad.go",
+		targets: ["go-vet"],
+		tools: [],
+		expectDiagnostic: true,
+	},
+	{
+		lang: "powershell",
+		dir: "tests/fixtures/tool-smoke/powershell",
+		file: "bad.ps1",
+		targets: ["psscriptanalyzer"],
+		tools: [],
+		expectDiagnostic: true,
+	},
 ];
 
 /**
