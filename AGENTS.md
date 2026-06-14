@@ -368,6 +368,19 @@ For anything that goes through the `index.ts` entry — flag/command/tool/hook r
 - Use `closes` only when the commit fully resolves the entire issue; use `refs` for any partial work.
 - GitHub auto-closes an issue on any commit containing `closes #NNN` regardless of trailing text — "closes #125 Phase 1" still closes #125.
 
+## Issue triage & labels
+Every issue should carry **one TYPE label + at least one `area:` label**.
+
+- **TYPE (pick one):**
+  - `bug` — something is broken / behaves wrong.
+  - `feature` — a **net-new capability**: a command, agent tool, runner/formatter/LSP, integration, or config surface that **didn't exist**.
+  - `enhancement` — **improve/harden/refactor/perf/test an existing** capability (no net-new surface).
+  - `documentation` — docs only.
+  - Litmus, feature vs enhancement: *does it add something a user/agent can invoke or configure that wasn't there before?* Yes → `feature`; "make the existing thing better/faster/cleaner" → `enhancement`. (GitHub's stock `enhancement` description conflates both — we deliberately split them; `feature` is green `#0e8a16`.)
+- **AREA (one or more, color `#0052cc`):** `area:lsp`, `area:dispatch` (runners/linters/formatters), `area:diagnostics` (model/surfacing/suppression/project-diagnostics), `area:read-guard` (read-guard + edit substrate), `area:project-intelligence` (codebase model/scan/debt/ranking), `area:perf`, `area:observability` (telemetry/health/status), `area:session`, `area:config`, `area:security`, `area:tests`.
+- Reuse GitHub defaults as needed (`good first issue`, `help wanted`, `question`, `duplicate`, `wontfix`).
+- New issues (incl. agent-filed) get labelled at creation: `gh issue create … --label "feature,area:dispatch"`.
+
 ## Conventions
 - TypeScript ESM throughout (`"type": "module"`)
 - Edit the `.ts` sources only. Do **not** hand-edit sibling/generated `.js` files in this repo; pi loads TS via on-the-fly jiti transpilation and JS files are generated artifacts. If tests/runtime could see stale `.js`, run `npm run build` to regenerate from TS before testing.
