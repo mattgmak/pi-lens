@@ -39,6 +39,18 @@ describe("isLspTransportRequiredError (#208)", () => {
 		expect(isLspTransportRequiredError("")).toBe(false);
 	});
 
+	it("does NOT mask the real Markdown server load-crash (smoke-tested, Node >=24)", () => {
+		// vscode-markdown-language-server@4.10.0 crashes at module load under
+		// Node 24 (vscode-uri ESM-interop) BEFORE reaching the transport check —
+		// a genuinely non-loading server that must stay rejected, not be forced
+		// green (verbatim stderr captured from the real binary during #208 smoke).
+		const realMarkdownCrash =
+			"node_modules/vscode-markdown-languageservice/out/util/vscodeUri.js:5\n" +
+			"import uri from 'vscode-uri';\n       ^^^\n" +
+			"SyntaxError: The requested module 'vscode-uri' does not provide an export named 'default'";
+		expect(isLspTransportRequiredError(realMarkdownCrash)).toBe(false);
+	});
+
 	it("does NOT match an unrelated non-zero exit (e.g. unknown flag)", () => {
 		expect(
 			isLspTransportRequiredError("error: unknown option '--version'"),
