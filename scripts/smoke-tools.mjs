@@ -14,8 +14,15 @@
  *   Step 2 (--step2):  additionally, the tool PRODUCES A PARSEABLE DIAGNOSTIC
  *                      on the fixture's known defect.
  *
+ * LSP handshake layer (--lsp): for each LSP fixture, drives the SAME production
+ * entry the lsp runner uses (`LSPService.touchFile`, with a generous cold-spawn
+ * budget) so a pass means the real server installed, spawned, completed the
+ * JSON-RPC initialize handshake, and answered — verified via
+ * `getDiagnosticsHealth` (serverCountReady > 0), not a hand-rolled handshake.
+ *
  * Usage:
- *   node scripts/smoke-tools.mjs [lang ...] [--step2] [--verbose]
+ *   node scripts/smoke-tools.mjs [lang ...] [--step2] [--install] [--verbose]
+ *   node scripts/smoke-tools.mjs --lsp [lang ...] [--install] [--verbose]
  *
  * Requires a built dist/ (run `npm run build:dist` first).
  */
@@ -84,6 +91,54 @@ const FIXTURES = [
 	},
 ];
 
+/**
+ * LSP handshake fixtures: a file whose extension routes to the LSP server under
+ * test, plus the installer tool id for that server (--install). `lang` is the
+ * filter key; `serverHint` is shown in the report.
+ */
+const LSP_FIXTURES = [
+	{
+		lang: "typescript",
+		dir: "tests/fixtures/tool-smoke/typescript",
+		file: "bad.ts",
+		serverHint: "typescript-language-server",
+		tools: ["typescript-language-server"],
+	},
+	{
+		lang: "python",
+		dir: "tests/fixtures/tool-smoke/python",
+		file: "bad.py",
+		serverHint: "pyright",
+		tools: ["pyright"],
+	},
+	{
+		lang: "yaml",
+		dir: "tests/fixtures/tool-smoke/yaml",
+		file: "bad.yaml",
+		serverHint: "yaml-language-server",
+		tools: ["yaml-language-server"],
+	},
+	{
+		lang: "json",
+		dir: "tests/fixtures/tool-smoke/json",
+		file: "bad.json",
+		serverHint: "vscode-json-language-server",
+		tools: ["vscode-json-language-server"],
+	},
+	{
+		lang: "shell",
+		dir: "tests/fixtures/tool-smoke/shell",
+		file: "bad.sh",
+		serverHint: "bash-language-server",
+		tools: ["bash-language-server"],
+	},
+];
+
+// Generous cold-spawn / handshake budgets — the harness is not on the hot path,
+// so give a cold server time to install (when --install), spawn, and initialize.
+const LSP_CLIENT_WAIT_MS = 30000;
+const LSP_DIAGNOSTICS_WAIT_MS = 8000;
+
 const INFRA_FAILURES = new Set(["timeout", "exception", "server_error"]);
 
 function parseArgs(argv) {
@@ -91,13 +146,15 @@ function parseArgs(argv) {
 	let step2 = false;
 	let verbose = false;
 	let install = false;
+	let lsp = false;
 	for (const arg of argv) {
 		if (arg === "--step2") step2 = true;
 		else if (arg === "--verbose" || arg === "-v") verbose = true;
 		else if (arg === "--install") install = true;
+		else if (arg === "--lsp") lsp = true;
 		else langs.push(arg);
 	}
-	return { langs, step2, verbose, install };
+	return { langs, step2, verbose, install, lsp };
 }
 
 const TMP_PREFIX = "pi-lens-smoke-";
@@ -175,12 +232,137 @@ function classify(outcome) {
 
 const ICON = { pass: "✓", fail: "✗", skip: "⚠" };
 
+function report(rows, title) {
+	const pad = (s, n) => String(s).padEnd(n);
+	console.log(`\nLive tool-smoke (#209) — ${title}\n`);
+	console.log(`${pad("", 2)} ${pad("LANG", 12)} ${pad("RUNNER/SERVER", 28)} ${pad("DIAG", 5)} DETAIL`);
+	for (const r of rows) {
+		console.log(
+			`${ICON[r.state]}  ${pad(r.lang, 12)} ${pad(r.runner, 28)} ${pad(r.diags, 5)} ${r.detail}`,
+		);
+	}
+	const counts = { pass: 0, fail: 0, skip: 0 };
+	for (const r of rows) counts[r.state]++;
+	console.log(
+		`\n${counts.pass} passed · ${counts.fail} failed · ${counts.skip} skipped (tool/config unavailable)`,
+	);
+	console.log(
+		"Legend: ✓ ok  ✗ failure  ⚠ unavailable (not a failure)\n",
+	);
+	return counts.fail;
+}
+
+/**
+ * LSP handshake layer — drives the real `LSPService.touchFile` (same entry the
+ * lsp runner uses) per fixture, then asserts the handshake via
+ * `getDiagnosticsHealth` (serverCountReady > 0). Returns the failure count.
+ */
+async function runLspHandshake({ langs, install, verbose }) {
+	const lspEntry = path.join(repoRoot, "dist", "clients", "lsp", "index.js");
+	if (!fs.existsSync(lspEntry)) {
+		console.error(`dist build missing: ${lspEntry}\nRun \`npm run build:dist\` first.`);
+		process.exit(2);
+	}
+	const { getLSPService } = await import(pathToFileURL(lspEntry).href);
+
+	let ensureTool;
+	if (install) {
+		const installerEntry = path.join(repoRoot, "dist", "clients", "installer", "index.js");
+		({ ensureTool } = await import(pathToFileURL(installerEntry).href));
+	}
+
+	const selected = langs.length
+		? LSP_FIXTURES.filter((f) => langs.includes(f.lang))
+		: LSP_FIXTURES;
+	if (selected.length === 0) {
+		console.error(`No LSP fixtures matched: ${langs.join(", ")}`);
+		process.exit(2);
+	}
+
+	const lsp = getLSPService();
+	const rows = [];
+	for (const fx of selected) {
+		if (install && ensureTool) {
+			for (const toolId of fx.tools ?? []) {
+				const resolved = await ensureTool(toolId);
+				if (verbose) {
+					console.error(`[${fx.lang}] ensureTool(${toolId}) → ${resolved ?? "UNAVAILABLE"}`);
+				}
+			}
+		}
+		const workspace = copyDirToTemp(fx.dir);
+		const absFile = path.join(workspace, fx.file);
+		const push = (state, detail, diags = 0) =>
+			rows.push({ lang: fx.lang, runner: fx.serverHint, state, detail, diags });
+		try {
+			if (!lsp.supportsLSP(absFile)) {
+				push("skip", "no LSP server registered for this file");
+				continue;
+			}
+			const content = fs.readFileSync(absFile, "utf8");
+			let touched;
+			let threw;
+			try {
+				touched = await lsp.touchFile(absFile, content, {
+					diagnostics: "document",
+					collectDiagnostics: true,
+					clientScope: "primary",
+					maxClientWaitMs: LSP_CLIENT_WAIT_MS,
+					maxDiagnosticsWaitMs: LSP_DIAGNOSTICS_WAIT_MS,
+					source: "smoke-lsp",
+				});
+			} catch (err) {
+				threw = err?.message ?? String(err);
+			}
+			// touchFile returns the diagnostics array once a client is ready (spawn
+			// + initialize handshake completed), or undefined if none became ready
+			// in the budget. (getDiagnosticsHealth is populated by getDiagnostics,
+			// not touchFile, so it's only an extra hint when present.)
+			const diags = Array.isArray(touched) ? touched.length : 0;
+			if (verbose) {
+				console.error(
+					`[${fx.lang}] touched=${Array.isArray(touched) ? touched.length : touched} health=${JSON.stringify(lsp.getDiagnosticsHealth(absFile))}`,
+				);
+			}
+			if (threw) {
+				push("fail", `handshake/server error: ${threw}`, diags);
+			} else if (Array.isArray(touched)) {
+				push(
+					"pass",
+					`handshook — server replied${diags ? ` (${diags} diagnostic${diags === 1 ? "" : "s"})` : ""}`,
+					diags,
+				);
+			} else {
+				push(
+					"skip",
+					`no client ready in ${LSP_CLIENT_WAIT_MS}ms (server missing/slow; try --install)`,
+				);
+			}
+		} catch (err) {
+			push("fail", `error: ${err?.message ?? err}`);
+		} finally {
+			safeRm(workspace);
+		}
+	}
+
+	try {
+		await lsp.shutdown();
+	} catch {
+		// best-effort teardown
+	}
+	return report(rows, "LSP handshake (install → spawn → initialize)");
+}
+
 async function main() {
-	const { langs, step2, verbose, install } = parseArgs(process.argv.slice(2));
+	const { langs, step2, verbose, install, lsp } = parseArgs(process.argv.slice(2));
 
 	// Clean leftovers from prior runs (their file locks are released now).
 	const swept = sweepLeftovers();
 	if (verbose && swept > 0) console.error(`swept ${swept} leftover temp workspace(s)`);
+
+	if (lsp) {
+		process.exit((await runLspHandshake({ langs, install, verbose })) > 0 ? 1 : 0);
+	}
 
 	const distEntry = path.join(repoRoot, "dist", "clients", "dispatch", "integration.js");
 	if (!fs.existsSync(distEntry)) {
@@ -261,28 +443,14 @@ async function main() {
 		}
 	}
 
-	// Report
-	const pad = (s, n) => String(s).padEnd(n);
-	console.log(
-		`\nLive tool-smoke (#209) — ${step2 ? "Step 2 (spawn + diagnostic)" : "Step 1 (spawn + exit clean)"}\n`,
+	process.exit(
+		report(
+			rows,
+			step2 ? "Step 2 (spawn + diagnostic)" : "Step 1 (spawn + exit clean)",
+		) > 0
+			? 1
+			: 0,
 	);
-	console.log(`${pad("", 2)} ${pad("LANG", 12)} ${pad("RUNNER", 14)} ${pad("DIAG", 5)} DETAIL`);
-	for (const r of rows) {
-		console.log(
-			`${ICON[r.state]}  ${pad(r.lang, 12)} ${pad(r.runner, 14)} ${pad(r.diags, 5)} ${r.detail}`,
-		);
-	}
-
-	const counts = { pass: 0, fail: 0, skip: 0 };
-	for (const r of rows) counts[r.state]++;
-	console.log(
-		`\n${counts.pass} passed · ${counts.fail} failed · ${counts.skip} skipped (tool/config unavailable)`,
-	);
-	console.log(
-		"Legend: ✓ tool spawned & exited cleanly  ✗ infra failure  ⚠ tool/config unavailable (not a failure)\n",
-	);
-
-	process.exit(counts.fail > 0 ? 1 : 0);
 }
 
 main().catch((err) => {
