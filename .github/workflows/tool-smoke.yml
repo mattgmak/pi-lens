@@ -76,3 +76,6 @@ jobs:
 
       - name: LSP handshake layer (install + spawn + initialize each server)
         run: node scripts/smoke-tools.mjs --lsp --install --verbose
+
+      - name: Format layer (select + reformat through the real formatter pipeline)
+        run: node scripts/smoke-tools.mjs --format --install --verbose

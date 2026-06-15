@@ -20,9 +20,15 @@
  * JSON-RPC initialize handshake, and answered — verified via
  * `getDiagnosticsHealth` (serverCountReady > 0), not a hand-rolled handshake.
  *
+ * Format layer (--format): for each formatter fixture, drives the SAME entry
+ * the format pipeline uses (`getFormattersForFile` → `formatFile`) so a pass
+ * means the expected formatter was selected and actually reformatted a
+ * deliberately mis-formatted file. The lint dispatch path never runs formatters.
+ *
  * Usage:
  *   node scripts/smoke-tools.mjs [lang ...] [--step2] [--install] [--verbose]
  *   node scripts/smoke-tools.mjs --lsp [lang ...] [--install] [--verbose]
+ *   node scripts/smoke-tools.mjs --format [lang ...] [--install] [--verbose]
  *
  * Requires a built dist/ (run `npm run build:dist` first).
  */
@@ -341,6 +347,163 @@ const LSP_FIXTURES = [
 	},
 ];
 
+/**
+ * Formatter fixtures (--format): a deliberately mis-formatted but otherwise
+ * valid file per language. The expected `formatter` (by name, per
+ * `listAllFormatters()`) must be selected by `getFormattersForFile` and, when
+ * run via the real `formatFile`, must reformat the file (`changed === true`).
+ * `tools` are installer ids to prefetch under --install (formatters auto-install
+ * via their own resolveCommand otherwise). Toolchain-gated entries only pass
+ * where the language toolchain is present (⚠ skip otherwise).
+ */
+const FORMAT_FIXTURES = [
+	{
+		// biome is pi-lens's smart-default JS/TS formatter (not prettier, which
+		// only wins with explicit project config).
+		lang: "javascript",
+		dir: "tests/fixtures/format-smoke/javascript",
+		file: "messy.js",
+		formatter: "biome",
+		tools: ["biome"],
+	},
+	{
+		lang: "python",
+		dir: "tests/fixtures/format-smoke/python",
+		file: "messy.py",
+		formatter: "ruff",
+		tools: ["ruff"],
+	},
+	{
+		lang: "toml",
+		dir: "tests/fixtures/format-smoke/toml",
+		file: "messy.toml",
+		formatter: "taplo",
+		tools: ["taplo"],
+	},
+	{
+		lang: "shell",
+		dir: "tests/fixtures/format-smoke/shell",
+		file: "messy.sh",
+		formatter: "shfmt",
+		tools: ["shfmt"],
+	},
+	{
+		// css/html/yaml carry a smart-default formatter policy, so the formatter
+		// is auto-selected without project config (no .prettierrc/.biome needed).
+		lang: "css",
+		dir: "tests/fixtures/format-smoke/css",
+		file: "messy.css",
+		formatter: "biome",
+		tools: ["biome"],
+	},
+	{
+		lang: "html",
+		dir: "tests/fixtures/format-smoke/html",
+		file: "messy.html",
+		formatter: "prettier",
+		tools: ["prettier"],
+	},
+	{
+		lang: "yaml",
+		dir: "tests/fixtures/format-smoke/yaml",
+		file: "messy.yaml",
+		formatter: "prettier",
+		tools: ["prettier"],
+	},
+	{
+		// markdown/json have NO smart-default policy — prettier is only selected
+		// with explicit config, so the fixture ships a `.prettierrc`.
+		lang: "markdown",
+		dir: "tests/fixtures/format-smoke/markdown",
+		file: "messy.md",
+		formatter: "prettier",
+		tools: ["prettier"],
+	},
+	{
+		lang: "json",
+		dir: "tests/fixtures/format-smoke/json",
+		file: "messy.json",
+		formatter: "prettier",
+		tools: ["prettier"],
+	},
+	// Toolchain-gated (skip where the toolchain is absent).
+	{
+		lang: "go",
+		dir: "tests/fixtures/format-smoke/go",
+		file: "messy.go",
+		formatter: "gofmt",
+		tools: [],
+	},
+	{
+		lang: "rust",
+		dir: "tests/fixtures/format-smoke/rust",
+		file: "messy.rs",
+		formatter: "rustfmt",
+		tools: [],
+	},
+	{
+		lang: "dart",
+		dir: "tests/fixtures/format-smoke/dart",
+		file: "messy.dart",
+		formatter: "dart",
+		tools: [],
+	},
+	{
+		lang: "zig",
+		dir: "tests/fixtures/format-smoke/zig",
+		file: "messy.zig",
+		formatter: "zig",
+		tools: [],
+	},
+	{
+		// ktlint is a smart-default (auto-installs); elixir's `mix format` is
+		// toolchain-detected. No project config required.
+		lang: "kotlin",
+		dir: "tests/fixtures/format-smoke/kotlin",
+		file: "messy.kt",
+		formatter: "ktlint",
+		tools: ["ktlint"],
+	},
+	{
+		lang: "elixir",
+		dir: "tests/fixtures/format-smoke/elixir",
+		file: "messy.ex",
+		formatter: "mix",
+		tools: [],
+	},
+	{
+		// Config-gated formatters: the fixture ships the config each one's detect()
+		// requires (gleam.toml / .rubocop.yml / .sqlfluff). csharpier needs the
+		// `dotnet csharpier` tool installed (no config).
+		lang: "gleam",
+		dir: "tests/fixtures/format-smoke/gleam",
+		file: "messy.gleam",
+		formatter: "gleam",
+		tools: [],
+	},
+	{
+		lang: "ruby",
+		dir: "tests/fixtures/format-smoke/ruby",
+		file: "messy.rb",
+		formatter: "rubocop",
+		tools: ["rubocop"],
+	},
+	{
+		lang: "sql",
+		dir: "tests/fixtures/format-smoke/sql",
+		file: "messy.sql",
+		formatter: "sqlfluff",
+		tools: ["sqlfluff"],
+	},
+	{
+		lang: "csharp",
+		dir: "tests/fixtures/format-smoke/csharp",
+		file: "messy.cs",
+		formatter: "csharpier",
+		tools: [],
+	},
+];
+
 // Generous cold-spawn / handshake budgets — the harness is not on the hot path,
 // so give a cold server time to install (when --install), spawn, and initialize.
 const LSP_CLIENT_WAIT_MS = 30000;
@@ -354,14 +517,16 @@ function parseArgs(argv) {
 	let verbose = false;
 	let install = false;
 	let lsp = false;
+	let format = false;
 	for (const arg of argv) {
 		if (arg === "--step2") step2 = true;
 		else if (arg === "--verbose" || arg === "-v") verbose = true;
 		else if (arg === "--install") install = true;
 		else if (arg === "--lsp") lsp = true;
+		else if (arg === "--format") format = true;
 		else langs.push(arg);
 	}
-	return { langs, step2, verbose, install, lsp };
+	return { langs, step2, verbose, install, lsp, format };
 }
 
 const TMP_PREFIX = "pi-lens-smoke-";
@@ -560,8 +725,94 @@ async function runLspHandshake({ langs, install, verbose }) {
 	return report(rows, "LSP handshake (install → spawn → initialize)");
 }
 
+/**
+ * Format layer — drives the real formatter pipeline entry
+ * (`getFormattersForFile` → `formatFile`, the same path `runFormatPhase` uses),
+ * which the lint dispatch never touches. A pass means the expected formatter was
+ * selected for the file and actually reformatted the deliberately-mangled
+ * fixture (`changed === true`). Returns the failure count.
+ */
+async function runFormatSmoke({ langs, install, verbose }) {
+	const fmtEntry = path.join(repoRoot, "dist", "clients", "formatters.js");
+	if (!fs.existsSync(fmtEntry)) {
+		console.error(`dist build missing: ${fmtEntry}\nRun \`npm run build:dist\` first.`);
+		process.exit(2);
+	}
+	const { getFormattersForFile, formatFile } = await import(
+		pathToFileURL(fmtEntry).href
+	);
+
+	let ensureTool;
+	if (install) {
+		const installerEntry = path.join(repoRoot, "dist", "clients", "installer", "index.js");
+		({ ensureTool } = await import(pathToFileURL(installerEntry).href));
+	}
+
+	const selected = langs.length
+		? FORMAT_FIXTURES.filter((f) => langs.includes(f.lang))
+		: FORMAT_FIXTURES;
+	if (selected.length === 0) {
+		console.error(`No format fixtures matched: ${langs.join(", ")}`);
+		process.exit(2);
+	}
+
+	const rows = [];
+	for (const fx of selected) {
+		if (install && ensureTool) {
+			for (const toolId of fx.tools ?? []) {
+				const resolved = await ensureTool(toolId);
+				if (verbose) {
+					console.error(`[${fx.lang}] ensureTool(${toolId}) → ${resolved ?? "UNAVAILABLE"}`);
+				}
+			}
+		}
+		const workspace = copyDirToTemp(fx.dir);
+		const absFile = path.join(workspace, fx.file);
+		const push = (state, detail) =>
+			rows.push({ lang: fx.lang, runner: fx.formatter, state, detail, diags: 0 });
+		try {
+			const formatters = await getFormattersForFile(absFile, workspace);
+			const names = formatters.map((f) => f.name);
+			if (verbose) {
+				console.error(`[${fx.lang}] formatters selected: ${names.join(", ") || "(none)"}`);
+			}
+			const target = formatters.find((f) => f.name === fx.formatter);
+			if (!target) {
+				push(
+					"skip",
+					names.length
+						? `expected '${fx.formatter}' not selected (got: ${names.join(", ")})`
+						: "no formatter selected for this file (toolchain/config missing?)",
+				);
+				continue;
+			}
+			const before = fs.readFileSync(absFile, "utf8");
+			const result = await formatFile(absFile, target);
+			const after = fs.readFileSync(absFile, "utf8");
+			if (verbose) {
+				console.error(
+					`[${fx.lang}] formatFile → success=${result.success} changed=${result.changed}${result.error ? ` error=${result.error}` : ""}`,
+				);
+			}
+			if (!result.success) {
+				push("fail", `formatter failed to run: ${result.error ?? "unknown error"}`);
+			} else if (result.changed && before !== after) {
+				push("pass", `${fx.formatter} reformatted the file`);
+			} else {
+				push("fail", "ran clean but left the mis-formatted file unchanged");
+			}
+		} catch (err) {
+			push("fail", `error: ${err?.message ?? err}`);
+		} finally {
+			safeRm(workspace);
+		}
+	}
+
+	return report(rows, "Format (select → reformat)");
+}
+
 async function main() {
-	const { langs, step2, verbose, install, lsp } = parseArgs(process.argv.slice(2));
+	const { langs, step2, verbose, install, lsp, format } = parseArgs(process.argv.slice(2));
 
 	// Clean leftovers from prior runs (their file locks are released now).
 	const swept = sweepLeftovers();
@@ -569,6 +820,10 @@ async function main() {
 
 	if (lsp) {
 		process.exit((await runLspHandshake({ langs, install, verbose })) > 0 ? 1 : 0);
+	}
+
+	if (format) {
+		process.exit((await runFormatSmoke({ langs, install, verbose })) > 0 ? 1 : 0);
 	}
 
 	const distEntry = path.join(repoRoot, "dist", "clients", "dispatch", "integration.js");

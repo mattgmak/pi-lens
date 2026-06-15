@@ -85,6 +85,9 @@ BUG_*.md
 # Tool-smoke fixtures (#209) — real per-language projects with intentional
 # defects; must be tracked despite the global *.js / *.md / *.sh ignores above.
 !tests/fixtures/tool-smoke/**
+# Format-smoke fixtures (#209 --format layer) — deliberately mis-formatted but
+# otherwise valid files; the formatter must reformat them.
+!tests/fixtures/format-smoke/**
 
 clients/dispatch/debug.log
 clients/lsp/.intelephense/
