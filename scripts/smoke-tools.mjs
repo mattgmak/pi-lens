@@ -1237,7 +1237,16 @@ async function main() {
 	);
 }
 
-main().catch((err) => {
-	console.error(err);
-	process.exit(2);
-});
+// Run main() only when executed directly, not when imported (the
+// smoke-fixture-coverage guard imports the fixture arrays below).
+const invokedDirectly =
+	process.argv[1] &&
+	path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (invokedDirectly) {
+	main().catch((err) => {
+		console.error(err);
+		process.exit(2);
+	});
+}
+
+export { FIXTURES, LSP_FIXTURES, FORMAT_FIXTURES, AUTOFIX_FIXTURES };
