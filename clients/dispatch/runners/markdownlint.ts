@@ -56,13 +56,20 @@ const MARKDOWNLINT_FIXABLE_RULES = new Set<string>([
 	"MD058",
 ]);
 
-// markdownlint-cli output: path/to/file.md:10:3 MD013/line-length Line length
+// markdownlint-cli2 output: `path:line[:col] [error|warning] MD###/name[/name…] message`
+// Two things the original parser missed (→ silent 0 diagnostics, #212):
+//   1. cli2 emits a severity token (`error`/`warning`) between the col and the
+//      rule code — older markdownlint-cli did not.
+//   2. some rules carry MULTIPLE slash-separated names (e.g.
+//      `MD041/first-line-heading/first-line-h1`).
+// The severity token is optional so older/relative-path output still parses.
 function parseMarkdownlintOutput(raw: string, filePath: string): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
 	for (const line of raw.split(/\r?\n/)) {
 		if (!line.trim()) continue;
-		// Format: filePath:line[:col] ruleCode/ruleName message
-		const match = line.match(/^.*?:(\d+)(?::(\d+))?\s+(MD\d+\/[\w-]+)\s+(.+)$/);
+		const match = line.match(
+			/^.*?:(\d+)(?::(\d+))?\s+(?:error|warning)?\s*(MD\d+(?:\/[\w-]+)+)\s+(.+)$/,
+		);
 		if (!match) continue;
 		const [, lineNum, col, ruleCode, message] = match;
 		const ruleName = ruleCode.split("/")[0];
