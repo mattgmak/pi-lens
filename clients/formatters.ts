@@ -283,6 +283,9 @@ function hasExplicitFormatterConfig(
 			return (
 				hasOxfmtConfig(cwd) ||
 				hasVitePlusConfig(cwd) ||
+				// The published package is `oxfmt`; `@oxc-project/oxfmt` does not
+				// exist on npm. Accept both (scoped kept for forward-compat).
+				hasNearestPackageJsonDependency(cwd, "oxfmt") ||
 				hasNearestPackageJsonDependency(cwd, "@oxc-project/oxfmt")
 			);
 		case "ruff":
@@ -445,6 +448,8 @@ export const oxfmtFormatter: FormatterInfo = {
 		return (
 			hasOxfmtConfig(cwd) ||
 			hasVitePlusConfig(cwd) ||
+			// Published package is `oxfmt` (the scoped name does not exist on npm).
+			hasNearestPackageJsonDependency(cwd, "oxfmt") ||
 			hasNearestPackageJsonDependency(cwd, "@oxc-project/oxfmt")
 		);
 	},

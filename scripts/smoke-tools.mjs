@@ -547,6 +547,16 @@ const FORMAT_FIXTURES = [
 		formatter: "cmake-format",
 		tools: [],
 	},
+	{
+		// oxfmt (the JS Oxidation Compiler formatter) is selected over biome via a
+		// package.json `oxfmt` devDependency — the real npm package name (the
+		// scoped `@oxc-project/oxfmt` the code used to look for doesn't exist).
+		lang: "js-oxfmt",
+		dir: "tests/fixtures/format-smoke/js-oxfmt",
+		file: "messy.js",
+		formatter: "oxfmt",
+		tools: [],
+	},
 ];
 
 // Generous cold-spawn / handshake budgets — the harness is not on the hot path,

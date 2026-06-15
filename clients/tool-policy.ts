@@ -1725,7 +1725,8 @@ export function hasOxfmtConfig(cwd: string): boolean {
 					...(pkg.dependencies as Record<string, unknown> | undefined),
 					...(pkg.devDependencies as Record<string, unknown> | undefined),
 				};
-				if (deps["@oxc-project/oxfmt"]) return true;
+				// Published package is `oxfmt`; the scoped name does not exist on npm.
+				if (deps["oxfmt"] || deps["@oxc-project/oxfmt"]) return true;
 			} catch {}
 		}
 	}
