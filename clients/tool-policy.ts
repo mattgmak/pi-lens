@@ -234,9 +234,12 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		},
 	],
 	[
+		// ktfmt is offered alongside ktlint but only wins when the project opts in
+		// (hasExplicitFormatterConfig("ktfmt")); otherwise ktlint stays the
+		// smart-default. #129
 		".kt",
 		{
-			formatterNames: ["ktlint"],
+			formatterNames: ["ktfmt", "ktlint"],
 			defaultFormatter: "ktlint",
 			defaultWhenUnconfigured: true,
 			gate: "smart-default",
@@ -245,7 +248,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 	[
 		".kts",
 		{
-			formatterNames: ["ktlint"],
+			formatterNames: ["ktfmt", "ktlint"],
 			defaultFormatter: "ktlint",
 			defaultWhenUnconfigured: true,
 			gate: "smart-default",
@@ -759,6 +762,7 @@ export type AutofixToolName =
 	| "sqlfluff"
 	| "rubocop"
 	| "ktlint"
+	| "ktfmt"
 	| "rust-clippy"
 	| "dart-analyze"
 	| "golangci-lint"
@@ -870,6 +874,10 @@ const AUTOFIX_CAPABILITIES = new Map<string, AutofixCapability>([
 		{ toolSupportsFix: true, safePipelineAutofix: true, fixKind: "pipeline" },
 	],
 	[
+		"ktfmt",
+		{ toolSupportsFix: true, safePipelineAutofix: true, fixKind: "pipeline" },
+	],
+	[
 		"rust-clippy",
 		{ toolSupportsFix: true, safePipelineAutofix: true, fixKind: "pipeline" },
 	],
@@ -910,6 +918,10 @@ const TOOL_EXECUTION_POLICY = new Map<string, ToolExecutionPolicy>([
 	["hadolint", { gate: "smart-default", autoInstall: true }],
 	["htmlhint", { gate: "smart-default", autoInstall: true }],
 	["ktlint", { gate: "smart-default", autoInstall: true }],
+	// ktfmt is opt-in (a project's explicit formatting choice), so it only runs
+	// when its config marker is present — config-first, but auto-installable via
+	// the maven-JAR strategy once elected (#129).
+	["ktfmt", { gate: "config-first", autoInstall: true }],
 	["golangci-lint", { gate: "config-first", autoInstall: true }],
 	["phpstan", { gate: "config-first", autoInstall: false }],
 	["eslint", { gate: "config-first", autoInstall: false }],
@@ -1193,6 +1205,7 @@ export interface LinterPolicyContext {
 	hasPhpstanConfig?: boolean;
 	hasMypyConfig?: boolean;
 	hasDetektConfig?: boolean;
+	hasKtfmtConfig?: boolean;
 }
 
 export interface AutofixPolicyContext {
@@ -1204,6 +1217,7 @@ export interface AutofixPolicyContext {
 	hasGolangciConfig?: boolean;
 	hasDetektConfig?: boolean;
 	hasOxlintConfig?: boolean;
+	hasKtfmtConfig?: boolean;
 }
 
 export function getLinterPolicyForFile(
@@ -1311,14 +1325,23 @@ export function getLinterPolicyForFile(
 	}
 
 	if ([".kt", ".kts"].includes(ext)) {
-		const preferredRunners: LintRunnerName[] = ["ktlint"];
+		// When the project opts into ktfmt, ktfmt (a pure formatter wired as a safe
+		// autofix) owns Kotlin formatting; ktlint's lint steps aside so its style
+		// suggestions don't conflict with ktfmt's output. detekt's *semantic* lint
+		// still runs when configured. #129
+		const preferredRunners: LintRunnerName[] = [];
+		if (!context.hasKtfmtConfig) preferredRunners.push("ktlint");
 		if (context.hasDetektConfig) preferredRunners.push("detekt");
 		return {
 			runnerNames: ["ktlint", "detekt"],
 			preferredRunners,
-			defaultRunner: "ktlint",
+			defaultRunner: preferredRunners[0],
 			defaultWhenUnconfigured: true,
-			gate: context.hasDetektConfig ? "mixed" : "smart-default",
+			gate: context.hasKtfmtConfig
+				? "config-first"
+				: context.hasDetektConfig
+					? "mixed"
+					: "smart-default",
 		};
 	}
 
@@ -1488,6 +1511,7 @@ export function getLinterPolicyForCwd(
 		hasPhpstanConfig: hasPhpstanConfig(cwd),
 		hasMypyConfig: hasMypyConfig(cwd),
 		hasDetektConfig: hasDetektConfig(cwd),
+		hasKtfmtConfig: hasKtfmtConfig(cwd),
 	};
 	const policy = getLinterPolicyForFile(filePath, context);
 	if (policy) {
@@ -1613,6 +1637,18 @@ export function getAutofixPolicyForFile(
 	}
 
 	if ([".kt", ".kts"].includes(ext)) {
+		// ktfmt is config-first and the project's explicit formatting choice, so it
+		// wins over both detekt and the ktlint smart-default when opted in (#129).
+		if (context.hasKtfmtConfig) {
+			return {
+				toolNames: ["ktfmt", "detekt", "ktlint"],
+				preferredTools: ["ktfmt"],
+				defaultTool: "ktfmt",
+				defaultWhenUnconfigured: false,
+				gate: "config-first",
+				safe: true,
+			};
+		}
 		// detekt --auto-correct is config-first; with a detekt config present it
 		// wins over the ktlint smart-default (and is the autofix path on Windows,
 		// where ktlint's install is currently broken, #218).
@@ -2081,6 +2117,35 @@ export function hasDetektConfig(cwd: string): boolean {
 	for (const dir of walkUpDirs(cwd)) {
 		if (DETEKT_CONFIGS.some((cfg) => fs.existsSync(path.join(dir, cfg))))
 			return true;
+	}
+	return false;
+}
+
+// ktfmt has no native config file format; these are pi-lens opt-in markers plus
+// the gradle-plugin signal, so a project that uses ktfmt elects it as its Kotlin
+// formatter instead of the ktlint smart-default (#129).
+const KTFMT_CONFIG_FILES = [".ktfmt", ".ktfmt.kts"];
+const KTFMT_GRADLE_FILES = [
+	"build.gradle.kts",
+	"build.gradle",
+	"settings.gradle.kts",
+	"settings.gradle",
+];
+
+export function hasKtfmtConfig(cwd: string): boolean {
+	for (const dir of walkUpDirs(cwd)) {
+		if (KTFMT_CONFIG_FILES.some((cfg) => fs.existsSync(path.join(dir, cfg))))
+			return true;
+		for (const gradle of KTFMT_GRADLE_FILES) {
+			const p = path.join(dir, gradle);
+			if (fs.existsSync(p)) {
+				try {
+					// Match the gradle plugin id / artifact, not a stray substring.
+					if (/ktfmt|com\.facebook\.ktfmt/i.test(fs.readFileSync(p, "utf-8")))
+						return true;
+				} catch {}
+			}
+		}
 	}
 	return false;
 }

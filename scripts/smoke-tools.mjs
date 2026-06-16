@@ -466,6 +466,15 @@ const FORMAT_FIXTURES = [
 		tools: ["ktlint"],
 	},
 	{
+		// ktfmt wins over the ktlint smart-default when the project ships its
+		// .ktfmt opt-in marker (#129).
+		lang: "kotlin",
+		dir: "tests/fixtures/format-smoke/kotlin-ktfmt",
+		file: "messy.kt",
+		formatter: "ktfmt",
+		tools: ["ktfmt"],
+	},
+	{
 		lang: "elixir",
 		dir: "tests/fixtures/format-smoke/elixir",
 		file: "messy.ex",
@@ -708,6 +717,15 @@ const AUTOFIX_FIXTURES = [
 		file: "messy.js",
 		tool: "oxlint",
 		tools: ["oxlint"],
+	},
+	{
+		// ktfmt is config-first (.ktfmt opt-in marker); it reformats the collapsed
+		// body in place. Auto-installs via the maven-JAR strategy (#129).
+		lang: "kotlin-ktfmt",
+		dir: "tests/fixtures/autofix-smoke/kotlin-ktfmt",
+		file: "messy.kt",
+		tool: "ktfmt",
+		tools: ["ktfmt"],
 	},
 	// NOTE: detekt --auto-correct (Kotlin) is wired into the autofix policy +
 	// pipeline (config-first, mirroring the detekt runner's invocation) and guarded

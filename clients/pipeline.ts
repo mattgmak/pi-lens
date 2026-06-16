@@ -65,6 +65,7 @@ import {
 	hasDetektConfig,
 	hasEslintConfig,
 	hasGolangciConfig,
+	hasKtfmtConfig,
 	hasOxlintConfig,
 	hasRubocopConfig,
 	hasSqlfluffConfig,
@@ -387,10 +388,21 @@ async function tryKtlintFix(filePath: string, cwd: string): Promise<number> {
 	);
 }
 
-// golangci-lint/detekt have no TOOL_COMMAND_SPEC; resolve via availability
+// golangci-lint/detekt/ktfmt have no TOOL_COMMAND_SPEC; resolve via availability
 // checkers like their runners do.
 const golangciAutofixChecker = createAvailabilityChecker("golangci-lint", ".exe");
 const detektAutofixChecker = createAvailabilityChecker("detekt", ".bat");
+const ktfmtAutofixChecker = createAvailabilityChecker("ktfmt", ".bat");
+
+async function tryKtfmtFix(filePath: string, cwd: string): Promise<number> {
+	// Config-first: the autofix policy only reaches here when the project opted
+	// into ktfmt, so resolveAvailableOrInstall honors that gate. ktfmt writes the
+	// formatted file in place and exits 0; treat any byte change as the fix.
+	const cmd = await resolveAvailableOrInstall(ktfmtAutofixChecker, "ktfmt", cwd);
+	if (!cmd) return 0;
+	const absPath = path.resolve(cwd, filePath);
+	return detectFileChangedAfterCommand(filePath, cmd, [absPath], cwd, [0]);
+}
 
 async function tryGolangciLintFix(filePath: string, cwd: string): Promise<number> {
 	// Config-first: the autofix policy only reaches here when a .golangci.* config
@@ -536,6 +548,7 @@ export async function runAutofix(
 		hasBiomeConfig: hasBiomeConfig(cwd),
 		hasGolangciConfig: hasGolangciConfig(cwd),
 		hasDetektConfig: hasDetektConfig(cwd),
+		hasKtfmtConfig: hasKtfmtConfig(cwd),
 		hasOxlintConfig: hasOxlintConfig(cwd),
 	};
 	const autofixPolicy = getAutofixPolicyForFile(filePath, autofixContext);
@@ -734,6 +747,19 @@ export async function runAutofix(
 				fixedThisTurn.add(filePath);
 				markTargetChanged();
 				dbg(`autofix: detekt --auto-correct fixed ${filePath}`);
+				needsContentRefresh = true;
+			}
+			continue;
+		}
+
+		if (toolName === "ktfmt") {
+			const fixed = await tryKtfmtFix(filePath, cwd);
+			if (fixed > 0) {
+				fixedCount += fixed;
+				autofixTools.push(`ktfmt:${fixed}`);
+				fixedThisTurn.add(filePath);
+				markTargetChanged();
+				dbg(`autofix: ktfmt formatted ${filePath}`);
 				needsContentRefresh = true;
 			}
 			continue;

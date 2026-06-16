@@ -32,6 +32,7 @@ const CASES: Array<{
 	{ label: "ruby", file: "a.rb", ctx: {}, expect: "rubocop" },
 	{ label: "kotlin default", file: "a.kt", ctx: {}, expect: "ktlint" },
 	{ label: "kotlin+detekt", file: "a.kt", ctx: { hasDetektConfig: true }, expect: "detekt" },
+	{ label: "kotlin+ktfmt", file: "a.kt", ctx: { hasKtfmtConfig: true }, expect: "ktfmt" },
 	{ label: "rust", file: "a.rs", ctx: {}, expect: "rust-clippy" },
 	{ label: "dart", file: "a.dart", ctx: {}, expect: "dart-analyze" },
 	{ label: "go", file: "a.go", ctx: { hasGolangciConfig: true }, expect: "golangci-lint" },

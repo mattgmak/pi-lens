@@ -22,6 +22,7 @@ import {
 	hasCljfmtConfig,
 	hasCmakeFormatConfig,
 	hasDetektConfig,
+	hasKtfmtConfig,
 	hasEslintConfig,
 	hasGolangciConfig,
 	hasGoogleJavaFormatConfig,
@@ -228,6 +229,17 @@ describe("tool-policy", () => {
 		expect(
 			getAutofixPolicyForFile("/tmp/file.kt", { hasDetektConfig: true }),
 		).toMatchObject({ preferredTools: ["detekt"], gate: "config-first" });
+		// ktfmt is config-first and outranks both detekt and the ktlint default
+		// when the project opts in (#129).
+		expect(
+			getAutofixPolicyForFile("/tmp/file.kt", { hasKtfmtConfig: true }),
+		).toMatchObject({ preferredTools: ["ktfmt"], gate: "config-first" });
+		expect(
+			getAutofixPolicyForFile("/tmp/file.kt", {
+				hasKtfmtConfig: true,
+				hasDetektConfig: true,
+			}),
+		).toMatchObject({ preferredTools: ["ktfmt"], gate: "config-first" });
 		// markdownlint is smart-default (no config needed).
 		expect(getAutofixPolicyForFile("/tmp/file.md", {})).toMatchObject({
 			preferredTools: ["markdownlint"],
@@ -289,6 +301,23 @@ describe("tool-policy", () => {
 			preferredRunners: ["markdownlint"],
 			gate: "smart-default",
 		});
+		// Kotlin: ktlint is the smart-default linter. Opting into ktfmt (a pure
+		// formatter wired as autofix, NOT a lint runner) makes ktlint's lint step
+		// aside so it won't conflict, while detekt's semantic lint is unaffected (#129).
+		expect(getLinterPolicyForFile("/tmp/file.kt", {})).toMatchObject({
+			preferredRunners: ["ktlint"],
+			defaultRunner: "ktlint",
+			gate: "smart-default",
+		});
+		expect(
+			getLinterPolicyForFile("/tmp/file.kt", { hasKtfmtConfig: true }),
+		).toMatchObject({ preferredRunners: [], gate: "config-first" });
+		expect(
+			getLinterPolicyForFile("/tmp/file.kt", {
+				hasKtfmtConfig: true,
+				hasDetektConfig: true,
+			}),
+		).toMatchObject({ preferredRunners: ["detekt"], gate: "config-first" });
 		expect(getLinterPolicyForFile("/tmp/file.html", {})).toMatchObject({
 			preferredRunners: ["htmlhint"],
 			gate: "smart-default",
@@ -740,6 +769,42 @@ describe("tool-policy", () => {
 			const subDir = path.join(env.tmpDir, "src");
 			fs.mkdirSync(subDir, { recursive: true });
 			expect(hasDetektConfig(subDir)).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("hasKtfmtConfig detects the .ktfmt opt-in marker in a parent directory", () => {
+		const env = setupTestEnvironment("pi-lens-tool-policy-ktfmt-marker-");
+		try {
+			createTempFile(env.tmpDir, ".ktfmt", "");
+			const subDir = path.join(env.tmpDir, "src");
+			fs.mkdirSync(subDir, { recursive: true });
+			expect(hasKtfmtConfig(subDir)).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("hasKtfmtConfig detects the ktfmt gradle plugin in build.gradle.kts", () => {
+		const env = setupTestEnvironment("pi-lens-tool-policy-ktfmt-gradle-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"build.gradle.kts",
+				'plugins {\n  id("com.ncorti.ktfmt.gradle") version "0.21.0"\n}\n',
+			);
+			expect(hasKtfmtConfig(env.tmpDir)).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("hasKtfmtConfig is false for a plain Kotlin project (ktlint stays default)", () => {
+		const env = setupTestEnvironment("pi-lens-tool-policy-ktfmt-absent-");
+		try {
+			createTempFile(env.tmpDir, "build.gradle.kts", "plugins {\n}\n");
+			expect(hasKtfmtConfig(env.tmpDir)).toBe(false);
 		} finally {
 			env.cleanup();
 		}

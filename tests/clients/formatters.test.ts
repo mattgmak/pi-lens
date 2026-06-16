@@ -426,6 +426,15 @@ describe("getFormattersForFile — policy selection", () => {
 		});
 	});
 
+	it("prefers ktfmt over the ktlint default when the project opts in (#129)", async () => {
+		createTempFile(tmpDir, ".ktfmt", "");
+		await withPathShim("ktfmt", async () => {
+			const filePath = fileIn(tmpDir, "App.kt");
+			const formatters = await getFormattersForFile(filePath, tmpDir);
+			expect(formatters.map((f) => f.name)).toEqual(["ktfmt"]);
+		});
+	});
+
 	it("uses swiftformat as the smart default for Swift files when available", async () => {
 		await withPathShim("swiftformat", async () => {
 			const filePath = fileIn(tmpDir, "App.swift");

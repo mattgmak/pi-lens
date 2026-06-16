@@ -23,6 +23,7 @@ import {
 	hasCljfmtConfig,
 	hasCmakeFormatConfig,
 	hasGoogleJavaFormatConfig,
+	hasKtfmtConfig,
 	hasNearestPackageJsonDependency,
 	hasNearestPackageJsonField,
 	hasOcamlformatConfig,
@@ -308,6 +309,8 @@ function hasExplicitFormatterConfig(
 			return hasOcamlformatConfig(cwd);
 		case "google-java-format":
 			return hasGoogleJavaFormatConfig(cwd);
+		case "ktfmt":
+			return hasKtfmtConfig(cwd);
 		case "cljfmt":
 			return hasCljfmtConfig(cwd);
 		case "cmake-format":
@@ -630,6 +633,25 @@ export const ktlintFormatter: FormatterInfo = {
 	},
 };
 
+export const ktfmtFormatter: FormatterInfo = {
+	name: "ktfmt",
+	// ktfmt formats in place when given a file path (no flag needed).
+	command: ["ktfmt", "$FILE"],
+	extensions: [".kt", ".kts"],
+	async resolveCommand(filePath, _cwd) {
+		const inPath = await which("ktfmt");
+		if (inPath) return [inPath, filePath];
+		const { ensureTool } = await import("./installer/index.js");
+		const installed = await ensureTool("ktfmt");
+		return installed ? [installed, filePath] : null;
+	},
+	async detect(cwd: string) {
+		// Opt-in only: ktfmt becomes the formatter when the project elects it,
+		// otherwise ktlint stays the Kotlin smart-default (#129).
+		return hasKtfmtConfig(cwd);
+	},
+};
+
 export const rubocopFormatter: FormatterInfo = {
 	name: "rubocop",
 	command: ["rubocop", "-a", "--no-color", "$FILE"],
@@ -878,6 +900,7 @@ const ALL_FORMATTERS: FormatterInfo[] = [
 	ocamlformatFormatter,
 	clangFormatFormatter,
 	ktlintFormatter,
+	ktfmtFormatter,
 	terraformFormatter,
 	phpCsFixerFormatter,
 	csharpierFormatter,
