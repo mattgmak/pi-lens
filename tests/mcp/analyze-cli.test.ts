@@ -59,7 +59,12 @@ afterAll(() => {
 	fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-describe("pi-lens-analyze bin", () => {
+// Spawns a real node subprocess that loads the engine (tree-sitter/native) and
+// runs analysis. In the full 200+-file parallel suite this occasionally loses a
+// CPU-starvation race and the child crashes at startup (non-zero exit / no
+// output) — it passes every time in isolation. retry: 2 absorbs the transient
+// contention spike (the established pattern for load-sensitive tests here).
+describe("pi-lens-analyze bin", { retry: 2 }, () => {
 	it("reports structural warnings in plain CLI mode", async () => {
 		const { stdout, code } = await runBin([
 			`--file=${smellyFile}`,

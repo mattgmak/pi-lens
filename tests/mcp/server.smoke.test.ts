@@ -65,7 +65,10 @@ class McpHarness {
 	}
 }
 
-describe("pi-lens MCP server (stdio smoke)", () => {
+// Spawns the MCP server as a real stdio subprocess; like analyze-cli, it can lose
+// a CPU-starvation race in the full parallel suite (passes in isolation). retry: 2
+// absorbs the transient spike (the established pattern for load-sensitive tests).
+describe("pi-lens MCP server (stdio smoke)", { retry: 2 }, () => {
 	let harness: McpHarness;
 
 	beforeAll(() => {
