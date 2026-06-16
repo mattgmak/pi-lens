@@ -346,6 +346,22 @@ const LSP_FIXTURES = [
 		serverHint: "rust-analyzer",
 		tools: ["rust-analyzer"],
 	},
+	// Auxiliary LSP (cross-cutting, diagnostic-only) — attaches alongside the
+	// primary language server. `auxiliaryServerIds` switches the touch to the
+	// with-auxiliary scope; `auxiliarySourceMatch` asserts the auxiliary actually
+	// produced a finding (proves install→spawn→scan→publish). `gitInit` gives the
+	// temp workspace a .git so opengrep's repo-rooted server treats the fixture as
+	// in-workspace. Generic: add a server-def + profile and a fixture entry here.
+	{
+		lang: "opengrep",
+		dir: "tests/fixtures/tool-smoke/opengrep-aux",
+		file: "danger.js",
+		serverHint: "opengrep (auxiliary)",
+		tools: ["opengrep"],
+		auxiliaryServerIds: ["opengrep"],
+		auxiliarySourceMatch: "semgrep|opengrep",
+		gitInit: true,
+	},
 ];
 
 /**
@@ -896,6 +912,17 @@ async function runLspHandshake({ langs, install, verbose }) {
 		}
 		const workspace = copyDirToTemp(fx.dir);
 		const absFile = path.join(workspace, fx.file);
+		// Some auxiliary servers (opengrep) root at the nearest .git — give the
+		// temp workspace one so the copied fixture is treated as in-workspace.
+		if (fx.gitInit) {
+			try {
+				execFileSync("git", ["init", "-q"], { cwd: workspace, stdio: "ignore" });
+			} catch {
+				// git unavailable — opengrep falls back to cwd; may not scan the temp file
+			}
+		}
+		const auxIds = fx.auxiliaryServerIds ?? [];
+		const useAux = auxIds.length > 0;
 		const push = (state, detail, diags = 0) =>
 			rows.push({ lang: fx.lang, runner: fx.serverHint, state, detail, diags });
 		try {
@@ -910,13 +937,34 @@ async function runLspHandshake({ langs, install, verbose }) {
 				touched = await lsp.touchFile(absFile, content, {
 					diagnostics: "document",
 					collectDiagnostics: true,
-					clientScope: "primary",
+					clientScope: useAux ? "with-auxiliary" : "primary",
+					...(useAux ? { auxiliaryServerIds: auxIds } : {}),
 					maxClientWaitMs: LSP_CLIENT_WAIT_MS,
 					maxDiagnosticsWaitMs: LSP_DIAGNOSTICS_WAIT_MS,
 					source: "smoke-lsp",
 				});
 			} catch (err) {
 				threw = err?.message ?? String(err);
+			}
+			// Auxiliary fixtures assert the cross-cutting server actually produced a
+			// finding (proves install→spawn→scan→publish), matched by LSP `source`.
+			if (useAux && fx.auxiliarySourceMatch && !threw) {
+				const re = new RegExp(fx.auxiliarySourceMatch, "i");
+				const list = Array.isArray(touched) ? touched : [];
+				const auxDiags = list.filter((d) => re.test(d.source || ""));
+				if (verbose) {
+					console.error(
+						`[${fx.lang}] aux=${auxIds.join(",")} matched=${auxDiags.length}/${list.length} sources=${JSON.stringify([...new Set(list.map((d) => d.source))])}`,
+					);
+				}
+				push(
+					auxDiags.length > 0 ? "pass" : "fail",
+					auxDiags.length > 0
+						? `auxiliary ${auxIds.join(",")} returned ${auxDiags.length} diagnostic(s)`
+						: `auxiliary ${auxIds.join(",")} produced no diagnostics (expected /${fx.auxiliarySourceMatch}/)`,
+					list.length,
+				);
+				continue;
 			}
 			// touchFile returns the diagnostics array once a client is ready (spawn
 			// + initialize handshake completed), or undefined if none became ready
