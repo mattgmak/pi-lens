@@ -1805,7 +1805,11 @@ async function installMavenTool(
 		return undefined;
 	}
 
-	const base = (spec.repoBaseUrl ?? MAVEN_CENTRAL_BASE).replace(/\/+$/, "");
+	// Strip trailing slashes without a regex (the `\/+$` form trips ReDoS
+	// scanners — S5852 — even though the input is a trusted constant/registry
+	// value). A plain loop is unambiguously linear.
+	let base = spec.repoBaseUrl ?? MAVEN_CENTRAL_BASE;
+	while (base.endsWith("/")) base = base.slice(0, -1);
 	const groupPath = spec.groupId.replace(/\./g, "/");
 	const jarFile = `${spec.artifactId}-${spec.version}${
 		spec.classifier ? `-${spec.classifier}` : ""
