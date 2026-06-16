@@ -4,6 +4,8 @@ All notable changes to pi-lens will be documented in this file.
 
 ## [Unreleased]
 
+## [3.8.53] - 2026-06-16
+
 ### Added
 
 - **ktfmt wired as a config-gated Kotlin formatter + safe autofix (closes #129)** — projects that use [ktfmt](https://github.com/facebook/ktfmt) (Facebook's opinionated, gofmt-style Kotlin formatter) now get real formatting support. ktfmt is a *pure formatter* (no lint rules), so it's wired only where that fits: as a **formatter** (`getFormattersForFile` → `ktfmtFormatter`, in-place) and a **safe pipeline autofix** (`runAutofix` → `tryKtfmtFix`), **not** as a lint runner — a "not formatted" nag would be redundant with the autofix pass (unlike shfmt, which has no autofix). Both are **config-first**: ktfmt activates only when the project opts in (a `.ktfmt`/`.ktfmt.kts` marker or the ktfmt gradle plugin in `build.gradle{.kts}`, via `hasKtfmtConfig`). When opted in, ktfmt **replaces ktlint** for formatting (the lint policy drops ktlint from `preferredRunners` so its style suggestions don't conflict with ktfmt's output); detekt's *semantic* lint is unaffected. Installs via the new maven-JAR strategy. Validated end-to-end on the dev box through the harness `--format` and `--autofix` layers (ktfmt reformats + applies a fix). Guards: `formatters.test.ts` (ktfmt wins over the ktlint default when opted in), `tool-policy.test.ts` (lint suppresses ktlint / autofix selects ktfmt + `hasKtfmtConfig` detection), and the `autofix-policy-consistency` gate-match. _(Follow-up filed: re-evaluate ktlint's default lint runner now that ktlint is itself a safe autofix — the same redundancy question applies to pure-formatter-linters generally.)_
