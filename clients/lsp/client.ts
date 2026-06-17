@@ -1396,7 +1396,7 @@ export async function createLSPClient(options: {
 	state.rawCapabilityKeys = Object.keys(
 		(initResult as { capabilities?: Record<string, unknown> })?.capabilities ??
 			{},
-	).sort();
+	).sort((a, b) => a.localeCompare(b));
 	for (const cmd of detectExecuteCommands(initResult)) {
 		state.advertisedCommands.add(cmd);
 	}
