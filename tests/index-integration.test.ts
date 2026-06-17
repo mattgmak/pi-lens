@@ -199,7 +199,13 @@ describe("index.ts integration", () => {
 		const shutdown = handlers.session_shutdown?.[0];
 		expect(shutdown).toBeTypeOf("function");
 		shutdown?.({ reason: "quit" }, { cwd: tmpDir });
-		expect(resetLSPService).toHaveBeenCalledWith({ fast: true });
+		// processExiting:true is required alongside fast — at session_shutdown the
+		// event loop is closing, so killProcessTree must terminate via the held
+		// handle instead of spawning taskkill (Windows libuv abort, #234 / caf2ee8).
+		expect(resetLSPService).toHaveBeenCalledWith({
+			fast: true,
+			processExiting: true,
+		});
 	}, 15_000);
 
 	it("context handler prepends injected guidance before the user prompt", async () => {
