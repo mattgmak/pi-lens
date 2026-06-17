@@ -2125,7 +2125,11 @@ export default function (pi: ExtensionAPI) {
 	// so it does not fire after shutdown. resetLSPService shuts down any live clients.
 	(pi as any).on("session_shutdown", () => {
 		cancelLSPIdleReset();
-		resetLSPService({ fast: true });
+		// processExiting: the loop is closing here — killing LSP servers must NOT
+		// spawn taskkill, or libuv aborts on uv_async_send to the closing loop
+		// (Assertion !(handle->flags & UV_HANDLE_CLOSING), src\win\async.c) — seen
+		// on `pi update`. Direct handle-kill only; the OS reaps any orphans.
+		resetLSPService({ fast: true, processExiting: true });
 	});
 
 	// --- Inject turn-end findings into next agent turn ---

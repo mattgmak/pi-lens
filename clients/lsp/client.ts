@@ -98,6 +98,18 @@ export interface LSPShutdownOptions {
 	 * unreferences child handles/timers instead of waiting for graceful escalation.
 	 */
 	fast?: boolean;
+	/**
+	 * Set only when the host process itself is exiting (e.g. `session_shutdown`
+	 * during `pi update`), i.e. the event loop is already closing. In that state,
+	 * spawning a child process (the Windows `taskkill /T` tree-kill) makes libuv
+	 * call `uv_async_send` on the closing loop-wakeup handle and hard-aborts
+	 * (Assertion `!(handle->flags & UV_HANDLE_CLOSING)`, `src\win\async.c`). When
+	 * set, we kill via the handle we already hold (synchronous `TerminateProcess`,
+	 * no new async handle) instead of spawning. Distinct from `fast`, which also
+	 * covers mid-session teardowns (subagent/turn boundaries) where the host keeps
+	 * running and the `/T` tree-kill is still wanted to avoid zombie accumulation.
+	 */
+	processExiting?: boolean;
 }
 
 export interface LSPOperationSupport {
@@ -383,7 +395,7 @@ function disposeClientConnection(state: LSPClientState): void {
 	}
 }
 
-async function killProcessTree(
+export async function killProcessTree(
 	proc: {
 		kill(signal?: NodeJS.Signals | number): boolean;
 		unref?: () => void;
@@ -392,6 +404,20 @@ async function killProcessTree(
 	options: LSPShutdownOptions = {},
 ): Promise<void> {
 	if (process.platform === "win32" && pid > 0) {
+		// Host process is exiting (loop already closing): never spawn a child here —
+		// the spawn's uv_async_send on the closing loop-wakeup handle hard-aborts
+		// (src\win\async.c). Kill the direct child via the handle we already hold
+		// (TerminateProcess; synchronous, no async handle). Orphaned grandchildren
+		// are reaped by the OS as the host exits.
+		if (options.processExiting) {
+			try {
+				proc.kill();
+			} catch {
+				// best-effort
+			}
+			proc.unref?.();
+			return;
+		}
 		try {
 			// Absolute path avoids PATH-resolution: SystemRoot is set by Windows itself.
 			const taskkill = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\taskkill.exe`;
