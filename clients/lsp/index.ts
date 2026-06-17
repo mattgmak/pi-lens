@@ -127,6 +127,8 @@ export interface LSPCapabilitySnapshot {
 	workspaceDiagnosticsSupport: LSPWorkspaceDiagnosticsSupport;
 	/** Commands the server advertised for workspace/executeCommand (the allowlist) */
 	advertisedCommands: string[];
+	/** Top-level keys of the raw ServerCapabilities advertised at initialize. */
+	rawCapabilityKeys: string[];
 }
 
 export interface LSPRenameFileResult {
@@ -1551,6 +1553,7 @@ export class LSPService {
 					operationSupport: client.getOperationSupport(),
 					workspaceDiagnosticsSupport: client.getWorkspaceDiagnosticsSupport(),
 					advertisedCommands: client.getAdvertisedCommands(),
+					rawCapabilityKeys: client.getRawCapabilityKeys?.() ?? [],
 				});
 			}
 			return snapshots;
@@ -1566,6 +1569,7 @@ export class LSPService {
 				operationSupport: client.getOperationSupport(),
 				workspaceDiagnosticsSupport: client.getWorkspaceDiagnosticsSupport(),
 				advertisedCommands: client.getAdvertisedCommands(),
+				rawCapabilityKeys: client.getRawCapabilityKeys?.() ?? [],
 			});
 		}
 		return snapshots;

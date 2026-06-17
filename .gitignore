@@ -61,6 +61,7 @@ migrate-*.js
 !docs/custom-rules.md
 !docs/lsp-latency-benchmark.md
 !docs/lsp-capability-matrix.md
+!docs/servercapabilities.md
 !skills/**/*.md
 
 # Local-only docs (not in git or npm)

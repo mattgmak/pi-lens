@@ -216,6 +216,9 @@ export interface LSPClientInfo {
 	getOperationSupport(): LSPOperationSupport;
 	/** Commands the server advertised for workspace/executeCommand (the allowlist) */
 	getAdvertisedCommands(): string[];
+	/** Top-level keys of the raw ServerCapabilities advertised at initialize —
+	 *  the full advertised surface (incl. providers pi-lens does not parse). */
+	getRawCapabilityKeys(): string[];
 	/**
 	 * Run a server command via workspace/executeCommand. Hardened: the command
 	 * MUST be in the server's advertised list or this rejects without sending.
@@ -403,6 +406,9 @@ export interface LSPClientState {
 	workspaceDiagnosticsSupport: LSPWorkspaceDiagnosticsSupport;
 	/** Mutable: upgraded by applyDynamicCapabilities after registerCapability events */
 	operationSupport: LSPOperationSupport;
+	/** Top-level keys of the raw ServerCapabilities from initialize (sorted) —
+	 *  captured once; the full advertised surface for diagnostics/documentation. */
+	rawCapabilityKeys?: string[];
 	/** Baseline mode from static initResult — used to revert on unregister */
 	staticDiagnosticsMode: "pull" | "push-only";
 	/** Live dynamic registrations from client/registerCapability: id → method */
@@ -1387,6 +1393,10 @@ export async function createLSPClient(options: {
 	state.workspaceDiagnosticsSupport =
 		detectWorkspaceDiagnosticsSupport(initResult);
 	state.operationSupport = detectOperationSupport(initResult);
+	state.rawCapabilityKeys = Object.keys(
+		(initResult as { capabilities?: Record<string, unknown> })?.capabilities ??
+			{},
+	).sort();
 	for (const cmd of detectExecuteCommands(initResult)) {
 		state.advertisedCommands.add(cmd);
 	}
@@ -1492,6 +1502,10 @@ export async function createLSPClient(options: {
 
 		getAdvertisedCommands() {
 			return [...state.advertisedCommands];
+		},
+
+		getRawCapabilityKeys() {
+			return state.rawCapabilityKeys ?? [];
 		},
 
 		async executeCommand(command, args) {

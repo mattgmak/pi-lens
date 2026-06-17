@@ -93,7 +93,13 @@ for (const fx of fixtures) {
 			clientScope: auxIds.length ? "with-auxiliary" : "primary",
 			...(auxIds.length ? { auxiliaryServerIds: auxIds } : {}),
 			maxClientWaitMs: 40000,
-			maxDiagnosticsWaitMs: 20000,
+			// Production-realistic diagnostic cap. NOT 20s: on the with-auxiliary
+			// path the deadline is max(callerCap, maxStrategyWait), so a huge cap
+			// becomes the deadline whenever the PRIMARY is push-silent on a clean
+			// file (it never early-returns) — which inflated ast-grep's warm number
+			// to ~20s even though ast-grep itself publishes promptly. 3000ms covers
+			// the slowest strategy budget (rust-analyzer) and reflects dispatch.
+			maxDiagnosticsWaitMs: 3000,
 			source: "bench",
 		});
 
