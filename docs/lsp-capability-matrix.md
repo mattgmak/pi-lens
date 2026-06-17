@@ -22,41 +22,49 @@ Detection is **cached** at `initialize` (`detectWorkspaceDiagnosticsSupport` →
 `state.workspaceDiagnosticsSupport.mode`, upgraded on `client/registerCapability`),
 so the tier is free at collection time — no per-edit probe.
 
-## Matrix (measured on the dev box, 2026-06)
+## Matrix (dev box + CI nightly, last refreshed 2026-06-17 from run 27713958681)
 
 `mode` from cached capabilities; `clean-behavior` from the publish-trace probe
-(only servers actually probed are marked — TBD otherwise).
+(only servers actually probed are marked — TBD otherwise). `src` = where the mode
+was measured: **ci** = the nightly `characterize-lsp.mjs` step, **dev** = the dev
+box. A few `dev` rows returned `unknown` in CI this run (the server spawned but
+didn't surface a mode within the characterize budget) — the `dev` value stands.
 
-| lang | server | mode | clean-behavior | tier |
-|---|---|---|---|---|
-| json | vscode-json-language-server | pull | — | 1 |
-| css | vscode-css-language-server | pull | — | 1 |
-| html | vscode-html-language-server | pull | — | 1 |
-| rust | rust-analyzer | pull | — | 1 |
-| svelte | svelte-language-server | pull | — | 1 |
-| deno | deno (alt of typescript) | pull | — | 1 |
-| typescript | typescript-language-server | push-only | **silent** (probed) | 3 |
-| python | pyright | push-only | TBD | 3? |
-| yaml | yaml-language-server | push-only | TBD | ? |
-| shell | bash-language-server | push-only | TBD | ? |
-| dockerfile | docker-langserver | push-only | TBD | ? |
-| toml | taplo | push-only | TBD | ? |
-| terraform | terraform-ls | push-only | TBD | ? |
-| prisma | @prisma/language-server | push-only | TBD | ? |
-| php | intelephense | push-only | TBD | ? |
-| go | gopls | push-only | TBD | ? |
-| zig | zls | push-only | TBD | ? |
-| vue | @vue/language-server | push-only | TBD | ? |
-| opengrep | opengrep (aux) | push-only | re-publishes (early-returns ~1.2s) | 2 |
-| ast-grep | ast-grep (aux) | push-only | **re-publishes empty+version** (probed) | 2 |
+| lang | server | mode | clean-behavior | tier | src |
+|---|---|---|---|---|---|
+| json | vscode-json-language-server | pull | — | 1 | dev |
+| css | vscode-css-language-server | pull | — | 1 | dev |
+| html | vscode-html-language-server | pull | — | 1 | dev |
+| rust | rust-analyzer | pull | — | 1 | dev |
+| svelte | svelte-language-server | pull | — | 1 | dev+ci |
+| deno | deno (alt of typescript) | pull | — | 1 | dev+ci |
+| ruby | ruby-lsp | pull | — | 1 | ci |
+| csharp | csharp-ls | pull | — | 1 | ci |
+| typescript | typescript-language-server | push-only | **silent** (probed) | 3 | dev |
+| python | pyright | push-only | TBD | 2/3? | dev |
+| jedi | jedi-language-server (alt of python) | push-only | TBD | 2/3? | ci |
+| yaml | yaml-language-server | push-only | TBD | 2/3? | dev |
+| shell | bash-language-server | push-only | TBD | 2/3? | dev |
+| dockerfile | docker-langserver | push-only | TBD | 2/3? | dev |
+| toml | taplo | push-only | TBD | 2/3? | dev |
+| terraform | terraform-ls | push-only | TBD | 2/3? | dev |
+| prisma | @prisma/language-server | push-only | TBD | 2/3? | dev+ci |
+| php | intelephense | push-only | TBD | 2/3? | dev |
+| zig | zls | push-only | TBD | 2/3? | dev+ci |
+| vue | @vue/language-server | push-only | TBD | 2/3? | dev+ci |
+| dart | dart language-server | push-only | TBD | 2/3? | ci |
+| gleam | gleam lsp | push-only | TBD | 2/3? | ci |
+| clojure | clojure-lsp | push-only | TBD | 2/3? | ci |
+| opengrep | opengrep (aux) | push-only | re-publishes (early-returns ~1.2s) | 2 | dev+ci |
+| ast-grep | ast-grep (aux) | push-only | **re-publishes empty+version** (probed) | 2 | dev+ci |
 
-**Pending — fixture exists, not yet characterized here** (server not installed; needs
-its specific install mechanism in a provisioned env / CI — dotnet tool, JVM jar, go
-install, binary download — and the toolchain on PATH). Toolchains present on the dev
-box but the servers themselves aren't installed: ruby, csharp, fsharp, java, kotlin,
-elixir, clojure. Genuinely absent toolchains: swift, dart, haskell, gleam, ocaml, nix.
-Also `omnisharp` (alternate of csharp) and `lua`/`cpp` (standalone-binary servers, not
-yet fetched).
+**Unknown — fixture exists, mode not yet captured.** The toolchain-gated family
+(no auto-install today; tracked in #241) — `go` (gopls), `java` (jdtls),
+`kotlin`, `swift` (sourcekit-lsp), `lua`, `cpp` (clangd), `haskell`, `elixir`,
+`ocaml`, `nix` (nixd), `fsharp`. Their servers don't install in the nightly, so
+characterize reports `unknown` (a non-failure ⚠). Once #241 lands they'll fill in
+the same way clojure-lsp/gleam now do (both auto-install via the github strategy
+and were characterized `push-only` in the run above).
 
 ## Key findings
 - **Mode ≠ tier.** Push-only further splits into Tier 2 (re-publishes empty — ast-grep,
@@ -77,12 +85,15 @@ tool-layer fixture we point `characterize-lsp.mjs` at the existing (deliberately
 dirty) `bad.*` source rather than a colliding clean duplicate; new languages get a
 minimal clean source. Either way the mode reported is the same.
 
-The nightly **tool-smoke** workflow now runs `characterize-lsp.mjs --install` (after
-the LSP handshake layer) on `ubuntu-latest`, which provisions Java/Ruby/Dart/PHP/Zig/
-Elixir/Gleam plus Go/Rust/.NET/Node/Python — so the matrix's `mode` column fills in CI
-for those. Toolchains the workflow does **not** yet set up (swift, haskell, ocaml,
-nix, lua, cpp, clojure-lsp) still report unavailable until those setup steps are added.
+The nightly **tool-smoke** workflow runs `characterize-lsp.mjs --install` (after the
+LSP handshake layer) on `ubuntu-latest`, so the matrix's `mode` column self-populates
+in CI. It fills for servers that either auto-install (npm/pip/github — including
+clojure-lsp and gleam, both github-strategy as of f263cf3) or whose toolchain the
+workflow provisions (Ruby/Dart/Zig + .NET→csharp). The remaining `unknown` rows are
+the toolchain-gated family (#241): until `runtimeInstall` + canonical-bin discovery
+land, their servers don't install in CI and stay ⚠.
 
-Each row needs both: (1) the cached `mode` (now produced by the nightly), and (2) the
-clean→clean publish-behavior probe (`probe-clean-signal.mjs` + `PILENS_PUB_DEBUG=1`) to
-assign Tier 2 vs 3 — the second cut is still per-server and manual.
+Each row still needs (2) the clean→clean publish-behavior probe (`probe-clean-signal.mjs`
++ `PILENS_PUB_DEBUG=1`) to split push-only into Tier 2 (re-publishes empty) vs Tier 3
+(silent). Only typescript (Tier 3) and ast-grep/opengrep (Tier 2) are probed so far —
+that second cut is still per-server and manual.
