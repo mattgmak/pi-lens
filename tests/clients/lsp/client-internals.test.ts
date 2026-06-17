@@ -388,6 +388,66 @@ describe("clientWaitForDiagnostics", () => {
 	});
 });
 
+describe("clientWaitForDiagnostics — pull mode (#240)", () => {
+	// serverId "typescript" → pullRetryBudgetMs 0, so no incremental retry loop;
+	// the first pull outcome is decisive. mode "pull" routes through the pull
+	// branch. diagnosticProviderKind "object" = an advertised pull provider.
+	const pullState = (): LSPClientState =>
+		createMockState({
+			serverId: "typescript",
+			workspaceDiagnosticsSupport: {
+				advertised: true,
+				mode: "pull",
+				diagnosticProviderKind: "object",
+			},
+		});
+
+	it("resolves immediately on an authoritative empty (clean) pull report", async () => {
+		const state = pullState();
+		state.connection.sendRequest = vi
+			.fn()
+			.mockResolvedValue({ kind: "full", items: [] });
+
+		const start = Date.now();
+		await clientWaitForDiagnostics(state, TEST_FILE, 1000);
+		expect(Date.now() - start).toBeLessThan(80);
+	});
+
+	it("resolves immediately when the pull returns diagnostics (found)", async () => {
+		const state = pullState();
+		state.connection.sendRequest = vi.fn().mockResolvedValue({
+			kind: "full",
+			items: [
+				{
+					severity: 1,
+					message: "boom",
+					range: {
+						start: { line: 0, character: 0 },
+						end: { line: 0, character: 0 },
+					},
+				},
+			],
+		});
+
+		const start = Date.now();
+		await clientWaitForDiagnostics(state, TEST_FILE, 1000);
+		expect(Date.now() - start).toBeLessThan(80);
+	});
+
+	it("does NOT treat a failed/unavailable pull as clean — waits the budget rather than short-circuiting", async () => {
+		const state = pullState();
+		// undefined reply → safeSendRequest returns undefined → outcome
+		// "unavailable". With no minVersion baseline the OLD code returned
+		// immediately via `|| hasFreshDiagnostics()` (a false clean); the fix must
+		// instead fall through to the push-wait/timeout backstop.
+		state.connection.sendRequest = vi.fn().mockResolvedValue(undefined);
+
+		const start = Date.now();
+		await clientWaitForDiagnostics(state, TEST_FILE, 120);
+		expect(Date.now() - start).toBeGreaterThanOrEqual(100);
+	});
+});
+
 describe("applyDynamicCapabilities", () => {
 	it("upgrades to pull mode when textDocument/diagnostic is registered", () => {
 		const state = createMockState();

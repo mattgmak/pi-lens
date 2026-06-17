@@ -813,11 +813,23 @@ function setupConnectionLifecycle(state: LSPClientState): void {
 	});
 }
 
+/**
+ * Outcome of a pull-diagnostics request. Distinguishes an AFFIRMATIVE answer
+ * (the server replied — either `found` with diagnostics or an authoritative
+ * empty `clean`) from `unavailable` (dead client / no reply / thrown). #240: a
+ * failed pull must NEVER be read as clean — only an authoritative empty report
+ * is clean. A bare count conflated the two (0 = clean OR failed).
+ */
+type PullDiagnosticsOutcome =
+	| { status: "found"; count: number }
+	| { status: "clean" }
+	| { status: "unavailable" };
+
 async function clientRequestPullDiagnostics(
 	state: LSPClientState,
 	filePath: string,
-): Promise<number> {
-	if (!isClientAlive(state)) return 0;
+): Promise<PullDiagnosticsOutcome> {
+	if (!isClientAlive(state)) return { status: "unavailable" };
 	const uri = pathToFileURL(filePath).href;
 	try {
 		const report = await safeSendRequest<{
@@ -826,7 +838,7 @@ async function clientRequestPullDiagnostics(
 			relatedDocuments?: Record<string, { items?: LSPDiagnostic[] }>;
 		}>(state.connection, "textDocument/diagnostic", { textDocument: { uri } });
 
-		if (!report) return 0;
+		if (!report) return { status: "unavailable" };
 
 		const normalizedPath = normalizeMapKey(filePath);
 		const primaryItems = normalizeLspDiagnostics(report.items ?? []);
@@ -855,9 +867,11 @@ async function clientRequestPullDiagnostics(
 		}
 
 		state.diagnosticEmitter.emit("diagnostics", normalizedPath);
-		return totalCount;
+		return totalCount > 0
+			? { status: "found", count: totalCount }
+			: { status: "clean" };
 	} catch {
-		return 0;
+		return { status: "unavailable" };
 	}
 }
 
@@ -887,8 +901,17 @@ export async function clientWaitForDiagnostics(
 	};
 
 	if (state.workspaceDiagnosticsSupport.mode === "pull") {
-		const firstPullCount = await clientRequestPullDiagnostics(state, filePath);
-		if (firstPullCount > 0 || hasFreshDiagnostics()) return;
+		// Pull is authoritative. An AFFIRMATIVE outcome — diagnostics `found`, or
+		// an authoritative empty `clean` report — ends the wait. An `unavailable`
+		// pull (dead client / no reply / thrown) is NOT clean and must not
+		// short-circuit: fall through to the push-wait/timeout backstop. This is
+		// the #240 fix — previously the early-return also fired on
+		// `hasFreshDiagnostics()`, which is unconditionally true when there is no
+		// version baseline (`minVersion === undefined`), so a failed pull returned
+		// 0 and was read as a fresh clean.
+		let outcome = await clientRequestPullDiagnostics(state, filePath);
+		if (outcome.status === "found") return;
+		let sawClean = outcome.status === "clean";
 
 		const strategy = getStrategy(state.serverId);
 		const retryBudgetMs =
@@ -896,15 +919,18 @@ export async function clientWaitForDiagnostics(
 				? Math.min(timeoutMs, strategy.pullRetryBudgetMs)
 				: 0;
 		const startedAt = Date.now();
-		let latestCount = firstPullCount;
 
-		while (latestCount === 0 && Date.now() - startedAt < retryBudgetMs) {
+		// Retry within budget to catch incremental servers whose first pull is
+		// empty while analysis is still running (rust-analyzer). A `clean` seen at
+		// any point is a valid affirmative answer for this touch.
+		while (outcome.status !== "found" && Date.now() - startedAt < retryBudgetMs) {
 			await new Promise((resolve) =>
 				setTimeout(resolve, PULL_DIAGNOSTICS_RETRY_INTERVAL_MS),
 			);
-			latestCount = await clientRequestPullDiagnostics(state, filePath);
+			outcome = await clientRequestPullDiagnostics(state, filePath);
+			if (outcome.status === "clean") sawClean = true;
 		}
-		if (latestCount > 0 || hasFreshDiagnostics()) return;
+		if (outcome.status === "found" || sawClean) return;
 	}
 
 	if (
