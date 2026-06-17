@@ -985,9 +985,11 @@ async function runLspHandshake({ langs, install, verbose }) {
 	const lsp = getLSPService();
 	const rows = [];
 	for (const fx of selected) {
+		const unavailableTools = new Set();
 		if (install && ensureTool) {
 			for (const toolId of fx.tools ?? []) {
 				const resolved = await ensureTool(toolId);
+				if (!resolved) unavailableTools.add(toolId);
 				if (verbose) {
 					console.error(`[${fx.lang}] ensureTool(${toolId}) → ${resolved ?? "UNAVAILABLE"}`);
 				}
@@ -1052,6 +1054,20 @@ async function runLspHandshake({ langs, install, verbose }) {
 					console.error(
 						`[${fx.lang}] aux=${auxIds.join(",")} matched=${auxDiags.length}/${list.length} sources=${JSON.stringify([...new Set(list.map((d) => d.source))])}`,
 					);
+				}
+				// If the auxiliary server's tool never installed, a zero result is
+				// "unavailable" (⚠), not a failure — mirrors the primary/alternate
+				// readiness handling so a missing optional tool can't red the nightly.
+				// (A tool that DID install but produced nothing is still a real fail.)
+				const toolList = fx.tools ?? [];
+				const auxUnavailable =
+					toolList.length > 0 && toolList.every((t) => unavailableTools.has(t));
+				if (auxDiags.length === 0 && auxUnavailable) {
+					push(
+						"skip",
+						`auxiliary ${auxIds.join(",")} unavailable (tool not installed; pass --install)`,
+					);
+					continue;
 				}
 				push(
 					auxDiags.length > 0 ? "pass" : "fail",
