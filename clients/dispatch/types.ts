@@ -13,6 +13,7 @@
 
 import type { FileKind } from "../file-kinds.js";
 import type { FileRole } from "../file-role.js";
+import type { PiLensProjectConfig } from "../project-lens-config.js";
 
 export type DefectClass =
 	| "silent-error"
@@ -162,6 +163,8 @@ export interface DispatchContext {
 	readonly autofix: boolean;
 	readonly deltaMode: boolean;
 	readonly facts: import("./fact-store.js").FactStore;
+	/** Project-local .pi-lens.json config captured for this dispatch. */
+	readonly projectConfig?: PiLensProjectConfig;
 	/** Only run blocking rules (severity: error) - used for fast feedback on file write */
 	readonly blockingOnly?: boolean;
 	readonly modifiedRanges?: ModifiedRange[];

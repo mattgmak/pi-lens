@@ -7,7 +7,10 @@ import {
 	getProjectIgnoreMatcher,
 } from "../../clients/file-utils.js";
 import { resetProjectLensConfigCache } from "../../clients/project-lens-config.js";
-import { collectSourceFiles } from "../../clients/source-filter.js";
+import {
+	collectSourceFiles,
+	collectSourceFilesAsync,
+} from "../../clients/source-filter.js";
 
 let tmpDir: string;
 
@@ -68,6 +71,21 @@ describe("createProjectIgnoreMatcher with project config", () => {
 		expect(
 			matcher.isIgnored(path.join(tmpDir, "project-ignored/x.ts"), false),
 		).toBe(true);
+	});
+
+	it("project ignore patterns support gitignore negation", () => {
+		fs.writeFileSync(
+			path.join(tmpDir, ".pi-lens.json"),
+			JSON.stringify({ ignore: ["fixtures/**", "!fixtures/keep.ts"] }),
+		);
+
+		const matcher = getProjectIgnoreMatcher(tmpDir);
+		expect(
+			matcher.isIgnored(path.join(tmpDir, "fixtures/noise.ts"), false),
+		).toBe(true);
+		expect(
+			matcher.isIgnored(path.join(tmpDir, "fixtures/keep.ts"), false),
+		).toBe(false);
 	});
 
 	it("getProjectIgnoreMatcher returns a clean matcher when no project config exists", () => {
@@ -137,9 +155,7 @@ describe("createProjectIgnoreMatcher with project config", () => {
 		);
 	});
 
-	it("project ignore patterns feed through collectSourceFiles", () => {
-		// End-to-end: a path that the project config ignores must not appear in
-		// the source file listing that drives every per-edit scan.
+	function writeSourceCollectionFixture(): void {
 		fs.writeFileSync(
 			path.join(tmpDir, ".pi-lens.json"),
 			JSON.stringify({ ignore: ["fixtures/**"] }),
@@ -153,9 +169,26 @@ describe("createProjectIgnoreMatcher with project config", () => {
 		const srcDir = path.join(tmpDir, "src");
 		fs.mkdirSync(srcDir);
 		fs.writeFileSync(path.join(srcDir, "real.ts"), "export const y = 2;\n");
+	}
 
-		const files = collectSourceFiles(tmpDir);
-		const rel = files.map((f) => path.relative(tmpDir, f).replace(/\\/g, "/"));
+	function relativeUnixPaths(files: string[]): string[] {
+		return files.map((f) => path.relative(tmpDir, f).replace(/\\/g, "/"));
+	}
+
+	it("project ignore patterns feed through collectSourceFiles", () => {
+		// End-to-end: a path that the project config ignores must not appear in
+		// the source file listing that drives every per-edit scan.
+		writeSourceCollectionFixture();
+
+		const rel = relativeUnixPaths(collectSourceFiles(tmpDir));
+		expect(rel).toContain("src/real.ts");
+		expect(rel).not.toContain("fixtures/noise.ts");
+	});
+
+	it("project ignore patterns feed through collectSourceFilesAsync", async () => {
+		writeSourceCollectionFixture();
+
+		const rel = relativeUnixPaths(await collectSourceFilesAsync(tmpDir));
 		expect(rel).toContain("src/real.ts");
 		expect(rel).not.toContain("fixtures/noise.ts");
 	});

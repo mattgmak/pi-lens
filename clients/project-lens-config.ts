@@ -15,19 +15,20 @@
  *
  * The file is loaded once per `(path, mtimeMs)` and cached — editing the file
  * invalidates the cache so the next access sees the new values without
- * restarting pi. Caller (currently `applyProjectLensConfig` in
- * `dispatch/integration.ts`) is responsible for translating the parsed values
- * into the relevant setters; this module is intentionally only a parser.
+ * restarting pi. Discovery is cached by starting directory and validated by the
+ * cached directory mtimes plus the config-file mtime, so hot paths do not repeat
+ * candidate-file probes on every dispatch.
  *
  * The loader walks up from the starting directory until it finds a config file
  * (mirroring `lsp/config.ts`'s `loadLSPConfig` so project-monorepos with a
  * `.pi-lens.json` at the repo root work without per-subdir configs).
  *
- * A malformed file is silently treated as "no config" — we never want a stray
- * syntax error in user-edited JSON to break diagnostics.
+ * A malformed file is treated as "no config" and logged once — we never want a
+ * stray syntax error in user-edited JSON to break diagnostics.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { walkUpDirs } from "./path-utils.js";
 
 const PROJECT_CONFIG_BASENAMES = [".pi-lens.json", "pi-lens.json"];
 
@@ -45,8 +46,6 @@ export interface PiLensProjectConfig {
 	raw: unknown;
 	/** Absolute path of the config file that was loaded, or undefined if none. */
 	configPath: string | undefined;
-	/** Directory containing the config file, or undefined if none was loaded. */
-	configDir: string | undefined;
 }
 
 export const EMPTY_PROJECT_CONFIG: PiLensProjectConfig = {
@@ -54,7 +53,6 @@ export const EMPTY_PROJECT_CONFIG: PiLensProjectConfig = {
 	rules: {},
 	raw: undefined,
 	configPath: undefined,
-	configDir: undefined,
 };
 
 interface CacheEntry {
@@ -62,15 +60,25 @@ interface CacheEntry {
 	config: PiLensProjectConfig;
 }
 
+interface DiscoveryCacheEntry {
+	info: PiLensProjectConfigFileInfo | undefined;
+	dirMtimes: Array<{ dir: string; mtimeMs: number }>;
+}
+
 /** Cache by absolute config path; we read each candidate's mtime before reuse. */
 const configCache = new Map<string, CacheEntry>();
+const discoveryCache = new Map<string, DiscoveryCacheEntry>();
+const warnedInvalidConfigs = new Set<string>();
 
 /**
  * Walk up from `startDir` looking for a `.pi-lens.json` or `pi-lens.json`.
  * Returns the parsed config, or an empty config if none was found.
  */
-export function loadPiLensProjectConfig(startDir: string): PiLensProjectConfig {
-	const configInfo = findPiLensProjectConfig(startDir);
+export function loadPiLensProjectConfig(
+	startDir: string,
+	preloadedInfo = findPiLensProjectConfig(startDir),
+): PiLensProjectConfig {
+	const configInfo = preloadedInfo;
 	if (!configInfo) return EMPTY_PROJECT_CONFIG;
 
 	const cached = configCache.get(configInfo.path);
@@ -86,6 +94,8 @@ export function loadPiLensProjectConfig(startDir: string): PiLensProjectConfig {
 /** For tests + callers that need to force a re-read (e.g. config-watcher hooks). */
 export function resetProjectLensConfigCache(): void {
 	configCache.clear();
+	discoveryCache.clear();
+	warnedInvalidConfigs.clear();
 }
 
 export interface PiLensProjectConfigFileInfo {
@@ -97,23 +107,66 @@ export interface PiLensProjectConfigFileInfo {
 export function findPiLensProjectConfig(
 	startDir: string,
 ): PiLensProjectConfigFileInfo | undefined {
-	let dir = path.resolve(startDir);
-	while (true) {
+	const cacheKey = path.resolve(startDir);
+	const cached = discoveryCache.get(cacheKey);
+	if (cached && discoveryCacheStillFresh(cached)) {
+		if (!cached.info) return undefined;
+		const stat = safeFileStat(cached.info.path);
+		if (stat?.isFile()) return { ...cached.info, mtimeMs: stat.mtimeMs };
+	}
+
+	const discovered = discoverPiLensProjectConfig(cacheKey);
+	discoveryCache.set(cacheKey, discovered);
+	return discovered.info;
+}
+
+function safeFileStat(filePath: string): fs.Stats | undefined {
+	try {
+		return fs.statSync(filePath);
+	} catch {
+		return undefined;
+	}
+}
+
+function safeDirMtimeMs(dir: string): number {
+	try {
+		return fs.statSync(dir).mtimeMs;
+	} catch {
+		return -1;
+	}
+}
+
+function discoveryCacheStillFresh(entry: DiscoveryCacheEntry): boolean {
+	return entry.dirMtimes.every(
+		(cached) => safeDirMtimeMs(cached.dir) === cached.mtimeMs,
+	);
+}
+
+function discoverPiLensProjectConfig(startDir: string): DiscoveryCacheEntry {
+	const dirMtimes: Array<{ dir: string; mtimeMs: number }> = [];
+	for (const dir of walkUpDirs(startDir)) {
+		dirMtimes.push({ dir, mtimeMs: safeDirMtimeMs(dir) });
 		for (const name of PROJECT_CONFIG_BASENAMES) {
 			const candidate = path.join(dir, name);
-			try {
-				const stat = fs.statSync(candidate);
-				if (stat.isFile()) {
-					return { path: candidate, dir, mtimeMs: stat.mtimeMs };
-				}
-			} catch {
-				// not present; keep walking
+			const stat = safeFileStat(candidate);
+			if (stat?.isFile()) {
+				return {
+					info: { path: candidate, dir, mtimeMs: stat.mtimeMs },
+					dirMtimes,
+				};
 			}
 		}
-		const parent = path.dirname(dir);
-		if (parent === dir) return undefined; // reached fs root
-		dir = parent;
 	}
+	return { info: undefined, dirMtimes };
+}
+
+function warnInvalidConfigOnce(configPath: string, reason: string): void {
+	const key = `${configPath}:${reason}`;
+	if (warnedInvalidConfigs.has(key)) return;
+	warnedInvalidConfigs.add(key);
+	console.error(
+		`[pi-lens] ignoring invalid project config ${configPath}: ${reason}`,
+	);
 }
 
 function parseConfigFile(configPath: string): PiLensProjectConfig {
@@ -121,11 +174,16 @@ function parseConfigFile(configPath: string): PiLensProjectConfig {
 	try {
 		const text = fs.readFileSync(configPath, "utf-8");
 		raw = JSON.parse(text);
-	} catch {
+	} catch (error) {
+		warnInvalidConfigOnce(
+			configPath,
+			error instanceof Error ? error.message : "failed to parse JSON",
+		);
 		return EMPTY_PROJECT_CONFIG;
 	}
 
 	if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+		warnInvalidConfigOnce(configPath, "top-level value must be an object");
 		return EMPTY_PROJECT_CONFIG;
 	}
 
@@ -149,9 +207,14 @@ function parseConfigFile(configPath: string): PiLensProjectConfig {
 				r.threshold > 0
 			) {
 				rules[ruleId] = { threshold: r.threshold };
+			} else if ("threshold" in r) {
+				warnInvalidConfigOnce(
+					configPath,
+					`rules.${ruleId}.threshold must be a positive finite number`,
+				);
 			}
 		}
 	}
 
-	return { ignore, rules, raw, configPath, configDir: path.dirname(configPath) };
+	return { ignore, rules, raw, configPath };
 }

@@ -2,21 +2,26 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-	applyProjectLensConfig,
-	resetDispatchBaselines,
-} from "../../../clients/dispatch/integration.js";
+import { createDispatchContext } from "../../../clients/dispatch/dispatcher.js";
+import { applyProjectLensConfig } from "../../../clients/dispatch/integration.js";
 import { FactStore } from "../../../clients/dispatch/fact-store.js";
 import { highComplexityRule } from "../../../clients/dispatch/rules/high-complexity.js";
 import { highFanOutRule } from "../../../clients/dispatch/rules/high-fan-out.js";
 import { resetHighComplexityThresholds } from "../../../clients/dispatch/rules/high-complexity.js";
 import { resetHighFanOutThreshold } from "../../../clients/dispatch/rules/high-fan-out.js";
-import { resetProjectLensConfigCache } from "../../../clients/project-lens-config.js";
+import {
+	resetProjectLensConfigCache,
+	type PiLensProjectConfig,
+} from "../../../clients/project-lens-config.js";
 import type { DispatchContext } from "../../../clients/dispatch/types.js";
 import type { FileKind } from "../../../clients/file-kinds.js";
 import type { FunctionSummary } from "../../../clients/dispatch/facts/function-facts.js";
 
-function makeCtx(filePath: string, facts: FactStore): DispatchContext {
+function makeCtx(
+	filePath: string,
+	facts: FactStore,
+	projectConfig?: PiLensProjectConfig,
+): DispatchContext {
 	return {
 		filePath,
 		cwd: "/tmp",
@@ -26,6 +31,7 @@ function makeCtx(filePath: string, facts: FactStore): DispatchContext {
 		autofix: false,
 		deltaMode: false,
 		facts,
+		projectConfig,
 		hasTool: async () => false,
 		log: () => {},
 	};
@@ -87,13 +93,13 @@ describe("applyProjectLensConfig", () => {
 	it("is a no-op when no .pi-lens.json exists", () => {
 		// Reset to known baseline (defaults), then apply with no config present.
 		// Expectation: thresholds stay at defaults (15 / 20).
-		applyProjectLensConfig(tmpDir);
+		const config = applyProjectLensConfig(tmpDir);
 
 		const filePath = "/tmp/a.ts";
 		const facts = new FactStore();
 		// CC=15 — exactly at default → should flag
 		facts.setFileFact(filePath, "file.functionSummaries", [summaryWithCC(15)]);
-		const ctx = makeCtx(filePath, facts);
+		const ctx = makeCtx(filePath, facts, config);
 		expect(highComplexityRule.evaluate(ctx, facts)).toHaveLength(1);
 	});
 
@@ -105,13 +111,13 @@ describe("applyProjectLensConfig", () => {
 			}),
 		);
 
-		applyProjectLensConfig(tmpDir);
+		const config = applyProjectLensConfig(tmpDir);
 
 		const filePath = "/tmp/a.ts";
 		const facts = new FactStore();
 		// CC=6 — above new threshold (5), below default (15) → should flag
 		facts.setFileFact(filePath, "file.functionSummaries", [summaryWithCC(6)]);
-		const ctx = makeCtx(filePath, facts);
+		const ctx = makeCtx(filePath, facts, config);
 		expect(highComplexityRule.evaluate(ctx, facts)).toHaveLength(1);
 	});
 
@@ -123,7 +129,7 @@ describe("applyProjectLensConfig", () => {
 			}),
 		);
 
-		applyProjectLensConfig(tmpDir);
+		const config = applyProjectLensConfig(tmpDir);
 
 		const filePath = "/tmp/a.ts";
 		const facts = new FactStore();
@@ -131,7 +137,7 @@ describe("applyProjectLensConfig", () => {
 		facts.setFileFact(filePath, "file.functionSummaries", [
 			summaryWithCallees(6),
 		]);
-		const ctx = makeCtx(filePath, facts);
+		const ctx = makeCtx(filePath, facts, config);
 		expect(highFanOutRule.evaluate(ctx, facts)).toHaveLength(1);
 	});
 
@@ -146,7 +152,7 @@ describe("applyProjectLensConfig", () => {
 			}),
 		);
 
-		applyProjectLensConfig(tmpDir);
+		const config = applyProjectLensConfig(tmpDir);
 
 		const filePath = "/tmp/a.ts";
 		const facts = new FactStore();
@@ -154,7 +160,7 @@ describe("applyProjectLensConfig", () => {
 			summaryWithCC(6),
 			summaryWithCallees(6),
 		]);
-		const ctx = makeCtx(filePath, facts);
+		const ctx = makeCtx(filePath, facts, config);
 		expect(highComplexityRule.evaluate(ctx, facts)).toHaveLength(1);
 		expect(highFanOutRule.evaluate(ctx, facts)).toHaveLength(1);
 	});
@@ -171,13 +177,15 @@ describe("applyProjectLensConfig", () => {
 			}),
 		);
 
-		// Should not throw.
-		expect(() => applyProjectLensConfig(tmpDir)).not.toThrow();
+		let config: PiLensProjectConfig | undefined;
+		expect(() => {
+			config = applyProjectLensConfig(tmpDir);
+		}).not.toThrow();
 
 		const filePath = "/tmp/a.ts";
 		const facts = new FactStore();
 		facts.setFileFact(filePath, "file.functionSummaries", [summaryWithCC(6)]);
-		const ctx = makeCtx(filePath, facts);
+		const ctx = makeCtx(filePath, facts, config);
 		expect(highComplexityRule.evaluate(ctx, facts)).toHaveLength(1);
 	});
 
@@ -190,22 +198,22 @@ describe("applyProjectLensConfig", () => {
 			}),
 		);
 
-		applyProjectLensConfig(tmpDir);
+		let config = applyProjectLensConfig(tmpDir);
 		let filePath = "/tmp/a.ts";
 		let facts = new FactStore();
 		facts.setFileFact(filePath, "file.functionSummaries", [summaryWithCC(10)]);
-		let ctx = makeCtx(filePath, facts);
+		let ctx = makeCtx(filePath, facts, config);
 		expect(highComplexityRule.evaluate(ctx, facts)).toHaveLength(1);
 
 		await new Promise((r) => setTimeout(r, 20));
 		fs.writeFileSync(configPath, JSON.stringify({ rules: {} }));
-		applyProjectLensConfig(tmpDir);
+		config = applyProjectLensConfig(tmpDir);
 
 		filePath = "/tmp/b.ts";
 		facts = new FactStore();
 		// CC=10 — below default (15) → should NOT flag after config removal.
 		facts.setFileFact(filePath, "file.functionSummaries", [summaryWithCC(10)]);
-		ctx = makeCtx(filePath, facts);
+		ctx = makeCtx(filePath, facts, config);
 		expect(highComplexityRule.evaluate(ctx, facts)).toHaveLength(0);
 	});
 
@@ -220,7 +228,7 @@ describe("applyProjectLensConfig", () => {
 			);
 
 			applyProjectLensConfig(tmpDir);
-			applyProjectLensConfig(otherDir);
+			const otherConfig = applyProjectLensConfig(otherDir);
 
 			const filePath = "/tmp/a.ts";
 			const facts = new FactStore();
@@ -228,14 +236,14 @@ describe("applyProjectLensConfig", () => {
 			facts.setFileFact(filePath, "file.functionSummaries", [
 				summaryWithCallees(6),
 			]);
-			const ctx = makeCtx(filePath, facts);
+			const ctx = makeCtx(filePath, facts, otherConfig);
 			expect(highFanOutRule.evaluate(ctx, facts)).toHaveLength(0);
 		} finally {
 			fs.rmSync(otherDir, { recursive: true, force: true });
 		}
 	});
 
-	it("resetDispatchBaselines applies project config through the production entry point", () => {
+	it("createDispatchContext carries project config through the production entry point", () => {
 		fs.writeFileSync(
 			path.join(tmpDir, ".pi-lens.json"),
 			JSON.stringify({
@@ -243,12 +251,16 @@ describe("applyProjectLensConfig", () => {
 			}),
 		);
 
-		resetDispatchBaselines(tmpDir);
-
-		const filePath = "/tmp/a.ts";
+		const filePath = path.join(tmpDir, "a.ts");
 		const facts = new FactStore();
 		facts.setFileFact(filePath, "file.functionSummaries", [summaryWithCC(6)]);
-		const ctx = makeCtx(filePath, facts);
+		const ctx = createDispatchContext(
+			filePath,
+			tmpDir,
+			{ getFlag: () => undefined },
+			facts,
+			false,
+		);
 		expect(highComplexityRule.evaluate(ctx, facts)).toHaveLength(1);
 	});
 
@@ -258,12 +270,12 @@ describe("applyProjectLensConfig", () => {
 			JSON.stringify({ ignore: ["fixtures/**"] }),
 		);
 
-		applyProjectLensConfig(tmpDir);
+		const config = applyProjectLensConfig(tmpDir);
 
 		const filePath = "/tmp/a.ts";
 		const facts = new FactStore();
 		facts.setFileFact(filePath, "file.functionSummaries", [summaryWithCC(10)]);
-		const ctx = makeCtx(filePath, facts);
+		const ctx = makeCtx(filePath, facts, config);
 		expect(highComplexityRule.evaluate(ctx, facts)).toHaveLength(0);
 	});
 
@@ -275,14 +287,14 @@ describe("applyProjectLensConfig", () => {
 			}),
 		);
 
-		applyProjectLensConfig(tmpDir);
+		const config = applyProjectLensConfig(tmpDir);
 		resetHighComplexityThresholds();
 
 		const filePath = "/tmp/a.ts";
 		const facts = new FactStore();
-		// CC=10 — below default (15) → should NOT flag after reset
+		// Project config is context-scoped and still applies after fallback reset.
 		facts.setFileFact(filePath, "file.functionSummaries", [summaryWithCC(10)]);
-		const ctx = makeCtx(filePath, facts);
-		expect(highComplexityRule.evaluate(ctx, facts)).toHaveLength(0);
+		const ctx = makeCtx(filePath, facts, config);
+		expect(highComplexityRule.evaluate(ctx, facts)).toHaveLength(1);
 	});
 });

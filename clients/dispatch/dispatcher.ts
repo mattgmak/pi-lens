@@ -25,6 +25,7 @@ import { getPrimaryDispatchGroup } from "../language-policy.js";
 import { resolveLanguageRootForFile } from "../language-profile.js";
 import { logLatency } from "../latency-logger.js";
 import { normalizeMapKey } from "../path-utils.js";
+import { loadPiLensProjectConfig } from "../project-lens-config.js";
 import { RUNTIME_CONFIG, getRunnerTimeoutFloorMs } from "../runtime-config.js";
 import { safeSpawnAsync } from "../safe-spawn.js";
 import { classifyDiagnostic } from "./diagnostic-taxonomy.js";
@@ -156,6 +157,7 @@ export function createDispatchContext(
 		normalizedFilePath,
 		readFilePrefix(normalizedFilePath),
 	);
+	const projectConfig = loadPiLensProjectConfig(normalizedCwd);
 
 	return {
 		filePath: normalizedFilePath,
@@ -166,6 +168,7 @@ export function createDispatchContext(
 		autofix: false,
 		deltaMode: !pi.getFlag("no-delta"),
 		facts,
+		projectConfig,
 		blockingOnly,
 		modifiedRanges,
 
@@ -938,9 +941,7 @@ async function runRunner(
 				timer = setTimeout(
 					() =>
 						reject(
-							new Error(
-								`Runner ${runner.id} timed out after ${timeoutMs}ms`,
-							),
+							new Error(`Runner ${runner.id} timed out after ${timeoutMs}ms`),
 						),
 					timeoutMs,
 				);

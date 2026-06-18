@@ -107,17 +107,8 @@ import { asyncNoiseRule } from "./rules/async-noise.js";
 import { asyncUnnecessaryWrapperRule } from "./rules/async-unnecessary-wrapper.js";
 import { errorObscuringRule } from "./rules/error-obscuring.js";
 import { errorSwallowingRule } from "./rules/error-swallowing.js";
-import {
-	DEFAULT_HIGH_COMPLEXITY_DEPTH_THRESHOLD,
-	highComplexityRule,
-	resetHighComplexityThresholds,
-	setHighComplexityThresholds,
-} from "./rules/high-complexity.js";
-import {
-	highFanOutRule,
-	resetHighFanOutThreshold,
-	setHighFanOutThreshold,
-} from "./rules/high-fan-out.js";
+import { highComplexityRule } from "./rules/high-complexity.js";
+import { highFanOutRule } from "./rules/high-fan-out.js";
 import { missingErrorPropagationRule } from "./rules/missing-error-propagation.js";
 import { passThroughWrappersRule } from "./rules/pass-through-wrappers.js";
 import { placeholderCommentsRule } from "./rules/placeholder-comments.js";
@@ -136,7 +127,10 @@ import {
 	maxSwitchCasesRule,
 } from "./rules/sonar-rules.js";
 import { unsafeBoundaryRule } from "./rules/unsafe-boundary.js";
-import { loadPiLensProjectConfig } from "../project-lens-config.js";
+import {
+	loadPiLensProjectConfig,
+	type PiLensProjectConfig,
+} from "../project-lens-config.js";
 
 registerRule(errorObscuringRule);
 registerRule(errorSwallowingRule);
@@ -160,41 +154,15 @@ registerRule(highImportCouplingRule);
 registerRule(noComplexConditionalsRule);
 
 /**
- * Apply a project's `.pi-lens.json` overrides to the registered rules.
+ * Load a project's `.pi-lens.json` config.
  *
- * Currently honors:
- *   - `rules["high-complexity"].threshold` (cyclomatic complexity)
- *   - `rules["high-fan-out"].threshold`     (distinct-function calls)
- *
- * The depth-threshold sub-knob of `high-complexity` is left at its hardcoded
- * default (6); only the CC threshold is exposed in config to keep the schema
- * small. Calling repeatedly is safe and idempotent; the underlying loader is
- * mtime-cached so re-applying within a session is essentially free.
- *
- * Called on session start via `resetDispatchBaselines(cwd)` and before each
- * dispatch entry point so config edits are picked up on the next scan.
+ * Rule thresholds are consumed from `DispatchContext.projectConfig` during rule
+ * evaluation, not applied to process-global module state. Keeping this helper as
+ * a thin loader preserves the existing integration seam while avoiding
+ * cross-workspace threshold bleed when multiple dispatches overlap.
  */
-export function applyProjectLensConfig(cwd: string): void {
-	// Rule thresholds are process-global module state. Always reset first so
-	// removing a key from `.pi-lens.json` (or switching to a project without one)
-	// returns to the historical defaults instead of leaking a previous override.
-	resetHighComplexityThresholds();
-	resetHighFanOutThreshold();
-
-	const config = loadPiLensProjectConfig(cwd);
-
-	const complexity = config.rules["high-complexity"];
-	if (typeof complexity?.threshold === "number") {
-		setHighComplexityThresholds(
-			complexity.threshold,
-			DEFAULT_HIGH_COMPLEXITY_DEPTH_THRESHOLD,
-		);
-	}
-
-	const fanOut = config.rules["high-fan-out"];
-	if (typeof fanOut?.threshold === "number") {
-		setHighFanOutThreshold(fanOut.threshold);
-	}
+export function applyProjectLensConfig(cwd: string): PiLensProjectConfig {
+	return loadPiLensProjectConfig(cwd);
 }
 
 const sessionFacts = new FactStore();
@@ -1332,7 +1300,6 @@ export async function dispatchLint(
 	pi: PiAgentAPI,
 	modifiedRanges?: ModifiedRange[],
 ): Promise<string> {
-	applyProjectLensConfig(cwd);
 	// By default, only run BLOCKING rules for fast feedback on file write
 	// Uses persistent sessionBaselines so delta mode actually filters
 	// pre-existing issues after the first write.
@@ -1373,7 +1340,6 @@ export async function dispatchLintWithResult(
 	logContext?: LogContext,
 	options?: { blockingOnly?: boolean },
 ): Promise<DispatchResult> {
-	applyProjectLensConfig(cwd);
 	// Default true preserves the per-edit fast path (errors only). Callers that
 	// want the full picture (warnings + structural smells), e.g. the MCP review
 	// facade, pass blockingOnly=false to run every runner.
@@ -1456,7 +1422,6 @@ export async function dispatchLintDetailed(
 	pi: PiAgentAPI,
 	options?: { blockingOnly?: boolean; modifiedRanges?: ModifiedRange[] },
 ): Promise<{ result: DispatchResult; runners: RunnerOutcome[] }> {
-	applyProjectLensConfig(cwd);
 	const empty: DispatchResult = {
 		diagnostics: [],
 		blockers: [],

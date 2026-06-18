@@ -368,13 +368,14 @@ function gitignoreMtimeMs(rootDir: string): number {
  * `.pi-lens.json` from a parent directory.
  */
 function lensConfigInfo(rootDir: string): {
+	info: ReturnType<typeof findPiLensProjectConfig>;
 	path: string | undefined;
 	mtimeMs: number;
 } {
 	const info = findPiLensProjectConfig(rootDir);
 	return info
-		? { path: info.path, mtimeMs: info.mtimeMs }
-		: { path: undefined, mtimeMs: -1 };
+		? { info, path: info.path, mtimeMs: info.mtimeMs }
+		: { info, path: undefined, mtimeMs: -1 };
 }
 
 export function getProjectIgnoreMatcher(rootDir: string): ProjectIgnoreMatcher {
@@ -393,7 +394,7 @@ export function getProjectIgnoreMatcher(rootDir: string): ProjectIgnoreMatcher {
 	// Load the project config fresh on cache miss. The loader is itself
 	// mtime-cached, so the cost here is one stat + one map lookup when the
 	// config hasn't changed since the last call — and a full parse when it has.
-	const projectConfig = loadPiLensProjectConfig(resolvedRoot);
+	const projectConfig = loadPiLensProjectConfig(resolvedRoot, lensConfig.info);
 	const matcher = createProjectIgnoreMatcher(
 		resolvedRoot,
 		projectConfig.ignore,

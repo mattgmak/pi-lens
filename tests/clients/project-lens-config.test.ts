@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	findPiLensProjectConfig,
 	loadPiLensProjectConfig,
@@ -13,11 +13,13 @@ let tmpDir: string;
 beforeEach(() => {
 	tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-project-config-"));
 	resetProjectLensConfigCache();
+	vi.spyOn(console, "error").mockImplementation(() => {});
 });
 
 afterEach(() => {
 	fs.rmSync(tmpDir, { recursive: true, force: true });
 	resetProjectLensConfigCache();
+	vi.restoreAllMocks();
 });
 
 describe("loadPiLensProjectConfig", () => {
@@ -41,7 +43,6 @@ describe("loadPiLensProjectConfig", () => {
 		expect(cfg.ignore).toEqual(["**/__tests__/**", "fixtures/**"]);
 		expect(cfg.rules["high-complexity"]?.threshold).toBe(25);
 		expect(cfg.configPath).toBe(path.join(tmpDir, ".pi-lens.json"));
-		expect(cfg.configDir).toBe(tmpDir);
 	});
 
 	it("accepts pi-lens.json (no leading dot) as a fallback name", () => {
@@ -98,6 +99,9 @@ describe("loadPiLensProjectConfig", () => {
 		const cfg = loadPiLensProjectConfig(tmpDir);
 		expect(cfg.ignore).toEqual([]);
 		expect(cfg.configPath).toBeUndefined();
+		expect(console.error).toHaveBeenCalledWith(
+			expect.stringContaining("ignoring invalid project config"),
+		);
 	});
 
 	it("returns empty config when root is a non-object JSON value", () => {
@@ -133,6 +137,9 @@ describe("loadPiLensProjectConfig", () => {
 			}),
 		);
 		const cfg = loadPiLensProjectConfig(tmpDir);
+		expect(console.error).toHaveBeenCalledWith(
+			expect.stringContaining("threshold must be a positive finite number"),
+		);
 		expect(cfg.rules["high-complexity"]).toBeUndefined();
 		expect(cfg.rules["high-fan-out"]).toBeUndefined();
 		expect(cfg.rules["high-import-coupling"]).toBeUndefined();

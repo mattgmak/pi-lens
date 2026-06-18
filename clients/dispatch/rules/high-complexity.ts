@@ -2,10 +2,10 @@ import type { FactRule } from "../fact-provider-types.js";
 import type { Diagnostic } from "../types.js";
 import type { FunctionSummary } from "../facts/function-facts.js";
 
-// Thresholds are mutable so a project's `.pi-lens.json` can override them via
-// `rules["high-complexity"].threshold` (cyclomatic complexity) and (implicitly)
-// the depth threshold via the same setter. Defaults match the historical
-// hardcoded values so behavior is unchanged for projects without a config.
+// Defaults match the historical hardcoded values so behavior is unchanged for
+// projects without a config. Project-specific overrides are read from the
+// per-dispatch context; these mutable fallbacks exist for tests/legacy direct
+// rule evaluation only.
 export const DEFAULT_HIGH_COMPLEXITY_THRESHOLD = 15;
 export const DEFAULT_HIGH_COMPLEXITY_DEPTH_THRESHOLD = 6;
 let ccThreshold = DEFAULT_HIGH_COMPLEXITY_THRESHOLD;
@@ -15,8 +15,10 @@ function isPositiveFiniteThreshold(value: number): boolean {
 	return Number.isFinite(value) && value > 0;
 }
 
-/** Override thresholds from a project's `.pi-lens.json`. Idempotent. */
+/** Override fallback thresholds for tests/legacy direct rule evaluation. */
 export function setHighComplexityThresholds(cc: number, depth: number): void {
+	// Non-positive thresholds make every function violate the rule; treat them as
+	// invalid config/test input rather than turning the rule into noise.
 	if (isPositiveFiniteThreshold(cc)) ccThreshold = cc;
 	if (isPositiveFiniteThreshold(depth)) depthThreshold = depth;
 }
@@ -41,9 +43,12 @@ export const highComplexityRule: FactRule = {
 			) ?? [];
 
 		const diagnostics: Diagnostic[] = [];
+		const configuredCcThreshold =
+			ctx.projectConfig?.rules["high-complexity"]?.threshold;
+		const activeCcThreshold = configuredCcThreshold ?? ccThreshold;
 
 		for (const f of fns) {
-			const ccBreached = f.cyclomaticComplexity >= ccThreshold;
+			const ccBreached = f.cyclomaticComplexity >= activeCcThreshold;
 			const depthBreached = f.maxNestingDepth >= depthThreshold;
 			if (!ccBreached && !depthBreached) continue;
 
