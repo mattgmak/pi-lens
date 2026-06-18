@@ -13,7 +13,6 @@ import {
 } from "../dispatch/facts/import-facts.js";
 import type { DispatchContext } from "../dispatch/types.js";
 import { featureHintMetadata } from "../feature-hints.js";
-import { getProjectDataDir } from "../file-utils.js";
 import { detectFileKind } from "../file-kinds.js";
 import { detectFileRole } from "../file-role.js";
 import { getProjectDataDir } from "../file-utils.js";
