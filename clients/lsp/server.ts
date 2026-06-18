@@ -17,6 +17,7 @@ import { KIND_EXTENSIONS } from "../file-kinds.js";
 import { ensureTool, getToolEnvironment } from "../installer/index.js";
 import { resolveOpengrepConfig } from "../opengrep-config.js";
 import { logLatency } from "../latency-logger.js";
+import { findLocalSgconfig, resolveBaselineSgconfig } from "../sgconfig.js";
 import { isCommandAvailableAsync, safeSpawnAsync } from "../safe-spawn.js";
 import { type LSPProcess, launchLSP } from "./launch.js";
 import { normalizeMapKey } from "./path-utils.js";
@@ -2095,16 +2096,15 @@ export const OpengrepServer: LSPServerInfo = {
 
 // ast-grep — a polyglot structural linter that speaks LSP. Like Opengrep it is a
 // cross-cutting, diagnostic-only auxiliary (never a file's primary language
-// server). Unlike Opengrep it is **sgconfig-gated**: the `ast-grep lsp` server
-// only operates in a project with an `sgconfig.y[a]ml` root, so its root detector
-// keys on that marker — no sgconfig ⇒ undefined root ⇒ it never attaches and the
-// existing napi ast-grep runner remains the path (Phase 1 of #239; the no-sgconfig
-// baseline via `--config` + shipped rules is Phase 2). When present, it surfaces
-// the team's OWN curated rules with codeAction fixes. NOTE: the napi runner is NOT
-// a subset — it delegates to napi's native engine via root.findAll({rule}) (#206),
-// the SAME Rust core as this LSP and the ast-grep CLI, so rule semantics are
-// identical across all three. The LSP's edge over napi is engine-driven codeAction
-// fixes + native sgconfig discovery, not faithfulness of matching.
+// server). It attaches EVERYWHERE (#239 Phase 2): a project `sgconfig.y[a]ml`
+// surfaces the team's OWN curated rules (auto-discovered), and absent one it
+// launches with `--config <shipped baseline>` so pi-lens's bundled ruleset runs
+// anyway — superseding the in-process napi runner, which steps aside when this
+// server's binary is available (and resumes as the fallback when it isn't —
+// Gate B). NOTE: the napi runner is NOT a subset — it delegates to napi's native
+// engine via root.findAll({rule}) (#206), the SAME Rust core as this LSP and the
+// ast-grep CLI, so rule semantics are identical across all three. The LSP's edge
+// is engine-driven codeAction fixes, not faithfulness of matching.
 const AST_GREP_KINDS = [
 	"csharp",
 	"cxx",
@@ -2142,18 +2142,31 @@ export const AstGrepServer: LSPServerInfo = {
 	name: "ast-grep structural linter",
 	role: "auxiliary",
 	extensions: AST_GREP_EXTENSIONS,
-	// sgconfig-gated: only a project with sgconfig.y[a]ml gets the server. No
-	// fallback — absence means "don't attach" (the napi runner stays).
-	root: createRootDetector(["sgconfig.yml", "sgconfig.yaml"]),
+	// Attaches everywhere (#239 Phase 2): prefer a project `sgconfig.y[a]ml` root,
+	// else the repo root (.git) or cwd — like Opengrep. When there's no project
+	// sgconfig the spawn launches with `--config <shipped baseline>` so the team's
+	// rules still run; the napi runner steps aside when this server is available
+	// (it falls back to napi when the ast-grep binary is absent — Gate B).
+	root: RootWithFallback(
+		createRootDetector(["sgconfig.yml", "sgconfig.yaml"]),
+		RootWithFallback(NearestRoot([".git"]), async () => process.cwd()),
+	),
 	availabilityKey: "ast-grep",
-	// First scan of a session compiles the project's rules.
+	// First scan of a session compiles the rules.
 	initializeTimeoutMs: 15000,
 	async spawn(root, options) {
-		// `ast-grep lsp` auto-discovers sgconfig from its cwd (the sgconfig root).
+		// A project sgconfig wins (the team's curated ruleset, auto-discovered from
+		// cwd). Otherwise point `--config` at pi-lens's shipped baseline ruleset.
+		const projectSgconfig = findLocalSgconfig(root);
+		let args = ["lsp"];
+		if (!projectSgconfig) {
+			const baseline = resolveBaselineSgconfig();
+			if (baseline) args = ["lsp", "--config", baseline];
+		}
 		return resolveAndLaunch(
 			{
 				candidates: ["ast-grep"],
-				args: ["lsp"],
+				args,
 				cwd: root,
 				managedToolId: "ast-grep",
 			},

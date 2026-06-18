@@ -11,6 +11,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { resolvePackagePath } from "../../package-root.js";
 import { hasEslintConfig } from "../../tool-policy.js";
+import { enabledAuxiliaryLspServerIds } from "../auxiliary-lsp.js";
 import { classifyDefect } from "../diagnostic-taxonomy.js";
 import { PRIORITY } from "../priorities.js";
 import type {
@@ -155,6 +156,18 @@ const astGrepNapiRunner: RunnerDefinition = {
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		if (!canHandle(ctx.filePath)) {
+			return { status: "skipped", diagnostics: [], semantic: "none" };
+		}
+
+		// #239 Phase 2: the ast-grep LSP supersedes this in-process runner when its
+		// binary is available — same Rust engine, plus codeAction fixes, and it runs
+		// the shipped baseline ruleset via `--config`. Skip here so we don't double-
+		// report against the LSP's `tool: ast-grep` diagnostics. Resume ONLY as the
+		// fallback when the binary is absent / can't spawn (Gate B).
+		const astGrepLspEnabled = enabledAuxiliaryLspServerIds((f) =>
+			ctx.pi?.getFlag?.(f),
+		).includes("ast-grep");
+		if (astGrepLspEnabled && (await ctx.hasTool("ast-grep"))) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 

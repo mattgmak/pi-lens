@@ -415,6 +415,21 @@ const LSP_FIXTURES = [
 		auxiliarySourceMatch: "ast[-_]?grep",
 		gitInit: true,
 	},
+	// ast-grep no-sgconfig BASELINE (#239 Phase 2). NO sgconfig in the fixture, so
+	// the server must attach everywhere and launch with `lsp --config <shipped
+	// baseline>` to run pi-lens's bundled ruleset (`arr.sort()` → the shipped
+	// `no-sort-without-comparator`). Proves the baseline path, distinct from the
+	// sgconfig-gated team-rules path above.
+	{
+		lang: "ast-grep-baseline",
+		dir: "tests/fixtures/tool-smoke/ast-grep-baseline",
+		file: "bad.ts",
+		serverHint: "ast-grep (no-sgconfig baseline)",
+		tools: ["ast-grep"],
+		auxiliaryServerIds: ["ast-grep"],
+		auxiliarySourceMatch: "ast[-_]?grep",
+		gitInit: true,
+	},
 	// Alternate primary servers — a second language server for a language whose
 	// default is registered ahead of it (deno↔typescript, jedi↔pyright). They are
 	// reached only when the default is unavailable/disabled, so the harness writes

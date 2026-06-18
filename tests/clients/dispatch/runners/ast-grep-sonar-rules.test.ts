@@ -33,7 +33,10 @@ async function rulesFiredOn(
 		deltaMode: true,
 		blockingOnly: false,
 		facts: new FactStore(),
-		hasTool: async () => true,
+		// napi is the fallback now (the ast-grep LSP supersedes it when its binary
+		// is available, #239 Phase 2); simulate the binary absent so this runner's
+		// rule matching actually executes.
+		hasTool: async (cmd: string) => cmd !== "ast-grep",
 		log: () => {},
 	};
 	const result = await runner.run(ctx as never);

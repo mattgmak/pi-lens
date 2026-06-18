@@ -32,11 +32,43 @@ function createCtx(filePath: string, overrides: Partial<Record<string, unknown>>
 		deltaMode: true,
 		blockingOnly: false,
 		facts: new FactStore(),
-		hasTool: async () => true,
+		// Default to the fallback path: the ast-grep LSP supersedes this runner
+		// when its binary is available (#239 Phase 2), so to exercise napi's own
+		// matching we simulate the binary being ABSENT. The gate is tested
+		// explicitly below by overriding hasTool.
+		hasTool: async (cmd: string) => cmd !== "ast-grep",
 		log: () => {},
 		...overrides,
 	};
 }
+
+describe("ast-grep-napi runner — LSP supersede gate (#239 Phase 2)", () => {
+	beforeEach(() => {
+		vi.resetModules();
+	});
+
+	it("skips when the ast-grep LSP is enabled and its binary IS available", async () => {
+		const env = setupTestEnvironment("pi-lens-ast-grep-gate-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "const r = arr.sort();\n"); // would match no-sort-without-comparator
+			vi.doMock("@ast-grep/napi", () => ({ ts: { parse: vi.fn() } }));
+			const mod = await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
+			const result = await mod.default.run(
+				createCtx(filePath, { hasTool: async () => true }) as any,
+			);
+			expect(result.status).toBe("skipped");
+			expect(result.diagnostics).toHaveLength(0);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// The fallback-RUNS direction (binary absent → napi matches) is covered
+	// comprehensively by ast-grep-sonar-rules.test.ts, whose ctx now defaults to
+	// hasTool('ast-grep') === false. Asserting it here too would require a working
+	// @ast-grep/napi mock and collides with the doMock in the skip-path suite.
+});
 
 describe("ast-grep-napi runner — skip paths", () => {
 	beforeEach(() => {
