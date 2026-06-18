@@ -1,0 +1,24 @@
+# DISABLED: Pattern doesn't match with current ast-grep-napi runner
+# The AST representation of boolean literals differs from string patterns
+# id: ts-unnecessary-ternary-boolean
+# language: typescript
+# severity: warning
+# message: cond ? true : false - use Boolean(cond) or cond directly
+# metadata:
+#   weight: 2
+#   category: slop
+# rule:
+#   any:
+#     - pattern: "$COND ? true : false"
+#     - pattern: "$COND ? false : true"
+# ---
+id: ts-typeof-equality
+language: typescript
+severity: warning
+message: typeof x === 'string' checks - consider instanceof or proper type guards
+metadata:
+  weight: 2
+  category: slop
+rule:
+  kind: binary_expression
+  pattern: "typeof $X === '$TYPE'"

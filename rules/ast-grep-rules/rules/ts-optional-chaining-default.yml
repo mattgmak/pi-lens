@@ -1,0 +1,10 @@
+id: ts-optional-chaining-default
+language: typescript
+severity: warning
+message: "obj && obj.prop ? obj.prop : default - use obj?.prop ?? default"
+metadata:
+  weight: 3
+  category: slop
+rule:
+  kind: ternary_expression
+  pattern: "$OBJ && $OBJ.$PROP ? $OBJ.$PROP : $DEFAULT"

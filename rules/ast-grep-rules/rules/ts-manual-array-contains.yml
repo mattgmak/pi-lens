@@ -1,0 +1,10 @@
+id: ts-manual-array-contains
+language: typescript
+severity: warning
+message: arr.indexOf(x) !== -1 - use arr.includes(x)
+metadata:
+  weight: 2
+  category: slop
+rule:
+  kind: binary_expression
+  pattern: "$ARR.indexOf($X) !== -1"

@@ -1,0 +1,10 @@
+id: ts-json-stringify-parse
+language: typescript
+severity: warning
+message: JSON.parse(JSON.stringify(x)) is noisy; use structuredClone or copy properly
+metadata:
+  weight: 3
+  category: slop
+rule:
+  kind: call_expression
+  pattern: "JSON.parse(JSON.stringify($X))"

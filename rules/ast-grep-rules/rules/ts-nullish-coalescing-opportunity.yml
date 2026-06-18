@@ -1,0 +1,10 @@
+id: ts-nullish-coalescing-opportunity
+language: typescript
+severity: warning
+message: "x !== null && x !== undefined ? x : default - use x ?? default"
+metadata:
+  weight: 3
+  category: slop
+rule:
+  kind: ternary_expression
+  pattern: "$X !== null && $X !== undefined ? $X : $DEFAULT"
