@@ -12,7 +12,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { logLatency } from "./latency-logger.js";
-import { safeSpawn, safeSpawnAsync } from "./safe-spawn.js";
+import { safeSpawnAsync } from "./safe-spawn.js";
 import {
 	getAutoInstallToolIdForFormatter,
 	getFormatterPolicyForFile,
@@ -23,6 +23,7 @@ import {
 	hasCljfmtConfig,
 	hasCmakeFormatConfig,
 	hasGoogleJavaFormatConfig,
+	hasKtfmtConfig,
 	hasNearestPackageJsonDependency,
 	hasNearestPackageJsonField,
 	hasOcamlformatConfig,
@@ -39,7 +40,7 @@ import {
 
 const _lazyInstallAttempts = new Set<string>();
 
-async function tryLazyInstallFormatterTool(
+export async function tryLazyInstallFormatterTool(
 	tool: "rubocop" | "rustfmt",
 	cwd: string,
 ): Promise<boolean> {
@@ -48,9 +49,10 @@ async function tryLazyInstallFormatterTool(
 	_lazyInstallAttempts.add(attemptKey);
 
 	if (tool === "rubocop") {
-		const res = safeSpawn("gem", ["install", "rubocop", "--no-document"], {
+		const res = await safeSpawnAsync("gem", ["install", "rubocop", "--no-document"], {
 			timeout: 180000,
 			cwd,
+			ignoreAmbientSignal: true,
 		});
 		const ok = !res.error && res.status === 0;
 		if (!ok) {
@@ -61,9 +63,10 @@ async function tryLazyInstallFormatterTool(
 		return ok;
 	}
 
-	const res = safeSpawn("rustup", ["component", "add", "rustfmt"], {
+	const res = await safeSpawnAsync("rustup", ["component", "add", "rustfmt"], {
 		timeout: 180000,
 		cwd,
+		ignoreAmbientSignal: true,
 	});
 	const ok = !res.error && res.status === 0;
 	if (!ok) {
@@ -131,7 +134,7 @@ async function findUp(
 }
 
 async function which(command: string): Promise<string | null> {
-	const result = safeSpawn(
+	const result = await safeSpawnAsync(
 		process.platform === "win32" ? "where" : "which",
 		[command],
 		{ timeout: 5000 },
@@ -144,7 +147,7 @@ async function resolveGoFmtBinary(): Promise<string | null> {
 	const inPath = await which("gofmt");
 	if (inPath) return inPath;
 
-	const goCheck = safeSpawn("go", ["env", "GOROOT"], {
+	const goCheck = await safeSpawnAsync("go", ["env", "GOROOT"], {
 		timeout: 5000,
 	});
 	if (goCheck.error || goCheck.status !== 0) return null;
@@ -281,6 +284,9 @@ function hasExplicitFormatterConfig(
 			return (
 				hasOxfmtConfig(cwd) ||
 				hasVitePlusConfig(cwd) ||
+				// The published package is `oxfmt`; `@oxc-project/oxfmt` does not
+				// exist on npm. Accept both (scoped kept for forward-compat).
+				hasNearestPackageJsonDependency(cwd, "oxfmt") ||
 				hasNearestPackageJsonDependency(cwd, "@oxc-project/oxfmt")
 			);
 		case "ruff":
@@ -303,6 +309,8 @@ function hasExplicitFormatterConfig(
 			return hasOcamlformatConfig(cwd);
 		case "google-java-format":
 			return hasGoogleJavaFormatConfig(cwd);
+		case "ktfmt":
+			return hasKtfmtConfig(cwd);
 		case "cljfmt":
 			return hasCljfmtConfig(cwd);
 		case "cmake-format":
@@ -427,11 +435,24 @@ export const oxfmtFormatter: FormatterInfo = {
 		if (found) return [found, filePath];
 		return null;
 	},
-	extensions: [".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"],
+	extensions: [
+		".js", ".jsx", ".mjs", ".cjs",
+		".ts", ".tsx", ".mts", ".cts",
+		".vue",
+		".css", ".scss", ".less",
+		".html", ".htm",
+		".json", ".jsonc",
+		".yaml", ".yml",
+		".md", ".mdx",
+		".graphql", ".gql",
+		".toml",
+	],
 	async detect(cwd: string) {
 		return (
 			hasOxfmtConfig(cwd) ||
 			hasVitePlusConfig(cwd) ||
+			// Published package is `oxfmt` (the scoped name does not exist on npm).
+			hasNearestPackageJsonDependency(cwd, "oxfmt") ||
 			hasNearestPackageJsonDependency(cwd, "@oxc-project/oxfmt")
 		);
 	},
@@ -612,6 +633,25 @@ export const ktlintFormatter: FormatterInfo = {
 	},
 };
 
+export const ktfmtFormatter: FormatterInfo = {
+	name: "ktfmt",
+	// ktfmt formats in place when given a file path (no flag needed).
+	command: ["ktfmt", "$FILE"],
+	extensions: [".kt", ".kts"],
+	async resolveCommand(filePath, _cwd) {
+		const inPath = await which("ktfmt");
+		if (inPath) return [inPath, filePath];
+		const { ensureTool } = await import("./installer/index.js");
+		const installed = await ensureTool("ktfmt");
+		return installed ? [installed, filePath] : null;
+	},
+	async detect(cwd: string) {
+		// Opt-in only: ktfmt becomes the formatter when the project elects it,
+		// otherwise ktlint stays the Kotlin smart-default (#129).
+		return hasKtfmtConfig(cwd);
+	},
+};
+
 export const rubocopFormatter: FormatterInfo = {
 	name: "rubocop",
 	command: ["rubocop", "-a", "--no-color", "$FILE"],
@@ -687,12 +727,33 @@ export const phpCsFixerFormatter: FormatterInfo = {
 
 export const csharpierFormatter: FormatterInfo = {
 	name: "csharpier",
-	command: ["dotnet", "csharpier", "$FILE"],
+	// CSharpier ≥1.0 is a standalone `csharpier format <file>`; the `dotnet
+	// csharpier <file>` form was removed (a bare `dotnet csharpier` now errors
+	// "a dotnet-prefixed executable with this name could not be found"). Keep the
+	// legacy form as a fallback for CSharpier 0.x via resolveCommand.
+	command: ["csharpier", "format", "$FILE"],
 	extensions: [".cs"],
+	async resolveCommand(filePath, _cwd) {
+		if ((await which("csharpier")) !== null) {
+			return ["csharpier", "format", filePath];
+		}
+		// CSharpier 0.x: invoked through the dotnet driver.
+		if ((await which("dotnet")) !== null) {
+			const legacy = await safeSpawnAsync("dotnet", ["csharpier", "--version"], {
+				timeout: 5000,
+			});
+			if (!legacy.error && legacy.status === 0) {
+				return ["dotnet", "csharpier", filePath];
+			}
+		}
+		return null;
+	},
 	async detect(_cwd: string) {
-		// Check dotnet is available AND csharpier tool is installed
+		// CSharpier ≥1.0 standalone binary …
+		if ((await which("csharpier")) !== null) return true;
+		// … or the legacy dotnet-driver form (CSharpier 0.x).
 		if ((await which("dotnet")) === null) return false;
-		const result = safeSpawn("dotnet", ["csharpier", "--version"], {
+		const result = await safeSpawnAsync("dotnet", ["csharpier", "--version"], {
 			timeout: 5000,
 		});
 		return !result.error && result.status === 0;
@@ -817,7 +878,7 @@ export const psscriptanalyzerFormatFormatter: FormatterInfo = {
 		const pwsh = (await which("pwsh")) ?? (await which("powershell"));
 		if (!pwsh) return false;
 		// Check PSScriptAnalyzer module is available
-		const result = safeSpawn(
+		const result = await safeSpawnAsync(
 			pwsh,
 			[
 				"-NoProfile",
@@ -849,6 +910,7 @@ const ALL_FORMATTERS: FormatterInfo[] = [
 	ocamlformatFormatter,
 	clangFormatFormatter,
 	ktlintFormatter,
+	ktfmtFormatter,
 	terraformFormatter,
 	phpCsFixerFormatter,
 	csharpierFormatter,

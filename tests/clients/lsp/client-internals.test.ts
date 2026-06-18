@@ -13,6 +13,7 @@ import {
 	clientShutdown,
 	clientWaitForDiagnostics,
 	handleNotifyChange,
+	stripDiagnosticNoiseLines,
 	handleNotifyOpen,
 	type LSPClientState,
 } from "../../../clients/lsp/client.js";
@@ -67,7 +68,9 @@ function createMockState(overrides?: Partial<LSPClientState>): LSPClientState {
 		documentPullDiagnosticTimestamps: new Map(),
 		pendingDiagnostics: new Map(),
 		diagnosticEmitter,
+		diagnosticsVersion: 0,
 		documentVersions: new Map(),
+		diagnosticDocVersions: new Map(),
 		openDocuments: new Set(),
 		pendingOpens: new Set(),
 		workspaceDiagnosticsSupport: {
@@ -77,6 +80,8 @@ function createMockState(overrides?: Partial<LSPClientState>): LSPClientState {
 		},
 		operationSupport: {
 			definition: false,
+			typeDefinition: false,
+			declaration: false,
 			references: false,
 			hover: false,
 			signatureHelp: false,
@@ -89,12 +94,24 @@ function createMockState(overrides?: Partial<LSPClientState>): LSPClientState {
 		},
 		staticDiagnosticsMode: "push-only",
 		dynamicRegistrations: new Map(),
+		advertisedCommands: new Set(),
+		serverEditsAllowed: 0,
 		serverId: "test-server",
 		root: "/project",
 		lspProcess: createMockLspProcess() as any,
 		...overrides,
 	};
 }
+
+describe("stripDiagnosticNoiseLines", () => {
+	it("removes bare URL and further-information diagnostic lines", () => {
+		expect(
+			stripDiagnosticNoiseLines(
+				"actual error\nfor further information visit https://example.test\nhttps://example.test/docs",
+			),
+		).toBe("actual error");
+	});
+});
 
 describe("clientShutdown", () => {
 	it("skips LSP protocol handshake in fast mode", async () => {
@@ -276,6 +293,7 @@ describe("handleNotifyChange", () => {
 describe("clientWaitForDiagnostics", () => {
 	it("resolves immediately if diagnostics already cached", async () => {
 		const state = createMockState();
+		state.diagnosticsVersion = 1;
 		state.pushDiagnostics.set(TEST_KEY, [
 			{
 				severity: 1,
@@ -289,6 +307,43 @@ describe("clientWaitForDiagnostics", () => {
 
 		await clientWaitForDiagnostics(state, TEST_FILE, 1000);
 		// Should resolve immediately without waiting
+	});
+
+	it("does not accept cached diagnostics at or below minVersion", async () => {
+		const state = createMockState();
+		state.diagnosticsVersion = 1;
+		state.pushDiagnostics.set(TEST_KEY, [
+			{
+				severity: 1,
+				message: "stale error",
+				range: {
+					start: { line: 0, character: 0 },
+					end: { line: 0, character: 0 },
+				},
+			},
+		]);
+
+		const start = Date.now();
+		await clientWaitForDiagnostics(state, TEST_FILE, 50, { minVersion: 1 });
+		const elapsed = Date.now() - start;
+
+		expect(elapsed).toBeGreaterThanOrEqual(40);
+	});
+
+	it("resolves when diagnostics advance past minVersion", async () => {
+		const state = createMockState();
+		state.diagnosticsVersion = 1;
+
+		const waitPromise = clientWaitForDiagnostics(state, TEST_FILE, 5000, {
+			minVersion: 1,
+		});
+
+		setTimeout(() => {
+			state.diagnosticsVersion = 2;
+			state.diagnosticEmitter.emit("diagnostics", TEST_FILE);
+		}, 50);
+
+		await waitPromise;
 	});
 
 	it("resolves when diagnostics arrive via emitter", async () => {
@@ -330,6 +385,66 @@ describe("clientWaitForDiagnostics", () => {
 		}, 100);
 
 		await waitPromise;
+	});
+});
+
+describe("clientWaitForDiagnostics — pull mode (#240)", () => {
+	// serverId "typescript" → pullRetryBudgetMs 0, so no incremental retry loop;
+	// the first pull outcome is decisive. mode "pull" routes through the pull
+	// branch. diagnosticProviderKind "object" = an advertised pull provider.
+	const pullState = (): LSPClientState =>
+		createMockState({
+			serverId: "typescript",
+			workspaceDiagnosticsSupport: {
+				advertised: true,
+				mode: "pull",
+				diagnosticProviderKind: "object",
+			},
+		});
+
+	it("resolves immediately on an authoritative empty (clean) pull report", async () => {
+		const state = pullState();
+		state.connection.sendRequest = vi
+			.fn()
+			.mockResolvedValue({ kind: "full", items: [] });
+
+		const start = Date.now();
+		await clientWaitForDiagnostics(state, TEST_FILE, 1000);
+		expect(Date.now() - start).toBeLessThan(80);
+	});
+
+	it("resolves immediately when the pull returns diagnostics (found)", async () => {
+		const state = pullState();
+		state.connection.sendRequest = vi.fn().mockResolvedValue({
+			kind: "full",
+			items: [
+				{
+					severity: 1,
+					message: "boom",
+					range: {
+						start: { line: 0, character: 0 },
+						end: { line: 0, character: 0 },
+					},
+				},
+			],
+		});
+
+		const start = Date.now();
+		await clientWaitForDiagnostics(state, TEST_FILE, 1000);
+		expect(Date.now() - start).toBeLessThan(80);
+	});
+
+	it("does NOT treat a failed/unavailable pull as clean — waits the budget rather than short-circuiting", async () => {
+		const state = pullState();
+		// undefined reply → safeSendRequest returns undefined → outcome
+		// "unavailable". With no minVersion baseline the OLD code returned
+		// immediately via `|| hasFreshDiagnostics()` (a false clean); the fix must
+		// instead fall through to the push-wait/timeout backstop.
+		state.connection.sendRequest = vi.fn().mockResolvedValue(undefined);
+
+		const start = Date.now();
+		await clientWaitForDiagnostics(state, TEST_FILE, 120);
+		expect(Date.now() - start).toBeGreaterThanOrEqual(100);
 	});
 });
 
@@ -405,6 +520,8 @@ describe("applyDynamicCapabilities", () => {
 		const state = createMockState({
 			operationSupport: {
 				definition: true,
+				typeDefinition: false,
+				declaration: false,
 				references: false,
 				hover: false,
 				signatureHelp: false,

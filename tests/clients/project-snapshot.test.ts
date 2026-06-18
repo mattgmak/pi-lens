@@ -10,9 +10,11 @@ import {
 	isProjectSnapshotFresh,
 	loadProjectSnapshot,
 	saveProjectSnapshot,
+	saveRuntimeProjectSnapshot,
 } from "../../clients/project-snapshot.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
-import { setupTestEnvironment } from "./test-utils.js";
+import { buildWordIndex, searchWordIndex } from "../../clients/word-index.js";
+import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
 function withProjectDataDir<T>(fn: (cwd: string) => T): T {
 	const env = setupTestEnvironment("project-snapshot-");
@@ -60,6 +62,50 @@ describe("project snapshot", () => {
 				cachedExports: [["makeThing", path.join(cwd, "src", "a.ts")]],
 			});
 			expect(isProjectSnapshotFresh(loaded, 7)).toBe(true);
+		}));
+
+	it("persists the word index and hydrates a searchable copy", () =>
+		withProjectDataDir((cwd) => {
+			const runtime = new RuntimeCoordinator();
+			runtime.seedProjectSequence(5);
+			runtime.wordIndex = buildWordIndex([
+				{
+					path: path.join(cwd, "src", "auth.ts"),
+					content: "export function authenticateUser() {}",
+				},
+			]);
+
+			saveProjectSnapshot(
+				cwd,
+				buildProjectSnapshotFromRuntime({ cwd, runtime }),
+			);
+			const loaded = loadProjectSnapshot(cwd);
+			expect(loaded?.wordIndex).toBeDefined();
+
+			// Hydrate a fresh runtime → its word index must be searchable.
+			const target = new RuntimeCoordinator();
+			hydrateRuntimeFromProjectSnapshot(target, loaded!);
+			expect(target.wordIndex).not.toBeNull();
+			const results = searchWordIndex(target.wordIndex!, "authenticate user");
+			expect(results[0]?.file).toBe(path.join(cwd, "src", "auth.ts"));
+		}));
+
+	it("preserves a previously-persisted word index when the runtime has none", () =>
+		withProjectDataDir((cwd) => {
+			const withIndex = new RuntimeCoordinator();
+			withIndex.seedProjectSequence(2);
+			withIndex.wordIndex = buildWordIndex([
+				{ path: path.join(cwd, "a.ts"), content: "function keepMe() {}" },
+			]);
+			saveRuntimeProjectSnapshot({ cwd, runtime: withIndex });
+
+			// A later save from a runtime whose word-index task hasn't finished
+			// must not clobber the persisted index.
+			const without = new RuntimeCoordinator();
+			without.seedProjectSequence(2);
+			saveRuntimeProjectSnapshot({ cwd, runtime: without });
+
+			expect(loadProjectSnapshot(cwd)?.wordIndex).toBeDefined();
 		}));
 
 	it("rejects wrong-version, stale, and future snapshots", () =>
@@ -114,6 +160,99 @@ describe("project snapshot", () => {
 				sourceFileCount: 2,
 			});
 			expect(loaded?.languageProfile?.detectedKinds).toEqual(["jsts"]);
+		}));
+
+	it("roundtrips project conventions through build + save + load", () =>
+		withProjectDataDir((cwd) => {
+			const runtime = new RuntimeCoordinator();
+			runtime.seedProjectSequence(11);
+			const snapshot = buildProjectSnapshotFromRuntime({
+				cwd,
+				runtime,
+				conventions: {
+					frameworks: [
+						{
+							id: "react",
+							confidence: "high",
+							signals: [
+								"package.json:dependencies.react",
+								"package.json:dependencies.react-dom",
+							],
+						},
+						{
+							id: "vite",
+							confidence: "high",
+							signals: ["vite.config.ts"],
+						},
+					],
+					testRunners: ["vitest"],
+					buildTools: ["vite"],
+					agentDocs: [{ filePath: "AGENTS.md", lineCount: 42 }],
+				},
+			});
+			saveProjectSnapshot(cwd, snapshot);
+			const loaded = loadProjectSnapshot(cwd);
+			expect(loaded?.conventions?.frameworks.map((f) => f.id).sort()).toEqual([
+				"react",
+				"vite",
+			]);
+			expect(loaded?.conventions?.testRunners).toEqual(["vitest"]);
+			expect(loaded?.conventions?.buildTools).toEqual(["vite"]);
+			expect(loaded?.conventions?.agentDocs).toEqual([
+				{ filePath: "AGENTS.md", lineCount: 42 },
+			]);
+		}));
+
+	it("auto-detects conventions inside saveRuntimeProjectSnapshot when none are passed", () =>
+		withProjectDataDir((cwd) => {
+			fs.mkdirSync(cwd, { recursive: true });
+			createTempFile(
+				cwd,
+				"package.json",
+				JSON.stringify({
+					dependencies: { react: "^18.0.0", "react-dom": "^18.0.0" },
+					devDependencies: { vite: "^5.0.0", vitest: "^1.0.0" },
+				}),
+			);
+			createTempFile(cwd, "vite.config.ts", "export default {};\n");
+
+			const runtime = new RuntimeCoordinator();
+			runtime.seedProjectSequence(5);
+			saveRuntimeProjectSnapshot({ cwd, runtime });
+
+			const loaded = loadProjectSnapshot(cwd);
+			const ids = loaded?.conventions?.frameworks.map((f) => f.id).sort();
+			expect(ids).toEqual(["react", "vite", "vitest"]);
+			expect(loaded?.conventions?.buildTools).toEqual(["vite"]);
+		}));
+
+	it("preserves existing conventions across a snapshot rewrite that does not supply them", () =>
+		withProjectDataDir((cwd) => {
+			fs.mkdirSync(cwd, { recursive: true });
+			// First write — explicit conventions object.
+			const runtime = new RuntimeCoordinator();
+			runtime.seedProjectSequence(2);
+			const first = buildProjectSnapshotFromRuntime({
+				cwd,
+				runtime,
+				conventions: {
+					frameworks: [
+						{ id: "next", confidence: "high", signals: ["next.config.js"] },
+					],
+					testRunners: [],
+					buildTools: ["next"],
+					agentDocs: [],
+				},
+			});
+			saveProjectSnapshot(cwd, first);
+
+			// Second write via saveRuntimeProjectSnapshot WITHOUT any package.json
+			// nor a conventions arg — should inherit the previously-saved value
+			// rather than overwriting it with the empty auto-detect result.
+			saveRuntimeProjectSnapshot({ cwd, runtime });
+
+			const loaded = loadProjectSnapshot(cwd);
+			expect(loaded?.conventions?.frameworks.map((f) => f.id)).toEqual(["next"]);
 		}));
 
 	it("hydrates cached exports and rules into a new runtime", () =>

@@ -140,7 +140,7 @@ const shellcheckRunner: RunnerDefinition = {
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		const cwd = ctx.cwd || process.cwd();
 		let cmd: string | null = null;
-		if (await (shellcheck.isAvailableAsync?.(cwd) ?? shellcheck.isAvailable(cwd))) {
+		if (await (shellcheck.isAvailableAsync(cwd))) {
 			cmd = shellcheck.getCommand(cwd);
 		} else {
 			const managed = await ensureTool("shellcheck");
@@ -160,9 +160,11 @@ const shellcheckRunner: RunnerDefinition = {
 		// Check for config file
 		const configPath = findShellcheckConfig(ctx.cwd);
 		if (!configPath) {
-			// No config file, use default settings
-			// Exclude "style" and "info" by default to reduce noise
-			args.push("--severity", "warning");
+			// No config file: surface `info`-level findings (e.g. SC2086
+			// double-quote-to-prevent-globbing — a high-value, commonly-relevant
+			// check that was previously dropped, #213) while still excluding pure
+			// `style` rules to limit noise. Projects opt into style via .shellcheckrc.
+			args.push("--severity", "info");
 		}
 
 		args.push(ctx.filePath);

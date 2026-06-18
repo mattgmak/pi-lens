@@ -23,11 +23,22 @@ import type {
 	RunnerResult,
 } from "../types.js";
 import { convertLspDiagnostics } from "../utils/lsp-diagnostics.js";
+import {
+	enabledAuxiliaryLspServerIds,
+	findAuxiliaryProfileForSource,
+} from "../auxiliary-lsp.js";
 import { readFileContent } from "./utils.js";
 
 const LSP_MAX_FILE_BYTES = RUNTIME_CONFIG.pipeline.lspMaxFileBytes;
 const LSP_MAX_FILE_LINES = RUNTIME_CONFIG.pipeline.lspMaxFileLines;
 const LSP_SPAWN_BUDGET_MS = RUNTIME_CONFIG.pipeline.lspSpawnBudgetMs;
+
+// Diagnostics-wait cap for the dispatch lsp-runner. Bounded so a slow LSP
+// (typescript-language-server on large monorepos has been observed >7 s)
+// can't dominate the per-edit pipeline budget. Diagnostics that arrive
+// after the cap still land in the client's cache and surface on the
+// next edit. Overridable via PI_LENS_LSP_DIAGNOSTICS_MAX_WAIT_MS.
+const LSP_DIAGNOSTICS_WAIT_MS = 2500;
 const MAX_CODE_ACTION_LOOKUPS = 6;
 const MAX_CODE_ACTION_TITLES = 3;
 
@@ -115,6 +126,10 @@ const lspRunner: RunnerDefinition = {
 		// does not operate on stale LSP snapshots.
 		let lspDiags: import("../../lsp/client.js").LSPDiagnostic[] = [];
 		let serverFailed = false;
+		// touchFile resolves to `undefined` when no LSP client was ready (a cold
+		// spawn that didn't complete in the budget, or LSP unavailable for this
+		// file) — distinct from `[]`, which means the server replied with zero.
+		let lspClientReady = true;
 		let failureReason = "";
 		const content = readFileContent(ctx.filePath);
 		if (!content) {
@@ -127,15 +142,27 @@ const lspRunner: RunnerDefinition = {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
+		// Cross-cutting auxiliary scanners (opengrep, …) attach alongside the
+		// primary language server when enabled — collected on the with-auxiliary
+		// path so their warm diagnostics merge into this same result.
+		const auxiliaryServerIds = enabledAuxiliaryLspServerIds((f) =>
+			ctx.pi.getFlag(f),
+		);
 		try {
 			const touched = await lspService.touchFile(ctx.filePath, content, {
 				diagnostics: "document",
 				collectDiagnostics: true,
-				clientScope: "primary",
+				clientScope: auxiliaryServerIds.length > 0 ? "with-auxiliary" : "primary",
+				auxiliaryServerIds,
 				maxClientWaitMs: LSP_SPAWN_BUDGET_MS,
+				maxDiagnosticsWaitMs: LSP_DIAGNOSTICS_WAIT_MS,
 				source: "dispatch-lsp-runner",
 			});
-			lspDiags = touched ?? [];
+			if (touched === undefined) {
+				lspClientReady = false;
+			} else {
+				lspDiags = touched;
+			}
 		} catch (err) {
 			serverFailed = true;
 			failureReason = err instanceof Error ? err.message : String(err);
@@ -154,6 +181,8 @@ const lspRunner: RunnerDefinition = {
 		if (serverFailed) {
 			return {
 				status: "failed",
+				failureKind: "server_error",
+				failureMessage: failureReason.slice(0, 200),
 				diagnostics: [
 					{
 						id: `lsp:server-error:0`,
@@ -168,6 +197,15 @@ const lspRunner: RunnerDefinition = {
 				],
 				semantic: "warning",
 			};
+		}
+
+		if (!lspClientReady) {
+			// No answer from the LSP — reporting "succeeded with 0 diagnostics"
+			// would read as a clean bill of health when we simply didn't get a
+			// reply. Report "skipped" so the coverage notice can flag the gap and
+			// the next edit re-checks once the server has warmed; any diagnostics
+			// published late still land in the client cache and surface then.
+			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
 		if (lspDiags.length === 0) {
@@ -217,6 +255,29 @@ const lspRunner: RunnerDefinition = {
 			{ fixSuggestionByIndex },
 		);
 
+		// convertLspDiagnostics maps validLspDiags 1:1, so re-tag any
+		// auxiliary-sourced diagnostics (opengrep emits source "Semgrep", …) with
+		// their tool id + semantic policy — language-server diagnostics keep "lsp".
+		// blockingAllowed is per-workspace (e.g. curated repo rules), computed once.
+		const blockingAllowedByProfile = new Map<unknown, boolean>();
+		for (let i = 0; i < diagnostics.length; i++) {
+			const profile = findAuxiliaryProfileForSource(validLspDiags[i]?.source);
+			if (!profile) continue;
+			let blockingAllowed = blockingAllowedByProfile.get(profile);
+			if (blockingAllowed === undefined) {
+				blockingAllowed = profile.allowBlocking?.(ctx.cwd) ?? false;
+				blockingAllowedByProfile.set(profile, blockingAllowed);
+			}
+			const d = diagnostics[i];
+			d.tool = profile.tool;
+			d.semantic = profile.semantic(validLspDiags[i], { blockingAllowed });
+			if (d.semantic !== "blocking" && d.severity === "error") {
+				d.severity = "warning";
+			}
+			const defectClass = profile.defectClass?.(validLspDiags[i]);
+			if (defectClass) d.defectClass = defectClass;
+		}
+
 		const hasErrors = diagnostics.some((d) => d.semantic === "blocking");
 		const resultSemantic = hasErrors
 			? "blocking"
@@ -226,6 +287,9 @@ const lspRunner: RunnerDefinition = {
 
 		return {
 			status: hasErrors ? "failed" : "succeeded",
+			// "failed" here means the file has blocking type errors — the check ran
+			// fine. Tag it so the smell analyzer doesn't read it as a runner crash.
+			failureKind: hasErrors ? "blocking_diagnostics" : undefined,
 			diagnostics,
 			semantic: resultSemantic,
 		};

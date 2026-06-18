@@ -1,17 +1,26 @@
 import * as nodeFs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
+import { isToolCallEventType } from "./clients/tool-event.js";
 import { AstGrepClient } from "./clients/ast-grep-client.js";
 import { loadBootstrapClients } from "./clients/bootstrap.js";
 import { CacheManager } from "./clients/cache-manager.js";
+import { resolvePackagePath } from "./clients/package-root.js";
 import {
 	clearWidgetState,
+	exportWidgetState,
+	importWidgetState,
+	type PersistedWidgetState,
 	renderWidget,
 	setRenderCallback,
 } from "./clients/widget-state.js";
+import {
+	dropStaleFiles,
+	loadSessionState,
+	saveSessionState,
+	sessionStartMode,
+} from "./clients/session-state-store.js";
 import { getDiagnosticTracker } from "./clients/diagnostic-tracker.js";
 import {
 	getCascadeSessionStats,
@@ -19,6 +28,10 @@ import {
 	getLatencyReports,
 	resetDispatchBaselines,
 } from "./clients/dispatch/integration.js";
+import {
+	extractReadPathsFromCommand,
+	extractWrittenPathsFromCommand,
+} from "./clients/bash-file-access.js";
 import { detectFileKind } from "./clients/file-kinds.js";
 import { isPathIgnoredByProject } from "./clients/file-utils.js";
 import {
@@ -47,10 +60,14 @@ import { logReadGuardEvent } from "./clients/read-guard-logger.js";
 import {
 	countFileLines,
 	getTouchedLinesForGuard,
+	relocateEditRange,
 	tryCorrectIndentationMismatch,
 	tryCorrectIndentationMismatchFromContent,
 } from "./clients/read-guard-tool-lines.js";
-import { computeTrailingWhitespaceOldTextPatch } from "./clients/oldtext-autopatch.js";
+import {
+	computeTrailingWhitespaceOldTextPatch,
+	findUniqueMatchLineRange,
+} from "./clients/oldtext-autopatch.js";
 import { applyPartiallyApplicableEdits } from "./clients/partial-edit-apply.js";
 import { retargetReplacementIndentation } from "./clients/indent-retarget.js";
 import { handleAgentEnd } from "./clients/runtime-agent-end.js";
@@ -63,26 +80,41 @@ import { RuntimeCoordinator } from "./clients/runtime-coordinator.js";
 import { handleSessionStart } from "./clients/runtime-session.js";
 import {
 	clearLastAnalyzedStateCache,
+	flushDebouncedToolResults,
 	handleToolResult,
 } from "./clients/runtime-tool-result.js";
 import { cancelLSPIdleReset, handleTurnEnd } from "./clients/runtime-turn.js";
 import { isExternalOrVendorFile } from "./clients/path-utils.js";
-import { safeSpawnAsync } from "./clients/safe-spawn.js";
-import {
-	createStarterSemgrepConfig,
-	findLocalSemgrepConfig,
-	loadPiLensSemgrepConfig,
-	removePiLensSemgrepConfig,
-	resolveSemgrepConfig,
-	savePiLensSemgrepConfig,
-} from "./clients/semgrep-config.js";
+import { setAmbientAbortSignal } from "./clients/safe-spawn.js";
 import { TreeSitterClient } from "./clients/tree-sitter-client.js";
 import { handleBooboo } from "./commands/booboo.js";
 import { initI18n, t } from "./i18n.js";
+import { createAstDumpTool } from "./tools/ast-dump.js";
+import { createLensDiagnosticsTool } from "./tools/lens-diagnostics.js";
 import { createAstGrepReplaceTool } from "./tools/ast-grep-replace.js";
 import { createAstGrepSearchTool } from "./tools/ast-grep-search.js";
 import { createLspDiagnosticsTool } from "./tools/lsp-diagnostics.js";
 import { createLspNavigationTool } from "./tools/lsp-navigation.js";
+import { logLatency } from "./clients/latency-logger.js";
+import {
+	markPiLensLoaded,
+	PI_LENS_LOADED_FROM,
+} from "./clients/startup-timing.js";
+import {
+	getEventLoopStats,
+	shouldLogWorstBlock,
+	startEventLoopMonitor,
+} from "./clients/event-loop-monitor.js";
+
+// First executable statement: every import above has been evaluated, so the
+// full load/transpile cost has been paid. Capture it now.
+const PI_LENS_LOAD_MS = markPiLensLoaded();
+// Start the event-loop occupancy monitor as early as possible so startup
+// blocks are captured. Native histogram — no per-event overhead. (#192)
+startEventLoopMonitor();
+// Worst event-loop block already persisted to latency.log (so we only log a
+// *new* worst freeze per turn, not the same growing max). (#192)
+let lastLoggedLoopWorstMs = 0;
 
 const DEBUG_LOG_DIR = path.join(os.homedir(), ".pi-lens");
 const DEBUG_LOG = path.join(DEBUG_LOG_DIR, "sessionstart.log");
@@ -100,6 +132,20 @@ function dbg(msg: string) {
 		console.error("[pi-lens-debug] write failed:", e);
 	}
 }
+
+// Log how long pi took to load pi-lens — the jiti transpile of every module is
+// paid by now. Source mode includes transpiling ~200 .ts files; the precompiled
+// dist build does not, so the delta is the #182 startup win. One line per load.
+dbg(
+	`pi-lens loaded: ${PI_LENS_LOAD_MS}ms after process start (from ${PI_LENS_LOADED_FROM})`,
+);
+logLatency({
+	type: "phase",
+	filePath: "<pi-lens>",
+	phase: "extension_loaded",
+	durationMs: PI_LENS_LOAD_MS,
+	metadata: { loadedFrom: PI_LENS_LOADED_FROM },
+});
 
 // No-op log function (verbose console logging was removed with lens-verbose flag)
 function log(_msg: string) {
@@ -359,7 +405,10 @@ export default function (pi: ExtensionAPI) {
 	function updateLspStatus(
 		setStatus: (id: string, text: string | undefined) => void,
 		theme: {
-			fg: (color: "accent" | "success" | "error", text: string) => string;
+			fg: (
+				color: "accent" | "success" | "error" | "warning" | "dim",
+				text: string,
+			) => string;
 		},
 	) {
 		try {
@@ -367,7 +416,10 @@ export default function (pi: ExtensionAPI) {
 			if (count > 0) {
 				setStatus("pi-lens-lsp", theme.fg("success", `LSP Active (${count})`));
 			} else {
-				setStatus("pi-lens-lsp", theme.fg("error", "LSP Inactive"));
+				// Inactive is a passive state (no server running for this file, or the
+				// idle timer released them) — not a fault. Render it neutral/grey, not
+				// red. Surfacing genuine LSP *failures* in red is tracked separately.
+				setStatus("pi-lens-lsp", theme.fg("dim", "LSP Inactive"));
 			}
 		} catch {
 			// Theme may not be fully initialized during early session startup.
@@ -430,22 +482,22 @@ export default function (pi: ExtensionAPI) {
 		default: false,
 	});
 
-	pi.registerFlag("lens-semgrep", {
+	pi.registerFlag("no-opengrep", {
 		description:
-			"Enable Semgrep dispatch when a Semgrep config is available (or with --lens-semgrep-config)",
+			"Disable the Opengrep security scanner (a default-on auxiliary LSP; auto-installs, uses repo rules if present else the login-free 'auto' ruleset)",
 		type: "boolean",
 		default: false,
 	});
 
-	pi.registerFlag("lens-semgrep-config", {
-		description:
-			"Semgrep config for dispatch: local path, auto, p/<pack>, or r/<rule>. Requires --lens-semgrep.",
-		type: "string",
-		default: "",
-	});
-
 	pi.registerFlag("no-read-guard", {
 		description: "Disable read-before-edit behavior monitor",
+		type: "boolean",
+		default: false,
+	});
+
+	pi.registerFlag("no-lens-context", {
+		description:
+			"Disable automatic context injection (session-start guidance, turn-end & test findings) while keeping tools, LSP, read-guard, and formatting active. Toggle with /lens-context-toggle. Also via contextInjection.enabled=false in config or PI_LENS_NO_CONTEXT_INJECTION=1.",
 		type: "boolean",
 		default: false,
 	});
@@ -465,7 +517,18 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	let lensEnabled = !getLensFlag("no-lens");
+	// Automatic context injection (the `context` hook). Independent of lensEnabled
+	// so tools/LSP/read-guard/formatting keep running when it is off. Precedence:
+	// env override → CLI flag → global config (resolved inside getLensFlag).
+	let contextInjectionEnabled =
+		process.env.PI_LENS_NO_CONTEXT_INJECTION !== "1" &&
+		!getLensFlag("no-lens-context");
 	let lensWidgetVisible = globalConfig?.widget?.visible !== false;
+	// #190 Phase 2: snapshot of the source session's diagnostics, captured at
+	// `session_before_fork` and adopted by the forked session at the subsequent
+	// `session_start` (reason="fork"). In-memory hand-off (same process) — avoids
+	// deriving the source id from a file path (the id lives in the file header).
+	let pendingForkSnapshot: PersistedWidgetState | undefined;
 	type LensWidgetTui = { requestRender: () => void };
 	type LensWidgetTheme = { fg: (color: string, s: string) => string };
 	type LensWidgetComponent = {
@@ -524,6 +587,20 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("lens-context-toggle", {
+		description:
+			"Toggle automatic context injection on/off for the current session (tools/LSP/read-guard/formatting stay active). Usage: /lens-context-toggle",
+		handler: async (_args, ctx) => {
+			contextInjectionEnabled = !contextInjectionEnabled;
+			ctx.ui.notify(
+				contextInjectionEnabled
+					? "pi-lens context injection enabled — findings will be added to the next turn."
+					: "pi-lens context injection disabled — findings are still cached (lens_diagnostics, /lens-health) but not added to model context.",
+				contextInjectionEnabled ? "info" : "warning",
+			);
+		},
+	});
+
 	pi.registerCommand("lens-widget-toggle", {
 		description:
 			"Show or hide the pi-lens diagnostics widget below the editor. Usage: /lens-widget-toggle",
@@ -547,110 +624,6 @@ export default function (pi: ExtensionAPI) {
 					: "pi-lens widget hidden. Run /lens-widget-toggle to show it.",
 				"info",
 			);
-		},
-	});
-
-	pi.registerCommand("lens-semgrep", {
-		description:
-			"Manage Semgrep dispatch. Usage: /lens-semgrep status | enable [--config <auto|p/pack|path>] | disable | init",
-		handler: async (args, ctx) => {
-			const parts = normalizeCommandArgs(args);
-			const action = parts[0] ?? "status";
-			const cwd = ctx.cwd ?? runtime.projectRoot;
-
-			function readConfigArg(): string | undefined {
-				const flagIndex = parts.findIndex(
-					(part) => part === "--config" || part === "-c",
-				);
-				if (flagIndex >= 0) return parts[flagIndex + 1];
-				return parts[1] && !parts[1].startsWith("-") ? parts[1] : undefined;
-			}
-
-			if (action === "enable") {
-				const config = readConfigArg();
-				const localConfig = findLocalSemgrepConfig(cwd);
-				if (!config && !localConfig) {
-					ctx.ui.notify(
-						[
-							"Semgrep dispatch not enabled yet: no local .semgrep.yml was found.",
-							"Use `/lens-semgrep init` to create a starter local config, or `/lens-semgrep enable --config auto` / `p/<pack>` if you want Semgrep registry/platform configuration.",
-							"pi-lens will not auto-install Semgrep; install it with pipx/uv/brew first and login only if your chosen Semgrep config requires it.",
-						].join("\n"),
-						"warning",
-					);
-					return;
-				}
-
-				const savedPath = savePiLensSemgrepConfig(cwd, {
-					enabled: true,
-					...(config ? { config } : {}),
-				});
-				ctx.ui.notify(
-					`Semgrep dispatch enabled (${config ? `config: ${config}` : `local config: ${localConfig}`}). Saved ${savedPath}`,
-					"info",
-				);
-				return;
-			}
-
-			if (action === "disable") {
-				const savedPath = savePiLensSemgrepConfig(cwd, { enabled: false });
-				ctx.ui.notify(`Semgrep dispatch disabled. Saved ${savedPath}`, "info");
-				return;
-			}
-
-			if (action === "clear") {
-				const removed = removePiLensSemgrepConfig(cwd);
-				ctx.ui.notify(
-					removed
-						? "Removed .pi-lens/semgrep.json; Semgrep now auto-enables only when local .semgrep.yml exists."
-						: "No .pi-lens/semgrep.json found.",
-					"info",
-				);
-				return;
-			}
-
-			if (action === "init") {
-				const configPath = createStarterSemgrepConfig(cwd);
-				const savedPath = savePiLensSemgrepConfig(cwd, { enabled: true });
-				ctx.ui.notify(
-					`Created starter Semgrep config at ${configPath} and enabled Semgrep dispatch (${savedPath}).`,
-					"info",
-				);
-				return;
-			}
-
-			if (action !== "status") {
-				ctx.ui.notify(
-					"Usage: /lens-semgrep status | enable [--config <auto|p/pack|path>] | disable | clear | init",
-					"warning",
-				);
-				return;
-			}
-
-			const localConfig = findLocalSemgrepConfig(cwd);
-			const piLensConfig = loadPiLensSemgrepConfig(cwd);
-			const resolved = resolveSemgrepConfig(cwd, {
-				enabled: Boolean(getLensFlag("lens-semgrep")),
-				config: getLensFlag("lens-semgrep-config"),
-			});
-			const version = await safeSpawnAsync("semgrep", ["--version"], {
-				cwd,
-				timeout: 5000,
-			});
-			const lines = [
-				"🔎 SEMGREP DISPATCH",
-				`CLI: ${!version.error && version.status === 0 ? `installed (${(version.stdout || version.stderr).trim()})` : "not found on PATH"}`,
-				`Local config: ${localConfig ?? "none"}`,
-				`pi-lens config: ${piLensConfig ? JSON.stringify(piLensConfig) : "none"}`,
-				`Effective: ${resolved.enabled ? "enabled" : "disabled"}`,
-				`Config arg: ${resolved.configArg ?? "none"}`,
-			];
-			if (resolved.reason) lines.push(`Reason: ${resolved.reason}`);
-			lines.push(
-				"",
-				"No auto-install. Token/login is only needed for Semgrep AppSec/Pro/managed configs; local .semgrep.yml scans do not require a token.",
-			);
-			ctx.ui.notify(lines.join("\n"), resolved.enabled ? "info" : "warning");
 		},
 	});
 
@@ -812,6 +785,21 @@ export default function (pi: ExtensionAPI) {
 					count: diagStats.totalUnresolved,
 				}),
 			);
+
+			// Event-loop occupancy — the dimension our duration logs were blind to
+			// (#192). `maxMs` ≈ the worst synchronous block (TUI stall) this session.
+			const elStats = getEventLoopStats();
+			if (elStats) {
+				lines.push(
+					"",
+					`Event loop (session): worst block ${elStats.maxMs}ms · p99 ${elStats.p99Ms}ms · mean ${elStats.meanMs}ms`,
+				);
+				if (elStats.maxMs > 100) {
+					lines.push(
+						"  ⚠ a >100ms synchronous block can stutter the TUI — check latency.log (#192)",
+					);
+				}
+			}
 
 			if (diagStats.repeatOffenders.length > 0) {
 				lines.push(t("lens.health.repeatOffenders", "Repeat offenders:"));
@@ -993,10 +981,30 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// --- Tools (extracted to tools/) ---
-	pi.registerTool(createAstGrepSearchTool(astGrepClient) as any);
-	pi.registerTool(createAstGrepReplaceTool(astGrepClient) as any);
-	pi.registerTool(createLspDiagnosticsTool() as any);
-	pi.registerTool(createLspNavigationTool((name) => getLensFlag(name)) as any);
+	// Guard each registration: if another extension (e.g. @narumitw/pi-lsp) already
+	// owns the same tool name, registerTool throws and would abort extension load.
+	// Catch the collision silently so both extensions can coexist.
+	for (const tool of [
+		createAstGrepSearchTool(astGrepClient),
+		createAstGrepReplaceTool(astGrepClient),
+		createAstDumpTool(astGrepClient),
+		createLensDiagnosticsTool(
+			cacheManager,
+			() => runtime.projectRoot,
+			undefined,
+			// Flush pending per-edit dispatches before reporting so fixes made
+			// earlier this turn are reflected (not the stale pre-fix state) (#190).
+			() => flushDebouncedToolResults(),
+		),
+		createLspDiagnosticsTool(),
+		createLspNavigationTool((name) => getLensFlag(name)),
+	]) {
+		try {
+			pi.registerTool(tool as any);
+		} catch {
+			// another extension already registered a tool with this name
+		}
+	}
 
 	// REMOVED: ~450 lines of inline tool definitions moved to tools/
 	// See tools/ast-grep-search.ts, tools/ast-grep-replace.ts, tools/lsp-navigation.ts
@@ -1007,9 +1015,13 @@ export default function (pi: ExtensionAPI) {
 
 	// --- Register skills with pi ---
 	pi.on("resources_discover", async (_event, _ctx) => {
-		// Get the extension directory (where this file is located)
-		const extensionDir = path.dirname(fileURLToPath(import.meta.url));
-		const skillsDir = path.join(extensionDir, "skills");
+		// Resolve skills relative to the package root (nearest package.json), not the
+		// module's own directory — under the compiled dist/ layout (#182) the module
+		// lives in dist/ but skills/ stays at the package root, so a module-relative
+		// join lands on the non-existent dist/skills/ and skills silently fail to load
+		// (#205). resolvePackagePath walks up to package.json, correct for both the
+		// source (index.ts at root) and dist (dist/index.js) layouts.
+		const skillsDir = resolvePackagePath(import.meta.url, "skills");
 
 		return {
 			skillPaths: [skillsDir],
@@ -1022,6 +1034,19 @@ export default function (pi: ExtensionAPI) {
 		try {
 			dbg("session_start fired");
 			updateRuntimeIdentityFromEvent(event);
+			// #190: pi's session lifecycle. `reason` distinguishes new/resume/fork/
+			// reload/startup; the STABLE session id comes from the session manager
+			// (the event carries none), and is what lets a resumed session rehydrate.
+			const sessionReason = (event as { reason?: string }).reason;
+			const stableSessionId = (() => {
+				try {
+					return (
+						ctx as { sessionManager?: { getSessionId?: () => string } }
+					)?.sessionManager?.getSessionId?.();
+				} catch {
+					return undefined;
+				}
+			})();
 			try {
 				await ensureLSPConfigInitialized(ctx.cwd ?? process.cwd());
 			} catch (cfgErr) {
@@ -1035,6 +1060,8 @@ export default function (pi: ExtensionAPI) {
 				ruffClient,
 				knipClient,
 				jscpdClient,
+				govulncheckClient,
+				gitleaksClient,
 				typeCoverageClient,
 				depChecker,
 				testRunnerClient,
@@ -1056,6 +1083,8 @@ export default function (pi: ExtensionAPI) {
 				ruffClient,
 				knipClient,
 				jscpdClient,
+				govulncheckClient,
+				gitleaksClient,
 				typeCoverageClient,
 				depChecker,
 				testRunnerClient,
@@ -1068,13 +1097,104 @@ export default function (pi: ExtensionAPI) {
 				resetLSPService,
 			});
 			ctx.ui && updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
-			clearWidgetState();
+
+			// Pin the stable identity + reason AFTER handleSessionStart (which ran
+			// resetForSession → a fresh random id); the stable id now wins (#190).
+			runtime.setSessionLifecycle({
+				sessionId: stableSessionId,
+				reason: sessionReason,
+			});
+
+			// Lifecycle-aware widget state (#190). The "should I rehydrate" signal is
+			// NOT the reason — it's whether a persisted snapshot exists for this
+			// STABLE session id. A `pi --session <id>` launch fires reason="startup"
+			// (not "resume" — that's only an in-process switchSession), so gating on
+			// "resume" alone missed the common resume path. So: fork branches from
+			// the in-memory stash; reload keeps state; new starts clean; everything
+			// else (resume / startup / default) rehydrates IFF a snapshot exists —
+			// a brand-new session has a fresh id with no file (→ clean), a
+			// resumed/launched one has its prior file (→ rehydrate).
+			const reasonLabel = sessionReason ?? "startup";
+			const startMode = sessionStartMode(sessionReason, !!pendingForkSnapshot);
+			if (startMode === "fork" && pendingForkSnapshot) {
+				// Branch the forked session from the source's in-memory snapshot, then
+				// persist it under the new session id so the fork owns its own copy.
+				clearWidgetState();
+				importWidgetState(pendingForkSnapshot);
+				const forkedFileCount = pendingForkSnapshot.files.length;
+				pendingForkSnapshot = undefined;
+				if (stableSessionId) {
+					void saveSessionState(
+						ctx.cwd ?? process.cwd(),
+						stableSessionId,
+						exportWidgetState(),
+					);
+				}
+				dbg(
+					`session_start: fork — branched ${forkedFileCount} file(s) from source`,
+				);
+			} else if (startMode === "keep") {
+				dbg("session_start: reload — keeping widget state");
+			} else if (startMode === "clean") {
+				pendingForkSnapshot = undefined;
+				clearWidgetState();
+				dbg("session_start: new — clean widget");
+			} else {
+				// maybe-rehydrate: covers resume AND startup (e.g. `pi --session <id>`)
+				pendingForkSnapshot = undefined;
+				clearWidgetState();
+				if (stableSessionId) {
+					const persisted = await loadSessionState(
+						ctx.cwd ?? process.cwd(),
+						stableSessionId,
+					);
+					if (persisted?.widget) {
+						// #180/#190: drop files changed on disk since the snapshot so a
+						// resume never surfaces stale diagnostics; they re-scan on edit.
+						const fresh = await dropStaleFiles(
+							persisted.widget,
+							persisted.savedAt,
+						);
+						const dropped =
+							persisted.widget.files.length - fresh.files.length;
+						importWidgetState(fresh);
+						dbg(
+							`session_start: ${reasonLabel} ${stableSessionId} — rehydrated ${fresh.files.length} file(s)` +
+								(dropped > 0 ? `, dropped ${dropped} stale` : ""),
+						);
+					} else {
+						dbg(
+							`session_start: ${reasonLabel} ${stableSessionId} — no persisted state (clean)`,
+						);
+					}
+				} else {
+					dbg(
+						`session_start: ${reasonLabel} — no stable session id (clean)`,
+					);
+				}
+			}
+
 			if (lensWidgetVisible) {
 				mountLensWidget(ctx.ui);
 			}
 		} catch (sessionErr) {
 			dbg(`session_start crashed: ${sessionErr}`);
 			dbg(`session_start crash stack: ${(sessionErr as Error).stack}`);
+		}
+	});
+
+	// #190 Phase 2: capture the source session's diagnostics just before a fork,
+	// so the forked session (its `session_start` fires with reason="fork") can
+	// branch from them instead of starting empty. In-memory hand-off within the
+	// same process; cleared once adopted (or on any non-fork start).
+	(pi as any).on("session_before_fork", () => {
+		try {
+			pendingForkSnapshot = exportWidgetState();
+			dbg(
+				`session_before_fork: stashed ${pendingForkSnapshot.files.length} file(s) for the fork`,
+			);
+		} catch (forkErr) {
+			dbg(`session_before_fork crashed: ${forkErr}`);
 		}
 	});
 
@@ -1279,10 +1399,14 @@ export default function (pi: ExtensionAPI) {
 							budgetMs: EXPANSION_BUDGET_MS,
 						},
 					});
+					const symbolPath = [
+						...(expansion.ancestry ?? []).map((a) => a.name),
+						expansion.enclosingSymbol.name,
+					].join(" → ");
 					dbg(
 						`ts expanded read: ${path.basename(filePath)} ` +
 							`lines ${requestedReadOffset}–${requestedReadOffset + requestedReadLimit - 1} ` +
-							`→ ${expansion.enclosingSymbol.name} ` +
+							`→ ${symbolPath} ` +
 							`(${expansion.newOffset}–${expansion.newOffset + expansion.newLimit - 1})`,
 					);
 				}
@@ -1327,6 +1451,47 @@ export default function (pi: ExtensionAPI) {
 				writeIndex: runtime.peekWriteIndex(),
 				timestamp: Date.now(),
 			});
+		}
+
+		// --- Read-Before-Edit Guard: register file access done via `bash` ---
+		// Mirrors how the Read/Write tools are tracked. Only the bash tool —
+		// grep/find tools (and their patterns) are not contiguous file access.
+		//   reads  (cat/head/tail/sed -n) → recordRead with the exact range shown
+		//   writes (>, >>, tee, sed -i, cp/mv dest, touch) → noteCreatedFile, so the
+		//          agent "owns" the file (recordWritten fires at tool_result), same
+		//          as the Write tool.
+		if (toolName === "bash" && !getLensFlag("no-read-guard")) {
+			const cmd = (event.input as Record<string, unknown>)?.command;
+			if (typeof cmd === "string" && cmd) {
+				const effectiveCwd = ctx.cwd ?? runtime.projectRoot ?? process.cwd();
+				const inScope = (fp: string) =>
+					!isPathIgnoredByProject(fp, runtime.projectRoot, false) &&
+					!isExternalOrVendorFile(fp, runtime.projectRoot);
+
+				for (const span of extractReadPathsFromCommand(cmd, effectiveCwd)) {
+					if (!inScope(span.filePath)) continue;
+					runtime.readGuard.recordRead({
+						filePath: span.filePath,
+						requestedOffset: span.offset,
+						requestedLimit: span.limit,
+						effectiveOffset: span.offset,
+						effectiveLimit: span.limit,
+						expandedByLsp: false,
+						turnIndex: runtime.turnIndex,
+						writeIndex: runtime.peekWriteIndex(),
+						timestamp: Date.now(),
+					});
+				}
+
+				for (const wp of extractWrittenPathsFromCommand(cmd, effectiveCwd)) {
+					if (!inScope(wp)) continue;
+					runtime.readGuard.noteCreatedFile(
+						wp,
+						runtime.turnIndex,
+						runtime.peekWriteIndex(),
+					);
+				}
+			}
 		}
 
 		const { complexityClient } = await loadBootstrapClients();
@@ -1500,6 +1665,31 @@ export default function (pi: ExtensionAPI) {
 							newTextTrailingEmptyLinesPatched: newTextPatched,
 						},
 					});
+					// Bridge: same rationale as the indent autopatch — the
+					// trailing-ws patcher only applies when the stripped oldText
+					// matches exactly once against the file, so the agent's text
+					// reflects real content at the matched span. Register a
+					// synthetic read covering it so the read-guard downstream
+					// doesn't fire a zero_read block after the verification.
+					if (matchNormalizedContent !== undefined && runtime.readGuard) {
+						const range = findUniqueMatchLineRange(
+							matchNormalizedContent,
+							patch.oldText,
+						);
+						if (range) {
+							runtime.readGuard.recordRead({
+								filePath,
+								requestedOffset: range.startLine,
+								requestedLimit: range.endLine - range.startLine + 1,
+								effectiveOffset: range.startLine,
+								effectiveLimit: range.endLine - range.startLine + 1,
+								expandedByLsp: false,
+								turnIndex: runtime.turnIndex,
+								writeIndex: 0,
+								timestamp: Date.now(),
+							});
+						}
+					}
 				}
 			}
 
@@ -1573,6 +1763,29 @@ export default function (pi: ExtensionAPI) {
 							newTextIndentationPatched: correctedNewText !== undefined,
 						},
 					});
+					// Bridge: a unique-match autopatch proves the agent's oldText
+					// reflects real content at this span. Register a synthetic read
+					// for the matched range so a zero_read block downstream isn't
+					// thrown after the autopatch already verified the content.
+					if (matchNormalizedContent !== undefined && runtime.readGuard) {
+						const range = findUniqueMatchLineRange(
+							matchNormalizedContent,
+							entry.corrected,
+						);
+						if (range) {
+							runtime.readGuard.recordRead({
+								filePath,
+								requestedOffset: range.startLine,
+								requestedLimit: range.endLine - range.startLine + 1,
+								effectiveOffset: range.startLine,
+								effectiveLimit: range.endLine - range.startLine + 1,
+								expandedByLsp: false,
+								turnIndex: runtime.turnIndex,
+								writeIndex: 0,
+								timestamp: Date.now(),
+							});
+						}
+					}
 				}
 			}
 		}
@@ -1683,7 +1896,46 @@ export default function (pi: ExtensionAPI) {
 								oldTextResolved: !!contentMatchValidated,
 							})
 						: { action: "allow" as const };
-				if (verdict.action === "block") {
+				// Content-verified range-stale relocation: the lines the agent meant
+				// to edit moved (read-time line hashes uniquely match the new spot),
+				// so re-target the positional edit to where the content now lives
+				// instead of dead-ending. Safe because the hashes prove the new span
+				// IS the intended content — the same guarantee that lets
+				// pi-hashline-readmap auto-apply. Single-range only (set by the guard).
+				if (verdict.relocation) {
+					const relocated = relocateEditRange(
+						(event as { input?: unknown }).input,
+						verdict.relocation.from,
+						verdict.relocation.to,
+					);
+					if (relocated) {
+						const [toStart, toEnd] = verdict.relocation.to;
+						runtime.readGuard?.recordRead({
+							filePath,
+							requestedOffset: toStart,
+							requestedLimit: toEnd - toStart + 1,
+							effectiveOffset: toStart,
+							effectiveLimit: toEnd - toStart + 1,
+							expandedByLsp: false,
+							turnIndex: runtime.turnIndex,
+							writeIndex: 0,
+							timestamp: Date.now(),
+						});
+						logReadGuardEvent({
+							event: "edit_range_relocated",
+							sessionId: runtime.telemetrySessionId,
+							filePath,
+							metadata: {
+								tool: "edit",
+								from: verdict.relocation.from,
+								to: verdict.relocation.to,
+							},
+						});
+						// Relocation applied — let the re-targeted edit proceed.
+					} else if (verdict.action === "block") {
+						return { block: true, reason: verdict.reason };
+					}
+				} else if (verdict.action === "block") {
 					return {
 						block: true,
 						reason: verdict.reason,
@@ -1698,9 +1950,6 @@ export default function (pi: ExtensionAPI) {
 		if (isWriteOrEdit && runtime.cachedExports.size > 0) {
 			const newContent = getNewContentFromToolCall(event);
 			if (newContent) {
-				const INLINE_SIMILARITY_THRESHOLD = 0.9;
-				const INLINE_SIMILARITY_MAX_HINTS = 3;
-				const INLINE_SIMILARITY_MAX_CHARS = 700;
 				const dupeWarnings: string[] = [];
 				const exportRe =
 					/export\s+(?:async\s+)?(?:function|class|const|let|type|interface)\s+(\w+)/g;
@@ -1742,116 +1991,40 @@ export default function (pi: ExtensionAPI) {
 							dupeWarnings.map((w) => "  • " + w).join("\n"),
 					};
 				}
-
-				// --- Structural similarity check (Phase 7b) ---
-				// If the project index was built at session_start, check new
-				// functions against it for structural clones (~50ms).
-				if (
-					runtime.cachedProjectIndex &&
-					runtime.cachedProjectIndex.entries.size > 0 &&
-					/\.(ts|tsx)$/.test(filePath)
-				) {
-					try {
-						const ts = await import("typescript");
-						const sourceFile = ts.createSourceFile(
-							filePath,
-							newContent,
-							ts.ScriptTarget.Latest,
-							true,
-						);
-						const { extractFunctions } = await import(
-							"./clients/dispatch/runners/similarity.js"
-						);
-						const { findSimilarFunctions } = await import(
-							"./clients/project-index.js"
-						);
-						const newFunctions = extractFunctions(ts, sourceFile, newContent);
-						const simWarnings: string[] = [];
-						let simHintsTruncated = false;
-						const relPath = path.relative(runtime.projectRoot, filePath);
-
-						for (const func of newFunctions) {
-							if (simWarnings.length >= INLINE_SIMILARITY_MAX_HINTS) {
-								simHintsTruncated = true;
-								break;
-							}
-							if (func.transitionCount < 20) continue;
-							const matches = findSimilarFunctions(
-								func.matrix,
-								runtime.cachedProjectIndex,
-								INLINE_SIMILARITY_THRESHOLD,
-								1,
-							);
-							for (const match of matches) {
-								if (simWarnings.length >= INLINE_SIMILARITY_MAX_HINTS) {
-									simHintsTruncated = true;
-									break;
-								}
-								const targetPathMatch = String(match.targetLocation).match(
-									/^(.*):\d+$/,
-								);
-								const targetPath =
-									targetPathMatch?.[1] ?? String(match.targetLocation);
-								const resolvedTarget = path.isAbsolute(targetPath)
-									? targetPath
-									: path.join(runtime.projectRoot, targetPath);
-								if (!nodeFs.existsSync(resolvedTarget)) continue;
-
-								// Skip self-matches
-								if (match.targetId === `${relPath}:${func.name}`) continue;
-								const pct = Math.round(match.similarity * 100);
-								simWarnings.push(
-									`\`${func.name}\` is ${pct}% similar to \`${match.targetName}\` at \`${String(match.targetLocation).replace(/\\/g, "/")}\``,
-								);
-							}
-						}
-
-						if (simWarnings.length > 0) {
-							let reason = `⚠️ Potential structural similarity (advisory):\n${simWarnings.map((w) => `  • ${w}`).join("\n")}`;
-							if (simHintsTruncated) {
-								reason += "\n  • ... additional similar candidates omitted";
-							}
-							reason +=
-								"\nUse this only as a hint; verify behavior before refactoring.";
-							if (reason.length > INLINE_SIMILARITY_MAX_CHARS) {
-								reason = `${reason.slice(0, INLINE_SIMILARITY_MAX_CHARS)}\n... (truncated)`;
-							}
-							return {
-								block: false,
-								reason,
-							};
-						}
-					} catch {
-						// Parsing failed - skip similarity check silently
-					}
-				}
 			}
 		}
 	});
 
 	// Real-time feedback on file writes/edits
 	// biome-ignore lint/suspicious/noExplicitAny: pi.on overload mismatch for tool_result event type
-	(pi as any).on("tool_result", async (event: any) => {
+	(pi as any).on("tool_result", async (event: any, ctx: any) => {
 		if (!lensEnabled) return;
 		updateRuntimeIdentityFromEvent(event);
-		const { biomeClient, ruffClient, metricsClient, agentBehaviorClient } =
-			await loadBootstrapClients();
-		return handleToolResult({
-			event: event as any,
-			getFlag: (name: string) => getLensFlag(name),
-			dbg,
-			runtime,
-			cacheManager,
-			biomeClient,
-			ruffClient,
-			metricsClient,
-			resetLSPService,
-			readGuard: runtime.readGuard,
-			agentBehaviorRecord: (toolName, filePath) =>
-				agentBehaviorClient.recordToolCall(toolName, filePath),
-			formatBehaviorWarnings: (warnings) =>
-				agentBehaviorClient.formatWarnings(warnings as any),
-		});
+		// Publish this turn's abort signal so the dispatch's linter/type-check
+		// child processes are killed if the agent is interrupted (#197 ctx.signal).
+		setAmbientAbortSignal(ctx?.signal);
+		try {
+			const { biomeClient, ruffClient, metricsClient, agentBehaviorClient } =
+				await loadBootstrapClients();
+			return await handleToolResult({
+				event: event as any,
+				getFlag: (name: string) => getLensFlag(name),
+				dbg,
+				runtime,
+				cacheManager,
+				biomeClient,
+				ruffClient,
+				metricsClient,
+				resetLSPService,
+				readGuard: runtime.readGuard,
+				agentBehaviorRecord: (toolName, filePath) =>
+					agentBehaviorClient.recordToolCall(toolName, filePath),
+				formatBehaviorWarnings: (warnings) =>
+					agentBehaviorClient.formatWarnings(warnings as any),
+			});
+		} finally {
+			setAmbientAbortSignal(undefined);
+		}
 	});
 
 	// --- Turn end: batch jscpd/madge on collected files, then clear state ---
@@ -1863,7 +2036,13 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_end", async (_event, ctx) => {
 		if (!lensEnabled) return;
+		// Esc/abort during the deferred format + flush kills in-flight children.
+		setAmbientAbortSignal((ctx as { signal?: AbortSignal })?.signal);
 		try {
+			// Ensure any pipeline still queued in the debounce window finishes
+			// before agent_end runs — otherwise project change-log entries and
+			// modified ranges this turn produced may not be reflected yet.
+			await flushDebouncedToolResults();
 			await handleAgentEnd({
 				ctxCwd: ctx.cwd,
 				getFlag: (name: string) => getLensFlag(name),
@@ -1878,12 +2057,34 @@ export default function (pi: ExtensionAPI) {
 		} catch (agentEndErr) {
 			dbg(`agent_end crashed: ${agentEndErr}`);
 			dbg(`agent_end crash stack: ${(agentEndErr as Error).stack}`);
+		} finally {
+			setAmbientAbortSignal(undefined);
 		}
 	});
 
 	pi.on("turn_end", async (_event: any, ctx) => {
 		if (!lensEnabled) return;
+		// Esc/abort during the turn-end flush (knip/madge/tests + debounced
+		// dispatch) kills in-flight children instead of waiting out their timeout.
+		setAmbientAbortSignal((ctx as { signal?: AbortSignal })?.signal);
 		try {
+			// Persist a new worst event-loop block to latency.log, attributed to
+			// this turn, so freezes are queryable across sessions (#192).
+			const loopMaxMs = getEventLoopStats()?.maxMs ?? 0;
+			if (shouldLogWorstBlock(loopMaxMs, lastLoggedLoopWorstMs)) {
+				logLatency({
+					type: "phase",
+					filePath: "<pi-lens>",
+					phase: "loop_block",
+					durationMs: Math.round(loopMaxMs),
+					metadata: { worstSoFar: true, turnIndex: runtime.turnIndex },
+				});
+				lastLoggedLoopWorstMs = loopMaxMs;
+			}
+
+			// Drain any tool_result still in the debounce window so turn_end
+			// reads consistent state (cache, modified ranges, change-log).
+			await flushDebouncedToolResults();
 			const { knipClient, depChecker, testRunnerClient } =
 				await loadBootstrapClients();
 			await handleTurnEnd({
@@ -1899,9 +2100,23 @@ export default function (pi: ExtensionAPI) {
 				resetFormatService,
 			});
 			ctx.ui && updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
+
+			// #190: persist this session's settled widget diagnostics so a later
+			// resume (`pi --session <id>`) can rehydrate them. Only when pi gave us
+			// a stable session id (else the file would be orphaned, never loaded).
+			// Fire-and-forget — persistence must never delay or break a turn.
+			if (runtime.hasStableSessionId) {
+				void saveSessionState(
+					ctx.cwd ?? process.cwd(),
+					runtime.telemetrySessionId,
+					exportWidgetState(),
+				);
+			}
 		} catch (turnEndErr) {
 			dbg(`turn_end crashed: ${turnEndErr}`);
 			dbg(`turn_end crash stack: ${(turnEndErr as Error).stack}`);
+		} finally {
+			setAmbientAbortSignal(undefined);
 		}
 	});
 
@@ -1910,7 +2125,11 @@ export default function (pi: ExtensionAPI) {
 	// so it does not fire after shutdown. resetLSPService shuts down any live clients.
 	(pi as any).on("session_shutdown", () => {
 		cancelLSPIdleReset();
-		resetLSPService({ fast: true });
+		// processExiting: the loop is closing here — killing LSP servers must NOT
+		// spawn taskkill, or libuv aborts on uv_async_send to the closing loop
+		// (Assertion !(handle->flags & UV_HANDLE_CLOSING), src\win\async.c) — seen
+		// on `pi update`. Direct handle-kill only; the OS reaps any orphans.
+		resetLSPService({ fast: true, processExiting: true });
 	});
 
 	// --- Inject turn-end findings into next agent turn ---
@@ -1926,7 +2145,7 @@ export default function (pi: ExtensionAPI) {
 			event: { messages?: Array<{ role: string; content: unknown }> } | unknown,
 			ctx: { cwd?: string },
 		) => {
-			if (!lensEnabled) return;
+			if (!lensEnabled || !contextInjectionEnabled) return;
 			try {
 				const cwd = ctx.cwd ?? process.cwd();
 				const turnEndFindings = consumeTurnEndFindings(cacheManager, cwd);

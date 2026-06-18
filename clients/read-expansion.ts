@@ -11,7 +11,7 @@ import * as fs from "node:fs";
 import type { TreeSitterClient } from "./tree-sitter-client.js";
 
 /** Only expand reads smaller than this (lines). Larger reads don't benefit. */
-export const EXPANSION_LIMIT_LINES = 60;
+export const EXPANSION_LIMIT_LINES = 100;
 
 /** Don't expand to a symbol larger than this. */
 const EXPANDED_SIZE_CAP_LINES = 300;
@@ -33,6 +33,31 @@ const EXT_TO_LANG: Record<string, string> = {
 	".go": "go",
 	".rs": "rust",
 	".rb": "ruby",
+	".java": "java",
+	".kt": "kotlin",
+	".kts": "kotlin",
+	".dart": "dart",
+	".ex": "elixir",
+	".exs": "elixir",
+	".c": "c",
+	".h": "c",
+	".cc": "cpp",
+	".cpp": "cpp",
+	".cxx": "cpp",
+	".c++": "cpp",
+	".hh": "cpp",
+	".hpp": "cpp",
+	".hxx": "cpp",
+	".cs": "csharp",
+	".php": "php",
+	".phtml": "php",
+	".swift": "swift",
+	".lua": "lua",
+	".ml": "ocaml",
+	".mli": "ocaml",
+	".zig": "zig",
+	".sh": "bash",
+	".bash": "bash",
 };
 
 /** AST node types considered "enclosing symbols" for coverage purposes. */
@@ -62,7 +87,38 @@ const ENCLOSING_TYPES: Record<string, string[]> = {
 	go: ["function_declaration", "method_declaration"],
 	rust: ["function_item", "impl_item"],
 	ruby: ["method", "class", "module"],
+	java: [
+		"method_declaration",
+		"constructor_declaration",
+		"class_declaration",
+		"interface_declaration",
+		"enum_declaration",
+	],
+	kotlin: ["function_declaration", "class_declaration", "object_declaration"],
+	dart: ["function_declaration", "method_declaration", "class_definition", "mixin_declaration"],
+	elixir: ["call"],
+	c: ["function_definition"],
+	cpp: ["function_definition", "class_specifier", "struct_specifier"],
+	csharp: [
+		"method_declaration",
+		"constructor_declaration",
+		"class_declaration",
+		"interface_declaration",
+		"struct_declaration",
+	],
+	php: ["function_definition", "method_declaration", "class_declaration"],
+	swift: ["function_declaration", "class_declaration", "protocol_declaration", "init_declaration"],
+	lua: ["function_declaration", "function_definition"],
+	ocaml: ["value_definition", "module_definition"],
+	zig: ["function_declaration"],
+	bash: ["function_definition"],
 };
+
+export interface AncestorSymbol {
+	name: string;
+	kind: string;
+	startLine: number;
+}
 
 export interface ExpandedRead {
 	newOffset: number;
@@ -73,6 +129,12 @@ export interface ExpandedRead {
 		startLine: number;
 		endLine: number;
 	};
+	/**
+	 * Ancestor symbols from outermost to innermost, not including
+	 * enclosingSymbol itself. Example: [ClassDecl, MethodDecl] when
+	 * the immediate enclosing symbol is an arrow function inside a method.
+	 */
+	ancestry?: AncestorSymbol[];
 	durationMs: number;
 }
 
@@ -110,6 +172,28 @@ function getSymbolName(node: any): string {
 		}
 	}
 	return node.type as string;
+}
+
+/**
+ * Walk parent nodes from `node` upward, collecting every ancestor that is
+ * one of the enclosing symbol types. Returns them outermost-first.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: tree-sitter AST node
+function buildAncestryChain(node: any, types: string[]): AncestorSymbol[] {
+	const chain: AncestorSymbol[] = [];
+	// biome-ignore lint/suspicious/noExplicitAny: tree-sitter parent node
+	let current: any = node.parent;
+	while (current) {
+		if (types.includes(current.type as string)) {
+			chain.push({
+				name: getSymbolName(current),
+				kind: current.type as string,
+				startLine: (current.startPosition?.row ?? 0) + 1,
+			});
+		}
+		current = current.parent;
+	}
+	return chain.reverse(); // outermost first
 }
 
 function withBudget<T>(
@@ -266,6 +350,7 @@ export async function tryExpandRead(
 		if (expandedSize > EXPANDED_SIZE_CAP_LINES) return undefined;
 		if (expandedSize <= requestedLimit) return undefined;
 
+		const ancestry = buildAncestryChain(enclosing, enclosingTypes);
 		return {
 			newOffset: expandedStart,
 			newLimit: expandedSize,
@@ -275,6 +360,7 @@ export async function tryExpandRead(
 				startLine: symbolStart,
 				endLine: symbolEnd,
 			},
+			ancestry: ancestry.length > 0 ? ancestry : undefined,
 			durationMs: Date.now() - startedAt,
 		};
 	} catch {

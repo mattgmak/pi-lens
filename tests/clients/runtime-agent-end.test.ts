@@ -17,8 +17,8 @@ describe("runtime-agent-end deferred formatting", () => {
 			const filePath = createTempFile(env.tmpDir, "src/app.ts", "const x=1");
 			const runtime = new RuntimeCoordinator();
 			runtime.projectRoot = env.tmpDir;
-			runtime.deferFormat(filePath, env.tmpDir, "edit");
-			runtime.deferFormat(filePath, env.tmpDir, "write");
+			runtime.deferFormat(filePath, env.tmpDir, "edit", env.tmpDir);
+			runtime.deferFormat(filePath, env.tmpDir, "write", env.tmpDir);
 
 			const formatFile = vi.fn(async (fp: string) => {
 				fs.writeFileSync(fp, "const x = 1;\n");
@@ -87,9 +87,9 @@ describe("runtime-agent-end deferred formatting", () => {
 			const file3 = createTempFile(env.tmpDir, "src/c.ts", "const c=3");
 			const runtime = new RuntimeCoordinator();
 			runtime.projectRoot = env.tmpDir;
-			runtime.deferFormat(file1, env.tmpDir, "edit");
-			runtime.deferFormat(file2, env.tmpDir, "edit");
-			runtime.deferFormat(file3, env.tmpDir, "edit");
+			runtime.deferFormat(file1, env.tmpDir, "edit", env.tmpDir);
+			runtime.deferFormat(file2, env.tmpDir, "edit", env.tmpDir);
+			runtime.deferFormat(file3, env.tmpDir, "edit", env.tmpDir);
 
 			const formatFile = vi.fn(async (fp: string) => {
 				fs.writeFileSync(fp, fs.readFileSync(fp, "utf-8") + "\n");
@@ -131,6 +131,21 @@ describe("runtime-agent-end deferred formatting", () => {
 			}
 			env.cleanup();
 		}
+	});
+
+	it("rejects deferFormat calls that omit turnStateCwd at compile time (PR #114 lock)", () => {
+		const runtime = new RuntimeCoordinator();
+		// @ts-expect-error — turnStateCwd is required; omitting it would
+		// silently reintroduce the monorepo cwd-mismatch bug PR #105 fixed.
+		runtime.deferFormat("/some/file.ts", "/dispatch/cwd", "edit");
+		// Sanity: the correct 4-arg form compiles and registers the entry.
+		runtime.deferFormat(
+			"/some/file.ts",
+			"/dispatch/cwd",
+			"edit",
+			"/workspace/root",
+		);
+		expect(runtime.pendingDeferredFormatCount).toBeGreaterThan(0);
 	});
 
 	it("records deferred format bookkeeping under the workspace root in monorepos", async () => {
@@ -258,7 +273,7 @@ describe("runtime-agent-end deferred formatting", () => {
 			const filePath = createTempFile(env.tmpDir, "src/app.ts", "const x=1");
 			const runtime = new RuntimeCoordinator();
 			runtime.projectRoot = env.tmpDir;
-			runtime.deferFormat(filePath, env.tmpDir, "edit");
+			runtime.deferFormat(filePath, env.tmpDir, "edit", env.tmpDir);
 			const formatFile = vi.fn();
 
 			const summary = await handleAgentEnd({

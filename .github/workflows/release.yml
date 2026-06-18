@@ -68,13 +68,31 @@ jobs:
 
       - name: Install dependencies
         if: steps.meta.outputs.should_release == 'true' && steps.meta.outputs.has_npm_token == 'true'
-        run: npm ci
+        run: npm install --no-audit --no-fund
 
       - name: Dry-run publish (validates tarball + registry auth)
         if: steps.meta.outputs.should_release == 'true' && steps.meta.outputs.has_npm_token == 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --dry-run
+
+      # The dry-run above runs prepare (tsc → dist/), so the compiled entry now
+      # exists in the working tree. Load it to catch a broken/missing-dep entry
+      # before we tag and publish (#182).
+      - name: Smoke-load compiled entry
+        if: steps.meta.outputs.should_release == 'true' && steps.meta.outputs.has_npm_token == 'true'
+        shell: bash
+        run: |
+          ENTRY=$(node -p "require('./package.json').pi.extensions[0]")
+          echo "Loading entry: $ENTRY"
+          node "$ENTRY" 2>&1 | tee /tmp/load-output.txt || true
+          if grep -q "ERR_MODULE_NOT_FOUND\|Cannot find module" /tmp/load-output.txt \
+             && ! grep -q "pi-coding-agent" /tmp/load-output.txt; then
+            echo "FAILED: missing module dependency in compiled entry"
+            cat /tmp/load-output.txt
+            exit 1
+          fi
+          echo "Compiled entry loads OK"
 
   release:
     runs-on: ubuntu-latest
@@ -94,7 +112,7 @@ jobs:
           git push origin "${{ needs.prepare.outputs.tag }}"
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           name: ${{ needs.prepare.outputs.tag }}
@@ -113,6 +131,13 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+
+      # Required: the `prepare` script builds dist/ (tsc), which needs
+      # node_modules. `npm install` runs prepare here, and `npm publish` runs it
+      # again before packing. Without the install the build — and the publish —
+      # fails.
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
 
       - name: Publish to npm
         env:

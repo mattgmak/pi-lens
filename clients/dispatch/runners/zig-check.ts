@@ -9,7 +9,9 @@ import type {
 } from "../types.js";
 import { PRIORITY } from "../priorities.js";
 
-const zig = createAvailabilityChecker("zig", ".exe");
+// zig rejects `--version`; the version subcommand is `zig version`. Using the
+// default probe would make this runner skip on every machine.
+const zig = createAvailabilityChecker("zig", ".exe", ["version"]);
 
 function parseZigOutput(raw: string, filePath: string): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
@@ -57,7 +59,7 @@ const zigCheckRunner: RunnerDefinition = {
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		const cwd = ctx.cwd || process.cwd();
-		if (!(await (zig.isAvailableAsync?.(cwd) ?? zig.isAvailable(cwd)))) {
+		if (!(await (zig.isAvailableAsync(cwd)))) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 

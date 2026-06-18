@@ -215,6 +215,255 @@ const SYMBOL_QUERIES: Record<string, { defs: string; refs: string }> = {
       (type_identifier) @typeIdent
     `,
 	},
+	java: {
+		defs: `
+      (method_declaration
+        name: (identifier) @methodName
+        parameters: (formal_parameters) @methodParams) @methodDef
+
+      (class_declaration
+        name: (identifier) @className) @classDef
+
+      (interface_declaration
+        name: (identifier) @interfaceName) @interfaceDef
+
+      (constructor_declaration
+        name: (identifier) @funcName
+        parameters: (formal_parameters) @funcParams) @funcDef
+
+      (enum_declaration
+        name: (identifier) @className) @classDef
+    `,
+		refs: `
+      (method_invocation
+        name: (identifier) @callMethod) @callRef
+
+      (object_creation_expression
+        type: (type_identifier) @newIdent) @newRef
+
+      (type_identifier) @typeIdent
+    `,
+	},
+	kotlin: {
+		defs: `
+      (function_declaration
+        (simple_identifier) @funcName) @funcDef
+
+      (class_declaration
+        (type_identifier) @className) @classDef
+
+      (object_declaration
+        (type_identifier) @className) @classDef
+
+      (class_declaration
+        (simple_identifier) @className) @classDef
+    `,
+		refs: `
+      (call_expression
+        calleeExpression: (simple_identifier) @callIdent) @callRef
+
+      (call_expression
+        calleeExpression: (navigation_expression
+          selectorExpression: (simple_identifier) @callMethod)) @callMethodRef
+
+      (user_type (type_reference (simple_identifier) @typeIdent)) @typeRef
+    `,
+	},
+	dart: {
+		defs: `
+      (function_signature
+        name: (identifier) @funcName
+        parameters: (formal_parameter_list) @funcParams) @funcDef
+
+      (method_signature
+        name: (identifier) @methodName
+        parameters: (formal_parameter_list) @methodParams) @methodDef
+
+      (class_definition
+        name: (identifier) @className) @classDef
+
+      (mixin_declaration
+        name: (identifier) @className) @classDef
+
+      (extension_declaration
+        name: (identifier) @className) @classDef
+    `,
+		refs: `
+      (function_expression_body
+        (identifier) @callIdent) @callRef
+
+      (type_identifier) @typeIdent
+    `,
+	},
+	elixir: {
+		defs: `
+      (call
+        target: (identifier) @_kw
+        (arguments
+          (call
+            target: (identifier) @funcName
+            (arguments) @funcParams) @funcDef)
+        (#match? @_kw "^def[pm]?$"))
+
+      (call
+        target: (identifier) @_kw
+        (arguments (alias) @moduleName) @moduleDef
+        (#match? @_kw "^defmodule$"))
+    `,
+		refs: `
+      (call
+        target: (identifier) @callIdent) @callRef
+
+      (alias) @typeIdent
+    `,
+	},
+	csharp: {
+		defs: `
+      (method_declaration
+        name: (identifier) @methodName
+        parameters: (parameter_list) @methodParams) @methodDef
+
+      (class_declaration
+        name: (identifier) @className) @classDef
+
+      (struct_declaration
+        name: (identifier) @className) @classDef
+
+      (interface_declaration
+        name: (identifier) @interfaceName) @interfaceDef
+
+      (constructor_declaration
+        name: (identifier) @funcName
+        parameters: (parameter_list) @funcParams) @funcDef
+
+      (enum_declaration
+        name: (identifier) @className) @classDef
+    `,
+		refs: `
+      (invocation_expression
+        function: (identifier) @callIdent) @callRef
+
+      (invocation_expression
+        function: (member_access_expression
+          name: (identifier) @callMethod)) @callMethodRef
+
+      (object_creation_expression
+        type: (identifier) @newIdent) @newRef
+    `,
+	},
+	php: {
+		defs: `
+      (function_definition
+        name: (name) @funcName
+        parameters: (formal_parameters) @funcParams) @funcDef
+
+      (method_declaration
+        name: (name) @methodName
+        parameters: (formal_parameters) @methodParams) @methodDef
+
+      (class_declaration
+        name: (name) @className) @classDef
+
+      (interface_declaration
+        name: (name) @interfaceName) @interfaceDef
+
+      (trait_declaration
+        name: (name) @className) @classDef
+    `,
+		refs: `
+      (function_call_expression
+        function: (name) @callIdent) @callRef
+
+      (member_call_expression
+        name: (name) @callMethod) @callMethodRef
+
+      (object_creation_expression
+        class_name: (name) @newIdent) @newRef
+    `,
+	},
+	swift: {
+		defs: `
+      (function_declaration
+        (simple_identifier) @funcName) @funcDef
+
+      (class_declaration
+        (type_identifier) @className) @classDef
+
+      (protocol_declaration
+        (type_identifier) @interfaceName) @interfaceDef
+    `,
+		refs: `
+      (call_expression
+        (simple_identifier) @callIdent) @callRef
+
+      (navigation_expression
+        (simple_identifier) @callMethod) @callMethodRef
+
+      (type_identifier) @typeIdent
+    `,
+	},
+	lua: {
+		defs: `
+      (function_declaration
+        name: (identifier) @funcName
+        parameters: (parameters) @funcParams) @funcDef
+
+      (local_function
+        name: (identifier) @funcName
+        parameters: (parameters) @funcParams) @funcDef
+    `,
+		refs: `
+      (function_call
+        (identifier) @callIdent) @callRef
+
+      (function_call
+        (method_index_expression
+          method: (identifier) @callMethod)) @callMethodRef
+    `,
+	},
+	ocaml: {
+		defs: `
+      (value_definition
+        (let_binding
+          pattern: (value_pattern (value_name) @funcName))) @funcDef
+
+      (module_definition
+        (module_binding
+          name: (module_name) @moduleName)) @moduleDef
+
+      (type_definition
+        (type_constructor) @typeName) @typeDef
+    `,
+		refs: `
+      (application_expression
+        (value_path (value_name) @callIdent)) @callRef
+
+      (value_path (value_name) @callIdent) @callRef
+    `,
+	},
+	zig: {
+		defs: `
+      (function_declaration
+        (identifier) @funcName) @funcDef
+    `,
+		refs: `
+      (call_expression
+        (identifier) @callIdent) @callRef
+
+      (field_access
+        (identifier) @callMethod) @callMethodRef
+    `,
+	},
+	bash: {
+		defs: `
+      (function_definition
+        name: (word) @funcName) @funcDef
+    `,
+		refs: `
+      (command
+        name: (command_name (word) @callIdent)) @callRef
+    `,
+	},
 };
 
 export interface ExtractedSymbols {

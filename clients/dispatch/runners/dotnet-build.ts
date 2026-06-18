@@ -140,11 +140,12 @@ const dotnetBuildRunner: RunnerDefinition = {
 	appliesTo: ["csharp"],
 	priority: PRIORITY.GENERAL_ANALYSIS,
 	enabledByDefault: true,
+	timeoutMs: 90_000,
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		const cwd = ctx.cwd || process.cwd();
-		if (!(await (dotnet.isAvailableAsync?.(cwd) ?? dotnet.isAvailable(cwd)))) {
+		if (!(await (dotnet.isAvailableAsync(cwd)))) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 

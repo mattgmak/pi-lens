@@ -37,7 +37,6 @@ export const LANGUAGE_CAPABILITY_MATRIX: Record<
 			{ mode: "all", runnerIds: ["tree-sitter"], filterKinds: ["jsts"] },
 			{ mode: "all", runnerIds: ["fact-rules"], filterKinds: ["jsts"] },
 			{ mode: "all", runnerIds: ["ast-grep-napi"], filterKinds: ["jsts"] },
-			{ mode: "fallback", runnerIds: ["type-safety"], filterKinds: ["jsts"] },
 			{
 				mode: "fallback",
 				runnerIds: ["eslint", "oxlint", "biome-check-json"],
@@ -71,7 +70,6 @@ export const LANGUAGE_CAPABILITY_MATRIX: Record<
 		capabilities: ["types", "lint", "smells"],
 		writeGroups: [
 			primary("go"),
-			{ mode: "fallback", runnerIds: ["go-vet"], filterKinds: ["go"] },
 			{ mode: "fallback", runnerIds: ["golangci-lint"], filterKinds: ["go"] },
 			{ mode: "all", runnerIds: ["tree-sitter"], filterKinds: ["go"] },
 			{ mode: "all", runnerIds: ["fact-rules"], filterKinds: ["go"] },
@@ -82,7 +80,6 @@ export const LANGUAGE_CAPABILITY_MATRIX: Record<
 		capabilities: ["types", "lint", "smells"],
 		writeGroups: [
 			primary("rust"),
-			{ mode: "fallback", runnerIds: ["rust-clippy"], filterKinds: ["rust"] },
 			{ mode: "all", runnerIds: ["tree-sitter"], filterKinds: ["rust"] },
 			{ mode: "all", runnerIds: ["fact-rules"], filterKinds: ["rust"] },
 		],
@@ -120,9 +117,10 @@ export const LANGUAGE_CAPABILITY_MATRIX: Record<
 	},
 	shell: {
 		name: "Shell Script Linting",
-		capabilities: ["lint", "security"],
+		capabilities: ["lint", "security", "format"],
 		writeGroups: [
 			primary("shell"),
+			{ mode: "all", runnerIds: ["shfmt"], filterKinds: ["shell"] },
 			{ mode: "all", runnerIds: ["fact-rules"], filterKinds: ["shell"] },
 		],
 	},
@@ -134,7 +132,10 @@ export const LANGUAGE_CAPABILITY_MATRIX: Record<
 	markdown: {
 		name: "Markdown Processing",
 		capabilities: ["docs", "format", "lint"],
-		writeGroups: [primary("markdown")],
+		writeGroups: [
+			primary("markdown"),
+			{ mode: "all", runnerIds: ["markdownlint"], filterKinds: ["markdown"] },
+		],
 	},
 	css: {
 		name: "CSS Processing",
@@ -281,7 +282,6 @@ function toFullPlan(kind: FileKind, entry: CapabilityMatrixEntry): ToolPlan {
 				{ mode: "all", runnerIds: ["tree-sitter"], filterKinds: ["jsts"] },
 				{ mode: "all", runnerIds: ["ast-grep-napi"], filterKinds: ["jsts"] },
 				...(entry.fullOnlyGroups ?? []),
-				{ mode: "fallback", runnerIds: ["type-safety"], filterKinds: ["jsts"] },
 				{
 					mode: "fallback",
 					runnerIds: ["eslint", "oxlint", "biome-check-json"],

@@ -16,7 +16,6 @@ import {
 	formatSlopScoreSummary,
 	type SlopScoreSummary,
 } from "../session-summary.js";
-import { resolveSemgrepConfig } from "../semgrep-config.js";
 import {
 	clearCoverageNoticeState,
 	clearLatencyReports,
@@ -27,6 +26,7 @@ import {
 	getLatencyReports,
 	type RunnerLatency,
 	RunnerRegistry,
+	type RunnerResultSink,
 } from "./dispatcher.js";
 import { FactStore } from "./fact-store.js";
 import { TOOL_PLANS } from "./plan.js";
@@ -35,6 +35,7 @@ import type {
 	ModifiedRange,
 	PiAgentAPI,
 	RunnerGroup,
+	RunnerResult,
 } from "./types.js";
 
 export type { DispatchLatencyReport, RunnerLatency };
@@ -45,7 +46,7 @@ import * as nodeFs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { formatCascadeNeighborDiagnostics } from "../cascade-format.js";
 import { logCascade } from "../cascade-logger.js";
-import type { CascadeResult } from "../cascade-types.js";
+import type { CascadeResult, CascadeRun, CascadeSkipReason } from "../cascade-types.js";
 import { getDiagnosticTracker } from "../diagnostic-tracker.js";
 import { getServersForFileWithConfig } from "../lsp/config.js";
 import { getLSPService } from "../lsp/index.js";
@@ -62,10 +63,15 @@ import {
 import {
 	buildOrUpdateGraph,
 	computeImpactCascade,
+	computeTransitiveImpact,
 	formatImpactCascade,
 } from "../review-graph/service.js";
 import { clearModuleGraphCache } from "../review-graph/workspace-modules.js";
 import { RUNTIME_CONFIG } from "../runtime-config.js";
+import {
+	findCompiledClassesDir,
+	hasJavaBuildDescriptor,
+} from "../tool-policy.js";
 // Register fact providers
 import { registerProvider, runProviders } from "./fact-runner.js";
 import { fileContentProvider } from "./facts/file-content.js";
@@ -114,7 +120,6 @@ import {
 	duplicateStringLiteralRule,
 	dynamicRegexpRule,
 	functionInLoopRule,
-	jwtWithoutVerifyRule,
 	maxSwitchCasesRule,
 } from "./rules/sonar-rules.js";
 import { unsafeBoundaryRule } from "./rules/unsafe-boundary.js";
@@ -132,7 +137,6 @@ registerRule(highFanOutRule);
 registerRule(commentedOutCodeRule);
 registerRule(duplicateStringLiteralRule);
 registerRule(functionInLoopRule);
-registerRule(jwtWithoutVerifyRule);
 registerRule(corsWildcardRule);
 registerRule(dynamicRegexpRule);
 registerRule(maxSwitchCasesRule);
@@ -163,7 +167,6 @@ const FACT_RULE_IDS = new Set([
 	"commented-out-code",
 	"duplicate-string-literal",
 	"function-in-loop",
-	"jwt-without-verify",
 	"cors-wildcard",
 	"dynamic-regexp",
 	"max-switch-cases",
@@ -298,52 +301,37 @@ export function getDispatchSlopScoreLine(): string {
 	return formatSlopScoreSummary(summary);
 }
 
-const SEMGREP_SUPPORTED_KINDS = new Set<FileKind>([
-	"csharp",
-	"css",
-	"cxx",
-	"dart",
-	"docker",
-	"go",
-	"html",
-	"java",
-	"json",
-	"jsts",
-	"kotlin",
-	"lua",
-	"php",
-	"python",
-	"ruby",
-	"rust",
-	"shell",
-	"swift",
-	"terraform",
-	"yaml",
-]);
+// SpotBugs analyzes JVM bytecode, so it applies to java + kotlin. Opt-in
+// (lens-spotbugs flag) and only when a Java build descriptor + compiled .class
+// dir exist — the runner itself mtime-caches so it doesn't re-run per keystroke. #133
+const SPOTBUGS_SUPPORTED_KINDS = new Set<FileKind>(["java", "kotlin"]);
 
-function withSemgrepGroup(
+function withSpotbugsGroup(
 	kind: FileKind,
 	groups: RunnerGroup[],
 	ctx: ReturnType<typeof createDispatchContext>,
 ): RunnerGroup[] {
-	if (!SEMGREP_SUPPORTED_KINDS.has(kind)) return groups;
-	const config = resolveSemgrepConfig(ctx.cwd, {
-		enabled: Boolean(ctx.pi.getFlag("lens-semgrep")),
-		config: ctx.pi.getFlag("lens-semgrep-config"),
-	});
-	if (!config.enabled) return groups;
-	if (groups.some((group) => group.runnerIds.includes("semgrep")))
+	if (!SPOTBUGS_SUPPORTED_KINDS.has(kind)) return groups;
+	if (!ctx.pi.getFlag("lens-spotbugs")) return groups;
+	if (
+		!hasJavaBuildDescriptor(ctx.cwd) ||
+		!findCompiledClassesDir(ctx.cwd)
+	) {
+		return groups;
+	}
+	if (groups.some((group) => group.runnerIds.includes("spotbugs")))
 		return groups;
 	return [
 		...groups,
 		{
 			mode: "all",
-			runnerIds: ["semgrep"],
+			runnerIds: ["spotbugs"],
 			filterKinds: [kind],
 			semantic: "warning",
 		},
 	];
 }
+
 
 function withPrimaryPolicyGroup(
 	kind: keyof typeof TOOL_PLANS,
@@ -478,6 +466,20 @@ function ensureCascadeTurnScope(turnSeq: number): void {
 const CASCADE_TTL_MS = 240_000;
 const MAX_PER_FILE = RUNTIME_CONFIG.pipeline.cascadeMaxDiagnosticsPerFile;
 const MAX_FILES = RUNTIME_CONFIG.pipeline.cascadeMaxFiles;
+
+// Bounded transitive cascade (#162): expand neighbour derivation beyond the
+// one-hop importers/callers to depth-2 dependents, so an edit's blast radius
+// reaches indirect dependents — capped so the per-edit cost stays bounded. The
+// one-hop set is always the floor (it sorts first, before depth-2). Both
+// env-tunable; set depth to 1 to restore the old one-hop-only behaviour.
+const CASCADE_TRANSITIVE_DEPTH = Math.max(
+	1,
+	Number.parseInt(process.env.PI_LENS_CASCADE_TRANSITIVE_DEPTH ?? "2", 10) || 2,
+);
+const CASCADE_NEIGHBOUR_BUDGET = Math.max(
+	MAX_FILES,
+	Number.parseInt(process.env.PI_LENS_CASCADE_NEIGHBOUR_BUDGET ?? "40", 10) || 40,
+);
 const CASCADE_GRAPH_KINDS = new Set([
 	"jsts",
 	"python",
@@ -508,7 +510,7 @@ export async function computeCascadeForFile(
 		turnSeq?: number;
 		writeSeq?: number;
 	} = {},
-): Promise<CascadeResult | undefined> {
+): Promise<CascadeRun> {
 	const { hasBlockers = false, dbg, turnSeq = 0, writeSeq } = options;
 
 	ensureCascadeTurnScope(turnSeq);
@@ -519,13 +521,13 @@ export async function computeCascadeForFile(
 			filePath,
 			reason: "primary_has_blockers",
 		});
-		return undefined;
+		return { filePath, result: undefined, neighborCount: 0, diagnosticCount: 0, skipReason: "blockers" as CascadeSkipReason };
 	}
 
 	const fileKind = detectFileKind(filePath);
 	if (!fileKind) {
 		logCascade({ phase: "cascade_skip", filePath, reason: "non_code_file" });
-		return undefined;
+		return { filePath, result: undefined, neighborCount: 0, diagnosticCount: 0, skipReason: "non_code" as CascadeSkipReason };
 	}
 
 	const normalizedFile = resolveRunnerPath(cwd, filePath);
@@ -700,7 +702,43 @@ export async function computeCascadeForFile(
 			}
 		}
 
-		// Sort by relationship strength (B6) then cap to MAX_FILES.
+		// Bounded transitive expansion: add depth>1 dependents (indirect
+		// importers/callers/referencers) so the blast radius isn't limited to one
+		// hop. The one-hop sets above remain the floor (they sort first); these
+		// fill the remaining budget. Graph BFS is in-memory + capped.
+		if (CASCADE_TRANSITIVE_DEPTH > 1) {
+			const transitive = computeTransitiveImpact(graph, normalizedFile, {
+				maxDepth: CASCADE_TRANSITIVE_DEPTH,
+				maxHits: CASCADE_NEIGHBOUR_BUDGET,
+			});
+			const added = [
+				...new Set(
+					transitive.hits
+						.map((hit) => hit.file)
+						.filter(
+							(file) => file && normalizeMapKey(file) !== normalizedFileKey,
+						),
+				),
+			].filter((file) => !impact.neighborFiles.includes(file));
+			if (added.length > 0) {
+				impact.neighborFiles = [...impact.neighborFiles, ...added];
+				logCascade({
+					phase: "neighbor_snapshot",
+					filePath,
+					neighborFile: "[transitive-impact]",
+					diagnosticCount: added.length,
+					autoPropagate: false,
+					metadata: {
+						transitive: true,
+						maxDepth: CASCADE_TRANSITIVE_DEPTH,
+						maxDepthReached: transitive.maxDepthReached,
+						truncated: transitive.truncated,
+					},
+				});
+			}
+		}
+
+		// Sort by relationship strength (B6) then cap to the neighbour budget.
 		// directImporters are most impactful, then callers, then reference edges.
 		importerSet = new Set(impact.directImporters);
 		callerSet = new Set(impact.directCallers);
@@ -723,7 +761,7 @@ export async function computeCascadeForFile(
 					importerSet.has(p) ? 0 : callerSet.has(p) ? 1 : 2;
 				return rank(a) - rank(b);
 			})
-			.slice(0, MAX_FILES);
+			.slice(0, CASCADE_NEIGHBOUR_BUDGET);
 	} else {
 		logCascade({
 			phase: "cascade_skip",
@@ -731,7 +769,7 @@ export async function computeCascadeForFile(
 			reason: "unsupported_graph_kind",
 			metadata: { fileKind },
 		});
-		return undefined;
+		return { filePath, result: undefined, neighborCount: 0, diagnosticCount: 0, skipReason: "non_code" as CascadeSkipReason };
 	}
 
 	logCascade({
@@ -1052,20 +1090,23 @@ export async function computeCascadeForFile(
 		},
 	});
 
+	const diagCount = visibleNeighbors.reduce((sum, n) => sum + n.diagnostics.length, 0);
+
 	cascadeSessionStats.runs += 1;
-	cascadeSessionStats.diagnosticsSurfaced += visibleNeighbors.reduce(
-		(sum, n) => sum + n.diagnostics.length,
-		0,
-	);
+	cascadeSessionStats.diagnosticsSurfaced += diagCount;
 	cascadeSessionStats.coldSnapshotTouches += coldSnapshotPaths.length;
 
-	if (!formatted) return undefined;
+	if (!formatted) {
+		const skipReason: CascadeSkipReason =
+			visibleNeighbors.length === 0 ? "no_neighbors" : "clean";
+		return { filePath, result: undefined, neighborCount: visibleNeighbors.length, diagnosticCount: diagCount, skipReason };
+	}
 
 	getDiagnosticTracker().trackShown(
 		visibleNeighbors.flatMap((n) => n.diagnostics),
 	);
 
-	return { filePath, impact, neighbors: visibleNeighbors, formatted };
+	return { filePath, result: { filePath, impact, neighbors: visibleNeighbors, formatted }, neighborCount: visibleNeighbors.length, diagnosticCount: diagCount };
 }
 
 function diagnosticDeltaKey(
@@ -1220,7 +1261,7 @@ export async function dispatchLint(
 	const kind = ctx.kind;
 	if (!kind) return "";
 
-	const groups = withSemgrepGroup(
+	const groups = withSpotbugsGroup(
 		kind,
 		getDispatchGroupsForKind(kind, pi),
 		ctx,
@@ -1242,13 +1283,17 @@ export async function dispatchLintWithResult(
 	pi: PiAgentAPI,
 	modifiedRanges?: ModifiedRange[],
 	logContext?: LogContext,
+	options?: { blockingOnly?: boolean },
 ): Promise<DispatchResult> {
+	// Default true preserves the per-edit fast path (errors only). Callers that
+	// want the full picture (warnings + structural smells), e.g. the MCP review
+	// facade, pass blockingOnly=false to run every runner.
 	const ctx = createDispatchContext(
 		filePath,
 		cwd,
 		pi,
 		sessionFacts,
-		true,
+		options?.blockingOnly ?? true,
 		modifiedRanges,
 	);
 	sessionFacts.clearFileFactsFor(ctx.filePath);
@@ -1268,7 +1313,7 @@ export async function dispatchLintWithResult(
 		};
 	}
 
-	const groups = withSemgrepGroup(
+	const groups = withSpotbugsGroup(
 		kind,
 		getDispatchGroupsForKind(kind, pi),
 		ctx,
@@ -1299,6 +1344,76 @@ export async function dispatchLintWithResult(
 	}
 
 	return result;
+}
+
+/** Per-runner outcome captured while driving the real dispatch path. */
+export interface RunnerOutcome {
+	runnerId: string;
+	result: RunnerResult;
+}
+
+/**
+ * Same real dispatch path as {@link dispatchLintWithResult} (real context, real
+ * file-kind→runner selection, real `run()` → spawn → tool), but also returns
+ * each runner's exact `RunnerResult` (status + `failureKind` + diagnostics) via
+ * the `onRunnerResult` sink. The live tool-smoke harness (#209) uses this to
+ * assert each supported tool spawned and exited cleanly without re-implementing
+ * dispatch's selection/gating. Defaults to `blockingOnly: false` so every
+ * applicable runner (not just blocking ones) executes.
+ */
+export async function dispatchLintDetailed(
+	filePath: string,
+	cwd: string,
+	pi: PiAgentAPI,
+	options?: { blockingOnly?: boolean; modifiedRanges?: ModifiedRange[] },
+): Promise<{ result: DispatchResult; runners: RunnerOutcome[] }> {
+	const empty: DispatchResult = {
+		diagnostics: [],
+		blockers: [],
+		warnings: [],
+		baselineWarningCount: 0,
+		fixed: [],
+		resolvedCount: 0,
+		output: "",
+		blockerOutput: "",
+		hasBlockers: false,
+	};
+
+	const ctx = createDispatchContext(
+		filePath,
+		cwd,
+		pi,
+		sessionFacts,
+		options?.blockingOnly ?? false,
+		options?.modifiedRanges,
+	);
+	sessionFacts.clearFileFactsFor(ctx.filePath);
+
+	const kind = ctx.kind;
+	if (!kind) return { result: empty, runners: [] };
+
+	const groups = withSpotbugsGroup(
+		kind,
+		getDispatchGroupsForKind(kind, pi),
+		ctx,
+	);
+	if (groups.length === 0) return { result: empty, runners: [] };
+
+	const runners: RunnerOutcome[] = [];
+	const sink: RunnerResultSink = (runnerId, result) => {
+		runners.push({ runnerId, result });
+	};
+
+	await runProviders(ctx);
+	const result = await dispatchForFile(
+		ctx,
+		groups,
+		sessionRunnerRegistry,
+		sink,
+	);
+	trackSessionSlopStats(ctx, result.diagnostics);
+
+	return { result, runners };
 }
 
 /**

@@ -34,7 +34,6 @@
  * - vscode-json-languageserver: npm install -g vscode-langservers-extracted
  * - bash-language-server: npm install -g bash-language-server
  * - svelte-language-server: npm install -g svelte-language-server
- * - vscode-eslint-language-server: npm install -g vscode-langservers-extracted
  * - vscode-css-languageserver: npm install -g vscode-langservers-extracted
  * - @prisma/language-server: npm install -g @prisma/language-server
  * - dockerfile-language-server: npm install -g dockerfile-language-server-nodejs
@@ -54,17 +53,19 @@ import https from "node:https";
 import os from "node:os";
 import path from "node:path";
 import { createGunzip } from "node:zlib";
+import { isTestMode } from "../env-utils.js";
+import { getGlobalPiLensDir } from "../file-utils.js";
 
 // Global installation directory for pi-lens tools
-const TOOLS_DIR = path.join(os.homedir(), ".pi-lens", "tools");
+const TOOLS_DIR = path.join(getGlobalPiLensDir(), "tools");
 
 // Directory for GitHub-downloaded binaries
-const GITHUB_BIN_DIR = path.join(os.homedir(), ".pi-lens", "bin");
+const GITHUB_BIN_DIR = path.join(getGlobalPiLensDir(), "bin");
 
 // Debug flag - set via PI_LENS_DEBUG=1 or --debug
 const DEBUG =
 	process.env.PI_LENS_DEBUG === "1" || process.argv.includes("--debug");
-const SESSIONSTART_LOG_DIR = path.join(os.homedir(), ".pi-lens");
+const SESSIONSTART_LOG_DIR = getGlobalPiLensDir();
 const SESSIONSTART_LOG = path.join(SESSIONSTART_LOG_DIR, "sessionstart.log");
 
 /**
@@ -77,10 +78,7 @@ function debugLog(...args: unknown[]): void {
 }
 
 function logSessionStart(msg: string): void {
-	if (
-		process.env.PI_LENS_TEST_MODE === "1" ||
-		(process.env.VITEST && process.env.PI_LENS_TEST_MODE !== "0")
-	) {
+	if (isTestMode()) {
 		return;
 	}
 	const line = `[${new Date().toISOString()}] ${msg}\n`;
@@ -110,20 +108,58 @@ interface GitHubAssetSpec {
 	 */
 	binaryInArchive?: string;
 	hashiCorpReleaseProduct?: string;
+	/**
+	 * Additional release assets (EXACT names) to download as bare files alongside
+	 * the primary binary. Needed when the primary is a wrapper that references a
+	 * sibling file — e.g. ktlint's Windows `ktlint.bat` runs `java -jar %~dp0ktlint`,
+	 * so the `ktlint` jar must land next to it (#218).
+	 */
+	extraAssets?: (platform: string, arch: string) => string[];
 }
 
-interface ToolDefinition {
+/**
+ * A tool distributed as a runnable fat JAR on a Maven repository (default Maven
+ * Central). Installed by downloading the JAR into the managed bin and writing a
+ * `java -jar` launcher next to it, so it resolves like any other managed binary.
+ * Requires a JRE at run time.
+ */
+export interface MavenJarSpec {
+	groupId: string;
+	artifactId: string;
+	version: string;
+	/** Classifier for the runnable fat jar, e.g. "with-dependencies". */
+	classifier?: string;
+	/** Maven repo base URL (default Maven Central). */
+	repoBaseUrl?: string;
+}
+
+export interface ArchiveSpec {
+	/** Download URL for the distribution archive (.tgz/.zip). */
+	url: string;
+	/** Archive kind — both extracted via `tar` (Windows bsdtar handles zip too). */
+	kind: "tgz" | "zip";
+	/**
+	 * Launcher path relative to the archive's top-level dir (which is stripped on
+	 * extraction), e.g. "bin/spotbugs". On win32 the installer resolves the
+	 * sibling `.bat`.
+	 */
+	launcher: string;
+}
+
+export interface ToolDefinition {
 	id: string;
 	name: string;
 	checkCommand: string;
 	checkArgs: string[];
-	installStrategy: "npm" | "pip" | "gem" | "github";
+	installStrategy: "npm" | "pip" | "gem" | "github" | "maven" | "archive";
 	packageName?: string;
 	binaryName?: string;
 	github?: GitHubAssetSpec;
+	maven?: MavenJarSpec;
+	archive?: ArchiveSpec;
 }
 
-const TOOLS: ToolDefinition[] = [
+export const TOOLS: ToolDefinition[] = [
 	// Core LSP servers
 	{
 		id: "typescript-language-server",
@@ -170,6 +206,17 @@ const TOOLS: ToolDefinition[] = [
 		installStrategy: "pip",
 		packageName: "ruff",
 		binaryName: "ruff",
+	},
+	{
+		// Alternate Python LSP (fallback when pyright/the `python` server is
+		// unavailable or disabled). Used as a managedToolId by PythonJediServer.
+		id: "jedi-language-server",
+		name: "Jedi Language Server",
+		checkCommand: "jedi-language-server",
+		checkArgs: ["--version"],
+		installStrategy: "pip",
+		packageName: "jedi-language-server",
+		binaryName: "jedi-language-server",
 	},
 	{
 		id: "biome",
@@ -264,15 +311,6 @@ const TOOLS: ToolDefinition[] = [
 		binaryName: "vscode-json-language-server",
 	},
 	{
-		id: "vscode-langservers-extracted",
-		name: "VSCode ESLint Language Server",
-		checkCommand: "vscode-eslint-language-server",
-		checkArgs: ["--version"],
-		installStrategy: "npm",
-		packageName: "vscode-langservers-extracted",
-		binaryName: "vscode-eslint-language-server",
-	},
-	{
 		id: "vscode-html-languageserver-bin",
 		name: "VSCode HTML Language Server",
 		checkCommand: "vscode-html-language-server",
@@ -305,6 +343,30 @@ const TOOLS: ToolDefinition[] = [
 				if (platform === "darwin")
 					return arch === "arm64" ? "macos-arm64" : "macos-x86_64";
 				if (platform === "win32") return "windows-x86_64.exe";
+				return undefined;
+			},
+		},
+	},
+	{
+		// Opengrep: a single standalone binary per platform on GitHub releases —
+		// no login, no telemetry (the reason for switching off Semgrep, #111).
+		id: "opengrep",
+		name: "Opengrep",
+		checkCommand: "opengrep",
+		checkArgs: ["--version"],
+		installStrategy: "github",
+		binaryName: "opengrep",
+		github: {
+			repo: "opengrep/opengrep",
+			assetMatch: (platform, arch) => {
+				if (platform === "linux")
+					return arch === "arm64"
+						? "opengrep_manylinux_aarch64"
+						: "opengrep_manylinux_x86";
+				if (platform === "darwin")
+					return arch === "arm64" ? "opengrep_osx_arm64" : "opengrep_osx_x86";
+				// One x86 Windows build; runs on arm64 Windows via emulation.
+				if (platform === "win32") return "opengrep_windows_x86.exe";
 				return undefined;
 			},
 		},
@@ -479,6 +541,34 @@ const TOOLS: ToolDefinition[] = [
 		},
 	},
 	{
+		// Alternate JS/TS LSP (fallback when the `typescript` server is unavailable
+		// or disabled — e.g. Deno projects). Used as a managedToolId by DenoServer.
+		// Every platform ships a .zip containing the `deno` binary (the github
+		// strategy extracts it, as it does for rust-analyzer's Windows .zip).
+		id: "deno",
+		name: "Deno",
+		checkCommand: "deno",
+		checkArgs: ["--version"],
+		installStrategy: "github",
+		binaryName: "deno",
+		github: {
+			repo: "denoland/deno",
+			assetMatch: (platform, arch) => {
+				if (platform === "linux")
+					return arch === "arm64"
+						? "deno-aarch64-unknown-linux-gnu.zip"
+						: "deno-x86_64-unknown-linux-gnu.zip";
+				if (platform === "darwin")
+					return arch === "arm64"
+						? "deno-aarch64-apple-darwin.zip"
+						: "deno-x86_64-apple-darwin.zip";
+				// Windows ships only x86_64 (runs under emulation on arm64).
+				if (platform === "win32") return "deno-x86_64-pc-windows-msvc.zip";
+				return undefined;
+			},
+		},
+	},
+	{
 		id: "golangci-lint",
 		name: "golangci-lint",
 		checkCommand: "golangci-lint",
@@ -509,8 +599,10 @@ const TOOLS: ToolDefinition[] = [
 		installStrategy: "github",
 		binaryName: "ktlint",
 		github: {
-			// ktlint ships one universal binary "ktlint" for Linux/macOS (GraalVM native)
-			// and "ktlint.bat" for Windows (requires Java). No arm64-specific asset.
+			// ktlint ships a self-executable `ktlint` (a JAR with a shell preamble)
+			// for Linux/macOS, plus a `ktlint.bat` wrapper for Windows that runs
+			// `java -jar %~dp0ktlint`. On Windows BOTH files are needed: the .bat AND
+			// the `ktlint` jar it wraps (#218). No arm64-specific asset.
 			repo: "pinterest/ktlint",
 			assetMatch: (platform, _arch) => {
 				if (platform === "linux") return "ktlint";
@@ -518,6 +610,41 @@ const TOOLS: ToolDefinition[] = [
 				if (platform === "win32") return "ktlint.bat";
 				return undefined;
 			},
+			extraAssets: (platform) => (platform === "win32" ? ["ktlint"] : []),
+		},
+	},
+	{
+		// ktfmt (Meta's opinionated Kotlin formatter) ships only as a Maven-Central
+		// fat JAR — no native binary, no npm package — so it uses the maven strategy
+		// (#129). Run via a `java -jar` launcher; requires a JRE.
+		id: "ktfmt",
+		name: "ktfmt",
+		checkCommand: "ktfmt",
+		checkArgs: ["--version"],
+		installStrategy: "maven",
+		binaryName: "ktfmt",
+		maven: {
+			groupId: "com.facebook",
+			artifactId: "ktfmt",
+			version: "0.63",
+			classifier: "with-dependencies",
+		},
+	},
+	{
+		// SpotBugs (bytecode bug-pattern analyzer for Java/Kotlin/Scala/Groovy)
+		// ships as a distribution archive — a lib/ of many JARs + bin/ launchers,
+		// NOT a runnable fat JAR — so it uses the archive strategy, not maven
+		// (refs #133). Requires a JRE (gated by the runner, not the install).
+		id: "spotbugs",
+		name: "SpotBugs",
+		checkCommand: "spotbugs",
+		checkArgs: ["-version"],
+		installStrategy: "archive",
+		binaryName: "spotbugs",
+		archive: {
+			url: "https://github.com/spotbugs/spotbugs/releases/download/4.10.2/spotbugs-4.10.2.tgz",
+			kind: "tgz",
+			launcher: "bin/spotbugs",
 		},
 	},
 	{
@@ -562,6 +689,30 @@ const TOOLS: ToolDefinition[] = [
 				return undefined;
 			},
 			binaryInArchive: "tflint",
+		},
+	},
+	{
+		id: "gitleaks",
+		name: "gitleaks",
+		checkCommand: "gitleaks",
+		checkArgs: ["version"],
+		installStrategy: "github",
+		binaryName: "gitleaks",
+		github: {
+			repo: "gitleaks/gitleaks",
+			// gitleaks asset naming uses `x64` not `amd64` (unlike most Go-built
+			// tools). Substring match is exact-enough — release assets are
+			// named e.g. `gitleaks_8.18.4_linux_x64.tar.gz`.
+			assetMatch: (platform, arch) => {
+				if (platform === "linux")
+					return arch === "arm64" ? "linux_arm64.tar.gz" : "linux_x64.tar.gz";
+				if (platform === "darwin")
+					return arch === "arm64" ? "darwin_arm64.tar.gz" : "darwin_x64.tar.gz";
+				if (platform === "win32")
+					return arch === "arm64" ? "windows_arm64.zip" : "windows_x64.zip";
+				return undefined;
+			},
+			binaryInArchive: "gitleaks",
 		},
 	},
 	{
@@ -679,6 +830,65 @@ const TOOLS: ToolDefinition[] = [
 				return undefined;
 			},
 			binaryInArchive: "zls",
+		},
+	},
+	{
+		// clojure-lsp ships a self-contained native (GraalVM) binary per platform
+		// on GitHub releases — no JVM needed. Used as managedToolId by ClojureServer.
+		// The .zip carries the bare binary (located recursively on extract).
+		id: "clojure-lsp",
+		name: "clojure-lsp",
+		checkCommand: "clojure-lsp",
+		checkArgs: ["--version"],
+		installStrategy: "github",
+		binaryName: "clojure-lsp",
+		github: {
+			repo: "clojure-lsp/clojure-lsp",
+			assetMatch: (platform, arch) => {
+				if (platform === "linux")
+					return arch === "arm64"
+						? "native-linux-aarch64.zip"
+						: "native-linux-amd64.zip";
+				if (platform === "darwin")
+					return arch === "arm64"
+						? "native-macos-aarch64.zip"
+						: "native-macos-amd64.zip";
+				// Only an x86_64 Windows native build; runs on arm64 via emulation.
+				if (platform === "win32") return "native-windows-amd64.zip";
+				return undefined;
+			},
+			binaryInArchive: "clojure-lsp",
+		},
+	},
+	{
+		// gleam ships a single static binary per platform on GitHub releases; the
+		// LSP runs via `gleam lsp`. Used as managedToolId by GleamServer. The linux
+		// build is a FLAT musl tarball (a bare `gleam`), handled by the recursive
+		// tar-binary lookup in installGitHubTool.
+		id: "gleam",
+		name: "Gleam",
+		checkCommand: "gleam",
+		checkArgs: ["--version"],
+		installStrategy: "github",
+		binaryName: "gleam",
+		github: {
+			repo: "gleam-lang/gleam",
+			assetMatch: (platform, arch) => {
+				if (platform === "linux")
+					return arch === "arm64"
+						? "aarch64-unknown-linux-musl.tar.gz"
+						: "x86_64-unknown-linux-musl.tar.gz";
+				if (platform === "darwin")
+					return arch === "arm64"
+						? "aarch64-apple-darwin.tar.gz"
+						: "x86_64-apple-darwin.tar.gz";
+				if (platform === "win32")
+					return arch === "arm64"
+						? "aarch64-pc-windows-msvc.zip"
+						: "x86_64-pc-windows-msvc.zip";
+				return undefined;
+			},
+			binaryInArchive: "gleam",
 		},
 	},
 ];
@@ -878,6 +1088,23 @@ async function isCommandAvailable(
 // --- Verification Functions
 
 /**
+ * Stdio LSP servers built on `vscode-languageserver-node` (the entire
+ * `vscode-langservers-extracted` family — json/css/html/eslint, and markdown)
+ * reject a bare `--version`: `createConnection()` throws immediately because no
+ * transport flag was supplied, and the process exits non-zero. That error is
+ * positive proof the binary loaded and is a working LSP server — it just needs
+ * `--stdio` to actually run — so `--version`-based verification must treat it as
+ * success rather than a broken install (#208). A genuinely broken binary fails
+ * with a different error (SyntaxError, ERR_MODULE_NOT_FOUND, …) that does not
+ * match this pattern, so the broken-install guard is preserved.
+ */
+export function isLspTransportRequiredError(output: string): boolean {
+	return /Connection (?:input|output) stream is not set|Use arguments of createConnection/i.test(
+		output,
+	);
+}
+
+/**
  * Verify a tool binary actually works by running --version
  * This catches broken symlinks, partial installs, and corrupted binaries
  */
@@ -923,6 +1150,11 @@ async function verifyToolBinary(binPath: string): Promise<boolean> {
 			if (code === 0) {
 				debugLog(`Verified: ${binPath} (version: ${stdout.trim()})`);
 				resolve(true);
+			} else if (isLspTransportRequiredError(`${stdout}\n${stderr}`)) {
+				// Valid stdio LSP server that rejects `--version` (#208) — the
+				// transport-required error proves the binary works.
+				debugLog(`Verified (stdio LSP, transport-required): ${binPath}`);
+				resolve(true);
 			} else {
 				logSessionStart(
 					`auto-install verify: failed for ${binPath} (exit=${code})`,
@@ -946,6 +1178,8 @@ export type ToolSource =
 	| "pip-user"
 	| "pi-lens-auto"
 	| "github-release"
+	| "maven-jar"
+	| "archive-dist"
 	| "npx-fallback"
 	| "not-installed";
 
@@ -956,7 +1190,7 @@ export interface ToolStatus {
 	source: ToolSource;
 	path?: string;
 	version?: string;
-	strategy: "npm" | "pip" | "gem" | "github";
+	strategy: ToolDefinition["installStrategy"];
 }
 
 /**
@@ -1023,12 +1257,21 @@ export async function getAllToolStatuses(): Promise<ToolStatus[]> {
 			}
 		}
 
-		// 4. Check GitHub releases (~/.pi-lens/bin/)
-		if (tool.installStrategy === "github") {
+		// 4. Check managed bin (~/.pi-lens/bin/) — github releases + maven/archive launchers
+		if (
+			tool.installStrategy === "github" ||
+			tool.installStrategy === "maven" ||
+			tool.installStrategy === "archive"
+		) {
 			const githubPath = await findGitHubToolPath(tool.binaryName || tool.id);
 			if (githubPath) {
 				status.installed = true;
-				status.source = "github-release";
+				status.source =
+					tool.installStrategy === "maven"
+						? "maven-jar"
+						: tool.installStrategy === "archive"
+							? "archive-dist"
+							: "github-release";
 				status.path = githubPath;
 				statuses.push(status);
 				continue;
@@ -1132,11 +1375,15 @@ export async function getToolPath(toolId: string): Promise<string | undefined> {
 		// fall through to global checks
 	}
 
-	// For github-strategy tools, prefer managed install (~/.pi-lens/bin/) over PATH.
-	// Managed installs are known-good binaries that pi-lens downloaded as a fallback
-	// when a PATH-resolved tool was broken or missing. Checking before PATH ensures
-	// force-reinstall flows find the newly downloaded binary.
-	if (tool.installStrategy === "github") {
+	// For github/maven tools, prefer the managed install (~/.pi-lens/bin/) over
+	// PATH. Managed installs are known-good binaries/launchers pi-lens downloaded
+	// as a fallback when a PATH-resolved tool was broken or missing. Checking
+	// before PATH ensures force-reinstall flows find the newly downloaded binary.
+	if (
+		tool.installStrategy === "github" ||
+		tool.installStrategy === "maven" ||
+		tool.installStrategy === "archive"
+	) {
 		const githubPath = await findGitHubToolPath(tool.binaryName || tool.id);
 		if (githubPath) return githubPath;
 	}
@@ -1393,32 +1640,70 @@ async function getPythonUserBaseCandidates(): Promise<string[]> {
 // --- Installation Functions
 
 /**
- * Fetch a URL, following up to `maxRedirects` redirects.
- * Returns the raw Buffer of the response body.
+ * Authorization header for the GitHub REST API, when a token is available.
+ * Unauthenticated GitHub API is 60 req/hr per IP — exhausted constantly on
+ * shared-IP CI runners, which silently fails every github-strategy install.
+ * Authenticated is 5000 req/hr. Used ONLY for the `api.github.com` metadata
+ * call, never the asset download (see installGitHubTool) — the release CDN must
+ * not receive the token.
  */
-function httpsGet(url: string, maxRedirects = 5): Promise<Buffer> {
+function githubApiAuthHeaders(): Record<string, string> {
+	const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+	return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+function sameHost(a: string, b: string): boolean {
+	try {
+		return new URL(a).host === new URL(b).host;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Fetch a URL, following up to `maxRedirects` redirects.
+ * Returns the raw Buffer of the response body. Any caller-supplied headers are
+ * dropped when a redirect crosses to a different host, so an Authorization
+ * header can never leak to a redirect target (e.g. a release CDN).
+ */
+function httpsGet(
+	url: string,
+	maxRedirects = 5,
+	headers: Record<string, string> = {},
+): Promise<Buffer> {
 	return new Promise((resolve, reject) => {
 		https
-			.get(url, { headers: { "User-Agent": "pi-lens/1.0" } }, (res) => {
-				if (
-					res.statusCode &&
-					res.statusCode >= 300 &&
-					res.statusCode < 400 &&
-					res.headers.location
-				) {
-					if (maxRedirects === 0)
-						return reject(new Error("Too many redirects"));
-					return resolve(httpsGet(res.headers.location, maxRedirects - 1));
-				}
-				if (res.statusCode !== 200) {
-					res.resume();
-					return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
-				}
-				const chunks: Buffer[] = [];
-				res.on("data", (chunk: Buffer) => chunks.push(chunk));
-				res.on("end", () => resolve(Buffer.concat(chunks)));
-				res.on("error", reject);
-			})
+			.get(
+				url,
+				{ headers: { "User-Agent": "pi-lens/1.0", ...headers } },
+				(res) => {
+					if (
+						res.statusCode &&
+						res.statusCode >= 300 &&
+						res.statusCode < 400 &&
+						res.headers.location
+					) {
+						if (maxRedirects === 0)
+							return reject(new Error("Too many redirects"));
+						const location = res.headers.location;
+						const nextHeaders = sameHost(url, location)
+							? headers
+							: (() => {
+									const { Authorization: _drop, ...rest } = headers;
+									return rest;
+								})();
+						return resolve(httpsGet(location, maxRedirects - 1, nextHeaders));
+					}
+					if (res.statusCode !== 200) {
+						res.resume();
+						return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+					}
+					const chunks: Buffer[] = [];
+					res.on("data", (chunk: Buffer) => chunks.push(chunk));
+					res.on("end", () => resolve(Buffer.concat(chunks)));
+					res.on("error", reject);
+				},
+			)
 			.on("error", reject);
 	});
 }
@@ -1473,6 +1758,8 @@ async function installGitHubTool(
 	try {
 		const body = await httpsGet(
 			`https://api.github.com/repos/${spec.repo}/releases/latest`,
+			5,
+			githubApiAuthHeaders(),
 		);
 		releaseJson = JSON.parse(body.toString("utf8"));
 	} catch (err) {
@@ -1536,7 +1823,7 @@ async function installGitHubTool(
 				gunzip.on("error", reject);
 				gunzip.end(assetBuffer);
 			});
-			await fs.writeFile(destPath, decompressed, { mode: 0o755 });
+			await fs.writeFile(destPath, decompressed, { mode: 0o750 });
 		} else if (assetName.endsWith(".tar.gz") || assetName.endsWith(".tar.xz")) {
 			// Write archive to temp file, extract with system tar
 			const tmpArchive = path.join(GITHUB_BIN_DIR, `_tmp_${assetName}`);
@@ -1546,7 +1833,7 @@ async function installGitHubTool(
 
 			const extracted = await runCommand(
 				"tar",
-				["xf", tmpArchive, "-C", tmpDir, "--strip-components=1"],
+				["xf", tmpArchive, "-C", tmpDir],
 				GITHUB_BIN_DIR,
 			);
 			await fs.rm(tmpArchive, { force: true });
@@ -1559,9 +1846,27 @@ async function installGitHubTool(
 				return undefined;
 			}
 
-			// Find the binary inside extracted dir
-			const srcBinary = path.join(tmpDir, spec.binaryInArchive ?? binaryName);
-			await fs.rename(srcBinary, destPath);
+			// Locate the binary at any depth — handles both flat tarballs (e.g.
+			// gleam ships a bare `gleam` at the archive root) and tools nested
+			// under a top-level dir (e.g. shellcheck-vX/shellcheck). Each registered
+			// tar tool has a uniquely-named binary, so a recursive match is
+			// unambiguous; this replaces the old `--strip-components=1` assumption,
+			// which silently extracted nothing from a flat tarball.
+			const tarBinaryName = spec.binaryInArchive ?? binaryName;
+			const tarSrcBinary = await findFirstFileRecursive(
+				tmpDir,
+				getArchiveBinaryCandidates(tarBinaryName, platform, assetName),
+			);
+			if (!tarSrcBinary) {
+				await fs.rm(tmpDir, { recursive: true, force: true });
+				logSessionStart(
+					`github-install ${tool.id}: binary candidates ${JSON.stringify(
+						getArchiveBinaryCandidates(tarBinaryName, platform, assetName),
+					)} not found in tar ${assetName}`,
+				);
+				return undefined;
+			}
+			await fs.rename(tarSrcBinary, destPath);
 			await fs.rm(tmpDir, { recursive: true, force: true });
 			if (!isWindows) await fs.chmod(destPath, 0o750);
 		} else if (assetName.endsWith(".zip")) {
@@ -1617,13 +1922,40 @@ async function installGitHubTool(
 			if (!isWindows) await fs.chmod(destPath, 0o750);
 		} else {
 			// Bare binary (e.g. shfmt_*_linux_amd64)
-			await fs.writeFile(destPath, assetBuffer, { mode: 0o755 });
+			await fs.writeFile(destPath, assetBuffer, { mode: 0o750 });
 		}
 	} catch (err) {
 		logSessionStart(
 			`github-install ${tool.id}: install failed: ${(err as Error).message}`,
 		);
 		return undefined;
+	}
+
+	// Download any sibling assets the primary wrapper depends on (e.g. ktlint's
+	// `ktlint` jar next to `ktlint.bat`, #218). Matched by EXACT name and written
+	// as bare files into the same dir; a missing one fails the install.
+	for (const extraName of spec.extraAssets?.(platform, arch) ?? []) {
+		const extraAsset = releaseJson.assets.find((a) => a.name === extraName);
+		if (!extraAsset) {
+			logSessionStart(
+				`github-install ${tool.id}: required extra asset "${extraName}" not found`,
+			);
+			return undefined;
+		}
+		try {
+			const extraBuffer = await httpsGet(extraAsset.browser_download_url);
+			await fs.writeFile(path.join(GITHUB_BIN_DIR, extraName), extraBuffer, {
+				mode: 0o750,
+			});
+			logSessionStart(
+				`github-install ${tool.id}: installed extra asset ${extraName} (${extraBuffer.length} bytes)`,
+			);
+		} catch (err) {
+			logSessionStart(
+				`github-install ${tool.id}: extra asset ${extraName} download failed: ${(err as Error).message}`,
+			);
+			return undefined;
+		}
 	}
 
 	debugLog(`[github] installed ${tool.name} → ${destPath}`);
@@ -1664,6 +1996,219 @@ const NEEDS_POSTINSTALL = new Set([
 	"esbuild",
 	"intelephense", // postinstall fetches platform binary; --ignore-scripts breaks install
 ]);
+
+const MAVEN_CENTRAL_BASE = "https://repo1.maven.org/maven2";
+
+/**
+ * Install a Maven-distributed runnable fat JAR: download it into the managed bin
+ * and write a `java -jar` launcher next to it (so it resolves like any managed
+ * binary via findGitHubToolPath). Requires a JRE — gated on `java` availability.
+ */
+async function installMavenTool(
+	tool: ToolDefinition,
+): Promise<string | undefined> {
+	const spec = tool.maven;
+	if (!spec) return undefined;
+	const binaryName = tool.binaryName ?? tool.id;
+	const isWindows = process.platform === "win32";
+
+	if (!(await isCommandAvailable("java", ["-version"]))) {
+		logSessionStart(
+			`maven-install ${tool.id}: java not found — a JAR tool can't run without a JRE`,
+		);
+		return undefined;
+	}
+
+	// Strip trailing slashes without a regex (the `\/+$` form trips ReDoS
+	// scanners — S5852 — even though the input is a trusted constant/registry
+	// value). A plain loop is unambiguously linear.
+	let base = spec.repoBaseUrl ?? MAVEN_CENTRAL_BASE;
+	while (base.endsWith("/")) base = base.slice(0, -1);
+	const groupPath = spec.groupId.replace(/\./g, "/");
+	const jarFile = `${spec.artifactId}-${spec.version}${
+		spec.classifier ? `-${spec.classifier}` : ""
+	}.jar`;
+	const url = `${base}/${groupPath}/${spec.artifactId}/${spec.version}/${jarFile}`;
+
+	logSessionStart(`maven-install ${tool.id}: downloading ${url}`);
+	let jarBuffer: Buffer;
+	try {
+		jarBuffer = await httpsGet(url);
+	} catch (err) {
+		logSessionStart(
+			`maven-install ${tool.id}: download failed: ${(err as Error).message}`,
+		);
+		return undefined;
+	}
+
+	try {
+		await fs.mkdir(GITHUB_BIN_DIR, { recursive: true });
+		const jarPath = path.join(GITHUB_BIN_DIR, `${tool.id}.jar`);
+		await fs.writeFile(jarPath, jarBuffer);
+
+		// Launcher so the tool resolves as a normal command in the managed bin.
+		const launcherName = isWindows ? `${binaryName}.bat` : binaryName;
+		const launcherPath = path.join(GITHUB_BIN_DIR, launcherName);
+		if (isWindows) {
+			await fs.writeFile(
+				launcherPath,
+				`@echo off\r\njava -jar "%~dp0${tool.id}.jar" %*\r\n`,
+			);
+		} else {
+			await fs.writeFile(
+				launcherPath,
+				`#!/bin/sh\nexec java -jar "$(dirname "$0")/${tool.id}.jar" "$@"\n`,
+				{ mode: 0o750 },
+			);
+		}
+		logSessionStart(
+			`maven-install ${tool.id}: installed → ${launcherPath} (${jarBuffer.length} bytes)`,
+		);
+		debugLog(`[maven] installed ${tool.name} → ${launcherPath}`);
+		return launcherPath;
+	} catch (err) {
+		logSessionStart(
+			`maven-install ${tool.id}: install failed: ${(err as Error).message}`,
+		);
+		return undefined;
+	}
+}
+
+/**
+ * Install a tool that ships as a distribution archive (.tgz/.zip with a lib/ of
+ * JARs + bin/ launchers — e.g. SpotBugs), not a single runnable binary or fat
+ * JAR. Downloads the archive, extracts it (top-level dir stripped) into
+ * ~/.pi-lens/tools/<id>/, then writes a thin launcher shim into the managed bin
+ * so the tool resolves like any other via findGitHubToolPath. Extraction uses
+ * `tar` (present on Windows 10+ as bsdtar, which also reads .zip).
+ */
+async function installArchiveTool(
+	tool: ToolDefinition,
+): Promise<string | undefined> {
+	const spec = tool.archive;
+	if (!spec) return undefined;
+	const binaryName = tool.binaryName ?? tool.id;
+	const isWindows = process.platform === "win32";
+
+	logSessionStart(`archive-install ${tool.id}: downloading ${spec.url}`);
+	let archiveBuffer: Buffer;
+	try {
+		archiveBuffer = await httpsGet(spec.url);
+	} catch (err) {
+		logSessionStart(
+			`archive-install ${tool.id}: download failed: ${(err as Error).message}`,
+		);
+		return undefined;
+	}
+
+	// Use basenames + cwd:TOOLS_DIR for the tar spawn so no argument contains a
+	// drive-letter colon — GNU tar (MSYS) otherwise reads `C:\…` as an rsync
+	// `host:path` ("Cannot connect to C:"). Relative paths work for both GNU tar
+	// and Windows bsdtar, so we avoid the GNU-only `--force-local` (which bsdtar
+	// rejects). fs.* calls still use the absolute paths.
+	const extractName = tool.id;
+	const archiveName = `${tool.id}.download.${spec.kind === "zip" ? "zip" : "tgz"}`;
+	const extractDir = path.join(TOOLS_DIR, extractName);
+	const tmpArchive = path.join(TOOLS_DIR, archiveName);
+	try {
+		await fs.mkdir(TOOLS_DIR, { recursive: true });
+		// Clear any prior extraction so a reinstall is clean.
+		await fs.rm(extractDir, { recursive: true, force: true });
+		await fs.mkdir(extractDir, { recursive: true });
+		await fs.writeFile(tmpArchive, archiveBuffer);
+
+		// `--strip-components=1` drops the versioned top-level dir so the launcher
+		// path is stable (bin/… not spotbugs-X.Y.Z/bin/…). bsdtar handles both
+		// .tgz and .zip with -xf.
+		const tarArgs = [
+			spec.kind === "tgz" ? "-xzf" : "-xf",
+			archiveName,
+			"-C",
+			extractName,
+			"--strip-components=1",
+		];
+		// Resolve `tar` to an absolute path on Windows (System32\tar.exe is the
+		// bsdtar shipped with Windows 10+) so extraction can't be hijacked via a
+		// writable PATH entry — same hardening as the taskkill spawn. On POSIX `tar`
+		// is a trusted coreutil whose absolute path varies by distro, so it stays
+		// bare (consistent with every other tool spawn).
+		const tarBin = isWindows
+			? `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\tar.exe`
+			: "tar";
+		const extracted = await new Promise<{ ok: boolean; stderr: string }>(
+			(resolve) => {
+				const proc = spawn(tarBin, tarArgs, {
+					cwd: TOOLS_DIR,
+					stdio: ["ignore", "ignore", "pipe"],
+				});
+				let stderr = "";
+				proc.stderr?.on("data", (d) => (stderr += d));
+				const timer = setTimeout(() => {
+					proc.kill();
+					resolve({ ok: false, stderr: "extraction timed out" });
+				}, 120_000);
+				proc.on("exit", (code) => {
+					clearTimeout(timer);
+					resolve({ ok: code === 0, stderr });
+				});
+				proc.on("error", (err) => resolve({ ok: false, stderr: err.message }));
+			},
+		);
+		await fs.rm(tmpArchive, { force: true });
+		if (!extracted.ok) {
+			logSessionStart(
+				`archive-install ${tool.id}: extraction failed: ${extracted.stderr}`,
+			);
+			return undefined;
+		}
+
+		// The launcher inside the extracted tree (e.g. bin/spotbugs[.bat]).
+		const innerLauncher = path.join(
+			extractDir,
+			...spec.launcher.split("/").map((p) => p),
+		);
+		const resolvedInner = isWindows ? `${innerLauncher}.bat` : innerLauncher;
+		try {
+			await fs.access(resolvedInner);
+		} catch {
+			logSessionStart(
+				`archive-install ${tool.id}: launcher not found at ${resolvedInner} after extraction`,
+			);
+			return undefined;
+		}
+		if (!isWindows) await fs.chmod(resolvedInner, 0o750).catch(() => {});
+
+		// Thin shim in the managed bin so discovery (findGitHubToolPath) resolves
+		// it like any other managed tool. `call`/`exec` preserves the real
+		// launcher's own %~dp0/$0 so it still finds its sibling lib/.
+		await fs.mkdir(GITHUB_BIN_DIR, { recursive: true });
+		const launcherName = isWindows ? `${binaryName}.bat` : binaryName;
+		const shimPath = path.join(GITHUB_BIN_DIR, launcherName);
+		if (isWindows) {
+			await fs.writeFile(
+				shimPath,
+				`@echo off\r\ncall "${resolvedInner}" %*\r\n`,
+			);
+		} else {
+			await fs.writeFile(
+				shimPath,
+				`#!/bin/sh\nexec "${resolvedInner}" "$@"\n`,
+				{ mode: 0o750 },
+			);
+		}
+		logSessionStart(
+			`archive-install ${tool.id}: installed → ${shimPath} (extracted ${archiveBuffer.length} bytes)`,
+		);
+		debugLog(`[archive] installed ${tool.name} → ${shimPath}`);
+		return shimPath;
+	} catch (err) {
+		await fs.rm(tmpArchive, { force: true }).catch(() => {});
+		logSessionStart(
+			`archive-install ${tool.id}: install failed: ${(err as Error).message}`,
+		);
+		return undefined;
+	}
+}
 
 async function installNpmTool(
 	packageName: string,
@@ -2055,6 +2600,26 @@ export async function installTool(toolId: string): Promise<boolean> {
 				return ok;
 			}
 
+			case "maven": {
+				if (!tool.maven) return false;
+				const mavenPath = await installMavenTool(tool);
+				const ok = mavenPath !== undefined;
+				logSessionStart(
+					`auto-install ${tool.id}: ${ok ? "success" : "failed"} (${Date.now() - startedAt}ms)`,
+				);
+				return ok;
+			}
+
+			case "archive": {
+				if (!tool.archive) return false;
+				const archivePath = await installArchiveTool(tool);
+				const ok = archivePath !== undefined;
+				logSessionStart(
+					`auto-install ${tool.id}: ${ok ? "success" : "failed"} (${Date.now() - startedAt}ms)`,
+				);
+				return ok;
+			}
+
 			default:
 				logSessionStart(`auto-install ${tool.id}: unsupported strategy`);
 				return false;
@@ -2240,6 +2805,18 @@ export function isKnownToolId(toolId: string): boolean {
 	return TOOLS.some((tool) => tool.id === toolId);
 }
 
+/**
+ * GitHub-release tools that ship an asset for **every** supported
+ * platform/arch combo (linux/darwin/win32 × x64/arm64). This is the set the
+ * full asset-matrix test (tests/clients/installer/github-release.test.ts)
+ * iterates, so membership must stay in lockstep with the registry — the
+ * tool-registry-consistency test enforces that every `installStrategy: "github"`
+ * entry resolving all six combos appears here, and vice versa.
+ *
+ * `swiftlint` is deliberately absent: it has no Windows asset (macOS + Linux
+ * only), so it cannot satisfy the full matrix and is covered by the weaker
+ * "at least one platform" guard instead.
+ */
 export const GITHUB_TOOLS = [
 	"shellcheck",
 	"shfmt",
@@ -2250,6 +2827,14 @@ export const GITHUB_TOOLS = [
 	"tflint",
 	"terraform-ls",
 	"zls",
+	"hadolint",
+	"gitleaks",
+	"taplo",
+	"vale",
+	"opengrep",
+	"deno",
+	"clojure-lsp",
+	"gleam",
 ] as const;
 export type GitHubToolId = (typeof GITHUB_TOOLS)[number];
 

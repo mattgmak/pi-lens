@@ -179,16 +179,68 @@ export function filterSourceFiles(
  * @param options - Optional configuration
  * @returns Array of absolute file paths that are source files (not artifacts)
  */
+interface ResolvedCollectionConfig {
+	ignoreMatcher: ReturnType<typeof getProjectIgnoreMatcher>;
+	extraExcludePatterns: string[];
+	extensions: Set<string>;
+	options?: SourceCollectionOptions;
+}
+
+function resolveCollectionConfig(
+	rootDir: string,
+	options?: SourceCollectionOptions,
+): ResolvedCollectionConfig {
+	return {
+		ignoreMatcher: getProjectIgnoreMatcher(rootDir),
+		extraExcludePatterns: options?.excludeDirs ?? [],
+		extensions: new Set(options?.extensions || ALL_SCANNABLE_EXTENSIONS),
+		options,
+	};
+}
+
+/**
+ * Decide how to handle a single directory entry. Returns the subdirectory to
+ * recurse into (`recurseInto`), the source file to keep (`keepFile`), or
+ * neither (skip). Shared verbatim by the sync and async collectors so they
+ * produce identical results — the only difference between the two is that the
+ * async variant yields to the event loop every N entries.
+ */
+function classifyEntry(
+	entry: fs.Dirent,
+	fullPath: string,
+	cfg: ResolvedCollectionConfig,
+): { recurseInto?: string; keepFile?: string } {
+	const { ignoreMatcher, extraExcludePatterns, extensions, options } = cfg;
+	if (entry.isDirectory()) {
+		if (isExcludedDirName(entry.name, extraExcludePatterns)) return {};
+		if (ignoreMatcher.isIgnored(fullPath, true)) return {};
+		if (
+			options?.includeGenerated !== true &&
+			isGeneratedArtifactDirectoryName(entry.name)
+		) {
+			return {};
+		}
+		if (!options?.followSymlinks && entry.isSymbolicLink()) return {};
+		return { recurseInto: fullPath };
+	}
+	if (entry.isFile()) {
+		if (ignoreMatcher.isIgnored(fullPath, false)) return {};
+		const ext = path.extname(entry.name).toLowerCase();
+		if (!extensions.has(ext)) return {};
+		// Skip if this is a build artifact or generated/codegen output.
+		if (isBuildArtifact(fullPath)) return {};
+		if (shouldSkipGeneratedOrArtifact(fullPath, options)) return {};
+		return { keepFile: fullPath };
+	}
+	return {};
+}
+
 export function collectSourceFiles(
 	dir: string,
 	options?: SourceCollectionOptions,
 ): string[] {
 	const rootDir = path.resolve(dir);
-	const ignoreMatcher = getProjectIgnoreMatcher(rootDir);
-	const extraExcludePatterns = options?.excludeDirs ?? [];
-
-	const extensions = new Set(options?.extensions || ALL_SCANNABLE_EXTENSIONS);
-
+	const cfg = resolveCollectionConfig(rootDir, options);
 	const files: string[] = [];
 
 	function scan(currentDir: string) {
@@ -201,33 +253,72 @@ export function collectSourceFiles(
 
 		for (const entry of entries) {
 			const fullPath = path.join(currentDir, entry.name);
-
-			if (entry.isDirectory()) {
-				if (isExcludedDirName(entry.name, extraExcludePatterns)) continue;
-				if (ignoreMatcher.isIgnored(fullPath, true)) continue;
-				if (
-					options?.includeGenerated !== true &&
-					isGeneratedArtifactDirectoryName(entry.name)
-				) {
-					continue;
-				}
-				if (!options?.followSymlinks && entry.isSymbolicLink()) continue;
-				scan(fullPath);
-			} else if (entry.isFile()) {
-				if (ignoreMatcher.isIgnored(fullPath, false)) continue;
-				const ext = path.extname(entry.name).toLowerCase();
-				if (!extensions.has(ext)) continue;
-
-				// Skip if this is a build artifact or generated/codegen output.
-				if (isBuildArtifact(fullPath)) continue;
-				if (shouldSkipGeneratedOrArtifact(fullPath, options)) continue;
-
-				files.push(fullPath);
-			}
+			const { recurseInto, keepFile } = classifyEntry(entry, fullPath, cfg);
+			if (recurseInto) scan(recurseInto);
+			else if (keepFile) files.push(keepFile);
 		}
 	}
 
 	scan(rootDir);
+	return files;
+}
+
+/**
+ * Async, chunked-yield twin of {@link collectSourceFiles}. Returns the exact
+ * same file list (it shares `classifyEntry`), but yields to the event loop
+ * every `yieldEvery` directory entries so a large tree never holds the loop in
+ * one synchronous burst.
+ *
+ * Why this exists: on a ~2k-file project the synchronous `collectSourceFiles`
+ * blocks the loop for ~1.5s on a cold scan (≈70% of that is the per-file
+ * generated-header read inside `shouldSkipGeneratedOrArtifact`). When that runs
+ * on a hook tick — even a deferred background one — pi's TUI input stalls for
+ * the whole burst. Background / deferred callers should prefer this variant;
+ * the sync version is kept for synchronous call sites and tests.
+ */
+export async function collectSourceFilesAsync(
+	dir: string,
+	options?: SourceCollectionOptions & { yieldEvery?: number },
+): Promise<string[]> {
+	const rootDir = path.resolve(dir);
+	const cfg = resolveCollectionConfig(rootDir, options);
+	// 50 entries/chunk keeps the worst-case synchronous burst under ~40ms even
+	// on a cold scan where every kept file pays the 4 KB generated-header read
+	// (measured on a 2k-file fixture). Larger values regress past the ~50ms
+	// event-loop budget; see PERF-AUDIT.md.
+	const yieldEvery = Math.max(1, options?.yieldEvery ?? 50);
+	const files: string[] = [];
+	// Depth-first stack mirrors the recursion order of the sync collector.
+	const stack: string[] = [rootDir];
+	let processedSinceYield = 0;
+
+	while (stack.length > 0) {
+		const currentDir = stack.pop();
+		if (currentDir === undefined) continue;
+
+		let entries: fs.Dirent[] = [];
+		try {
+			entries = fs.readdirSync(currentDir, { withFileTypes: true });
+		} catch {
+			continue; // Permission denied or directory doesn't exist
+		}
+
+		// Push subdirectories in reverse so the deepest-first pop order matches
+		// the sync collector's left-to-right recursion within a directory.
+		const subDirs: string[] = [];
+		for (const entry of entries) {
+			const fullPath = path.join(currentDir, entry.name);
+			const { recurseInto, keepFile } = classifyEntry(entry, fullPath, cfg);
+			if (recurseInto) subDirs.push(recurseInto);
+			else if (keepFile) files.push(keepFile);
+			if (++processedSinceYield >= yieldEvery) {
+				processedSinceYield = 0;
+				await new Promise<void>((resolve) => setImmediate(resolve));
+			}
+		}
+		for (let i = subDirs.length - 1; i >= 0; i--) stack.push(subDirs[i]);
+	}
+
 	return files;
 }
 

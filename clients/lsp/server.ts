@@ -7,14 +7,17 @@
  * - Platform-specific handling
  */
 
-import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync } from "node:fs";
-import { access, appendFile, mkdir, readFile, stat } from "node:fs/promises";
+import { access, appendFile, mkdir, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { isTestMode } from "../env-utils.js";
+import { getGlobalPiLensDir } from "../file-utils.js";
 import { KIND_EXTENSIONS } from "../file-kinds.js";
 import { ensureTool, getToolEnvironment } from "../installer/index.js";
+import { resolveOpengrepConfig } from "../opengrep-config.js";
 import { logLatency } from "../latency-logger.js";
+import { isCommandAvailableAsync, safeSpawnAsync } from "../safe-spawn.js";
 import { type LSPProcess, launchLSP } from "./launch.js";
 import { normalizeMapKey } from "./path-utils.js";
 
@@ -31,6 +34,14 @@ export interface LSPServerInfo {
 	name: string;
 	extensions: readonly string[];
 	root: RootFunction;
+	/**
+	 * "language" (default) = the file's primary language server (one is chosen per
+	 * file). "auxiliary" = a cross-cutting, diagnostic-only server (security,
+	 * spelling, …) that attaches across many languages and runs ALONGSIDE the
+	 * primary — never selected as primary, collected only on the with-auxiliary
+	 * diagnostics path. See clients/dispatch/auxiliary-lsp.ts.
+	 */
+	role?: "language" | "auxiliary";
 	/** Simple command name whose absence disables spawn attempts briefly across roots. */
 	availabilityKey?: string;
 	/**
@@ -125,15 +136,12 @@ function markDirectLspCommandUnavailable(command: string): void {
 	directLspCommandSkipLoggedUntil.delete(command);
 }
 
-const SESSIONSTART_LOG_DIR = path.join(os.homedir(), ".pi-lens");
+const SESSIONSTART_LOG_DIR = getGlobalPiLensDir();
 const SESSIONSTART_LOG = path.join(SESSIONSTART_LOG_DIR, "sessionstart.log");
-const PI_LENS_BIN_DIR = path.join(os.homedir(), ".pi-lens", "bin");
+const PI_LENS_BIN_DIR = path.join(getGlobalPiLensDir(), "bin");
 
 function logSessionStart(message: string): void {
-	if (
-		process.env.PI_LENS_TEST_MODE === "1" ||
-		(process.env.VITEST && process.env.PI_LENS_TEST_MODE !== "0")
-	) {
+	if (isTestMode()) {
 		return;
 	}
 	const line = `[${new Date().toISOString()}] ${message}\n`;
@@ -161,7 +169,7 @@ function logSessionStart(message: string): void {
 // All steps are silent and gated by canInstall(). Returns undefined if no
 // binary can be found or installed.
 
-interface ResolveAndLaunchSpec {
+export interface ResolveAndLaunchSpec {
 	/** Ordered list of full paths / bare commands to try first */
 	candidates: string[];
 	/** LSP args to pass on launch */
@@ -181,7 +189,7 @@ interface ResolveAndLaunchSpec {
 	};
 }
 
-async function resolveAndLaunch(
+export async function resolveAndLaunch(
 	spec: ResolveAndLaunchSpec,
 	allowInstall: boolean | undefined,
 ): Promise<
@@ -199,6 +207,18 @@ async function resolveAndLaunch(
 			lastRuntimeFailure = err instanceof Error ? err : new Error(message);
 		}
 	};
+
+	// A candidate that fails while a LATER candidate (or managed install)
+	// succeeds is just fallback, not a failure — logging each immediately floods
+	// the logs with scary "candidate failed / npm shim failed / Run npm install"
+	// lines that read as smells even though the launch succeeded. Collect them and
+	// surface only if ALL direct candidates fail.
+	const candidateFailures: Array<{
+		index: number;
+		command: string;
+		message: string;
+		err: unknown;
+	}> = [];
 
 	// Step 1 & 2 — try all explicit candidates (includes bare command = PATH lookup)
 	for (const [index, command] of spec.candidates.entries()) {
@@ -241,24 +261,31 @@ async function resolveAndLaunch(
 			return { process: proc, source: "direct" };
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
-			logLatency({
-				type: "phase",
-				phase: "lsp_launch_candidate_failed",
-				filePath: spec.cwd,
-				durationMs: 0,
-				metadata: {
-					tool: toolLabel,
-					command,
-					index,
-					error: message,
-				},
-			});
-			logSessionStart(
-				`lsp launch candidate failed tool=${toolLabel} idx=${index} command=${command} error=${message}`,
-			);
-			trackRuntimeFailure(err);
+			// Defer logging: only a failure if no later candidate/install succeeds.
+			candidateFailures.push({ index, command, message, err });
 			// try next
 		}
+	}
+
+	// All direct candidates failed (a successful one returns above). Surface the
+	// deferred failures now so the all-failed case stays fully diagnosable.
+	for (const failure of candidateFailures) {
+		logLatency({
+			type: "phase",
+			phase: "lsp_launch_candidate_failed",
+			filePath: spec.cwd,
+			durationMs: 0,
+			metadata: {
+				tool: toolLabel,
+				command: failure.command,
+				index: failure.index,
+				error: failure.message,
+			},
+		});
+		logSessionStart(
+			`lsp launch candidate failed tool=${toolLabel} idx=${failure.index} command=${failure.command} error=${failure.message}`,
+		);
+		trackRuntimeFailure(failure.err);
 	}
 
 	if (!canInstall(allowInstall)) {
@@ -382,7 +409,10 @@ async function resolveAndLaunch(
 	}
 
 	// Step 4 — language-native runtime install (go install, gem install, …)
-	if (spec.runtimeInstall && isOnPath(spec.runtimeInstall.runtimeCommand)) {
+	if (
+		spec.runtimeInstall &&
+		(await isOnPath(spec.runtimeInstall.runtimeCommand))
+	) {
 		const ok = await spec.runtimeInstall.install();
 		if (ok) {
 			const retry = spec.runtimeInstall.retryCandidates ?? spec.candidates;
@@ -416,53 +446,6 @@ function nodeBinCandidates(root: string, baseName: string): string[] {
 	return [localBase, baseName];
 }
 
-const ESLINT_CONFIG_FILES = [
-	".eslintrc",
-	".eslintrc.js",
-	".eslintrc.cjs",
-	".eslintrc.json",
-	".eslintrc.yaml",
-	".eslintrc.yml",
-	"eslint.config.js",
-	"eslint.config.mjs",
-	"eslint.config.cjs",
-	"eslint.config.ts",
-];
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
-}
-
-function packageHasEslintDependency(pkg: Record<string, unknown>): boolean {
-	for (const section of [
-		"dependencies",
-		"devDependencies",
-		"peerDependencies",
-		"optionalDependencies",
-	]) {
-		const deps = pkg[section];
-		if (isRecord(deps) && Object.hasOwn(deps, "eslint")) {
-			return true;
-		}
-	}
-	return false;
-}
-
-async function pathExists(filePath: string): Promise<boolean> {
-	try {
-		await stat(filePath);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-function rejectHomeRoot(root: string): string | undefined {
-	return normalizeRootKey(root) === normalizeRootKey(os.homedir())
-		? undefined
-		: root;
-}
-
 function normalizeSlashKey(value: string): string {
 	const normalized = path.resolve(value).replace(/\\/g, "/");
 	return process.platform === "win32" ? normalized.toLowerCase() : normalized;
@@ -475,50 +458,6 @@ function piAgentExtensionsRootKey(file: string): string | undefined {
 	if (index === -1) return undefined;
 	return dirKey.slice(0, index + marker.length);
 }
-
-function isSameOrUnderSlashKey(child: string, parentKey: string): boolean {
-	const childKey = normalizeSlashKey(child);
-	return childKey === parentKey || childKey.startsWith(`${parentKey}/`);
-}
-
-export const EslintRoot: RootFunction = async (file: string) => {
-	let currentDir = path.resolve(path.dirname(file));
-	const fsRoot = path.parse(currentDir).root;
-
-	while (true) {
-		for (const cfg of ESLINT_CONFIG_FILES) {
-			if (await pathExists(path.join(currentDir, cfg))) {
-				return rejectHomeRoot(currentDir);
-			}
-		}
-
-		const pkgPath = path.join(currentDir, "package.json");
-		if (await pathExists(pkgPath)) {
-			try {
-				const pkg = JSON.parse(await readFile(pkgPath, "utf-8")) as unknown;
-				if (
-					isRecord(pkg) &&
-					(pkg.eslintConfig !== undefined || packageHasEslintDependency(pkg))
-				) {
-					return rejectHomeRoot(currentDir);
-				}
-			} catch {
-				// Invalid package.json is not a positive ESLint signal.
-			}
-
-			// Treat package.json as a package boundary. A parent repo-level ESLint setup
-			// should not make plain nested JS packages pay the ESLint LSP startup cost.
-			return undefined;
-		}
-
-		if (currentDir === fsRoot) break;
-		const parent = path.dirname(currentDir);
-		if (parent === currentDir) break;
-		currentDir = parent;
-	}
-
-	return undefined;
-};
 
 function normalizeRootKey(root: string): string {
 	return process.platform === "win32"
@@ -787,62 +726,60 @@ export const createRootDetector = NearestRoot;
 // --- Runtime Tool Helpers ---
 
 /**
- * Check if a command is available on system PATH (synchronous, no process spawn overhead).
+ * Check if a command is available on system PATH.
+ *
+ * Async (was a blocking `spawnSync("where"/"which")`): runs on the spawn
+ * fall-through path (Step 4, runtime-install gate). The shared
+ * `isCommandAvailableAsync` spawns the same finder via `safeSpawnAsync` with a
+ * 5s timeout, so a stalled finder can no longer freeze the loop. Semantics are
+ * preserved: true iff the finder exits 0.
  */
-function isOnPath(command: string): boolean {
-	const isWindows = process.platform === "win32";
-	const result = spawnSync(isWindows ? "where" : "which", [command], {
-		stdio: "ignore",
-		shell: false,
-	});
-	return result.status === 0;
+function isOnPath(command: string): Promise<boolean> {
+	return isCommandAvailableAsync(command);
 }
 
 /**
  * Try to install gopls via `go install`. Resolves true if the install succeeded.
+ *
+ * Async (was a blocking `spawnSync`): runs on the LSP runtime-install gate, off
+ * the event loop. `ignoreAmbientSignal` keeps the install running to completion
+ * even if the agent turn is interrupted, matching the old uncancellable sync
+ * behaviour. Success semantics preserved: true iff the process exits 0.
  */
-function tryGoInstallGopls(): Promise<boolean> {
-	return new Promise((resolve) => {
-		const isWindows = process.platform === "win32";
-		const proc = spawnSync(
-			isWindows ? "go.exe" : "go",
-			["install", "golang.org/x/tools/gopls@latest"],
-			{ stdio: "ignore", shell: false },
-		);
-		resolve(proc.status === 0);
-	});
+export async function tryGoInstallGopls(): Promise<boolean> {
+	const isWindows = process.platform === "win32";
+	const result = await safeSpawnAsync(
+		isWindows ? "go.exe" : "go",
+		["install", "golang.org/x/tools/gopls@latest"],
+		{ timeout: 180000, ignoreAmbientSignal: true },
+	);
+	return !result.error && result.status === 0;
 }
 
-function tryDotnetToolInstall(tool: string): Promise<boolean> {
-	return new Promise((resolve) => {
-		mkdirSync(PI_LENS_BIN_DIR, { recursive: true });
-		const proc = spawnSync(
-			"dotnet",
-			["tool", "install", "--tool-path", PI_LENS_BIN_DIR, tool],
-			{ encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], shell: false },
-		);
-		if (proc.status === 0) {
-			resolve(true);
-			return;
-		}
+export async function tryDotnetToolInstall(tool: string): Promise<boolean> {
+	mkdirSync(PI_LENS_BIN_DIR, { recursive: true });
+	const result = await safeSpawnAsync(
+		"dotnet",
+		["tool", "install", "--tool-path", PI_LENS_BIN_DIR, tool],
+		{ timeout: 180000, ignoreAmbientSignal: true },
+	);
+	if (!result.error && result.status === 0) return true;
 
-		const stderr = proc.stderr ?? "";
-		if (stderr.includes("No NuGet sources are defined or enabled")) {
-			logSessionStart(
-				`lsp dotnet-install: NuGet sources missing — cannot install ${tool}. ` +
-					`Run: dotnet nuget add source https://api.nuget.org/v3/index.json -n nuget.org`,
-			);
-			resolve(false);
-			return;
-		}
-
-		const updateProc = spawnSync(
-			"dotnet",
-			["tool", "update", "--tool-path", PI_LENS_BIN_DIR, tool],
-			{ encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], shell: false },
+	const stderr = result.stderr ?? "";
+	if (stderr.includes("No NuGet sources are defined or enabled")) {
+		logSessionStart(
+			`lsp dotnet-install: NuGet sources missing — cannot install ${tool}. ` +
+				`Run: dotnet nuget add source https://api.nuget.org/v3/index.json -n nuget.org`,
 		);
-		resolve(updateProc.status === 0);
-	});
+		return false;
+	}
+
+	const updateResult = await safeSpawnAsync(
+		"dotnet",
+		["tool", "update", "--tool-path", PI_LENS_BIN_DIR, tool],
+		{ timeout: 180000, ignoreAmbientSignal: true },
+	);
+	return !updateResult.error && updateResult.status === 0;
 }
 
 /**
@@ -918,28 +855,27 @@ function dotnetToolCandidates(tool: string): string[] {
 /**
  * Try to install a gem to the pi-lens bin dir. Resolves true if the install succeeded.
  */
-async function tryGemInstall(gem: string): Promise<boolean> {
+export async function tryGemInstall(gem: string): Promise<boolean> {
 	const { join } = await import("node:path");
 	const { homedir } = await import("node:os");
 	const binDir = join(homedir(), ".pi-lens", "bin");
 	const { mkdir } = await import("node:fs/promises");
 	await mkdir(binDir, { recursive: true });
 
-	return new Promise((resolve) => {
-		const proc = spawnSync(
-			"gem",
-			["install", gem, "--bindir", binDir, "--no-document"],
-			{ stdio: "ignore", shell: false },
-		);
-		// Add binDir to PATH so subsequent lookups find the installed gem
-		if (proc.status === 0) {
-			const sep = process.platform === "win32" ? ";" : ":";
-			if (!process.env.PATH?.includes(binDir)) {
-				process.env.PATH = `${binDir}${sep}${process.env.PATH ?? ""}`;
-			}
+	const result = await safeSpawnAsync(
+		"gem",
+		["install", gem, "--bindir", binDir, "--no-document"],
+		{ timeout: 180000, ignoreAmbientSignal: true },
+	);
+	const ok = !result.error && result.status === 0;
+	// Add binDir to PATH so subsequent lookups find the installed gem
+	if (ok) {
+		const sep = process.platform === "win32" ? ";" : ":";
+		if (!process.env.PATH?.includes(binDir)) {
+			process.env.PATH = `${binDir}${sep}${process.env.PATH ?? ""}`;
 		}
-		resolve(proc.status === 0);
-	});
+	}
+	return ok;
 }
 
 /**
@@ -992,25 +928,99 @@ const JS_TS_LSP_EXTENSIONS = KIND_EXTENSIONS["jsts"].filter(
 	(ext) => ext !== ".svelte" && ext !== ".vue",
 );
 
+// Marker set used for both the unbounded TypeScriptProjectRoot walk and the
+// extension-bounded walk below. Kept in one place so both code paths look
+// for the same project signals.
+const TS_PROJECT_MARKERS = [
+	"package-lock.json",
+	"bun.lockb",
+	"bun.lock",
+	"pnpm-lock.yaml",
+	"yarn.lock",
+	"package.json",
+] as const;
+
 const TypeScriptProjectRoot = IgnoreHomeRoot(
-	createRootDetector([
-		"package-lock.json",
-		"bun.lockb",
-		"bun.lock",
-		"pnpm-lock.yaml",
-		"yarn.lock",
-		"package.json",
-	]),
+	createRootDetector([...TS_PROJECT_MARKERS]),
 );
+
+/**
+ * Walk up from the file's directory looking for a TypeScript project marker,
+ * but stop at `extensionRootKey` so we never escape the .pi/agent/extensions
+ * boundary into a higher-up project (e.g. ~/.pi/agent/package.json which
+ * would pull every extension in the directory into one LSP workspace).
+ *
+ * Returns the nearest directory containing a marker, or undefined if none
+ * is found between the file and the extensions root inclusive.
+ */
+async function findExtensionBoundedRoot(
+	file: string,
+	extensionRootKey: string,
+): Promise<string | undefined> {
+	const startDir = path.resolve(path.dirname(file));
+	let currentDir = startDir;
+	while (true) {
+		for (const pattern of TS_PROJECT_MARKERS) {
+			try {
+				await stat(path.join(currentDir, pattern));
+				return currentDir;
+			} catch {
+				/* not found, try next marker */
+			}
+		}
+		// Stop at or beyond the extensions root — never walk into the
+		// pi-agent-wide scope.
+		const currentKey = normalizeSlashKey(currentDir);
+		if (currentKey === extensionRootKey) return undefined;
+		const parent = path.dirname(currentDir);
+		if (parent === currentDir) return undefined;
+		currentDir = parent;
+	}
+}
+
+/**
+ * Check whether the directory immediately containing the extensions folder
+ * (i.e. `.pi/agent/`) holds any TypeScript project marker. This narrowly
+ * detects the #123 scenario — pi itself installs a package.json at
+ * `~/.pi/agent/` and the user's extension has none of its own — without
+ * picking up accidental markers further up the filesystem.
+ */
+async function hasAgentLevelProjectMarker(
+	extensionRootKey: string,
+): Promise<boolean> {
+	const agentDir = path.dirname(extensionRootKey);
+	if (!agentDir || agentDir === extensionRootKey) return false;
+	for (const pattern of TS_PROJECT_MARKERS) {
+		try {
+			await stat(path.join(agentDir, pattern));
+			return true;
+		} catch {
+			/* not found, try next */
+		}
+	}
+	return false;
+}
 
 const TypeScriptRoot: RootFunction = DenoExcludeRoot(async (file) => {
 	const extensionRootKey = piAgentExtensionsRootKey(file);
-	const projectRoot = await TypeScriptProjectRoot(file);
 	if (extensionRootKey) {
-		return projectRoot && isSameOrUnderSlashKey(projectRoot, extensionRootKey)
-			? projectRoot
-			: undefined;
+		// Bounded walk so we never adopt a parent (e.g. ~/.pi/agent/) as the
+		// LSP root.
+		const bounded = await findExtensionBoundedRoot(file, extensionRootKey);
+		if (bounded) return bounded;
+		// No marker inside the extension boundary. If pi itself has a
+		// package.json at ~/.pi/agent/ (the #123 setup), the previous code
+		// returned undefined and the LSP silently failed to start. Fall
+		// back to a per-file scope so the LSP at least runs.
+		if (await hasAgentLevelProjectMarker(extensionRootKey)) {
+			return FileDirRoot(file);
+		}
+		// Truly loose extension file with no project context anywhere
+		// relevant — preserve the existing skip behavior (LSP shouldn't
+		// analyze a lone .ts file with no package.json above or below).
+		return undefined;
 	}
+	const projectRoot = await TypeScriptProjectRoot(file);
 	if (projectRoot) return projectRoot;
 	return FileDirRoot(file);
 });
@@ -1107,13 +1117,16 @@ export const DenoServer: LSPServerInfo = {
 	extensions: JS_TS_LSP_EXTENSIONS,
 	autoPropagateDiagnostics: true,
 	root: createRootDetector(["deno.json", "deno.jsonc"]),
-	async spawn(root) {
-		try {
-			const proc = await launchLSP("deno", ["lsp"], { cwd: root });
-			return { process: proc, source: "direct" };
-		} catch {
-			return undefined;
-		}
+	async spawn(root, options) {
+		return resolveAndLaunch(
+			{
+				candidates: ["deno"],
+				args: ["lsp"],
+				cwd: root,
+				managedToolId: "deno",
+			},
+			options?.allowInstall,
+		);
 	},
 };
 
@@ -1212,17 +1225,24 @@ export const PythonJediServer: LSPServerInfo = {
 			"poetry.lock",
 		]),
 	),
-	async spawn(root) {
-		try {
-			const proc = await launchLSP("jedi-language-server", [], { cwd: root });
-			const pythonPath = await detectPythonVenv(root);
-			const initialization: Record<string, unknown> = pythonPath
+	async spawn(root, options) {
+		const launched = await resolveAndLaunch(
+			{
+				candidates: ["jedi-language-server"],
+				args: [],
+				cwd: root,
+				managedToolId: "jedi-language-server",
+			},
+			options?.allowInstall,
+		);
+		if (!launched) return undefined;
+		const pythonPath = await detectPythonVenv(root);
+		return {
+			...launched,
+			initialization: pythonPath
 				? { workspace: { environmentPath: pythonPath } }
-				: {};
-			return { process: proc, source: "direct", initialization };
-		} catch {
-			return undefined;
-		}
+				: {},
+		};
 	},
 };
 
@@ -1285,7 +1305,14 @@ export const RustServer: LSPServerInfo = {
 	id: "rust",
 	name: "rust-analyzer",
 	extensions: KIND_EXTENSIONS["rust"],
-	root: RootWithFallback(RustWorkspaceRoot()),
+	// No FileDirRoot fallback (#201): rust-analyzer is a heavy workspace server
+	// that is useless without a Cargo manifest. With the fallback, every .rs file
+	// written before a Cargo.toml exists resolved to its OWN directory as the
+	// root, and since clients dedup by `${serverId}:${root}`, each directory
+	// spawned a separate rust-analyzer (one per file/dir during scaffolding).
+	// Returning undefined here skips the spawn until a Cargo.toml gives a stable,
+	// shared crate root — then all files share one server.
+	root: RustWorkspaceRoot(),
 	async spawn(root, options) {
 		// Prefer rustup-installed rust-analyzer; fall back to GitHub-downloaded managed copy
 		const result = await resolveAndLaunch(
@@ -1402,7 +1429,7 @@ export const PHPServer: LSPServerInfo = {
 		return {
 			...result,
 			initialization: {
-				storagePath: path.join(os.homedir(), ".pi-lens", "intelephense"),
+				storagePath: path.join(getGlobalPiLensDir(), "intelephense"),
 			},
 		};
 	},
@@ -1412,6 +1439,12 @@ export const CSharpServer: LSPServerInfo = {
 	id: "csharp",
 	name: "csharp-ls",
 	extensions: KIND_EXTENSIONS["csharp"],
+	// NOTE (#201): this has the same per-file-dir fallback trap as rust did, but
+	// can't be fixed the same way yet — `createRootDetector` matches markers by
+	// EXACT filename (`stat(dir/.csproj)`), so `.sln`/`.csproj`/`.slnx` never
+	// match a real `Foo.csproj`/`Foo.sln`. C# root detection therefore relies
+	// entirely on the FileDirRoot fallback today; removing it would disable C#.
+	// Fixing this needs extension/glob marker support first (tracked on #201).
 	root: RootWithFallback(createRootDetector([".sln", ".csproj", ".slnx"])),
 	async spawn(root, options) {
 		const candidates = dotnetToolCandidates("csharp-ls");
@@ -1565,15 +1598,25 @@ export const ElixirServer = createInteractiveServer({
 	command: "elixir-ls",
 });
 
-export const GleamServer = createInteractiveServer({
+export const GleamServer: LSPServerInfo = {
 	id: "gleam",
 	name: "Gleam LSP",
 	extensions: KIND_EXTENSIONS["gleam"],
 	root: RootWithFallback(createRootDetector(["gleam.toml"])),
-	language: "gleam",
-	command: "gleam",
-	args: ["lsp"],
-});
+	async spawn(root, options) {
+		// Prefer a PATH `gleam` (full toolchain); fall back to the managed
+		// GitHub-release binary. `gleam lsp` is the server entrypoint either way.
+		return resolveAndLaunch(
+			{
+				candidates: ["gleam"],
+				args: ["lsp"],
+				cwd: root,
+				managedToolId: "gleam",
+			},
+			options?.allowInstall,
+		);
+	},
+};
 
 export const OCamlServer = createInteractiveServer({
 	id: "ocaml",
@@ -1584,14 +1627,25 @@ export const OCamlServer = createInteractiveServer({
 	command: "ocamllsp",
 });
 
-export const ClojureServer = createInteractiveServer({
+export const ClojureServer: LSPServerInfo = {
 	id: "clojure",
 	name: "Clojure LSP",
 	extensions: KIND_EXTENSIONS["clojure"],
 	root: createRootDetector(["deps.edn", "project.clj"]),
-	language: "clojure",
-	command: "clojure-lsp",
-});
+	async spawn(root, options) {
+		// Prefer a PATH `clojure-lsp`; fall back to the managed self-contained
+		// native (GraalVM) GitHub-release binary — no JVM needed either way.
+		return resolveAndLaunch(
+			{
+				candidates: ["clojure-lsp"],
+				args: [],
+				cwd: root,
+				managedToolId: "clojure-lsp",
+			},
+			options?.allowInstall,
+		);
+	},
+};
 
 export const TerraformServer: LSPServerInfo = {
 	id: "terraform",
@@ -1869,25 +1923,6 @@ export const SvelteServer: LSPServerInfo = {
 	},
 };
 
-export const ESLintServer: LSPServerInfo = {
-	id: "eslint",
-	name: "ESLint Language Server",
-	// Note: .ts/.tsx handled by TypeScript LSP + Biome
-	extensions: [".js", ".jsx", ".svelte", ".vue"],
-	root: EslintRoot,
-	spawn(root, options) {
-		return resolveAndLaunch(
-			{
-				candidates: nodeBinCandidates(root, "vscode-eslint-language-server"),
-				args: ["--stdio"],
-				cwd: root,
-				managedToolId: "vscode-langservers-extracted",
-			},
-			options?.allowInstall,
-		);
-	},
-};
-
 export const CssServer: LSPServerInfo = {
 	id: "css",
 	name: "CSS Language Server",
@@ -1918,6 +1953,154 @@ export const CssServer: LSPServerInfo = {
 };
 
 // --- Registry ---
+
+// Opengrep — a cross-language security scanner that speaks LSP. Unlike the
+// per-language servers it attaches to MANY file kinds (the aggregation layer
+// merges its diagnostics with the file's real language server). Running it as a
+// warm LSP server compiles the ruleset once per session instead of paying it on
+// every file (the ~8s CLI-per-file cost #111), bringing per-file scans to ~1.3s.
+// Rules load via `initializationOptions.scan.configuration` (a local rule file
+// if the repo has one, else Opengrep's login-free `auto` set).
+const OPENGREP_KINDS = [
+	"csharp",
+	"css",
+	"cxx",
+	"dart",
+	"docker",
+	"go",
+	"html",
+	"java",
+	"json",
+	"jsts",
+	"kotlin",
+	"lua",
+	"php",
+	"python",
+	"ruby",
+	"rust",
+	"shell",
+	"swift",
+	"terraform",
+	"yaml",
+] as const;
+const OPENGREP_EXTENSIONS: readonly string[] = Array.from(
+	new Set(
+		OPENGREP_KINDS.flatMap(
+			(k) => (KIND_EXTENSIONS as Record<string, readonly string[]>)[k] ?? [],
+		),
+	),
+);
+
+function opengrepInitialization(root: string): Record<string, unknown> {
+	// As an always-on LSP server, enablement is structural (the server is
+	// registered); resolveOpengrepConfig here only chooses WHICH rules — a local
+	// rule file if present, otherwise `auto`.
+	const resolved = resolveOpengrepConfig(root, { enabled: true });
+	return {
+		scan: {
+			configuration: [resolved.configArg ?? "auto"],
+			onlyGitDirty: false,
+			jobs: 16,
+		},
+		metrics: { enabled: false },
+		doHover: false,
+	};
+}
+
+export const OpengrepServer: LSPServerInfo = {
+	id: "opengrep",
+	name: "Opengrep Security Scanner",
+	role: "auxiliary",
+	extensions: OPENGREP_EXTENSIONS,
+	// Stable per-repo root so ONE warm server serves the whole project (a
+	// per-directory root would spawn a fresh server — and re-pay rule load —
+	// for every folder).
+	root: RootWithFallback(NearestRoot([".git"]), async () => process.cwd()),
+	availabilityKey: "opengrep",
+	// Rule compilation can take a few seconds on the first scan of a session.
+	initializeTimeoutMs: 15000,
+	async spawn(root, options) {
+		const launched = await resolveAndLaunch(
+			{
+				candidates: ["opengrep"],
+				args: ["lsp", "--experimental"],
+				cwd: root,
+				managedToolId: "opengrep",
+			},
+			options?.allowInstall,
+		);
+		if (!launched) return undefined;
+		return { ...launched, initialization: opengrepInitialization(root) };
+	},
+	autoInstall: async () => Boolean(await ensureTool("opengrep")),
+};
+
+// ast-grep — a polyglot structural linter that speaks LSP. Like Opengrep it is a
+// cross-cutting, diagnostic-only auxiliary (never a file's primary language
+// server). Unlike Opengrep it is **sgconfig-gated**: the `ast-grep lsp` server
+// only operates in a project with an `sgconfig.y[a]ml` root, so its root detector
+// keys on that marker — no sgconfig ⇒ undefined root ⇒ it never attaches and the
+// existing napi ast-grep runner remains the path (Phase 1 of #239; the no-sgconfig
+// baseline via `--config` + shipped rules is Phase 2). When present, it surfaces
+// the team's OWN curated rules (warm, full-engine, with codeAction fixes) — which
+// the napi subset interpreter cannot evaluate faithfully.
+const AST_GREP_KINDS = [
+	"csharp",
+	"cxx",
+	"css",
+	"elixir",
+	"go",
+	"haskell",
+	"html",
+	"java",
+	"json",
+	"jsts",
+	"kotlin",
+	"lua",
+	"nix",
+	"php",
+	"python",
+	"ruby",
+	"rust",
+	"scala",
+	"shell",
+	"solidity",
+	"swift",
+	"yaml",
+] as const;
+const AST_GREP_EXTENSIONS: readonly string[] = Array.from(
+	new Set(
+		AST_GREP_KINDS.flatMap(
+			(k) => (KIND_EXTENSIONS as Record<string, readonly string[]>)[k] ?? [],
+		),
+	),
+);
+
+export const AstGrepServer: LSPServerInfo = {
+	id: "ast-grep",
+	name: "ast-grep structural linter",
+	role: "auxiliary",
+	extensions: AST_GREP_EXTENSIONS,
+	// sgconfig-gated: only a project with sgconfig.y[a]ml gets the server. No
+	// fallback — absence means "don't attach" (the napi runner stays).
+	root: createRootDetector(["sgconfig.yml", "sgconfig.yaml"]),
+	availabilityKey: "ast-grep",
+	// First scan of a session compiles the project's rules.
+	initializeTimeoutMs: 15000,
+	async spawn(root, options) {
+		// `ast-grep lsp` auto-discovers sgconfig from its cwd (the sgconfig root).
+		return resolveAndLaunch(
+			{
+				candidates: ["ast-grep"],
+				args: ["lsp"],
+				cwd: root,
+				managedToolId: "ast-grep",
+			},
+			options?.allowInstall,
+		);
+	},
+	autoInstall: async () => Boolean(await ensureTool("ast-grep")),
+};
 
 export const LSP_SERVERS: LSPServerInfo[] = [
 	TypeScriptServer,
@@ -1956,8 +2139,10 @@ export const LSP_SERVERS: LSPServerInfo[] = [
 	// Web frameworks & styling
 	VueServer,
 	SvelteServer,
-	ESLintServer,
 	CssServer,
+	// Auxiliary (cross-cutting, diagnostic-only) servers go last — never primary.
+	OpengrepServer,
+	AstGrepServer,
 ];
 
 /**

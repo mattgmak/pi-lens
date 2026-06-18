@@ -1,16 +1,13 @@
 /**
  * SonarJS-inspired FactRules for TypeScript/TSX
  *
- * SN-001  commented-out-code          — comment blocks containing ≥3 valid statements
- * SN-002  duplicate-string-literal    — same string literal ≥3 occurrences in a file
- * SN-003  function-in-loop            — function declaration inside a loop body
- * SN-004  no-deprecated-api           — call to @deprecated-tagged function/method
- * SN-005  jwt-without-verify          — jwt.sign() without jwt.verify() in same file
- * SN-006  cors-wildcard               — Access-Control-Allow-Origin: * in express-style code
- * SN-007  dynamic-regexp              — new RegExp() with non-literal first argument
- * SN-008  misused-promise             — .then()/.catch() on a non-Promise (void/undefined return)
- * SN-009  max-switch-cases            — switch with > 30 cases
- * SN-010  no-commented-credentials   — password/token/secret in commented-out code
+ * SN-001  commented-out-code          — comment blocks containing ≥2 code indicators
+ * SN-002  duplicate-string-literal    — same string literal ≥10 occurrences in a file
+ * SN-003  function-in-loop            — function/arrow/expression inside a loop body
+ * SN-004  cors-wildcard               — Access-Control-Allow-Origin: * (TS/JS/Python/Go)
+ * SN-005  dynamic-regexp              — new RegExp() with non-literal first argument
+ * SN-006  max-switch-cases            — switch with > 40 cases
+ * SN-007  no-commented-credentials   — password/token/secret in comments (TS/JS/Python/Go/Ruby)
  */
 
 import * as ts from "typescript";
@@ -173,30 +170,15 @@ const SKIP_STRINGS = new Set([
 	"shell",
 	"typescript",
 	"javascript",
-	// Test directory conventions
+	// Test and package management conventions
 	"__tests__",
 	"tests",
 	"install",
 	"ignore",
-	// Dispatch plan / policy DSL discriminators — these naturally repeat as structural values
-	"types",
-	"fallback",
-	"direct",
-	"primary",
-	"all",
-	"mode",
-	"filter",
-	"source",
-	"latest",
-	"stable",
-	// Tool names, registry sources, and platform/arch identifiers naturally repeat in installer code
+	// Common auth/config keys
 	"github",
-	"rubocop",
 	"allow",
 	"deny",
-	"arm64",
-	"x86_64",
-	"aarch64",
 ]);
 
 export const duplicateStringLiteralRule: FactRule = {
@@ -299,10 +281,19 @@ export const functionInLoopRule: FactRule = {
 		const diagnostics: Diagnostic[] = [];
 
 		function visit(node: ts.Node) {
-			if (ts.isFunctionDeclaration(node) && isInsideLoop(node)) {
+			const isFn =
+				ts.isFunctionDeclaration(node) ||
+				ts.isFunctionExpression(node) ||
+				ts.isArrowFunction(node);
+			if (isFn && isInsideLoop(node)) {
 				const { line, character } = sf.getLineAndCharacterOfPosition(
 					node.getStart(sf),
 				);
+				const label = ts.isFunctionDeclaration(node)
+					? "Function declaration"
+					: ts.isFunctionExpression(node)
+						? "Function expression"
+						: "Arrow function";
 				diagnostics.push(
 					makeD(
 						"function-in-loop",
@@ -310,7 +301,7 @@ export const functionInLoopRule: FactRule = {
 						ctx.filePath,
 						line + 1,
 						character + 1,
-						"Function declaration inside a loop — creates a new function on every iteration",
+						`${label} inside a loop — creates a new function object on every iteration`,
 					),
 				);
 			}
@@ -321,43 +312,14 @@ export const functionInLoopRule: FactRule = {
 	},
 };
 
-// ---------- SN-004: JWT sign without verify ----------
-
-export const jwtWithoutVerifyRule: FactRule = {
-	id: "jwt-without-verify",
-	requires: ["file.content"],
-	appliesTo: tsFile,
-	evaluate(ctx, store) {
-		const content = store.getFileFact<string>(ctx.filePath, "file.content");
-		if (!content) return [];
-
-		const hasSign = /\bjwt\.sign\s*\(/.test(content);
-		const hasVerify = /\bjwt\.verify\s*\(/.test(content);
-		if (!hasSign || hasVerify) return [];
-
-		// Find the line of jwt.sign
-		const match = content.match(/^([\s\S]*?\bjwt\.sign\s*\()/m);
-		const line = match ? (match[0].match(/\n/g)?.length ?? 0) + 1 : 1;
-
-		return [
-			makeD(
-				"jwt-without-verify",
-				"jwt-without-verify",
-				ctx.filePath,
-				line,
-				1,
-				"jwt.sign() used but jwt.verify() not found in this file — ensure tokens are verified before trusting",
-			),
-		];
-	},
-};
-
-// ---------- SN-005: CORS wildcard ----------
+// ---------- SN-004: CORS wildcard ----------
 
 export const corsWildcardRule: FactRule = {
 	id: "cors-wildcard",
 	requires: ["file.content"],
-	appliesTo: tsFile,
+	appliesTo(ctx) {
+		return /\.(tsx?|py|go)$/.test(ctx.filePath);
+	},
 	evaluate(ctx, store) {
 		const content = store.getFileFact<string>(ctx.filePath, "file.content");
 		if (!content) return [];
@@ -366,12 +328,26 @@ export const corsWildcardRule: FactRule = {
 		const lines = content.split("\n");
 		for (let i = 0; i < lines.length; i++) {
 			const line = lines[i];
-			if (
+			if (/^\s*(?:\/\/|\*|#|\/)/.test(line)) continue;
+			const isWildcard =
+				// TS/JS: header assignment or cors() call
 				(/["']Access-Control-Allow-Origin["']/.test(line) &&
 					/["']\*["']/.test(line)) ||
 				/origin\s*:\s*["']\*["']/.test(line) ||
-				(/cors\s*\(/.test(line) && /\*/.test(line))
-			) {
+				(/cors\s*\(/.test(line) && /\*/.test(line)) ||
+				// Python (FastAPI CORSMiddleware / Flask-CORS):
+				// wildcard allow_origins/origins assignment
+				/(?:allow_origins|origins)\s*=\s*["']\*["']/.test(line) ||
+				// wildcard allow_origins/origins array assignment
+				/(?:allow_origins|origins)\s*=\s*[[(]["']\*["']/.test(line) ||
+				// Go (gin-cors, chi-cors, gorilla):
+				// AllowAllOrigins enabled
+				/AllowAllOrigins\s*:\s*true/.test(line) ||
+				// wildcard AllowOrigins/AllowedOrigins slice
+				// Use [^*\n]{0,60} instead of .* to prevent super-linear backtracking
+				/Allow(?:ed)?Origins[^*\n]{0,60}\*/.test(line);
+
+			if (isWildcard) {
 				diagnostics.push({
 					...makeD(
 						"cors-wildcard",
@@ -390,7 +366,122 @@ export const corsWildcardRule: FactRule = {
 	},
 };
 
-// ---------- SN-006: dynamic RegExp ----------
+// ---------- SN-005: dynamic RegExp ----------
+
+function isEscapeRegExpCall(expr: ts.Expression): boolean {
+	if (!ts.isCallExpression(expr)) return false;
+	const callee = expr.expression;
+	return (
+		(ts.isIdentifier(callee) && callee.text === "escapeRegExp") ||
+		(ts.isPropertyAccessExpression(callee) &&
+			callee.name.text === "escapeRegExp")
+	);
+}
+
+function hasParameterShadow(node: ts.Node, name: string): boolean {
+	for (let current = node.parent; current; current = current.parent) {
+		if (!ts.isFunctionLike(current)) continue;
+		for (const param of current.parameters) {
+			if (ts.isIdentifier(param.name) && param.name.text === name) return true;
+		}
+	}
+	return false;
+}
+
+function isAncestor(ancestor: ts.Node, node: ts.Node): boolean {
+	for (let current = node.parent; current; current = current.parent) {
+		if (current === ancestor) return true;
+	}
+	return false;
+}
+
+function declarationContainer(node: ts.Node): ts.Node {
+	let current: ts.Node = node;
+	while (current.parent) {
+		if (
+			ts.isBlock(current.parent) ||
+			ts.isSourceFile(current.parent) ||
+			ts.isModuleBlock(current.parent) ||
+			ts.isCaseBlock(current.parent)
+		) {
+			return current.parent;
+		}
+		current = current.parent;
+	}
+	return current;
+}
+
+function containerDepth(container: ts.Node): number {
+	let depth = 0;
+	for (let current = container.parent; current; current = current.parent)
+		depth++;
+	return depth;
+}
+
+function findVisibleVariableInitializer(
+	sf: ts.SourceFile,
+	useNode: ts.Node,
+	name: string,
+): ts.Expression | undefined {
+	if (hasParameterShadow(useNode, name)) return undefined;
+	let best: { depth: number; initializer: ts.Expression } | undefined;
+	const useStart = useNode.getStart(sf);
+	const visit = (node: ts.Node): void => {
+		if (
+			ts.isVariableDeclaration(node) &&
+			ts.isIdentifier(node.name) &&
+			node.name.text === name &&
+			node.initializer &&
+			node.getStart(sf) < useStart
+		) {
+			const container = declarationContainer(node);
+			if (container === sf || isAncestor(container, useNode)) {
+				const depth = containerDepth(container);
+				if (!best || depth >= best.depth) {
+					best = { depth, initializer: node.initializer };
+				}
+			}
+		}
+		ts.forEachChild(node, visit);
+	};
+	visit(sf);
+	return best?.initializer;
+}
+
+function isEscapedRegExpArgument(
+	expr: ts.Expression,
+	sf: ts.SourceFile,
+	seen = new Set<string>(),
+): boolean {
+	if (ts.isStringLiteral(expr) || ts.isNoSubstitutionTemplateLiteral(expr)) {
+		return true;
+	}
+	if (ts.isParenthesizedExpression(expr)) {
+		return isEscapedRegExpArgument(expr.expression, sf, seen);
+	}
+	if (isEscapeRegExpCall(expr)) return true;
+	if (ts.isTemplateExpression(expr)) {
+		return expr.templateSpans.every((span) =>
+			isEscapedRegExpArgument(span.expression, sf, seen),
+		);
+	}
+	if (
+		ts.isBinaryExpression(expr) &&
+		expr.operatorToken.kind === ts.SyntaxKind.PlusToken
+	) {
+		return (
+			isEscapedRegExpArgument(expr.left, sf, seen) &&
+			isEscapedRegExpArgument(expr.right, sf, seen)
+		);
+	}
+	if (ts.isIdentifier(expr)) {
+		if (seen.has(expr.text)) return false;
+		seen.add(expr.text);
+		const initializer = findVisibleVariableInitializer(sf, expr, expr.text);
+		return initializer ? isEscapedRegExpArgument(initializer, sf, seen) : false;
+	}
+	return false;
+}
 
 export const dynamicRegexpRule: FactRule = {
 	id: "dynamic-regexp",
@@ -411,11 +502,8 @@ export const dynamicRegexpRule: FactRule = {
 				node.arguments.length > 0
 			) {
 				const firstArg = node.arguments[0];
-				// Only flag if the argument is NOT a string/template literal (i.e. dynamic)
-				if (
-					!ts.isStringLiteral(firstArg) &&
-					!ts.isNoSubstitutionTemplateLiteral(firstArg)
-				) {
+				// Flag dynamic patterns unless the dynamic pieces are escaped first.
+				if (!isEscapedRegExpArgument(firstArg, sf)) {
 					const { line, character } = sf.getLineAndCharacterOfPosition(
 						node.getStart(sf),
 					);
@@ -438,7 +526,7 @@ export const dynamicRegexpRule: FactRule = {
 	},
 };
 
-// ---------- SN-007: max switch cases ----------
+// ---------- SN-006: max switch cases ----------
 
 const MAX_SWITCH_CASES = 40;
 
@@ -478,7 +566,7 @@ export const maxSwitchCasesRule: FactRule = {
 	},
 };
 
-// ---------- SN-008: no-commented-credentials ----------
+// ---------- SN-007: no-commented-credentials ----------
 
 const CREDENTIAL_PATTERNS = [
 	/password\s*[:=]\s*["'][^"']{3,}/i,
@@ -488,14 +576,21 @@ const CREDENTIAL_PATTERNS = [
 
 // Files that define credential patterns as code (scanners, test fixtures, etc.) —
 // their own regex literals would otherwise self-trigger this rule.
-const CREDENTIALS_EXEMPT = /[/\\](secrets?[-_]?(scanner|detect|check)|scanner|fixture|mock)[^/\\]*\.(tsx?|ya?ml|json|env)$/i;
+const CREDENTIALS_EXEMPT =
+	/[/\\](secrets?[-_]?(scanner|detect|check)|scanner|fixture|mock)[^/\\]*\.(tsx?|ya?ml|json|env)$/i;
+
+function isCommentLine(line: string): boolean {
+	return line.startsWith("//") || line.startsWith("#") || line.startsWith("*");
+}
 
 export const commentedCredentialsRule: FactRule = {
 	id: "no-commented-credentials",
 	requires: ["file.content"],
 	appliesTo(ctx) {
-		return /\.(tsx?|ya?ml|json|env)$/.test(ctx.filePath) &&
-			!CREDENTIALS_EXEMPT.test(ctx.filePath);
+		return (
+			/\.(tsx?|py|go|rb|ya?ml|json|env)$/.test(ctx.filePath) &&
+			!CREDENTIALS_EXEMPT.test(ctx.filePath)
+		);
 	},
 	evaluate(ctx, store) {
 		const content = store.getFileFact<string>(ctx.filePath, "file.content");
@@ -505,12 +600,7 @@ export const commentedCredentialsRule: FactRule = {
 		const lines = content.split("\n");
 		for (let i = 0; i < lines.length; i++) {
 			const line = lines[i].trimStart();
-			if (
-				!line.startsWith("//") &&
-				!line.startsWith("#") &&
-				!line.startsWith("*")
-			)
-				continue;
+			if (!isCommentLine(line)) continue;
 			for (const p of CREDENTIAL_PATTERNS) {
 				if (p.test(line)) {
 					diagnostics.push({

@@ -155,7 +155,9 @@ Create a cheap query equivalent to codedb `changesSince(seq)`.
 
 Append-only project change log:
 
-- `.pi-lens/change-log.jsonl`
+- `<project-data-dir>/change-log.jsonl`
+
+Use the same project data directory convention as worklog/metrics history so sequence state survives sessions without coupling it to repository checkout files.
 
 Entry:
 
@@ -227,33 +229,173 @@ getAffectedFiles(cwd, filePath, depth = 1): string[]
 - Reverse deps query avoids rebuilding full graph on common path.
 - Cache updates incrementally for edited files where possible.
 
-## Phase 5 — Hot files and session friction summary
+## Phase 5 — Project friction / hot files summary
 
-Borrow codedb's `hot` idea, but make it agent-oriented.
+Status: **not implemented**. This phase should aggregate the telemetry pi-lens already collects into a small, agent-useful report instead of adding more raw logs.
 
-### New report/cache
+### Goal
 
-`.pi-lens/cache/hot-files.json`
+Create a bounded project-friction summary that consolidates recent changes, edit friction, diagnostics, complexity trends, latency, and reverse-dependency fanout. The purpose is to help agents notice risky or high-friction files without reading many separate logs.
 
-Tracks:
+Prefer a broader name than just "hot files":
 
-- files changed this session
-- files changed recently across sessions
-- files with repeated read-guard blocks
-- files with repeated diagnostics
-- files touched by autofix/format
+- Latest cache: `.pi-lens/cache/project-friction.json`
+- Optional compatibility/view: `.pi-lens/cache/hot-files.json`
+
+### Existing signal inventory
+
+Use existing sources first:
+
+| Source | Path | Useful signals |
+|---|---|---|
+| Project changes | `<project-data-dir>/change-log.jsonl` | recently changed files, edit frequency, mutation source (`agent-edit`, `format`, `autofix`, `partial-apply`, etc.), latest project/file seq |
+| Read guard | `~/.pi-lens/read-guard.log` | failed edit risk: `oldtext_duplicate`, `oldtext_not_found`, `edit_blocked`, `edit_warned`, `edit_partial_apply`, autopatch counts |
+| Code-quality history | `<project-data-dir>/code-quality-warnings.jsonl` | recurring non-fixable code-quality warnings by file/rule/category |
+| Actionable warnings | `.pi-lens/cache/actionable-warnings.json`, `~/.pi-lens/actionable-warnings.log` | current fixable warnings, LSP enrichment failures/skips, stale autofix skips |
+| Diagnostic history | `~/.pi-lens/logs/YYYY-MM-DD.jsonl` | recurring diagnostics across sessions, noisy rules, unresolved patterns |
+| Worklog | `<project-data-dir>/worklog.jsonl` | fixable/autofixed diagnostic history by file/rule |
+| Latency | `~/.pi-lens/latency.log` | slow files/runners/phases, repeated expensive dispatches |
+| Cascade | `~/.pi-lens/cascade.log` | cascade diagnostics, cold snapshot touches, reverse-deps cache refresh/load/merge, neighbor counts |
+| Project snapshot | `.pi-lens/cache/project-snapshot.json` | reverse dependency fanout, cached project metadata |
+| Metrics history | `<project-data-dir>/metrics-history.json` | maintainability/cognitive/nesting/max-cyclomatic/entropy trends and TDI |
+
+### Metrics/complexity consolidation
+
+The current metrics story is split and partly unused:
+
+- `clients/complexity-client.ts` computes rich per-file code metrics: maintainability index, cognitive/cyclomatic complexity, nesting, function length, Halstead, entropy, and AI-slop indicators.
+- `clients/metrics-history.ts` persists a subset of those metrics and computes trends / TDI.
+- `clients/metrics-client.ts` tracks session entropy baselines but is barely used beyond construction/reset/pass-through.
+
+Plan:
+
+1. Treat `ComplexityClient` as the source of truth for code metrics.
+2. Fold or deprecate `MetricsClient` session entropy tracking unless a real call path uses it. Entropy already exists in `FileComplexity` as `codeEntropy` and in metrics history snapshots.
+3. Move toward a single `code-metrics` service/module that exposes:
+   - `analyzeFile(filePath): FileComplexity | null`
+   - `captureSnapshot(cwd, filePath, metrics)`
+   - `loadHistory(cwd)` / `computeTrendSummary(cwd)` / `computeTDI(cwd)`
+   - optional `compareToBaseline(filePath, previous, current)` for turn-end regressions
+4. Preserve existing APIs during migration to avoid churn, but stop adding new uses of `MetricsClient` unless it is merged into the consolidated service.
+
+### Proposed report shape
+
+```ts
+interface ProjectFrictionReport {
+  generatedAt: string;
+  projectSeq?: number;
+  window: {
+    sinceSeq?: number;
+    maxAgeHours?: number;
+    maxEntries: number;
+  };
+  summary: {
+    files: number;
+    changedFiles: number;
+    readGuardEvents: number;
+    codeQualityWarnings: number;
+    slowDispatches: number;
+    complexityRegressions: number;
+  };
+  files: Array<{
+    filePath: string;
+    displayPath: string;
+    score: number;
+    reasons: string[];
+    lastChangedAt?: string;
+    projectSeq?: number;
+    fileSeq?: number;
+    changeCount?: number;
+    mutationSources?: Record<string, number>;
+    readGuard?: {
+      blocked?: number;
+      warned?: number;
+      oldTextNotFound?: number;
+      oldTextDuplicate?: number;
+      partialApply?: number;
+      autopatched?: number;
+    };
+    diagnostics?: {
+      recurring?: number;
+      topRules?: Array<{ rule: string; count: number }>;
+      codeQuality?: number;
+      actionable?: number;
+      autofixed?: number;
+    };
+    complexity?: {
+      maintainabilityIndex?: number;
+      cognitive?: number;
+      maxCyclomatic?: number;
+      entropy?: number;
+      trend?: "improving" | "stable" | "regressing";
+      miDelta?: number;
+    };
+    dependency?: {
+      reverseDepFanout?: number;
+      cascadeNeighborCount?: number;
+      cascadeDiagnostics?: number;
+    };
+    latency?: {
+      dispatchCount?: number;
+      maxMs?: number;
+      avgMs?: number;
+      slowestRunner?: string;
+    };
+  }>;
+}
+```
+
+### Scoring guidelines
+
+Keep scoring simple and explainable. Each file accumulates points and `reasons`:
+
+- +3 repeated `edit_blocked` / stale read-guard blocks
+- +2 `oldtext_duplicate` / `oldtext_not_found`
+- +2 recurring code-quality warning
+- +2 maintainability trend regressing
+- +1 format/autofix touched repeatedly
+- +1 high reverse-dependency fanout
+- +1 slow dispatch / runner hotspot
+- cap or normalize to a 0–100 score
+
+The report should always include the reason strings so agents do not need to trust a magic score.
 
 ### Agent-facing use
 
-Session-start guidance can include:
+Session-start guidance can include only the top few items:
 
 ```text
-Recently active files:
-  clients/read-guard-tool-lines.ts — edited 4x, 2 quality warnings
-  index.ts — formatted/autofixed last session
+Project friction summary:
+  clients/read-guard-tool-lines.ts — repeated oldText failures, edited 4x, 2 quality warnings
+  clients/runtime-session.ts — high fanout (12 dependents), slow cascade, format touched last session
+  index.ts — maintainability trend regressing (MI -4.2)
 ```
 
-Keep this concise and advisory-only.
+Rules:
+
+- Advisory only; never a blocker.
+- Top 3–5 files max.
+- Prefer concrete reason labels over raw metric dumps.
+- Include path to full JSON report.
+- Suppress if no meaningful signals.
+
+### Implementation order
+
+1. Add `clients/project-friction.ts` with pure aggregation helpers and tests using fixture logs/cache files.
+2. Aggregate `change-log.jsonl`, `code-quality-warnings.jsonl`, and `metrics-history.json` first — these are project-scoped and stable.
+3. Add parsers for bounded tails of global logs (`read-guard.log`, `latency.log`, `cascade.log`, daily diagnostic JSONL). Tail only recent N lines to avoid startup cost.
+4. Add reverse-dep fanout from project snapshot.
+5. Write `.pi-lens/cache/project-friction.json` at session start after snapshot load or as a deferred background task.
+6. Surface a concise advisory in session-start guidance.
+7. Later, use the report in turn-end context when the current turn touches a known hot/friction file.
+
+### Acceptance criteria
+
+- Aggregator reads existing logs/caches without adding expensive hook-path work.
+- Report is bounded and deterministic in tests.
+- Session-start only surfaces concise, actionable top findings.
+- Metrics/complexity consolidation plan is followed: no new dependencies on the unused `MetricsClient` entropy baseline path.
+- Existing manual commands like `/lens-health` and `/lens-tdi` can reuse the aggregation helpers over time.
 
 ## Phase 6 — Internal edit substrate to reduce failed edits
 
@@ -366,46 +508,139 @@ type ApplyInternalEditResult =
 
 ## Phase 7 — Lazy heavy indexes
 
-Do not eagerly build everything at session start.
+Status: **partly implemented / needs policy cleanup**. pi-lens already defers many startup scans, but the boundaries between interactive-path work, queued background work, and command-only heavy work should be explicit.
+
+### Goal
+
+Do not eagerly build everything at session start. Keep the interactive path fast, hydrate fresh persisted intelligence when available, and only rebuild expensive indexes when a hook/command actually needs them.
+
+### Scheduling policy
+
+Classify each project intelligence task by cost and freshness need:
+
+| Class | Examples | Startup behavior | Hook-path behavior |
+|---|---|---|---|
+| Eager cheap | project seq seed, snapshot probe, cache metadata, file-kind detection | allowed on interactive path if bounded | allowed |
+| Deferred warm | LSP config walk, tool preinstall/probe-cache refresh, fresh reverse-dep cache merge | `setImmediate` fire-and-forget; logs queued vs run time | avoid unless already warm |
+| Background heavy | knip, jscpd, full review graph, project index, ast-grep export scan | only after session_start returns, guarded by in-flight locks | never synchronous |
+| Command-only / explicit | full project health, future search-index rebuild, full dependency audit | only via command or opt-in config | never automatic |
 
 ### Keep eager/lightweight
 
-- file inventory
-- shallow outlines/symbols
-- reverse deps if cache fresh
-- project rules scan summary
+- Seed project/file sequence state from `<project-data-dir>/change-log.jsonl`.
+- Probe `.pi-lens/cache/project-snapshot.json` and hydrate only if `snapshot.seq === runtime.projectSeq`.
+- Load small cache metadata files and latest-turn reports.
+- Detect the edited file's `FileKind` and project root for dispatch.
+- Read fresh reverse-dependency data from snapshot if available; do not rebuild graph on the interactive path.
 
 ### Keep lazy/background
 
-- jscpd
-- knip
-- full review graph rebuild
-- expensive structural similarity/project index
-- future full-text/trigram index
+- jscpd startup scan.
+- knip startup scan and delta analysis when a startup scan is still in flight.
+- full review graph rebuild / dependency extraction.
+- expensive structural similarity/project index.
+- ast-grep export scan when no fresh snapshot exports exist.
+- project-friction aggregation over global logs.
+- future full-text/trigram index.
 
-### Triggering
+### Triggering rules
 
-- hook paths request only what they need
-- turn-end can refresh if needed
-- commands can force rebuild
+- **Session start:** may queue background tasks, but should not await expensive scans. Continue logging queued delay separately from run duration.
+- **Tool result:** may use cached data and per-file cheap checks only. If a cache is stale, record a best-effort advisory and queue refresh rather than blocking the edit pipeline.
+- **Turn end:** may refresh targeted/delta indexes for touched files, subject to in-flight guards and short timeouts.
+- **Commands:** may force full rebuilds because users explicitly requested them.
+- **Tests:** should be able to disable background scheduling or await a deterministic drain helper.
+
+### In-flight/cache guard requirements
+
+- Every heavy project-root task has a root-keyed in-flight guard.
+- Cache writes include version + project seq/source metadata where applicable.
+- Stale cache reads degrade to missing data rather than triggering synchronous rebuilds.
+- Long-lived timers/processes are `.unref()`'d where safe.
+- Expensive tool availability checks use the probe cache before spawning.
+
+### Acceptance criteria
+
+- Warm `session_start` stays near the current ~150ms target.
+- No hook path calls `safeSpawn()` or performs full-project scans synchronously.
+- If knip/jscpd/review-graph scans are already running, subsequent turns reuse/skip rather than duplicate them.
+- Snapshot/reverse-dep/project-friction consumers tolerate stale or missing caches without user-visible crashes.
 
 ## Phase 8 — Optional search index experiment
 
-codedb's trigram/word index is impressive, but pi-lens already has ripgrep/ast-grep/LSP. Treat this as optional.
+Status: **optional / not implemented**. codedb's trigram/word index is impressive, but pi-lens already has ripgrep, ast-grep, LSP navigation, cached exports, and project snapshots. Treat this as an experiment only after Phases 5–7 are solid.
+
+### Goal
+
+Provide a tiny persisted lookup cache for agent guidance when it is faster or more contextual than spawning a search tool. The cache should answer "where is this identifier/symbol mentioned?" and "what files are likely related?" — not replace `rg`, AST search, or LSP.
 
 ### Candidate feature
 
 A lightweight word/symbol lookup cache for agent guidance:
 
-- exact identifier lookup
-- symbol name lookup
-- maybe simple substring search
+- exact identifier lookup (`RuntimeCoordinator.cachedExports` can seed symbol definitions)
+- symbol name lookup with kind/file metadata
+- import/export relationship hints from project snapshot + reverse deps
+- small substring or normalized-token lookup for project-specific terms
+- optional co-change/recency boost from `change-log.jsonl`
+
+### Storage sketch
+
+Prefer extending the project snapshot only after the model proves useful:
+
+```ts
+interface ProjectSearchIndex {
+  version: 1;
+  seq: number;
+  generatedAt: string;
+  tokens: Record<string, Array<{ filePath: string; count: number; lines?: number[] }>>;
+  symbols: Record<string, Array<{ filePath: string; kind?: string; line?: number }>>;
+  files: Record<string, { tokenCount: number; mtimeMs: number; size: number }>;
+}
+```
+
+Possible cache path if kept separate:
+
+- `.pi-lens/cache/project-search-index.json`
+
+### Query API sketch
+
+```ts
+lookupProjectTerm(cwd, term, opts?: { maxFiles?: number; includeLines?: boolean }): ProjectTermHit[]
+lookupSymbolLike(cwd, name, opts?: { maxFiles?: number }): ProjectSymbolHit[]
+getRelatedFiles(cwd, filePath, opts?: { maxFiles?: number }): RelatedFileHit[]
+```
+
+Ranking can combine:
+
+- exact symbol definition/export match
+- same directory/package/module
+- reverse-dependency adjacency
+- recent co-change in `change-log.jsonl`
+- token frequency with caps to avoid common-word dominance
+
+### Build strategy
+
+- Build lazily from cached file inventory and touched files first.
+- Update incrementally on pi-observed writes when a fresh index exists.
+- Rebuild fully only via command or background task with time/size caps.
+- Skip ignored/generated/vendor files using the same project scan policy as snapshots.
+- Store line numbers only for low-frequency tokens; high-frequency tokens keep file counts only.
 
 ### Avoid initially
 
 - full custom trigram engine
-- replacing ripgrep
+- replacing ripgrep/ast-grep/LSP navigation
 - parsing every language deeply
+- querying from hook paths when the cache is missing/stale
+- indexing large/binary/generated files
+
+### Acceptance criteria for pursuing
+
+- Demonstrates clear latency or context-quality benefit over `rg`/cached exports in this repo.
+- Adds no measurable warm-start regression.
+- Reuses snapshot/seq invalidation semantics.
+- Has deterministic tests for tokenization, stale cache rejection, and ranking.
 
 ## Things not to copy directly
 
@@ -421,8 +656,8 @@ A lightweight word/symbol lookup cache for agent guidance:
 3. ~~Add seq metadata to actionable/code-quality reports.~~ Done.
 4. ~~Project snapshot cache consolidating existing indexes.~~ Foundation done.
 5. ~~Reverse dependency cache/query helper.~~ Foundation done.
-6. Hot files report.
-7. Native versioned edit helper.
+6. Project friction / hot files report.
+7. Internal versioned edit substrate.
 8. Optional search index experiment.
 
 ## Tests
@@ -434,13 +669,13 @@ Add tests for:
 - changesSince filtering and max cap
 - snapshot load/save/version invalidation
 - reverse dependency lookup from cached graph — foundation covered
-- hot files aggregation
-- native edit stale-seq rejection
-- native edit post-pipeline routing
+- project friction / hot files aggregation
+- internal edit stale-seq rejection
+- internal edit post-pipeline routing
 
-## Open questions
+## Open questions / decisions
 
-- Should project sequence be persisted across sessions or reset per session? Prefer persisted per project.
+- **Decision:** project sequence is persisted per project via `<project-data-dir>/change-log.jsonl`; session start seeds runtime state from the latest entry.
 - Should file hashes be cheap line hashes, full content hashes, or mtime+size initially? Prefer mtime+size initially, full hash only for touched files.
 - Should a future `lens_changes` tool be exposed to agents, or only used internally for guidance?
-- Native edit helper decision: keep it internal initially. It should complement read expansion/read-guard/autopatch by powering pi-lens-owned mutations, not replace the native agent `edit` path or be exposed as a model-facing tool.
+- **Decision:** the versioned edit helper stays internal initially. It should complement read expansion/read-guard/autopatch by powering pi-lens-owned mutations, not replace the native agent `edit` path or be exposed as a model-facing tool.

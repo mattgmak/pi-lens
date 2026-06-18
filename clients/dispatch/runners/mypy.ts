@@ -35,6 +35,7 @@ function parseMypyOutput(raw: string, filePath: string): Diagnostic[] {
 			semantic: severity === "error" ? "blocking" : "warning",
 			tool: "mypy",
 			rule,
+			defectClass: "correctness",
 		});
 	}
 	return diagnostics;
@@ -56,7 +57,7 @@ const mypyRunner: RunnerDefinition = {
 		}
 
 		let cmd: string | null = null;
-		if (await (mypy.isAvailableAsync?.(cwd) ?? mypy.isAvailable(cwd))) {
+		if (await (mypy.isAvailableAsync(cwd))) {
 			cmd = mypy.getCommand(cwd);
 		} else {
 			cmd = await resolveToolCommandWithInstallFallback(cwd, "mypy");

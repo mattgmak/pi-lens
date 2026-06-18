@@ -215,18 +215,43 @@ describe("runner status/semantic edge cases", () => {
 
 			const result = await runner.run(ctx(filePath, env.tmpDir) as never);
 			expect(result.status).toBe("succeeded");
+			// Bounded touch: primary language server + the enabled auxiliaries
+			// (opengrep is default-on) — NOT the unbounded "all"/aggregate path.
 			expect(touchFile).toHaveBeenCalledWith(
 				filePath,
 				"const x = 1;\n",
 				expect.objectContaining({
 					diagnostics: "document",
 					collectDiagnostics: true,
-					clientScope: "primary",
+					clientScope: "with-auxiliary",
+					auxiliaryServerIds: expect.arrayContaining(["opengrep"]),
 					maxClientWaitMs: expect.any(Number),
 					source: "dispatch-lsp-runner",
 				}),
 			);
 			expect(getDiagnostics).not.toHaveBeenCalled();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("lsp runner returns skipped (not succeeded) when no client is ready", async () => {
+		// touchFile resolves undefined → no LSP client was ready (cold/unavailable).
+		// Reporting "succeeded, 0 diagnostics" would read as a clean result; the
+		// runner must report "skipped" so the gap is flagged instead.
+		const runner = (await import("../../../../clients/dispatch/runners/lsp.js"))
+			.default;
+		const env = setupTestEnvironment("pi-lens-lsp-cold-");
+		try {
+			const filePath = path.join(env.tmpDir, "main.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+
+			supportsLSP.mockReturnValue(true);
+			touchFile.mockResolvedValue(undefined);
+
+			const result = await runner.run(ctx(filePath, env.tmpDir) as never);
+			expect(result.status).toBe("skipped");
+			expect(result.diagnostics).toEqual([]);
 		} finally {
 			env.cleanup();
 		}

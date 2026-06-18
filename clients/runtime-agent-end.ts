@@ -160,8 +160,10 @@ export async function handleAgentEnd({
 
 			if (result.formatChanged) {
 				summary.changed.push(filePath);
-				const bookkeepingCwd =
-					record.turnStateCwd || ctxCwd || runtime.projectRoot || record.cwd;
+				// turnStateCwd is required on DeferredFormatRecord (PR #114) — the
+				// previous fallback chain through ctxCwd / projectRoot / record.cwd
+				// could silently regress the monorepo cwd-mismatch fix from PR #105.
+				const bookkeepingCwd = record.turnStateCwd;
 				recordProjectChange({
 					runtime,
 					cwd: bookkeepingCwd,
@@ -197,7 +199,6 @@ export async function handleAgentEnd({
 					false,
 					getFlag,
 					dbg,
-					result.formatChanged,
 				);
 			}
 

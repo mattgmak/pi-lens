@@ -20,10 +20,6 @@ import type { JscpdClient } from "../clients/jscpd-client.js";
 import type { KnipClient } from "../clients/knip-client.js";
 import { validateProductionReadiness } from "../clients/production-readiness.js";
 import {
-	buildProjectIndex,
-	type ProjectIndex,
-} from "../clients/project-index.js";
-import {
 	detectProjectMetadata,
 	getAvailableCommands,
 } from "../clients/project-metadata.js";
@@ -33,7 +29,6 @@ import {
 	collectSourceFiles,
 	getFilterStats,
 } from "../clients/source-filter.js";
-import { calculateSimilarity } from "../clients/state-matrix.js";
 import type { TodoScanner } from "../clients/todo-scanner.js";
 import { TreeSitterClient } from "../clients/tree-sitter-client.js";
 import { queryLoader } from "../clients/tree-sitter-query-loader.js";
@@ -430,47 +425,6 @@ export async function handleBooboo(
 		return { findings: filteredGroups.length, status: "done" };
 	});
 
-	// Runner 3: Semantic similarity
-	await tracker.run("semantic similarity (Amain)", async () => {
-		try {
-			const absoluteFiles = collectSourceFiles(targetPath, {
-				extensions: [".ts"],
-			}).filter(shouldIncludeFile);
-
-			if (absoluteFiles.length === 0) {
-				return { findings: 0, status: "done" };
-			}
-			const index = await buildProjectIndex(targetPath, absoluteFiles);
-			const topPairs = findTopSimilarPairs(index, 10);
-
-			if (topPairs.length > 0) {
-				summaryItems.push({
-					category: "Semantic Duplicates",
-					count: topPairs.length,
-					severity: "🟡",
-					fixable: true,
-				});
-
-				let fullSection = `## Semantic Duplicates (Amain Algorithm)\n\n`;
-				fullSection += `**${topPairs.length} pair(s) with >=${(SEMANTIC_SIMILARITY_THRESHOLD * 100).toFixed(0)}% semantic similarity**\n\n`;
-				fullSection +=
-					"Functions with different names/variables but similar logic structures.\n\n";
-
-				for (const pair of topPairs) {
-					fullSection += `### ${pair.func1} ↔ ${pair.func2}\n\n`;
-					fullSection += `- Similarity: **${(pair.similarity * 100).toFixed(1)}%**\n`;
-					fullSection += `- Consider consolidating or extracting shared logic\n\n`;
-				}
-				fullReport.push(fullSection);
-			}
-
-			return { findings: topPairs.length, status: "done" };
-		} catch (err) {
-			console.error("[booboo] Semantic similarity analysis failed:", err);
-			return { findings: 0, status: "error" };
-		}
-	});
-
 	// Runner 4: Complexity metrics
 	await tracker.run("complexity metrics", async () => {
 		const results: import("../clients/complexity-client.js").FileComplexity[] =
@@ -616,6 +570,9 @@ export async function handleBooboo(
 		return { findings: 0, status: "done" };
 	});
 
+	// TODO(#173): migrate this tree-sitter/fact-rule project scan to consume
+	// clients/project-diagnostics/scanner.ts once the Markdown report renderer can
+	// group normalized ProjectDiagnostic records into the richer booboo sections.
 	// Runner 4: Tree-sitter patterns — language-aware, driven by .yml rule files
 	// Uses the same queryLoader + singleton client as the per-write dispatch runner.
 	// Covers all languages: TypeScript, JavaScript, Python, Go, Rust, Ruby.
@@ -937,11 +894,11 @@ export async function handleBooboo(
 		if (!langs.has("typescript")) {
 			return { findings: 0, status: "skipped" };
 		}
-		if (!clients.typeCoverage.isAvailable()) {
+		if (!(await clients.typeCoverage.isAvailableAsync())) {
 			return { findings: 0, status: "skipped" };
 		}
 
-		const tcResult = clients.typeCoverage.scan(targetPath);
+		const tcResult = await clients.typeCoverage.scanAsync(targetPath);
 
 		if (tcResult.percentage < 100) {
 			// Filter out test file locations using centralized exclusion
@@ -1756,82 +1713,4 @@ ${fullReport.join("\n")}`;
 
 		ctx.ui.notify(summaryLines.join("\n"), "info");
 	}
-}
-
-// ============================================================================
-// Semantic Similarity Helper
-// ============================================================================
-
-interface SimilarPair {
-	func1: string;
-	func2: string;
-	similarity: number;
-}
-
-const SEMANTIC_SIMILARITY_THRESHOLD = 0.98;
-const MIN_SIMILARITY_TRANSITIONS = 40;
-const MAX_TRANSITION_RATIO = 1.8;
-
-/**
- * Find top N most similar function pairs in the project index
- * Uses canonical pair ordering to avoid duplicates (A,B) vs (B,A)
- */
-function findTopSimilarPairs(
-	index: ProjectIndex,
-	maxPairs: number,
-): SimilarPair[] {
-	const entries = Array.from(index.entries.values());
-	const seenPairs = new Set<string>();
-	const pairs: SimilarPair[] = [];
-
-	for (let i = 0; i < entries.length; i++) {
-		for (let j = i + 1; j < entries.length; j++) {
-			const entry1 = entries[i];
-			const entry2 = entries[j];
-
-			// Skip if same file (we want cross-file duplicates)
-			if (entry1.filePath === entry2.filePath) continue;
-
-			// Skip low-signal functions where matrix noise dominates.
-			if (
-				entry1.transitionCount < MIN_SIMILARITY_TRANSITIONS ||
-				entry2.transitionCount < MIN_SIMILARITY_TRANSITIONS
-			) {
-				continue;
-			}
-
-			// Skip pairs with very different complexity/size; these are often
-			// boilerplate-wrapper false positives (shared try/catch/logging shell).
-			const maxTransitions = Math.max(
-				entry1.transitionCount,
-				entry2.transitionCount,
-			);
-			const minTransitions = Math.min(
-				entry1.transitionCount,
-				entry2.transitionCount,
-			);
-			if (minTransitions <= 0) continue;
-			if (maxTransitions / minTransitions > MAX_TRANSITION_RATIO) continue;
-
-			const similarity = calculateSimilarity(entry1.matrix, entry2.matrix);
-
-			if (similarity >= SEMANTIC_SIMILARITY_THRESHOLD) {
-				// Canonical pair key (sorted to avoid duplicates)
-				const pairKey = [entry1.id, entry2.id]
-					.sort((a, b) => a.localeCompare(b))
-					.join("::");
-				if (seenPairs.has(pairKey)) continue;
-				seenPairs.add(pairKey);
-
-				pairs.push({
-					func1: entry1.id,
-					func2: entry2.id,
-					similarity,
-				});
-			}
-		}
-	}
-
-	// Sort by similarity descending, take top N
-	return pairs.sort((a, b) => b.similarity - a.similarity).slice(0, maxPairs);
 }

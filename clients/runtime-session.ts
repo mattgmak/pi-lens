@@ -8,7 +8,12 @@ import type { DependencyChecker } from "./dependency-checker.js";
 import { getDiagnosticTracker } from "./diagnostic-tracker.js";
 import { clearAllSessions as clearFileTimeSessions } from "./file-time.js";
 import { getKnipIgnorePatterns } from "./file-utils.js";
+import { GitleaksClient, type GitleaksResult } from "./gitleaks-client.js";
 import type { GoClient } from "./go-client.js";
+import {
+	GovulncheckClient,
+	type GovulncheckResult,
+} from "./govulncheck-client.js";
 import type { JscpdClient } from "./jscpd-client.js";
 import type { KnipClient, KnipResult } from "./knip-client.js";
 import { canRunStartupHeavyScans } from "./language-policy.js";
@@ -22,12 +27,6 @@ import { initLSPConfig, loadLSPConfig } from "./lsp/config.js";
 import { getLSPService } from "./lsp/index.js";
 import type { LSPShutdownOptions } from "./lsp/client.js";
 import type { MetricsClient } from "./metrics-client.js";
-import {
-	buildProjectIndex,
-	isIndexFresh,
-	loadIndex,
-	saveIndex,
-} from "./project-index.js";
 import { readLatestProjectSequence } from "./project-changes.js";
 import {
 	getProjectSnapshotPath,
@@ -42,7 +41,6 @@ import { scanProjectRules } from "./rules-scanner.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
 import type { RustClient } from "./rust-client.js";
 
-import { getSourceFiles } from "./scan-utils.js";
 import {
 	findNearestProjectRoot,
 	resolveStartupScanContext,
@@ -67,6 +65,8 @@ interface SessionStartDeps {
 	ruffClient: RuffClient;
 	knipClient: KnipClient;
 	jscpdClient: JscpdClient;
+	govulncheckClient: GovulncheckClient;
+	gitleaksClient: GitleaksClient;
 	typeCoverageClient: TypeCoverageClient;
 	depChecker: DependencyChecker;
 	testRunnerClient: TestRunnerClient;
@@ -185,6 +185,80 @@ async function igniteWarmFiles(
 	}
 }
 
+/**
+ * Fallback warm when a project has no explicit `warmFiles`: pre-spawn the LSP
+ * for the project's *dominant* language (highest source-file count) by opening
+ * one representative file. This eliminates the cold-spawn stall the first edit
+ * would otherwise pay (`lsp_client_wait_timeout`, observed up to 5s on
+ * TypeScript/Deno). Only a single server is warmed — launching every detected
+ * language's server at once (rust-analyzer + gopls + tsserver …) would spike CPU
+ * and the event loop at startup, working against the very latency we protect.
+ * Projects that want more pre-warming can list explicit `warmFiles` (#203).
+ */
+async function igniteDominantLanguageWarm(
+	cwd: string,
+	runtime: RuntimeCoordinator,
+	sessionGeneration: number,
+	dbg: (msg: string) => void,
+): Promise<void> {
+	try {
+		await initLSPConfig(cwd);
+		if (!runtime.isCurrentSession(sessionGeneration)) return;
+
+		const lspService = getLSPService();
+		const { collectSourceFilesAsync } = await import("./source-filter.js");
+		const { detectFileKind } = await import("./file-kinds.js");
+		// Async, event-loop-yielding walk (deferred off the interactive path).
+		// inspectGeneratedHeaders:false keeps the walk to directory reads only — no
+		// per-file content opens — so we never hold a file handle (cheaper, and it
+		// can't collide with concurrent fs teardown). Picking a representative file
+		// doesn't need generated-banner filtering.
+		const files = await collectSourceFilesAsync(cwd, {
+			inspectGeneratedHeaders: false,
+		});
+		if (!runtime.isCurrentSession(sessionGeneration)) return;
+
+		// Rank languages by source-file count. Computed here from the scan rather
+		// than reused from languageProfile.counts, which is left empty on the
+		// no-warm-caches startup path (detectProjectLanguageProfile is called with
+		// an empty file list there).
+		const counts = new Map<string, number>();
+		for (const f of files) {
+			const kind = detectFileKind(f);
+			if (kind) counts.set(kind, (counts.get(kind) ?? 0) + 1);
+		}
+		if (counts.size === 0) {
+			dbg("session_start lsp-warm: no detected languages to auto-warm");
+			return;
+		}
+		const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+
+		// Walk languages by descending count; warm the first that has both an LSP
+		// server and a representative on-disk file.
+		for (const [kind] of ranked) {
+			const sample = files.find(
+				(f) => detectFileKind(f) === kind && lspService.supportsLSP(f),
+			);
+			if (!sample) continue;
+			const content = await nodeFs.promises.readFile(sample, "utf-8");
+			if (!runtime.isCurrentSession(sessionGeneration)) return;
+			await lspService.touchFile(sample, content, {
+				diagnostics: "none",
+				source: "startup-warm-dominant",
+				clientScope: "primary",
+				maxClientWaitMs: 2000,
+			});
+			dbg(
+				`session_start lsp-warm: dominant=${kind} via ${path.basename(sample)}`,
+			);
+			return;
+		}
+		dbg("session_start lsp-warm: no dominant-language LSP file found to warm");
+	} catch (err) {
+		dbg(`session_start lsp-warm: dominant warm error: ${err}`);
+	}
+}
+
 function firePreinstallDefaults(
 	ensureTool: SessionStartDeps["ensureTool"],
 	dbg: SessionStartDeps["dbg"],
@@ -247,9 +321,66 @@ async function probePrettierInstall(
 	}
 }
 
+/** A todo scanner that may expose a per-file API (newer) or only the
+ * directory walk (older / mocked). `scanFile` returns the items array directly
+ * (`TodoItem[]`); `scanDirectory` returns a `{ items }` result. */
+type TodoScannerLike = {
+	scanDirectory: (root: string) => { items: unknown[] };
+	scanFile?: (filePath: string) => unknown[];
+};
+
+/** Scan one file via the per-file API, pushing any items. Tolerates an
+ * unreadable file and a scanner without `scanFile` (no-op). */
+function scanOneTodoFile(
+	scanner: TodoScannerLike,
+	filePath: string,
+	items: unknown[],
+): void {
+	if (typeof scanner.scanFile !== "function") return;
+	try {
+		// scanFile returns TodoItem[] directly (not a { items } result).
+		const result = scanner.scanFile(filePath);
+		if (Array.isArray(result)) items.push(...result);
+	} catch {
+		// Per-file error: skip and continue (matches scanDirectory's tolerance).
+	}
+}
+
+/** Collect the TODO baseline without blocking: enumerate source files and scan
+ * them per-file, yielding to the event loop every 30 files. Falls back to the
+ * blocking `scanDirectory` if the chunked path can't run (import error or a
+ * scanner without `scanFile`). */
+async function collectTodoBaselineItems(
+	scanner: TodoScannerLike,
+	analysisRoot: string,
+	stillCurrent: () => boolean,
+): Promise<unknown[]> {
+	const items: unknown[] = [];
+	try {
+		const { getSourceFilesAsync } = await import("./scan-utils.js");
+		// Enumerate with the chunked-yield walker so the file collection itself
+		// (the previously-synchronous ~1.5s burst on a 2k-file tree) no longer
+		// blocks the event loop before the per-file scan loop below even starts.
+		const files = await getSourceFilesAsync(analysisRoot, true);
+		if (!stillCurrent()) return items;
+		let processedSinceYield = 0;
+		for (const file of files) {
+			if (!stillCurrent()) return items;
+			scanOneTodoFile(scanner, file, items);
+			if (++processedSinceYield % 30 === 0) {
+				await new Promise<void>((resolve) => setImmediate(resolve));
+			}
+		}
+	} catch {
+		const todoResult = scanner.scanDirectory(analysisRoot);
+		items.push(...todoResult.items);
+	}
+	return items;
+}
+
 // Fire off heavy scans as background tasks — don't block session start.
 // Each consumer already handles the "not ready yet" case gracefully
-// (cachedExports.size > 0, cachedProjectIndex != null, cache miss paths).
+// (cachedExports.size > 0, cache miss paths).
 function scheduleStartupScans(
 	deps: SessionStartDeps,
 	runtime: RuntimeCoordinator,
@@ -259,14 +390,34 @@ function scheduleStartupScans(
 	languageProfile: ReturnType<typeof detectProjectLanguageProfile>,
 	dbg: SessionStartDeps["dbg"],
 ): void {
-	const { todoScanner, cacheManager, knipClient, jscpdClient, astGrepClient } =
-		deps;
+	const {
+		todoScanner,
+		cacheManager,
+		knipClient,
+		jscpdClient,
+		govulncheckClient,
+		gitleaksClient,
+		astGrepClient,
+	} = deps;
 
+	// Some background scans are CPU-heavy and arrive on the event loop
+	// just as the user is most likely typing (right after /new). Defer
+	// those by a few seconds so the perceptible 50-100ms sync bursts they
+	// contain land during LLM streaming idle time instead. All other
+	// tasks (those not listed here) run on the next `setImmediate` tick
+	// as before. The delays are deliberately staggered (200ms apart) so
+	// two heavy tasks don't both run on the same macrotask.
+	const taskDeferMsByName: Record<string, number> = {
+		"call-graph": 5000,
+		"codebase-model": 5200,
+		"ast-grep exports": 5400,
+		"project index": 5400,
+	};
 	const runTask = (name: string, task: () => Promise<void>): void => {
 		const queuedAt = Date.now();
 		dbg(`session_start task ${name}: scheduled`);
 		runtime.markStartupScanInFlight(name, sessionGeneration);
-		setImmediate(() => {
+		const fire = (): void => {
 			const startedAt = Date.now();
 			dbg(`session_start task ${name}: start queuedMs=${startedAt - queuedAt}`);
 			void task()
@@ -285,7 +436,13 @@ function scheduleStartupScans(
 					runtime.clearStartupScanInFlight(name, sessionGeneration);
 					dbg(`session_start task ${name}: end`);
 				});
-		});
+		};
+		const delay = taskDeferMsByName[name] ?? 0;
+		if (delay > 0) {
+			setTimeout(fire, delay);
+		} else {
+			setImmediate(fire);
+		}
 	};
 
 	const canRunJsTsHeavyScans = canRunStartupHeavyScans(languageProfile, "jsts");
@@ -297,16 +454,18 @@ function scheduleStartupScans(
 
 	runTask("todo", async () => {
 		if (!runtime.isCurrentSession(sessionGeneration)) return;
-		const todoResult = todoScanner.scanDirectory(analysisRoot);
-		if (!runtime.isCurrentSession(sessionGeneration)) return;
-		dbg(
-			`session_start TODO scan: ${todoResult.items.length} items (baseline stored)`,
-		);
-		cacheManager.writeCache(
-			"todo-baseline",
-			{ items: todoResult.items },
+		// The original implementation called todoScanner.scanDirectory(), which
+		// walks the project synchronously and freezes the TUI for ~3s on a 2k-file
+		// project. collectTodoBaselineItems re-implements the walk in async chunks
+		// (per-file scan, yielding every 30 files), falling back to scanDirectory.
+		const items = await collectTodoBaselineItems(
+			todoScanner as TodoScannerLike,
 			analysisRoot,
+			() => runtime.isCurrentSession(sessionGeneration),
 		);
+		if (!runtime.isCurrentSession(sessionGeneration)) return;
+		dbg(`session_start TODO scan: ${items.length} items (baseline stored)`);
+		cacheManager.writeCache("todo-baseline", { items }, analysisRoot);
 	});
 
 	if (!canRunJsTsHeavyScans) {
@@ -345,25 +504,178 @@ function scheduleStartupScans(
 	runTask("jscpd", async () => {
 		if (await jscpdClient.ensureAvailable()) {
 			if (!runtime.isCurrentSession(sessionGeneration)) return;
+			// Detect TS projects by tsconfig.json at the analysis root. When
+			// set, JscpdClient.scan adds **/*.js and **/*.jsx to its ignore
+			// pattern so compiled artifacts under dist/ aren't flagged as
+			// duplicates of their TypeScript sources (closes #126's latent
+			// dist/-as-duplicate bug). Cache scanner key varies by this flag
+			// so a stale cache built with the wrong setting invalidates on
+			// first read.
+			const isTsProject = nodeFs.existsSync(
+				path.join(analysisRoot, "tsconfig.json"),
+			);
+			const scannerKey = isTsProject ? "jscpd-ts" : "jscpd";
 			const cached = cacheManager.readCache<
 				Awaited<ReturnType<JscpdClient["scan"]>>
-			>("jscpd", analysisRoot);
+			>(scannerKey, analysisRoot);
 			if (cached) {
 				if (!runtime.isCurrentSession(sessionGeneration)) return;
-				dbg("session_start jscpd: cache hit");
+				dbg(`session_start jscpd: cache hit (${scannerKey})`);
 			} else {
 				const startMs = Date.now();
-				const jscpdResult = await jscpdClient.scan(analysisRoot);
+				const jscpdResult = await jscpdClient.scan(
+					analysisRoot,
+					undefined,
+					undefined,
+					isTsProject,
+				);
 				if (!runtime.isCurrentSession(sessionGeneration)) return;
-				cacheManager.writeCache("jscpd", jscpdResult, analysisRoot, {
+				cacheManager.writeCache(scannerKey, jscpdResult, analysisRoot, {
 					scanDurationMs: Date.now() - startMs,
 				});
-				dbg(`session_start jscpd scan done (${Date.now() - startMs}ms)`);
+				dbg(
+					`session_start jscpd scan done (${Date.now() - startMs}ms, isTsProject=${isTsProject})`,
+				);
 			}
 		} else {
 			if (!runtime.isCurrentSession(sessionGeneration)) return;
 			dbg("session_start jscpd: not available");
 		}
+	});
+
+	// govulncheck — Go module CVE detection (#132)
+	// Skipped silently when the project isn't a Go module or when
+	// `govulncheck` isn't installed (no auto-install in this slice).
+	runTask("govulncheck", async () => {
+		if (!GovulncheckClient.hasGoModule(analysisRoot)) {
+			dbg("session_start govulncheck: no go.mod — skipped");
+			return;
+		}
+		if (!(await govulncheckClient.ensureAvailable())) {
+			if (!runtime.isCurrentSession(sessionGeneration)) return;
+			dbg(
+				"session_start govulncheck: not installed (go install golang.org/x/vuln/cmd/govulncheck@latest)",
+			);
+			return;
+		}
+		if (!runtime.isCurrentSession(sessionGeneration)) return;
+		const cached = cacheManager.readCache<GovulncheckResult>(
+			"govulncheck",
+			analysisRoot,
+		);
+		if (cached) {
+			if (!runtime.isCurrentSession(sessionGeneration)) return;
+			dbg(
+				`session_start govulncheck: cache hit (${cached.data.findings.length} findings)`,
+			);
+			return;
+		}
+		const startMs = Date.now();
+		const result = await govulncheckClient.analyze(analysisRoot);
+		if (!runtime.isCurrentSession(sessionGeneration)) return;
+		cacheManager.writeCache("govulncheck", result, analysisRoot, {
+			scanDurationMs: Date.now() - startMs,
+		});
+		dbg(
+			`session_start govulncheck: ${result.findings.length} reachable findings (${Date.now() - startMs}ms)`,
+		);
+	});
+
+	// gitleaks — committed-secrets detection (#130)
+	// Config-gated: opts in via .gitleaks.toml / .gitleaksignore / git
+	// hook / gitleaks dep. Cross-language by design.
+	runTask("gitleaks", async () => {
+		if (!GitleaksClient.hasGitleaksSignal(analysisRoot)) {
+			dbg("session_start gitleaks: no opt-in signal — skipped");
+			return;
+		}
+		if (!(await gitleaksClient.ensureAvailable())) {
+			if (!runtime.isCurrentSession(sessionGeneration)) return;
+			dbg("session_start gitleaks: not available (install failed?)");
+			return;
+		}
+		if (!runtime.isCurrentSession(sessionGeneration)) return;
+		const cached = cacheManager.readCache<GitleaksResult>(
+			"gitleaks",
+			analysisRoot,
+		);
+		if (cached) {
+			if (!runtime.isCurrentSession(sessionGeneration)) return;
+			dbg(
+				`session_start gitleaks: cache hit (${cached.data.findings.length} findings)`,
+			);
+			return;
+		}
+		const startMs = Date.now();
+		const result = await gitleaksClient.scan(analysisRoot);
+		if (!runtime.isCurrentSession(sessionGeneration)) return;
+		cacheManager.writeCache("gitleaks", result, analysisRoot, {
+			scanDurationMs: Date.now() - startMs,
+		});
+		dbg(
+			`session_start gitleaks: ${result.findings.length} findings (${Date.now() - startMs}ms)`,
+		);
+	});
+
+	// call-graph — build function-level call graph from review graph data
+	runTask("call-graph", async () => {
+		const { FactStore } = await import("./dispatch/fact-store.js");
+		const { buildOrUpdateGraph, extractSymbolsAndRefsFromGraph } = await import(
+			"./review-graph/builder.js"
+		);
+		const {
+			buildCallGraph,
+			saveCallGraph,
+			loadCallGraph,
+			staleFiles,
+			readMtimes,
+		} = await import("./call-graph.js");
+		if (!runtime.isCurrentSession(sessionGeneration)) return;
+		const startMs = Date.now();
+		// Try loading from cache first
+		const cached = loadCallGraph(snapshotRoot);
+		if (cached) {
+			const cachedFiles = [...cached.fileMtimes.keys()];
+			const stale = staleFiles(cached.fileMtimes, cachedFiles);
+			if (stale.length === 0 && cachedFiles.length > 0) {
+				runtime.callGraph = cached.graph;
+				dbg(
+					`session_start call-graph: loaded from cache (${cached.graph.edges.length} edges, ${Date.now() - startMs}ms)`,
+				);
+				return;
+			}
+		}
+		// Build from the review graph (reuses already-parsed data, no re-parse)
+		const sessionFacts = new FactStore();
+		const graph = await buildOrUpdateGraph(analysisRoot, [], sessionFacts);
+		if (!runtime.isCurrentSession(sessionGeneration)) return;
+		const { allSymbols, allRefs } = extractSymbolsAndRefsFromGraph(graph);
+		const callGraph = buildCallGraph(allSymbols, allRefs);
+		runtime.callGraph = callGraph;
+		const mtimes = readMtimes([...allSymbols.keys()]);
+		saveCallGraph(snapshotRoot, callGraph, mtimes);
+		dbg(
+			`session_start call-graph: built ${callGraph.edges.length} edges, ${callGraph.callers.size} callee entries (${Date.now() - startMs}ms)`,
+		);
+	});
+
+	// codebase-model — build mental model from call graph (internal-only until validated)
+	runTask("codebase-model", async () => {
+		if (!runtime.isCurrentSession(sessionGeneration)) return;
+		if (!runtime.callGraph) return; // call-graph task may not have completed yet
+		const { buildCodebaseModel, saveCodebaseModel } = await import(
+			"./codebase-model.js"
+		);
+		const model = buildCodebaseModel(runtime.callGraph, analysisRoot);
+		saveCodebaseModel(snapshotRoot, model);
+		const top3 = model.entries
+			.slice(0, 3)
+			.map((e) => e.name)
+			.join(", ");
+		dbg(
+			`session_start codebase-model: ${model.entries.length} entries, ` +
+				`${model.totalTokens} tokens, top symbols: ${top3 || "(none)"}`,
+		);
 	});
 
 	// ast-grep — export scan for duplicate detection
@@ -383,42 +695,41 @@ function scheduleStartupScans(
 		}
 	});
 
-	// Project index — structural similarity detection
-	runTask("project-index", async () => {
-		const existing = await loadIndex(analysisRoot);
+	// word-index — identifier inverted index + BM25 for ranked symbol search (#162)
+	runTask("word-index", async () => {
 		if (!runtime.isCurrentSession(sessionGeneration)) return;
-		if (
-			existing &&
-			existing.entries.size > 0 &&
-			(await isIndexFresh(analysisRoot))
-		) {
-			if (!runtime.isCurrentSession(sessionGeneration)) return;
-			runtime.cachedProjectIndex = existing;
-			dbg(
-				`session_start: loaded fresh project index (${existing.entries.size} entries)`,
-			);
-			saveRuntimeProjectSnapshot({ cwd: snapshotRoot, runtime, dbg });
-		} else {
-			const sourceFiles = getSourceFiles(analysisRoot, true);
-			const tsFiles = sourceFiles.filter(
-				(f) => f.endsWith(".ts") || f.endsWith(".tsx"),
-			);
-			if (tsFiles.length > 0 && tsFiles.length <= 500) {
-				runtime.cachedProjectIndex = await buildProjectIndex(
-					analysisRoot,
-					tsFiles,
-				);
+		const { collectSourceFilesAsync } = await import("./source-filter.js");
+		const { buildWordIndex } = await import("./word-index.js");
+		const startMs = Date.now();
+		// Bounds keep the build off the critical path on large repos: cap the file
+		// count and skip files too large to be hand-written source (generated /
+		// bundled output the source filter didn't already exclude).
+		const MAX_FILES = 6000;
+		const MAX_BYTES = 512 * 1024;
+		const files = await collectSourceFilesAsync(analysisRoot);
+		if (!runtime.isCurrentSession(sessionGeneration)) return;
+		const docs: Array<{ path: string; content: string }> = [];
+		let processed = 0;
+		for (const file of files.slice(0, MAX_FILES)) {
+			try {
+				const stat = nodeFs.statSync(file);
+				if (stat.size <= MAX_BYTES) {
+					docs.push({ path: file, content: nodeFs.readFileSync(file, "utf-8") });
+				}
+			} catch {
+				// unreadable / vanished file — skip
+			}
+			if (++processed % 100 === 0) {
+				await new Promise<void>((resolve) => setImmediate(resolve));
 				if (!runtime.isCurrentSession(sessionGeneration)) return;
-				await saveIndex(runtime.cachedProjectIndex, analysisRoot);
-				dbg(
-					`session_start: built project index (${runtime.cachedProjectIndex.entries.size} entries from ${tsFiles.length} files)`,
-				);
-				saveRuntimeProjectSnapshot({ cwd: snapshotRoot, runtime, dbg });
-			} else {
-				if (!runtime.isCurrentSession(sessionGeneration)) return;
-				dbg(`session_start: skipped project index (${tsFiles.length} files)`);
 			}
 		}
+		runtime.wordIndex = buildWordIndex(docs);
+		saveRuntimeProjectSnapshot({ cwd: snapshotRoot, runtime, dbg });
+		dbg(
+			`session_start word-index: ${runtime.wordIndex.docCount} files, ` +
+				`${runtime.wordIndex.postings.size} tokens (${Date.now() - startMs}ms)`,
+		);
 	});
 }
 
@@ -476,7 +787,95 @@ export async function handleSessionStart(
 	deps: SessionStartDeps,
 ): Promise<void> {
 	const sessionStartMs = Date.now();
-	const startupMode = resolveStartupMode();
+	// Cold-start input-latency mitigation. The first `session_start` of
+	// the process — i.e. the one that fires immediately after the user
+	// launches `pi` — must return as fast as possible so the TUI input
+	// box becomes responsive. The full startup mode runs several
+	// expensive synchronous walks (resolveStartupScanContext,
+	// detectProjectLanguageProfile, scanProjectRules, scheduleStartupScans)
+	// that together can block the event loop for 3-6s on a 2k-file
+	// project, during which keystrokes are dropped or batched.
+	//
+	// Strategy:
+	//   - Force the very first invocation to "quick" mode, which exits
+	//     after a minimal runtime reset and snapshot hydration.
+	//   - 2 seconds later, schedule a background warmup that walks the
+	//     project asynchronously (yielding every 100 entries) and
+	//     populates the in-process memo caches
+	//     (startupScanContextCache + languageProfileCache).
+	//   - The user's first /new (or any subsequent session_start) sees
+	//     a cache hit on both walks and finishes the full path in <50ms.
+	//
+	// Opt-out: PI_LENS_COLD_START_QUICK=0 disables this behaviour.
+	// Override: PI_LENS_STARTUP_MODE explicitly set wins (we honour it).
+	// Tunable: PI_LENS_WARMUP_DELAY_MS adjusts the warmup delay.
+	let startupMode = resolveStartupMode();
+	const processGlobals = globalThis as unknown as {
+		__piLensFirstSessionDone?: boolean;
+		__piLensWarmupScheduled?: boolean;
+	};
+	const isFirstSessionOfProcess = !processGlobals.__piLensFirstSessionDone;
+	if (
+		isFirstSessionOfProcess &&
+		process.env.PI_LENS_COLD_START_QUICK !== "0" &&
+		!process.env.PI_LENS_STARTUP_MODE
+	) {
+		startupMode = "quick";
+	}
+	processGlobals.__piLensFirstSessionDone = true;
+
+	if (
+		startupMode === "quick" &&
+		process.env.PI_LENS_COLD_START_QUICK !== "0" &&
+		!processGlobals.__piLensWarmupScheduled
+	) {
+		processGlobals.__piLensWarmupScheduled = true;
+		const warmupDelayMs = Number(
+			process.env.PI_LENS_WARMUP_DELAY_MS ?? 2000,
+		);
+		const warmupCwd = deps.ctxCwd ?? process.cwd();
+		const warmupDbg = deps.dbg;
+		setTimeout(() => {
+			const warmupStartedAt = Date.now();
+			void (async () => {
+				try {
+					warmupDbg("warmup: starting background warmup");
+					// Dynamic imports keep the warmup pipeline off the hot
+					// startup path — these modules don't load until the timer
+					// fires, well after the TUI is interactive.
+					const startupScanModule = await import(
+						"./startup-scan.js"
+					);
+					const languageProfileModule = await import(
+						"./language-profile.js"
+					);
+					const scan =
+						await startupScanModule.resolveStartupScanContextAsync(
+							warmupCwd,
+						);
+					warmupDbg(
+						`warmup: scan-context done in ${Date.now() - warmupStartedAt}ms (canWarm=${scan.canWarmCaches})`,
+					);
+					const languageRoot = scan.projectRoot ?? warmupCwd;
+					const languageProfileStartedAt = Date.now();
+					await languageProfileModule.detectProjectLanguageProfileAsync(
+						languageRoot,
+					);
+					warmupDbg(
+						`warmup: language-profile done in ${Date.now() - languageProfileStartedAt}ms`,
+					);
+					warmupDbg(
+						`warmup: total ${Date.now() - warmupStartedAt}ms`,
+					);
+				} catch (err) {
+					warmupDbg(`warmup: error ${err}`);
+					// Allow a future session to retry the warmup.
+					processGlobals.__piLensWarmupScheduled = false;
+				}
+			})();
+		}, warmupDelayMs);
+	}
+
 	const allowBootstrapTasks = startupMode === "full";
 	const quickMode = startupMode === "quick";
 	const {
@@ -691,13 +1090,18 @@ export async function handleSessionStart(
 	const detectedRunner = testRunnerClient.detectRunner(analysisRoot);
 	phase("test-runner-detect");
 	if (detectedRunner) tools.push(`Test runner (${detectedRunner.runner})`);
-	if (goClient.isGoAvailable()) tools.push("Go (go vet)");
-	if (rustClient.isAvailable()) tools.push("Rust (cargo)");
+	if (await goClient.isGoAvailableAsync()) tools.push("Go (go vet)");
+	if (await rustClient.isAvailableAsync()) tools.push("Rust (cargo)");
 	log(`Active tools: ${tools.join(", ")}`);
 	dbg(`session_start tools: ${tools.join(", ")}`);
 
 	const agentStartupGuidance = [
-		"📌 pi-lens active — automated checks run on your edits and writes. Blocking errors will be shown inline; you must fix all errors including pre-existing ones. Prefer: lsp_diagnostics for proactive file/folder/batch error checks, lsp_navigation for definitions/references/symbols, ast_grep_search for code patterns (retry once with a simpler valid AST pattern on zero matches), grep for text/TODO search.",
+		"📌 pi-lens active — automated checks run on your edits and writes. Blocking errors will be shown inline; you must fix all errors including pre-existing ones.\n" +
+			"Key pi-lens tools:\n" +
+			"• lens_diagnostics mode=all — diagnostic state for every file EDITED this session (all runners: LSP + tree-sitter + ast-grep + linters). Stale blocking errors from earlier turns appear here even if they dropped from turn-end context. mode=delta (default) shows all warnings for the current turn only. mode=full is expensive: actively scans project-wide LSP diagnostics for unedited files too, then merges with cached runner state; add refreshRunners=cheap to refresh project-wide tree-sitter/fact-rule diagnostics.\n" +
+			"• lsp_diagnostics — actively probe LSP for errors in a specific file, folder, or workspace (LSP only, triggers a fresh server check).\n" +
+			"• lsp_navigation — definitions, references, symbols, rename_file, capabilities.\n" +
+			"• ast_grep_search / ast_grep_replace — structural code patterns. Cross-context queries: use insideKind/hasKind/follows/precedes params (synthesises YAML automatically). Full DSL: use rule= param with raw YAML for all/any/not/nthChild/regex. ast_dump to discover node kinds before writing patterns.",
 	];
 
 	runtime.projectRulesScan = scanProjectRules(analysisRoot);
@@ -769,6 +1173,17 @@ export async function handleSessionStart(
 						dbg,
 					).catch((err) =>
 						dbg(`session_start lsp-warm: unhandled error: ${err}`),
+					);
+				} else {
+					// No explicit warmFiles — pre-spawn just the dominant language's
+					// LSP so the first edit doesn't pay the cold-spawn stall (#203).
+					igniteDominantLanguageWarm(
+						cwd,
+						runtime,
+						sessionGeneration,
+						dbg,
+					).catch((err) =>
+						dbg(`session_start lsp-warm: unhandled dominant error: ${err}`),
 					);
 				}
 			});

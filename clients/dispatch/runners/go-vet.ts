@@ -22,10 +22,11 @@ const goVetRunner: RunnerDefinition = {
 	appliesTo: ["go"],
 	priority: PRIORITY.SPECIALIZED_ANALYSIS,
 	enabledByDefault: true,
+	timeoutMs: 40_000,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		// Resolve go path using platform-aware lookup (handles system install paths on Windows)
-		const goExe = goClient.findGoPath();
+		const goExe = await goClient.findGoPathAsync();
 		if (!goExe) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}

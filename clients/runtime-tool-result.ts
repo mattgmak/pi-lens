@@ -1,7 +1,15 @@
 import * as nodeCrypto from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
+import {
+	extractGrepSearchReadsFromOutput,
+	extractWrittenPathsFromCommand,
+} from "./bash-file-access.js";
 import type { BiomeClient } from "./biome-client.js";
+import {
+	registerSearchReads,
+	type SearchReadLocation,
+} from "./search-read-registration.js";
 import type { CacheManager } from "./cache-manager.js";
 import { createFileTime } from "./file-time.js";
 import { isPathIgnoredByProject } from "./file-utils.js";
@@ -45,6 +53,11 @@ interface ToolResultDeps {
 	agentBehaviorRecord: (toolName: string, filePath?: string) => unknown[];
 	formatBehaviorWarnings: (warnings: unknown[]) => string;
 	readGuard?: ReadGuard;
+	/**
+	 * Internal: set when the debounce timer fires to skip re-scheduling.
+	 * Do not pass from external callers.
+	 */
+	_bypassDebounce?: boolean;
 }
 
 function parseDiffRanges(diff: string): { start: number; end: number }[] {
@@ -92,6 +105,128 @@ const lastAnalyzedStateByFile = new Map<
 // files touched in the current turn only (typically < 20).
 export function clearLastAnalyzedStateCache(): void {
 	lastAnalyzedStateByFile.clear();
+}
+
+// ── Coalesce sequential edits via debounce window (#115) ────────────────────
+
+type ToolResultReturn = {
+	content: Array<{ type: string; text?: string }>;
+	isError?: boolean;
+} | void;
+
+interface DebouncedEntry {
+	timer: NodeJS.Timeout;
+	promise: Promise<ToolResultReturn>;
+	resolve: (value: ToolResultReturn) => void;
+	reject: (err: unknown) => void;
+	latestDeps: ToolResultDeps;
+	scheduledAt: number;
+	coalescedCount: number;
+}
+
+const debouncedPipelines = new Map<string, DebouncedEntry>();
+
+const DEFAULT_DEBOUNCE_MS = 0;
+const MAX_DEBOUNCE_MS = 1000;
+
+function getDebounceMs(): number {
+	const raw = Number(process.env.PI_LENS_TOOL_RESULT_DEBOUNCE_MS);
+	if (!Number.isFinite(raw) || raw < 0) return DEFAULT_DEBOUNCE_MS;
+	// Cap at 1s so turn_end and agent_end don't block on the timer for
+	// pathologically long windows. flushDebouncedToolResults below also
+	// short-circuits at boundary events.
+	return Math.min(raw, MAX_DEBOUNCE_MS);
+}
+
+/**
+ * Drain any pending debounced tool_result pipelines immediately, awaiting their
+ * completion. Call from turn_end / agent_end before reading anything that depends
+ * on the pipeline's bookkeeping (project change log, modified ranges, etc.).
+ *
+ * Passing a filePath flushes only that entry; omitting it flushes all.
+ */
+export async function flushDebouncedToolResults(
+	filePath?: string,
+): Promise<void> {
+	const entries = filePath
+		? debouncedPipelines.has(filePath)
+			? [
+					[
+						filePath,
+						debouncedPipelines.get(filePath) as DebouncedEntry,
+					] as const,
+				]
+			: []
+		: [...debouncedPipelines.entries()];
+	for (const [key, entry] of entries) {
+		clearTimeout(entry.timer);
+		debouncedPipelines.delete(key);
+		// Re-enter the pipeline synchronously via the bypass flag so the
+		// timer body's resolve/reject still fires through the shared promise.
+		handleToolResult({ ...entry.latestDeps, _bypassDebounce: true }).then(
+			entry.resolve,
+			entry.reject,
+		);
+	}
+	if (entries.length > 0) {
+		// Allow microtasks to settle so awaiting callers see the latest state.
+		await Promise.all(
+			entries.map(([, entry]) => entry.promise.catch(() => undefined)),
+		);
+	}
+}
+
+function scheduleDebounced(
+	filePath: string,
+	debounceMs: number,
+	deps: ToolResultDeps,
+): Promise<ToolResultReturn> {
+	const existing = debouncedPipelines.get(filePath);
+	if (existing) {
+		clearTimeout(existing.timer);
+		existing.latestDeps = deps;
+		existing.coalescedCount += 1;
+		existing.timer = setTimeout(() => {
+			debouncedPipelines.delete(filePath);
+			deps.dbg(
+				`tool_result: debounce fired after ${
+					existing.coalescedCount
+				} coalesced calls for ${filePath}`,
+			);
+			handleToolResult({ ...existing.latestDeps, _bypassDebounce: true }).then(
+				existing.resolve,
+				existing.reject,
+			);
+		}, debounceMs);
+		deps.dbg(
+			`tool_result: coalesced into pending debounce for ${filePath} (count=${existing.coalescedCount})`,
+		);
+		return existing.promise;
+	}
+
+	let resolveFn!: (value: ToolResultReturn) => void;
+	let rejectFn!: (err: unknown) => void;
+	const promise = new Promise<ToolResultReturn>((res, rej) => {
+		resolveFn = res;
+		rejectFn = rej;
+	});
+	const entry: DebouncedEntry = {
+		timer: setTimeout(() => {
+			debouncedPipelines.delete(filePath);
+			handleToolResult({ ...entry.latestDeps, _bypassDebounce: true }).then(
+				entry.resolve,
+				entry.reject,
+			);
+		}, debounceMs),
+		promise,
+		resolve: resolveFn,
+		reject: rejectFn,
+		latestDeps: deps,
+		scheduledAt: Date.now(),
+		coalescedCount: 1,
+	};
+	debouncedPipelines.set(filePath, entry);
+	return promise;
 }
 
 function getFileStateHash(filePath: string): string {
@@ -177,6 +312,69 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		: rawFilePath;
 	const behaviorWarnings = agentBehaviorRecord(event.toolName, filePath);
 
+	// Bash writes (redirects, tee, sed -i, cp/mv, touch, git checkout/restore) —
+	// these change file content but never go through the edit tool, so bash
+	// early-returns before the dispatch pipeline below. For each in-project file
+	// the command wrote/restored we therefore: (1) mark it authored-by-agent for
+	// the read-guard (like the Write tool), and (2) re-run the pipeline via a
+	// synthetic `write` event so its diagnostics, fileSeq, and change-log refresh.
+	// Without (2) a `git checkout -- f` restore keeps serving the pre-restore
+	// (e.g. broken-state) warnings on every later lens_diagnostics call.
+	if (
+		event.toolName === "bash" &&
+		typeof (event.input as { command?: unknown }).command === "string"
+	) {
+		const command = (event.input as { command: string }).command;
+		const written = extractWrittenPathsFromCommand(
+			command,
+			workspaceRoot,
+		).filter(
+			(wp) =>
+				!isExternalOrVendorFile(wp, workspaceRoot) &&
+				!isPathIgnoredByProject(wp, workspaceRoot, false),
+		);
+		for (const wp of written) {
+			if (!getFlag("no-read-guard")) deps.readGuard?.recordWritten(wp);
+			await handleToolResult({
+				...deps,
+				event: { ...event, toolName: "write", input: { path: wp } },
+				_bypassDebounce: true,
+			});
+		}
+	}
+
+	// Search tools reveal specific lines (file:line) the agent then edits — register
+	// those shown lines (± context) as reads so the follow-up edit isn't blocked (#169).
+	// Our tools attach locations as `details.searchReads`; bash grep is parsed from
+	// `grep -n` output. Only shown lines are registered, never the whole file.
+	if (deps.readGuard && !getFlag("no-read-guard")) {
+		const searchReads: SearchReadLocation[] = [];
+		const detailSearchReads = (
+			event.details as { searchReads?: SearchReadLocation[] }
+		)?.searchReads;
+		if (Array.isArray(detailSearchReads))
+			searchReads.push(...detailSearchReads);
+		if (
+			event.toolName === "bash" &&
+			typeof (event.input as { command?: unknown }).command === "string"
+		) {
+			const command = (event.input as { command: string }).command;
+			const output = event.content
+				.map((part) => (typeof part.text === "string" ? part.text : ""))
+				.join("\n");
+			searchReads.push(
+				...extractGrepSearchReadsFromOutput(command, workspaceRoot, output),
+			);
+		}
+		if (searchReads.length > 0) {
+			registerSearchReads(deps.readGuard, searchReads, {
+				projectRoot: workspaceRoot,
+				turnIndex: runtime.turnIndex,
+				writeIndex: runtime.peekWriteIndex(),
+			});
+		}
+	}
+
 	if (event.toolName !== "write" && event.toolName !== "edit") {
 		dbg(
 			`tool_result: skipped turn tracking - toolName="${event.toolName}" (not write/edit)`,
@@ -194,6 +392,16 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			`tool_result: skipped pipeline - file outside project root or in node_modules: ${filePath}`,
 		);
 		return;
+	}
+
+	// Coalesce sequential edits to the same file into one pipeline run against
+	// the final state. Only the debounce-fired call (with _bypassDebounce=true)
+	// proceeds to the pipeline body; in-window callers share its promise.
+	if (!deps._bypassDebounce) {
+		const debounceMs = getDebounceMs();
+		if (debounceMs > 0) {
+			return scheduleDebounced(filePath, debounceMs, deps);
+		}
 	}
 
 	// Refresh the read-guard's FileTime stamp so that the model's own write
@@ -271,7 +479,9 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 
 	const dispatchCwd = resolveLanguageRootForFile(filePath, workspaceRoot);
 	const turnStateCwd = path.resolve(workspaceRoot);
-	dbg(`tool_result: resolved dispatch cwd ${dispatchCwd} for ${filePath} (turnState cwd ${turnStateCwd})`);
+	dbg(
+		`tool_result: resolved dispatch cwd ${dispatchCwd} for ${filePath} (turnState cwd ${turnStateCwd})`,
+	);
 	if (event.model || event.provider || event.sessionId || event.session?.id) {
 		runtime.setTelemetryIdentity({
 			model: event.model,
@@ -472,8 +682,8 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		}
 	}
 
-	if (result.cascadeResult) {
-		runtime.appendCascadeResult(result.cascadeResult);
+	if (result.cascadeRun) {
+		runtime.appendCascadeRun(result.cascadeRun);
 	}
 
 	if (result.actionableWarnings?.length) {

@@ -5,6 +5,15 @@ import * as path from "node:path";
 export type PiLensFormatMode = "deferred" | "immediate";
 
 export interface PiLensGlobalConfig {
+	dispatch?: {
+		/**
+		 * Minimum wall-clock budget (ms) for every dispatch runner.
+		 * Acts as a floor: effective timeout = max(runner.timeoutMs ?? 30_000, runnerTimeoutFloorMs).
+		 * Useful for large monorepos where slow toolchains (e.g. cargo clippy) exceed
+		 * any runner's declared budget. Also overridable via PI_LENS_RUNNER_TIMEOUT_FLOOR_MS.
+		 */
+		runnerTimeoutFloorMs?: number;
+	};
 	widget?: {
 		/** Whether the diagnostics widget is visible when a session starts. */
 		visible?: boolean;
@@ -27,6 +36,16 @@ export interface PiLensGlobalConfig {
 			enabled?: boolean;
 		};
 	};
+	contextInjection?: {
+		/**
+		 * Whether pi-lens prepends automatic findings (session-start guidance,
+		 * turn-end findings, test findings) into the next model turn via the
+		 * `context` hook. Defaults true. Set false to keep tools/LSP/read-guard/
+		 * formatting running while avoiding prompt-cache invalidation from injected
+		 * messages. Findings are still cached for `lens_diagnostics` / `/lens-health`.
+		 */
+		enabled?: boolean;
+	};
 }
 
 export function getPiLensGlobalConfigPath(homeDir = os.homedir()): string {
@@ -43,6 +62,11 @@ export function loadPiLensGlobalConfig(
 		if (!parsed || typeof parsed !== "object") return undefined;
 
 		const raw = parsed as Record<string, unknown>;
+		const dispatchRaw = raw.dispatch;
+		const dispatch =
+			dispatchRaw && typeof dispatchRaw === "object"
+				? (dispatchRaw as Record<string, unknown>)
+				: undefined;
 		const widgetRaw = raw.widget;
 		const widget =
 			widgetRaw && typeof widgetRaw === "object"
@@ -64,12 +88,27 @@ export function loadPiLensGlobalConfig(
 			typeof actionableWarningsAutoFixRaw === "object"
 				? (actionableWarningsAutoFixRaw as Record<string, unknown>)
 				: undefined;
+		const contextInjectionRaw = raw.contextInjection;
+		const contextInjection =
+			contextInjectionRaw && typeof contextInjectionRaw === "object"
+				? (contextInjectionRaw as Record<string, unknown>)
+				: undefined;
 		const formatMode =
 			format?.mode === "immediate" || format?.mode === "deferred"
 				? format.mode
 				: undefined;
 
 		return {
+			dispatch: dispatch
+				? {
+						runnerTimeoutFloorMs:
+							typeof dispatch.runnerTimeoutFloorMs === "number" &&
+							Number.isFinite(dispatch.runnerTimeoutFloorMs) &&
+							dispatch.runnerTimeoutFloorMs > 0
+								? dispatch.runnerTimeoutFloorMs
+								: undefined,
+					}
+				: undefined,
 			widget: widget
 				? {
 						visible:
@@ -107,6 +146,14 @@ export function loadPiLensGlobalConfig(
 							: undefined,
 					}
 				: undefined,
+			contextInjection: contextInjection
+				? {
+						enabled:
+							typeof contextInjection.enabled === "boolean"
+								? contextInjection.enabled
+								: undefined,
+					}
+				: undefined,
 		};
 	} catch {
 		return undefined;
@@ -123,6 +170,12 @@ export function getGlobalAutoformatEnabled(configPath?: string): boolean {
 
 export function getGlobalImmediateFormatDefault(configPath?: string): boolean {
 	return loadPiLensGlobalConfig(configPath)?.format?.mode === "immediate";
+}
+
+export function getGlobalContextInjectionEnabled(configPath?: string): boolean {
+	return (
+		loadPiLensGlobalConfig(configPath)?.contextInjection?.enabled !== false
+	);
 }
 
 export function resolvePiLensFlag(
@@ -148,6 +201,9 @@ export function resolvePiLensFlag(
 	}
 	if (name === "lens-actionable-warning-all") {
 		return config?.actionableWarnings?.deltaOnly === false;
+	}
+	if (name === "no-lens-context") {
+		return config?.contextInjection?.enabled === false;
 	}
 	return value;
 }

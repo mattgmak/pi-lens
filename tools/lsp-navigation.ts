@@ -6,7 +6,7 @@
 
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { Type } from "typebox";
 import { logLatency } from "../clients/latency-logger.js";
 import type { LSPCallHierarchyItem } from "../clients/lsp/client.js";
@@ -15,9 +15,12 @@ import {
 	summarizeWorkspaceEdit,
 } from "../clients/lsp/edits.js";
 import { getLSPService } from "../clients/lsp/index.js";
+import type { SearchReadLocation } from "../clients/search-read-registration.js";
 
 const VALID_OPERATIONS = [
 	"definition",
+	"typeDefinition",
+	"declaration",
 	"references",
 	"hover",
 	"signatureHelp",
@@ -26,11 +29,14 @@ const VALID_OPERATIONS = [
 	"workspaceSymbol",
 	"codeAction",
 	"rename",
+	"rename_file",
 	"implementation",
 	"prepareCallHierarchy",
 	"incomingCalls",
 	"outgoingCalls",
+	"executeCommand",
 	"workspaceDiagnostics",
+	"capabilities",
 ] as const;
 
 type LspNavigationOperation = (typeof VALID_OPERATIONS)[number];
@@ -50,6 +56,8 @@ function operationSupportStatus(
 ): boolean | null {
 	if (!support) return null;
 	if (operation === "definition") return support.definition;
+	if (operation === "typeDefinition") return support.typeDefinition;
+	if (operation === "declaration") return support.declaration;
 	if (operation === "references") return support.references;
 	if (operation === "hover") return support.hover;
 	if (operation === "signatureHelp") return support.signatureHelp;
@@ -73,12 +81,171 @@ function emptyReasonForOperation(operation: LspNavigationOperation): string {
 		return "position-sensitive-or-no-signature";
 	if (operation === "codeAction") return "no-applicable-actions";
 	if (operation === "rename") return "no-rename-edits-or-symbol-not-renamable";
+	if (operation === "rename_file") return "no-file-rename-result";
 	if (operation === "findSymbol") return "no-matching-symbols";
 	if (operation === "workspaceSymbol")
 		return "no-matching-symbols-or-server-index-unavailable";
+	if (operation === "capabilities") return "no-active-lsp-servers";
+	if (operation === "executeCommand") return "command-returned-no-result";
 	if (operation === "incomingCalls" || operation === "outgoingCalls")
 		return "no-call-hierarchy-results";
 	return "no-results";
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+type SymbolColumnResolution = {
+	character: number;
+	requestedSymbol?: string;
+	baseSymbol?: string;
+	requestedOccurrence?: number;
+	usedOccurrence?: number;
+	strategy: "explicit" | "word-boundary" | "case-insensitive" | "fallback";
+	debug?: string;
+};
+
+function parseSymbolSelector(symbol: string): {
+	baseSymbol: string;
+	occurrence: number;
+	debug?: string;
+} {
+	const trimmed = symbol.trim();
+	const match = /^([^#]*)(?:#(-?\d+))?$/.exec(trimmed);
+	const baseSymbol = (match?.[1] ?? trimmed).trim();
+	const rawOccurrence = match?.[2];
+	if (!rawOccurrence) return { baseSymbol, occurrence: 1 };
+	const occurrence = Number.parseInt(rawOccurrence, 10);
+	if (!Number.isFinite(occurrence) || occurrence < 1) {
+		return {
+			baseSymbol,
+			occurrence: 1,
+			debug: `invalid occurrence selector #${rawOccurrence}; using #1`,
+		};
+	}
+	return { baseSymbol, occurrence };
+}
+
+function findNthMatch(
+	lineText: string,
+	regex: RegExp,
+	occurrence: number,
+): RegExpExecArray | null {
+	let seen = 0;
+	regex.lastIndex = 0;
+	let match: RegExpExecArray | null;
+	while ((match = regex.exec(lineText)) !== null) {
+		seen += 1;
+		if (seen === occurrence) return match;
+		if (match[0].length === 0) regex.lastIndex += 1;
+	}
+	return null;
+}
+
+function firstNonWhitespaceCharacter(lineText: string): number {
+	const match = /\S/.exec(lineText);
+	return (match?.index ?? 0) + 1;
+}
+
+function resolveSymbolColumn(
+	content: string,
+	line1: number,
+	character: number | undefined,
+	symbol: string | undefined,
+): SymbolColumnResolution {
+	if (typeof character === "number" && character > 0) {
+		return { character, strategy: "explicit" };
+	}
+
+	const lineText = content.split(/\r?\n/)[line1 - 1] ?? "";
+	if (!symbol || symbol.trim().length === 0) {
+		return {
+			character: 1,
+			strategy: "fallback",
+			debug: "character omitted and no symbol supplied; using column 1",
+		};
+	}
+
+	const { baseSymbol, occurrence, debug } = parseSymbolSelector(symbol);
+	if (!baseSymbol) {
+		return {
+			character: firstNonWhitespaceCharacter(lineText),
+			requestedSymbol: symbol,
+			baseSymbol,
+			requestedOccurrence: occurrence,
+			usedOccurrence: 1,
+			strategy: "fallback",
+			debug:
+				debug ?? "empty symbol selector; using first non-whitespace column",
+		};
+	}
+
+	const pattern = `\\b${escapeRegExp(baseSymbol)}\\b`;
+	const exactRegex = new RegExp(pattern, "g");
+	const exact = findNthMatch(lineText, exactRegex, occurrence);
+	if (exact) {
+		return {
+			character: exact.index + 1,
+			requestedSymbol: symbol,
+			baseSymbol,
+			requestedOccurrence: occurrence,
+			usedOccurrence: occurrence,
+			strategy: "word-boundary",
+			debug,
+		};
+	}
+
+	const firstExact = findNthMatch(lineText, exactRegex, 1);
+	if (firstExact && occurrence !== 1) {
+		return {
+			character: firstExact.index + 1,
+			requestedSymbol: symbol,
+			baseSymbol,
+			requestedOccurrence: occurrence,
+			usedOccurrence: 1,
+			strategy: "word-boundary",
+			debug: `${debug ? `${debug}; ` : ""}occurrence #${occurrence} not found; using #1`,
+		};
+	}
+
+	const insensitiveRegex = new RegExp(pattern, "gi");
+	const insensitive = findNthMatch(lineText, insensitiveRegex, occurrence);
+	if (insensitive) {
+		return {
+			character: insensitive.index + 1,
+			requestedSymbol: symbol,
+			baseSymbol,
+			requestedOccurrence: occurrence,
+			usedOccurrence: occurrence,
+			strategy: "case-insensitive",
+			debug:
+				debug ?? "exact-case symbol not found; used case-insensitive match",
+		};
+	}
+
+	const firstInsensitive = findNthMatch(lineText, insensitiveRegex, 1);
+	if (firstInsensitive && occurrence !== 1) {
+		return {
+			character: firstInsensitive.index + 1,
+			requestedSymbol: symbol,
+			baseSymbol,
+			requestedOccurrence: occurrence,
+			usedOccurrence: 1,
+			strategy: "case-insensitive",
+			debug: `${debug ? `${debug}; ` : ""}occurrence #${occurrence} not found case-insensitively; using #1`,
+		};
+	}
+
+	return {
+		character: firstNonWhitespaceCharacter(lineText),
+		requestedSymbol: symbol,
+		baseSymbol,
+		requestedOccurrence: occurrence,
+		usedOccurrence: 1,
+		strategy: "fallback",
+		debug: `${debug ? `${debug}; ` : ""}symbol not found on line; using first non-whitespace column`,
+	};
 }
 
 function tokenAtPosition(
@@ -269,6 +436,244 @@ function pickLocalSymbolLocation(
 		);
 }
 
+function workspaceSymbolDedupeKey(symbol: SymbolNode): string {
+	const location = symbol.location;
+	const start = rangeStart(
+		location?.range ?? symbol.range ?? symbol.selectionRange,
+	);
+	return [
+		symbol.name ?? "",
+		symbol.detail ?? "",
+		symbol.kind ?? "",
+		location?.uri ?? "",
+		start.line ?? "",
+		start.character ?? "",
+	].join(":");
+}
+
+function dedupeWorkspaceSymbols<T extends SymbolNode>(symbols: T[]): T[] {
+	const out: T[] = [];
+	const seen = new Set<string>();
+	for (const symbol of symbols) {
+		const key = workspaceSymbolDedupeKey(symbol);
+		if (seen.has(key)) continue;
+		seen.add(key);
+		out.push(symbol);
+	}
+	return out;
+}
+
+type RangeLike = {
+	start?: { line?: unknown };
+	end?: { line?: unknown };
+};
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+	return typeof value === "object" && value !== null
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+function searchReadFromUriRange(
+	uri: unknown,
+	range: unknown,
+): SearchReadLocation | undefined {
+	if (typeof uri !== "string" || !uri.startsWith("file:")) return undefined;
+	const rangeLike = asRecord(range) as RangeLike | undefined;
+	const startLine = rangeLike?.start?.line;
+	if (typeof startLine !== "number" || !Number.isFinite(startLine)) {
+		return undefined;
+	}
+	const endLine = rangeLike?.end?.line;
+	try {
+		return {
+			file: fileURLToPath(uri),
+			startLine: Math.max(1, Math.floor(startLine) + 1),
+			endLine:
+				typeof endLine === "number" && Number.isFinite(endLine)
+					? Math.max(1, Math.floor(endLine) + 1)
+					: undefined,
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+function pushSearchRead(
+	out: SearchReadLocation[],
+	uri: unknown,
+	range: unknown,
+): void {
+	const loc = searchReadFromUriRange(uri, range);
+	if (loc) out.push(loc);
+}
+
+function collectLocationSearchReads(result: unknown): SearchReadLocation[] {
+	const out: SearchReadLocation[] = [];
+	for (const entry of Array.isArray(result) ? result : [result]) {
+		const record = asRecord(entry);
+		if (!record) continue;
+		pushSearchRead(out, record.uri, record.range);
+		pushSearchRead(
+			out,
+			record.targetUri,
+			record.targetSelectionRange ?? record.targetRange,
+		);
+	}
+	return out;
+}
+
+function collectWorkspaceSymbolSearchReads(
+	result: unknown,
+): SearchReadLocation[] {
+	const out: SearchReadLocation[] = [];
+	for (const entry of Array.isArray(result) ? result : [result]) {
+		const symbol = asRecord(entry);
+		const location = asRecord(symbol?.location);
+		if (!location) continue;
+		pushSearchRead(out, location.uri, location.range);
+		pushSearchRead(
+			out,
+			location.targetUri,
+			location.targetSelectionRange ?? location.targetRange,
+		);
+	}
+	return out;
+}
+
+function collectCallHierarchySearchReads(
+	result: unknown,
+	operation: "incomingCalls" | "outgoingCalls",
+	callHierarchyItem: LSPCallHierarchyItem | undefined,
+): SearchReadLocation[] {
+	const out: SearchReadLocation[] = [];
+	for (const entry of Array.isArray(result) ? result : [result]) {
+		const record = asRecord(entry);
+		if (!record) continue;
+		const item = asRecord(
+			operation === "incomingCalls" ? record.from : record.to,
+		);
+		pushSearchRead(out, item?.uri, item?.selectionRange ?? item?.range);
+		const rangeUri =
+			operation === "incomingCalls" ? item?.uri : callHierarchyItem?.uri;
+		const fromRanges = record.fromRanges;
+		if (Array.isArray(fromRanges)) {
+			for (const range of fromRanges) pushSearchRead(out, rangeUri, range);
+		}
+	}
+	return out;
+}
+
+function collectSearchReadsForOperation(
+	operation: LspNavigationOperation,
+	result: unknown,
+	callHierarchyItem?: LSPCallHierarchyItem,
+): SearchReadLocation[] {
+	if (
+		[
+			"definition",
+			"typeDefinition",
+			"declaration",
+			"references",
+			"implementation",
+		].includes(operation)
+	) {
+		return collectLocationSearchReads(result);
+	}
+	if (operation === "workspaceSymbol") {
+		return collectWorkspaceSymbolSearchReads(result);
+	}
+	if (operation === "incomingCalls" || operation === "outgoingCalls") {
+		return collectCallHierarchySearchReads(
+			result,
+			operation,
+			callHierarchyItem,
+		);
+	}
+	return [];
+}
+
+type CapabilitySnapshot = {
+	serverId: string;
+	root: string;
+	operationSupport: {
+		definition: boolean;
+		typeDefinition: boolean;
+		declaration: boolean;
+		references: boolean;
+		hover: boolean;
+		signatureHelp: boolean;
+		documentSymbol: boolean;
+		workspaceSymbol: boolean;
+		codeAction: boolean;
+		rename: boolean;
+		implementation: boolean;
+		callHierarchy: boolean;
+	};
+	workspaceDiagnosticsSupport: { advertised?: boolean; mode?: string };
+	advertisedCommands?: string[];
+};
+
+function formatCapabilities(
+	snapshots: CapabilitySnapshot[],
+	filePath?: string,
+): string {
+	if (snapshots.length === 0) {
+		return filePath
+			? `No active LSP server for ${path.basename(filePath)}. Open/touch the file first or run another LSP operation to start the server.`
+			: "No active LSP servers in this session.";
+	}
+
+	const rows: Array<
+		[string, (snapshot: CapabilitySnapshot) => boolean, string?]
+	> = [
+		["definition", (s) => !!s.operationSupport.definition],
+		["typeDefinition", (s) => !!s.operationSupport.typeDefinition],
+		["declaration", (s) => !!s.operationSupport.declaration],
+		["references", (s) => !!s.operationSupport.references],
+		["hover", (s) => !!s.operationSupport.hover],
+		["rename", (s) => !!s.operationSupport.rename],
+		["codeAction", (s) => !!s.operationSupport.codeAction],
+		["workspaceSymbol", (s) => !!s.operationSupport.workspaceSymbol],
+		["implementation", (s) => !!s.operationSupport.implementation],
+		["signatureHelp", (s) => !!s.operationSupport.signatureHelp],
+		["incomingCalls", (s) => !!s.operationSupport.callHierarchy],
+		["outgoingCalls", (s) => !!s.operationSupport.callHierarchy],
+		[
+			"workspaceDiagnostics",
+			(s) => s.workspaceDiagnosticsSupport.mode === "pull",
+			"pull diagnostics",
+		],
+		[
+			"rename_file",
+			() => true,
+			"willRenameFiles/didRenameFiles helper available",
+		],
+	];
+
+	const lines: string[] = [];
+	for (const snapshot of snapshots) {
+		const label = filePath
+			? `${snapshot.serverId} (${path.basename(filePath)})`
+			: `${snapshot.serverId} (${snapshot.root})`;
+		lines.push(label);
+		for (const [name, supported, note] of rows) {
+			const suffix = note ? `  (${note})` : "";
+			lines.push(
+				`  ${name.padEnd(22)} ${supported(snapshot) ? "✓" : "✗"}${suffix}`,
+			);
+		}
+		const commands = snapshot.advertisedCommands ?? [];
+		lines.push(
+			`  ${"executeCommand".padEnd(22)} ${commands.length > 0 ? "✓" : "✗"}` +
+				`  (${commands.length} advertised command(s)` +
+				(commands.length > 0 ? `: ${commands.slice(0, 20).join(", ")}` : "") +
+				")",
+		);
+	}
+	return lines.join("\n");
+}
+
 function classifyCodeActions(actions: Array<{ kind?: string }> | undefined): {
 	quickfix: number;
 	refactor: number;
@@ -325,6 +730,8 @@ export function createLspNavigationTool(
 			"Navigate code using LSP (Language Server Protocol). LSP is enabled by default; disable with --no-lsp.\n" +
 			"Operations:\n" +
 			"- definition: Jump to where a symbol is defined\n" +
+			"- typeDefinition: Jump to the definition of a symbol's TYPE (e.g. the class/interface of a variable)\n" +
+			"- declaration: Jump to a symbol's declaration (e.g. an extern/forward decl, distinct from its definition)\n" +
 			"- references: Find all usages of a symbol\n" +
 			"- hover: Get type/doc info at a position\n" +
 			"- signatureHelp: Show callable signatures at cursor\n" +
@@ -333,12 +740,15 @@ export function createLspNavigationTool(
 			"- workspaceSymbol: Search symbols across the whole project (best with filePath context)\n" +
 			"- codeAction: Find available quick fixes/refactors at a range\n" +
 			"- rename: Compute or apply workspace edits for renaming a symbol\n" +
+			"- rename_file: Preview/apply LSP-aware source file rename notifications\n" +
 			"- implementation: Jump to interface implementations\n" +
 			"- prepareCallHierarchy: Get callable item at position (for incoming/outgoing)\n" +
 			"- incomingCalls: Find all functions/methods that CALL this function\n" +
 			"- outgoingCalls: Find all functions/methods CALLED by this function\n" +
-			"- workspaceDiagnostics: List all diagnostics tracked by active LSP clients\n\n" +
-			"Line and character are 1-based (as shown in editors).",
+			"- executeCommand: Run a server-advertised command via workspace/executeCommand. HARDENED: allowlisted to commands the server advertised; dry-run by default (reports whether advertised) — set apply:true to actually run. Pass command (+ optional commandArguments).\n" +
+			"- workspaceDiagnostics: List all diagnostics tracked by active LSP clients\n" +
+			"- capabilities: Show cached operation support for active LSP servers\n\n" +
+			"Line and character are 1-based (as shown in editors). For position-based operations, prefer passing symbol when you know the line but not the exact character; character can be omitted or -1 and pi-lens will resolve the symbol column. Use symbol#N for repeated symbols on the same line (1-based occurrence).",
 		promptSnippet:
 			"Use lsp_navigation to find definitions, references, and hover info via LSP",
 		parameters: Type.Object({
@@ -362,7 +772,13 @@ export function createLspNavigationTool(
 			character: Type.Optional(
 				Type.Number({
 					description:
-						"Character offset (1-based). Required for definition/references/hover/implementation",
+						"Character offset (1-based). Optional when symbol is provided; use -1 to force symbol-column resolution.",
+				}),
+			),
+			symbol: Type.Optional(
+				Type.String({
+					description:
+						"Symbol name on the target line for automatic character resolution. Use symbol#N to select the Nth occurrence on the line.",
 				}),
 			),
 			endLine: Type.Optional(
@@ -382,10 +798,27 @@ export function createLspNavigationTool(
 					description: "Required for rename operation.",
 				}),
 			),
+			newFilePath: Type.Optional(
+				Type.String({
+					description: "Required for rename_file operation.",
+				}),
+			),
 			apply: Type.Optional(
 				Type.Boolean({
 					description:
-						"rename only: apply the returned workspace edit to disk (default: false; preview only).",
+						"rename/executeCommand: apply for real. rename defaults to preview; executeCommand defaults to a dry-run that only reports whether the command is advertised — set apply:true to actually run it.",
+				}),
+			),
+			command: Type.Optional(
+				Type.String({
+					description:
+						"executeCommand only: the server command id to run. Must be one the server advertised (see the capabilities operation).",
+				}),
+			),
+			commandArguments: Type.Optional(
+				Type.Array(Type.Unknown(), {
+					description:
+						"executeCommand only: arguments array passed to workspace/executeCommand.",
 				}),
 			),
 			query: Type.Optional(
@@ -461,6 +894,7 @@ export function createLspNavigationTool(
 			const startedAt = Date.now();
 			let supported: boolean | null = null;
 			let diagnosticsMode: "pull" | "push-only" | "unknown" = "unknown";
+			let columnResolution: SymbolColumnResolution | undefined;
 
 			const finalize = (
 				payload: {
@@ -491,6 +925,7 @@ export function createLspNavigationTool(
 						resultCount: meta.resultCount,
 						supported,
 						diagnosticsMode,
+						columnResolution,
 					},
 				});
 
@@ -528,29 +963,39 @@ export function createLspNavigationTool(
 				filePath: rawPath,
 				line,
 				character,
+				symbol,
 				endLine,
 				endCharacter,
 				newName,
+				newFilePath,
 				apply,
+				command,
+				commandArguments,
 				query,
 				kinds,
 				exactMatch,
 				topLevelOnly,
 				maxResults,
+				callHierarchyItem,
 			} = params as {
 				operation: string;
 				filePath?: string;
 				line?: number;
 				character?: number;
+				symbol?: string;
 				endLine?: number;
 				endCharacter?: number;
 				newName?: string;
+				newFilePath?: string;
 				apply?: boolean;
+				command?: string;
+				commandArguments?: unknown[];
 				query?: string;
 				kinds?: string[];
 				exactMatch?: boolean;
 				topLevelOnly?: boolean;
 				maxResults?: number;
+				callHierarchyItem?: LSPCallHierarchyItem;
 			};
 			const normalizedOperation = normalizeOperation(rawOperation);
 			if (!isValidOperation(normalizedOperation)) {
@@ -586,6 +1031,8 @@ export function createLspNavigationTool(
 			const needsFilePath =
 				operation !== "workspaceDiagnostics" &&
 				operation !== "workspaceSymbol" &&
+				operation !== "executeCommand" &&
+				operation !== "capabilities" &&
 				!isCallHierarchyTraversal;
 			if (needsFilePath && (!rawPath || rawPath.trim().length === 0)) {
 				return finalize(
@@ -623,6 +1070,32 @@ export function createLspNavigationTool(
 			}
 
 			const lspService = getLSPService();
+			if (operation === "capabilities") {
+				const snapshots = await lspService.getCapabilitySnapshots(
+					rawPath ? filePath : undefined,
+				);
+				const output = formatCapabilities(
+					snapshots,
+					rawPath ? filePath : undefined,
+				);
+				return finalize(
+					{
+						content: [{ type: "text" as const, text: output }],
+						details: {
+							operation,
+							resultCount: snapshots.length,
+							servers: snapshots.map((snapshot) => snapshot.serverId),
+						},
+					},
+					{
+						operation,
+						filePath: rawPath ? filePath : "(workspace)",
+						failureKind: snapshots.length === 0 ? "empty_result" : "success",
+						resultCount: snapshots.length,
+					},
+				);
+			}
+
 			if (operation === "workspaceDiagnostics") {
 				const wsDiagSupport = await lspService.getWorkspaceDiagnosticsSupport(
 					rawPath ? filePath : undefined,
@@ -801,16 +1274,47 @@ export function createLspNavigationTool(
 				await openFileBestEffort(lspService, filePath);
 			}
 
-			// Convert 1-based editor coords to 0-based LSP coords
+			// Convert 1-based editor coords to 0-based LSP coords.
 			const lspLine = (line ?? 1) - 1;
-			const lspChar = (character ?? 1) - 1;
+			const needsPosition = [
+				"definition",
+				"typeDefinition",
+				"declaration",
+				"references",
+				"hover",
+				"signatureHelp",
+				"codeAction",
+				"rename",
+				"implementation",
+				"prepareCallHierarchy",
+			].includes(operation);
+			const resolvedCharacter =
+				needsPosition && filePath
+					? resolveSymbolColumn(
+							nodeFs.existsSync(filePath)
+								? nodeFs.readFileSync(filePath, "utf-8")
+								: "",
+							line ?? 1,
+							character,
+							symbol,
+						)
+					: ({
+							character: character ?? 1,
+							strategy: "explicit",
+						} satisfies SymbolColumnResolution);
+			columnResolution = resolvedCharacter;
+			const lspChar = resolvedCharacter.character - 1;
 			const lspEndLine = (endLine ?? line ?? 1) - 1;
-			const lspEndChar = (endCharacter ?? character ?? 1) - 1;
+			const lspEndChar = (endCharacter ?? resolvedCharacter.character) - 1;
 
 			const runOperation = async (): Promise<unknown> => {
 				switch (operation) {
 					case "definition":
 						return lspService.definition(filePath, lspLine, lspChar);
+					case "typeDefinition":
+						return lspService.typeDefinition(filePath, lspLine, lspChar);
+					case "declaration":
+						return lspService.declaration(filePath, lspLine, lspChar);
 					case "references":
 						return lspService.references(filePath, lspLine, lspChar);
 					case "hover":
@@ -880,14 +1384,23 @@ export function createLspNavigationTool(
 									typeof s === "object" &&
 									s !== null &&
 									(!s.kind || NAVIGABLE_KINDS.has(s.kind)),
-							);
-							return filtered.slice(0, 15);
+							) as SymbolNode[];
+							return dedupeWorkspaceSymbols(filtered).slice(0, 15);
 						} catch (err) {
 							const msg = err instanceof Error ? err.message : String(err);
 							if (rawPath && /No Project/i.test(msg)) {
 								await openFileBestEffort(lspService, filePath);
 								await new Promise((resolve) => setTimeout(resolve, 120));
-								return lspService.workspaceSymbol(query ?? "", filePath);
+								const retryRaw = await lspService.workspaceSymbol(
+									query ?? "",
+									filePath,
+								);
+								const retrySymbols = (
+									Array.isArray(retryRaw) ? retryRaw : [retryRaw]
+								).filter(
+									(s) => typeof s === "object" && s !== null,
+								) as SymbolNode[];
+								return dedupeWorkspaceSymbols(retrySymbols);
 							}
 							throw err;
 						}
@@ -929,31 +1442,89 @@ export function createLspNavigationTool(
 						}
 						return { applied: true, ...applied };
 					}
+					case "rename_file": {
+						if (!newFilePath || newFilePath.trim().length === 0) {
+							throw new Error(
+								"__BADINPUT__ newFilePath parameter required for rename_file",
+							);
+						}
+						const resolvedNewFilePath = path.isAbsolute(newFilePath)
+							? newFilePath
+							: path.resolve(ctx.cwd || ".", newFilePath);
+						const result = await lspService.renameFile(
+							filePath,
+							resolvedNewFilePath,
+							{
+								cwd: ctx.cwd || ".",
+								apply: apply ?? false,
+							},
+						);
+						if (result.applied) {
+							for (const touchedFile of result.files ?? []) {
+								try {
+									await openFileBestEffort(lspService, touchedFile, false);
+								} catch {
+									// Best-effort LSP resync only; disk edit already succeeded.
+								}
+							}
+						}
+						return result;
+					}
 					case "implementation":
 						return lspService.implementation(filePath, lspLine, lspChar);
 					case "prepareCallHierarchy":
 						return lspService.prepareCallHierarchy(filePath, lspLine, lspChar);
+					case "executeCommand": {
+						if (!command || command.trim().length === 0) {
+							throw new Error(
+								"__BADINPUT__ command parameter required for executeCommand",
+							);
+						}
+						const advertised = await lspService.getAdvertisedCommands(
+							rawPath ? filePath : undefined,
+						);
+						const isAdvertised = advertised.includes(command);
+						// Dry-run by default: report advertisement status without running.
+						// Mutation only on explicit apply:true (and the client re-checks
+						// the allowlist — defense in depth).
+						if (apply !== true) {
+							return {
+								executed: false,
+								dryRun: true,
+								command,
+								advertised: isAdvertised,
+								advertisedCommands: advertised,
+								note: isAdvertised
+									? "Command is advertised. Re-run with apply:true to execute."
+									: "Command is NOT advertised by the active server; execution would be refused.",
+							};
+						}
+						if (!isAdvertised) {
+							throw new Error(
+								`__UNSUPPORTED__ command "${command}" is not advertised by the active LSP server (advertised: ${advertised.join(", ") || "none"})`,
+							);
+						}
+						return lspService.executeCommand(
+							rawPath ? filePath : undefined,
+							command,
+							commandArguments,
+						);
+					}
 					case "incomingCalls": {
-						const callItem = (
-							params as { callHierarchyItem?: LSPCallHierarchyItem }
-						).callHierarchyItem;
-						if (!callItem) {
+						if (!callHierarchyItem) {
 							throw new Error(
 								"__BADINPUT__ callHierarchyItem parameter required for incomingCalls",
 							);
 						}
-						return lspService.incomingCalls(callItem);
+						return lspService.incomingCalls(callHierarchyItem);
 					}
 					case "outgoingCalls": {
-						const callItem = (
-							params as { callHierarchyItem?: LSPCallHierarchyItem }
-						).callHierarchyItem;
-						if (!callItem) {
+						if (!callHierarchyItem) {
 							throw new Error(
 								"__BADINPUT__ callHierarchyItem parameter required for outgoingCalls",
 							);
 						}
-						return lspService.outgoingCalls(callItem);
+						return lspService.outgoingCalls(callHierarchyItem);
 					}
 					default:
 						return [];
@@ -971,6 +1542,8 @@ export function createLspNavigationTool(
 					needsFilePath &&
 					[
 						"definition",
+						"typeDefinition",
+						"declaration",
 						"references",
 						"hover",
 						"signatureHelp",
@@ -1095,16 +1668,26 @@ export function createLspNavigationTool(
 				: result
 					? 1
 					: 0;
+			const searchReads = collectSearchReadsForOperation(
+				operation,
+				result,
+				callHierarchyItem,
+			);
 			return finalize(
 				{
 					content: [{ type: "text" as const, text: output }],
 					details: {
 						operation,
 						supported,
+						searchReads: searchReads.length > 0 ? searchReads : undefined,
 						emptyReason: isEmpty
 							? emptyReasonForOperation(operation)
 							: undefined,
 						codeActionKinds: actionStats ?? undefined,
+						columnResolution:
+							columnResolution?.strategy === "explicit"
+								? undefined
+								: columnResolution,
 						resultCount,
 					},
 				},

@@ -1,8 +1,8 @@
 /**
  * Shared TypeScript Service for pi-lens
  *
- * Creates a single ts.Program per session that is shared across all clients
- * (complexity-client, type-safety-client). Avoids creating a new program per file.
+ * Creates a single ts.Program per session that is shared by complexity-client.
+ * Avoids creating a new program per file.
  */
 
 import * as fs from "node:fs";

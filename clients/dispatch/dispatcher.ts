@@ -25,7 +25,7 @@ import { getPrimaryDispatchGroup } from "../language-policy.js";
 import { resolveLanguageRootForFile } from "../language-profile.js";
 import { logLatency } from "../latency-logger.js";
 import { normalizeMapKey } from "../path-utils.js";
-import { RUNTIME_CONFIG } from "../runtime-config.js";
+import { RUNTIME_CONFIG, getRunnerTimeoutFloorMs } from "../runtime-config.js";
 import { safeSpawnAsync } from "../safe-spawn.js";
 import { classifyDiagnostic } from "./diagnostic-taxonomy.js";
 import type { FactStore } from "./fact-store.js";
@@ -348,6 +348,17 @@ function promoteDeltaUnusedToBlockers(diagnostics: Diagnostic[]): Diagnostic[] {
 
 // --- Latency Logger ---
 
+/**
+ * Optional per-runner result sink. Fires once for each runner that actually
+ * executes (immediately after its `run()` returns), with the exact
+ * `RunnerResult` — including `failureKind`/`failureMessage` that the merged
+ * `DispatchResult` discards. Runners that are filtered out, `when`-skipped, or
+ * not registered do not fire it. Lets the live tool-smoke harness (#209) assert
+ * each tool spawned and exited cleanly without duplicating dispatch's
+ * selection/gating logic.
+ */
+export type RunnerResultSink = (runnerId: string, result: RunnerResult) => void;
+
 export interface RunnerLatency {
 	runnerId: string;
 	startTime: number;
@@ -409,15 +420,14 @@ function buildCoverageNotice(
 			.filter((runnerId) => !primary.runnerIds.includes(runnerId)),
 	);
 
-	// Structural-only runners (tree-sitter, ast-grep, similarity) are not
-	// substitutes for real linters — don't suppress the notice if only they ran.
+	// Structural-only runners (tree-sitter, ast-grep) are not substitutes
+	// for real linters — don't suppress the notice if only they ran.
 	const STRUCTURAL_RUNNERS = new Set([
 		"tree-sitter",
 		"ast-grep-napi",
-		"similarity",
 		"spellcheck",
 		"fact-rules",
-		"semgrep",
+		"opengrep",
 	]);
 	const anyLinterHasCoverage = runnerLatencies.some(
 		(r) =>
@@ -433,7 +443,7 @@ function buildCoverageNotice(
 
 	return {
 		id: `coverage-unavailable:${ctx.kind}:${path.basename(ctx.filePath)}`,
-		message: `Pi-lens analysis unavailable. Tools for ${ctx.kind} not installed.`,
+		message: `Pi-lens ${ctx.kind} analysis unavailable — language tools are missing or the LSP server isn't ready yet, so this file was not fully checked (not a clean result).`,
 		filePath: ctx.filePath,
 		severity: "warning",
 		semantic: "warning",
@@ -530,6 +540,7 @@ async function runGroup(
 	ctx: DispatchContext,
 	group: RunnerGroup,
 	registry: RunnerRegistryContract,
+	onRunnerResult?: RunnerResultSink,
 ): Promise<GroupResult> {
 	const diagnostics: Diagnostic[] = [];
 	const latencies: RunnerLatency[] = [];
@@ -604,6 +615,7 @@ async function runGroup(
 		}
 
 		const result = await runRunner(ctx, runner, semantic);
+		onRunnerResult?.(runnerId, result);
 		const runnerEnd = Date.now();
 		const duration = runnerEnd - runnerStart;
 
@@ -633,6 +645,13 @@ async function runGroup(
 							line: d.line,
 							semantic: d.semantic,
 						}))
+					: undefined,
+			metadata:
+				result.status === "failed" && result.failureKind
+					? {
+							failureKind: result.failureKind,
+							failureMessage: result.failureMessage,
+						}
 					: undefined,
 		});
 		recordRunner(
@@ -668,6 +687,7 @@ export async function dispatchForFile(
 	ctx: DispatchContext,
 	groups: RunnerGroup[],
 	registry: RunnerRegistryContract,
+	onRunnerResult?: RunnerResultSink,
 ): Promise<DispatchResult> {
 	const _overallStart = Date.now();
 	if (ctx.fileRole === "generated") {
@@ -706,7 +726,7 @@ export async function dispatchForFile(
 	// preserved (sequential first-success). Results are merged in original
 	// group order so output is deterministic.
 	const groupResults = await Promise.all(
-		groups.map((group) => runGroup(ctx, group, registry)),
+		groups.map((group) => runGroup(ctx, group, registry, onRunnerResult)),
 	);
 
 	// Count baseline warnings before filtering (for delta count display)
@@ -785,8 +805,8 @@ export async function dispatchForFile(
 			.catch(() => {});
 	}
 
-	const inlineBlockers = blockers.filter((d) => d.tool !== "similarity");
-	const inlineFixed = fixedItems.filter((d) => d.tool !== "similarity");
+	const inlineBlockers = blockers;
+	const inlineFixed = fixedItems;
 	const coverageNotice = buildCoverageNotice(ctx, runnerLatencies);
 
 	// Format output — only blocking issues shown inline
@@ -906,20 +926,25 @@ async function runRunner(
 	runner: RunnerDefinition,
 	defaultSemantic: OutputSemantic,
 ): Promise<RunnerResult> {
+	const timeoutMs = Math.max(
+		runner.timeoutMs ?? RUNNER_TIMEOUT_MS,
+		getRunnerTimeoutFloorMs(),
+	);
+	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
 		const result = await Promise.race([
-			runner.run(ctx),
-			new Promise<never>((_, reject) =>
-				setTimeout(
+			runner.run(ctx).finally(() => clearTimeout(timer)),
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(
 					() =>
 						reject(
 							new Error(
-								`Runner ${runner.id} timed out after ${RUNNER_TIMEOUT_MS}ms`,
+								`Runner ${runner.id} timed out after ${timeoutMs}ms`,
 							),
 						),
-					RUNNER_TIMEOUT_MS,
-				),
-			),
+					timeoutMs,
+				);
+			}),
 		]);
 
 		const diagnostics = result.diagnostics.map((d) => ({
@@ -933,11 +958,15 @@ async function runRunner(
 			semantic: result.semantic ?? defaultSemantic,
 		};
 	} catch (error) {
+		clearTimeout(timer);
 		ctx.log(`Runner ${runner.id} failed: ${error}`);
+		const message = error instanceof Error ? error.message : String(error);
 		return {
 			status: "failed",
 			diagnostics: [],
 			semantic: defaultSemantic,
+			failureKind: message.includes("timed out") ? "timeout" : "exception",
+			failureMessage: message.slice(0, 200),
 		};
 	}
 }

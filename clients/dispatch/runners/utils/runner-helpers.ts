@@ -8,11 +8,11 @@
  */
 
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { getGlobalPiLensDir } from "../../../file-utils.js";
 import { ensureTool } from "../../../installer/index.js";
-import { safeSpawn, safeSpawnAsync } from "../../../safe-spawn.js";
+import { safeSpawnAsync } from "../../../safe-spawn.js";
 import {
 	getToolCommandSpec,
 	shouldAutoInstallTool,
@@ -44,7 +44,7 @@ if (typeof __dirname !== "undefined") {
 }
 
 // Managed tools directory (~/.pi-lens/tools) — where ensureTool() installs binaries
-const _managedToolsDir = path.join(os.homedir(), ".pi-lens", "tools");
+const _managedToolsDir = path.join(getGlobalPiLensDir(), "tools");
 
 // =============================================================================
 // VENV-AWARE COMMAND FINDER
@@ -97,12 +97,18 @@ type AvailabilityCache = {
 /**
  * Create a cached availability checker for a command.
  * The checker will look for the command in venv first, then global.
+ *
+ * `versionArgs` defaults to `["--version"]` but some tools reject that flag and
+ * expose version under a subcommand instead (e.g. `zig version`, not
+ * `zig --version`). Passing the wrong probe makes the runner silently skip on
+ * every machine, so toolchains with a non-standard version command must override
+ * this.
  */
 export function createAvailabilityChecker(
 	command: string,
 	windowsExt = "",
+	versionArgs: string[] = ["--version"],
 ): {
-	isAvailable: (cwd?: string) => boolean;
 	isAvailableAsync: (cwd?: string) => Promise<boolean>;
 	getCommand: (cwd?: string) => string | null;
 } {
@@ -120,23 +126,6 @@ export function createAvailabilityChecker(
 		return created;
 	}
 
-	function isAvailable(cwd?: string): boolean {
-		const resolvedCwd = cwd || process.cwd();
-		const cache = getCache(resolvedCwd);
-		if (cache.available !== null) return cache.available;
-
-		const cmd = findCommand(resolvedCwd);
-		const result = safeSpawn(cmd, ["--version"], {
-			timeout: 5000,
-		});
-
-		cache.available = !result.error && result.status === 0;
-		if (cache.available) {
-			cache.command = cmd;
-		}
-		return cache.available;
-	}
-
 	async function isAvailableAsync(cwd?: string): Promise<boolean> {
 		const resolvedCwd = cwd || process.cwd();
 		const cache = getCache(resolvedCwd);
@@ -148,7 +137,7 @@ export function createAvailabilityChecker(
 
 		const promise = (async () => {
 			const cmd = findCommand(resolvedCwd);
-			const result = await safeSpawnAsync(cmd, ["--version"], {
+			const result = await safeSpawnAsync(cmd, versionArgs, {
 				timeout: 5000,
 			});
 
@@ -169,7 +158,33 @@ export function createAvailabilityChecker(
 		return cache.command;
 	}
 
-	return { isAvailable, isAvailableAsync, getCommand };
+	return { isAvailableAsync, getCommand };
+}
+
+/**
+ * Per-cwd cached availability probe for spawn signatures that don't fit
+ * `createAvailabilityChecker` — multi-arg subcommands like `npx biome
+ * --version`, `cargo clippy --version`, `mix credo --version`, or a
+ * dynamically-resolved `<cmd> --version`. Each cwd is probed at most once;
+ * concurrent first-time callers share the in-flight promise.
+ *
+ * The cache stores the boolean outcome forever (same shape as
+ * `createAvailabilityChecker`): once known unavailable for a cwd, the
+ * runner stays skipped for that cwd until the process restarts. Pass a
+ * fresh probe for retry-after-install flows.
+ */
+export function createCwdCachedProbe(
+	probe: (cwd: string) => Promise<boolean>,
+): (cwd: string) => Promise<boolean> {
+	const cacheByCwd = new Map<string, Promise<boolean>>();
+	return (cwd: string) => {
+		const key = path.resolve(cwd || process.cwd());
+		const existing = cacheByCwd.get(key);
+		if (existing) return existing;
+		const promise = probe(key).catch(() => false);
+		cacheByCwd.set(key, promise);
+		return promise;
+	};
 }
 
 export function resolveNodeToolCommand(
@@ -305,16 +320,13 @@ export async function resolveCommandWithInstallFallback(
 
 export async function resolveAvailableOrInstall(
 	checker: {
-		isAvailable: (cwd?: string) => boolean;
-		isAvailableAsync?: (cwd?: string) => Promise<boolean>;
+		isAvailableAsync: (cwd?: string) => Promise<boolean>;
 		getCommand: (cwd?: string) => string | null;
 	},
 	toolId: string,
 	cwd: string,
 ): Promise<string | null> {
-	const available = checker.isAvailableAsync
-		? await checker.isAvailableAsync(cwd)
-		: checker.isAvailable(cwd);
+	const available = await checker.isAvailableAsync(cwd);
 	if (available) {
 		return checker.getCommand(cwd);
 	}
@@ -373,15 +385,6 @@ function isAstGrepVersionOutput(output: string): boolean {
 	return /\bast[- ]grep\b/i.test(output);
 }
 
-function probeAstGrepCommand(cmd: string, argsPrefix: string[] = []): boolean {
-	const check = safeSpawn(cmd, [...argsPrefix, "--version"], { timeout: 5000 });
-	return (
-		!check.error &&
-		check.status === 0 &&
-		isAstGrepVersionOutput(`${check.stdout}\n${check.stderr}`)
-	);
-}
-
 async function probeAstGrepCommandAsync(
 	cmd: string,
 	argsPrefix: string[] = [],
@@ -425,40 +428,6 @@ function buildSgLocalBins(): string[] {
 		}
 	}
 	return bins;
-}
-
-/**
- * Check if ast-grep CLI is available.
- * Prefers the canonical ast-grep binary, and only accepts sg if its version
- * output proves it is ast-grep (Linux /usr/bin/sg is group-switch).
- */
-export function isSgAvailable(): boolean {
-	if (sgAvailable !== null) return sgAvailable;
-
-	// 1. Local node_modules/.bin
-	for (const localBin of buildSgLocalBins()) {
-		if (probeAstGrepCommand(localBin)) {
-			sgCmd = localBin; sgCmdArgs = []; sgAvailable = true;
-			return true;
-		}
-	}
-
-	// 2. Global PATH — prefer ast-grep; reject util-linux /usr/bin/sg.
-	for (const cmd of ["ast-grep", "sg"]) {
-		if (probeAstGrepCommand(cmd)) {
-			sgCmd = cmd; sgCmdArgs = []; sgAvailable = true;
-			return true;
-		}
-	}
-
-	// 3. npx --no (cache-only, no silent download).
-	if (probeAstGrepCommand("npx", ["--no", "--", "ast-grep"])) {
-		sgCmd = "npx"; sgCmdArgs = ["--no", "--", "ast-grep"]; sgAvailable = true;
-		return true;
-	}
-
-	sgAvailable = false;
-	return false;
 }
 
 let sgAvailableInFlight: Promise<boolean> | null = null;
@@ -516,28 +485,6 @@ export function getSgCommand(): { cmd: string; args: string[] } {
  *
  * Returns: { cmd, args } where args may include ["npx", toolName] preamble.
  */
-export function resolveLocalFirst(
-	toolName: string,
-	cwd: string,
-	windowsExt = ".cmd",
-): { cmd: string; args: string[] } {
-	const isWin = process.platform === "win32";
-	const binName = isWin ? `${toolName}${windowsExt}` : toolName;
-
-	// 1. Local node_modules/.bin (project-installed)
-	const local = path.join(cwd, "node_modules", ".bin", binName);
-	if (fs.existsSync(local)) return { cmd: local, args: [] };
-
-	// 2. Global PATH (already installed system-wide)
-	const globalCheck = safeSpawn(toolName, ["--version"], { timeout: 3000 });
-	if (!globalCheck.error && globalCheck.status === 0) {
-		return { cmd: toolName, args: [] };
-	}
-
-	// 3. npx fallback — only for already-cached packages (no silent download)
-	return { cmd: "npx", args: ["--no", toolName] };
-}
-
 export async function resolveLocalFirstAsync(
 	toolName: string,
 	cwd: string,
@@ -569,4 +516,7 @@ export async function resolveLocalFirstAsync(
 export const pyright = createAvailabilityChecker("pyright", ".exe");
 export const ruff = createAvailabilityChecker("ruff", ".exe");
 export const biome = createAvailabilityChecker("biome");
-export const sg = { isAvailable: isSgAvailable, getCommand: getSgCommand };
+export const sg = {
+	isAvailableAsync: isSgAvailableAsync,
+	getCommand: getSgCommand,
+};

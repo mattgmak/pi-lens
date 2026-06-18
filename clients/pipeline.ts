@@ -14,6 +14,7 @@
 
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
+import { findNearestContaining } from "./path-utils.js";
 import {
 	recordFromDispatchDiagnostic,
 	type ActionableWarningRecord,
@@ -32,10 +33,13 @@ import {
 } from "./dispatch/integration.js";
 import { toRunnerDisplayPath } from "./dispatch/runner-context.js";
 import {
+	createAvailabilityChecker,
+	resolveAvailableOrInstall,
 	resolveCommandArgsWithInstallFallback,
 	resolveToolCommand,
 	resolveToolCommandWithInstallFallback,
 } from "./dispatch/runners/utils/runner-helpers.js";
+import { findDetektConfig } from "./dispatch/runners/detekt.js";
 import type { Diagnostic, PiAgentAPI } from "./dispatch/types.js";
 import { detectFileKind, getFileKindLabel } from "./file-kinds.js";
 import {
@@ -58,7 +62,11 @@ import {
 	getPreferredAutofixTools,
 	getRubocopCommand,
 	hasBiomeConfig,
+	hasDetektConfig,
 	hasEslintConfig,
+	hasGolangciConfig,
+	hasKtfmtConfig,
+	hasOxlintConfig,
 	hasRubocopConfig,
 	hasSqlfluffConfig,
 	hasStylelintConfig,
@@ -189,7 +197,7 @@ export interface PipelineResult {
 	 * Intentionally NOT included in output — surfaced at turn_end instead
 	 * so mid-refactor intermediate errors don't derail the agent.
 	 */
-	cascadeResult?: import("./cascade-types.js").CascadeResult;
+	cascadeRun?: import("./cascade-types.js").CascadeRun;
 	/** True if secrets found — block the agent */
 	isError: boolean;
 	/** True if file was modified by format/autofix */
@@ -293,20 +301,27 @@ async function tryEslintFix(filePath: string, cwd: string): Promise<number> {
 	);
 	if (dry.status === 2) return 0;
 	let fixableCount = 0;
+	let anyDryRunOutput = false;
 	try {
 		const results: Array<{
 			fixableErrorCount?: number;
 			fixableWarningCount?: number;
+			output?: string;
 		}> = JSON.parse(dry.stdout);
 		fixableCount = results.reduce(
 			(sum, r) =>
 				sum + (r.fixableErrorCount ?? 0) + (r.fixableWarningCount ?? 0),
 			0,
 		);
+		// `--fix-dry-run` reports the POST-fix state: when every problem is
+		// auto-fixable, `messages`/`fixableErrorCount` are 0 and the fixed source
+		// lands in the `output` field instead. Keying on `fixableErrorCount` alone
+		// therefore misses the common "all fixable" case and never applies fixes.
+		anyDryRunOutput = results.some((r) => typeof r.output === "string");
 	} catch {
 		/* treat as zero fixable on error */
 	}
-	if (fixableCount === 0) return 0;
+	if (fixableCount === 0 && !anyDryRunOutput) return 0;
 	// Apply the fixes
 	const fix = await safeSpawnAsync(
 		cmd,
@@ -314,7 +329,7 @@ async function tryEslintFix(filePath: string, cwd: string): Promise<number> {
 		{ timeout: 30000, cwd },
 	);
 	if (fix.status === 2) return 0;
-	return fixableCount;
+	return fixableCount > 0 ? fixableCount : anyDryRunOutput ? 1 : 0;
 }
 
 async function tryStylelintFix(filePath: string, cwd: string): Promise<number> {
@@ -373,22 +388,78 @@ async function tryKtlintFix(filePath: string, cwd: string): Promise<number> {
 	);
 }
 
+// golangci-lint/detekt/ktfmt have no TOOL_COMMAND_SPEC; resolve via availability
+// checkers like their runners do.
+const golangciAutofixChecker = createAvailabilityChecker("golangci-lint", ".exe");
+const detektAutofixChecker = createAvailabilityChecker("detekt", ".bat");
+const ktfmtAutofixChecker = createAvailabilityChecker("ktfmt", ".bat");
+
+async function tryKtfmtFix(filePath: string, cwd: string): Promise<number> {
+	// Config-first: the autofix policy only reaches here when the project opted
+	// into ktfmt, so resolveAvailableOrInstall honors that gate. ktfmt writes the
+	// formatted file in place and exits 0; treat any byte change as the fix.
+	const cmd = await resolveAvailableOrInstall(ktfmtAutofixChecker, "ktfmt", cwd);
+	if (!cmd) return 0;
+	const absPath = path.resolve(cwd, filePath);
+	return detectFileChangedAfterCommand(filePath, cmd, [absPath], cwd, [0]);
+}
+
+async function tryGolangciLintFix(filePath: string, cwd: string): Promise<number> {
+	// Config-first: the autofix policy only reaches here when a .golangci.* config
+	// exists. resolveAvailableOrInstall honors that gate (won't auto-install a
+	// config-first tool). golangci-lint exits non-zero when issues remain after
+	// --fix, so allow its issue-found codes.
+	const cmd = await resolveAvailableOrInstall(
+		golangciAutofixChecker,
+		"golangci-lint",
+		cwd,
+	);
+	if (!cmd) return 0;
+	return detectFileChangedAfterCommand(
+		filePath,
+		cmd,
+		["run", "--fix", filePath],
+		cwd,
+		[1, 7],
+	);
+}
+
+async function tryDetektFix(filePath: string, cwd: string): Promise<number> {
+	const configPath = findDetektConfig(cwd);
+	if (!configPath) return 0;
+	if (!(await detektAutofixChecker.isAvailableAsync(cwd))) return 0;
+	const cmd = detektAutofixChecker.getCommand(cwd);
+	if (!cmd) return 0;
+	const absPath = path.resolve(cwd, filePath);
+	return detectFileChangedAfterCommand(
+		filePath,
+		cmd,
+		["--auto-correct", "--input", absPath, "--config", configPath],
+		cwd,
+		[1, 2],
+	);
+}
+
+async function tryMarkdownlintFix(filePath: string, cwd: string): Promise<number> {
+	const cmd = await resolveToolCommandWithInstallFallback(cwd, "markdownlint");
+	if (!cmd) return 0;
+	// markdownlint-cli2 --fix exits non-zero when unfixable violations remain.
+	return detectFileChangedAfterCommand(filePath, cmd, ["--fix", filePath], cwd, [1]);
+}
+
+async function tryOxlintFix(filePath: string, cwd: string): Promise<number> {
+	const cmd = await resolveToolCommandWithInstallFallback(cwd, "oxlint");
+	if (!cmd) return 0;
+	return detectFileChangedAfterCommand(filePath, cmd, ["--fix", filePath], cwd, [1]);
+}
+
 async function tryRustClippyFix(filePath: string): Promise<string[]> {
 	const check = await safeSpawnAsync("cargo", ["--version"], { timeout: 5000 });
 	if (check.error || check.status !== 0) return [];
 
-	let dir = path.dirname(path.resolve(filePath));
-	const root = path.parse(dir).root;
-	let cargoDir: string | undefined;
-	while (dir !== root) {
-		if (nodeFs.existsSync(path.join(dir, "Cargo.toml"))) {
-			cargoDir = dir;
-			break;
-		}
-		const parent = path.dirname(dir);
-		if (parent === dir) break;
-		dir = parent;
-	}
+	const cargoDir = findNearestContaining(path.dirname(path.resolve(filePath)), [
+		"Cargo.toml",
+	]);
 	if (!cargoDir) return [];
 
 	const before = snapshotProjectFiles(cargoDir);
@@ -405,18 +476,10 @@ async function tryDartFix(filePath: string): Promise<string[]> {
 	const check = await safeSpawnAsync("dart", ["--version"], { timeout: 5000 });
 	if (check.error || check.status !== 0) return [];
 
-	let dir = path.dirname(path.resolve(filePath));
-	const root = path.parse(dir).root;
-	let pubspecDir: string | undefined;
-	while (dir !== root) {
-		if (nodeFs.existsSync(path.join(dir, "pubspec.yaml"))) {
-			pubspecDir = dir;
-			break;
-		}
-		const parent = path.dirname(dir);
-		if (parent === dir) break;
-		dir = parent;
-	}
+	const pubspecDir = findNearestContaining(
+		path.dirname(path.resolve(filePath)),
+		["pubspec.yaml"],
+	);
 	if (!pubspecDir) return [];
 
 	const before = snapshotProjectFiles(pubspecDir);
@@ -430,7 +493,7 @@ async function tryDartFix(filePath: string): Promise<string[]> {
 
 // --- Pipeline phase helpers ---
 
-async function runAutofix(
+export async function runAutofix(
 	filePath: string,
 	cwd: string,
 	getFlag: PipelineContext["getFlag"],
@@ -483,6 +546,10 @@ async function runAutofix(
 		hasSqlfluffConfig: hasSqlfluffConfig(cwd),
 		hasRubocopConfig: hasRubocopConfig(cwd),
 		hasBiomeConfig: hasBiomeConfig(cwd),
+		hasGolangciConfig: hasGolangciConfig(cwd),
+		hasDetektConfig: hasDetektConfig(cwd),
+		hasKtfmtConfig: hasKtfmtConfig(cwd),
+		hasOxlintConfig: hasOxlintConfig(cwd),
 	};
 	const autofixPolicy = getAutofixPolicyForFile(filePath, autofixContext);
 	const preferredAutofixTools = autofixPolicy?.safe
@@ -656,6 +723,72 @@ async function runAutofix(
 				);
 				needsContentRefresh = true;
 			}
+			continue;
+		}
+
+		if (toolName === "golangci-lint") {
+			const fixed = await tryGolangciLintFix(filePath, cwd);
+			if (fixed > 0) {
+				fixedCount += fixed;
+				autofixTools.push(`golangci-lint:${fixed}`);
+				fixedThisTurn.add(filePath);
+				markTargetChanged();
+				dbg(`autofix: golangci-lint fixed ${filePath}`);
+				needsContentRefresh = true;
+			}
+			continue;
+		}
+
+		if (toolName === "detekt") {
+			const fixed = await tryDetektFix(filePath, cwd);
+			if (fixed > 0) {
+				fixedCount += fixed;
+				autofixTools.push(`detekt:${fixed}`);
+				fixedThisTurn.add(filePath);
+				markTargetChanged();
+				dbg(`autofix: detekt --auto-correct fixed ${filePath}`);
+				needsContentRefresh = true;
+			}
+			continue;
+		}
+
+		if (toolName === "ktfmt") {
+			const fixed = await tryKtfmtFix(filePath, cwd);
+			if (fixed > 0) {
+				fixedCount += fixed;
+				autofixTools.push(`ktfmt:${fixed}`);
+				fixedThisTurn.add(filePath);
+				markTargetChanged();
+				dbg(`autofix: ktfmt formatted ${filePath}`);
+				needsContentRefresh = true;
+			}
+			continue;
+		}
+
+		if (toolName === "markdownlint") {
+			const fixed = await tryMarkdownlintFix(filePath, cwd);
+			if (fixed > 0) {
+				fixedCount += fixed;
+				autofixTools.push(`markdownlint:${fixed}`);
+				fixedThisTurn.add(filePath);
+				markTargetChanged();
+				dbg(`autofix: markdownlint --fix fixed ${filePath}`);
+				needsContentRefresh = true;
+			}
+			continue;
+		}
+
+		if (toolName === "oxlint") {
+			const fixed = await tryOxlintFix(filePath, cwd);
+			if (fixed > 0) {
+				fixedCount += fixed;
+				autofixTools.push(`oxlint:${fixed}`);
+				fixedThisTurn.add(filePath);
+				markTargetChanged();
+				dbg(`autofix: oxlint --fix fixed ${filePath}`);
+				needsContentRefresh = true;
+			}
+			continue;
 		}
 	}
 
@@ -681,7 +814,6 @@ export async function resyncLspFile(
 	lspSyncCompleted: boolean,
 	getFlag: PipelineContext["getFlag"],
 	dbg: PipelineContext["dbg"],
-	formatChanged = false,
 ): Promise<void> {
 	if (getFlag("no-lsp")) return;
 	if (!needsContentRefresh && lspSyncCompleted) return;
@@ -692,19 +824,23 @@ export async function resyncLspFile(
 	try {
 		const lspService = getLSPService();
 		if (lspService.supportsLSP(filePath)) {
-			// Format-only resyncs preserve the existing diagnostics cache so
-			// waitForDiagnostics fast-paths instead of sitting the full 5s timeout
-			// waiting for TypeScript to re-confirm what it already knows.
-			if (formatChanged) {
-				await lspService.openFile(filePath, fileContent, {
-					preserveDiagnostics: true,
-					spawnBudgetMs: LSP_SPAWN_BUDGET_MS,
-				});
-			} else {
-				await lspService.openFile(filePath, fileContent, {
-					spawnBudgetMs: LSP_SPAWN_BUDGET_MS,
-				});
-			}
+			// Push the final post-format/post-fix content through touchFile (not the
+			// bare openFile) so it registers in the touch-debounce map via
+			// markTouched. The dispatch-lsp-runner's touchFile fires ~80ms later with
+			// identical content; registering this push makes its shouldSkipNotify
+			// return true, so it reuses the diagnostics THIS push triggers instead of
+			// re-clearing the cache and forcing the server to recompute from scratch —
+			// the dominant per-edit LSP latency (#203). diagnostics:"none" keeps this
+			// call non-blocking; the dispatch runner owns the diagnostics wait. We let
+			// the cache clear (no preserveDiagnostics) so the wait resolves on fresh,
+			// correctly-positioned diagnostics rather than stale pre-edit ones — the
+			// didChange triggers a server recompute regardless of cache preservation.
+			await lspService.touchFile(filePath, fileContent, {
+				diagnostics: "none",
+				source: "lsp_sync",
+				clientScope: "primary",
+				maxClientWaitMs: LSP_SPAWN_BUDGET_MS,
+			});
 		}
 	} catch (err) {
 		dbg(`LSP resync after autofix error: ${err}`);
@@ -964,15 +1100,7 @@ export async function runPipeline(
 	phase.start("lsp_sync");
 	let lspSyncCompleted = false;
 	if (fileContent) {
-		await resyncLspFile(
-			filePath,
-			fileContent,
-			true,
-			false,
-			getFlag,
-			dbg,
-			formatChanged && fixedCount === 0,
-		);
+		await resyncLspFile(filePath, fileContent, true, false, getFlag, dbg);
 		lspSyncCompleted = true;
 	}
 	phase.end("lsp_sync", { completed: lspSyncCompleted, finalContent: true });
@@ -1019,9 +1147,7 @@ export async function runPipeline(
 				d.column || 0,
 			].join("|");
 		const inlineKeys = new Set(
-			[...dispatchResult.blockers, ...dispatchResult.fixed]
-				.filter((d) => d.tool !== "similarity")
-				.map(toKey),
+			[...dispatchResult.blockers, ...dispatchResult.fixed].map(toKey),
 		);
 		for (const d of dispatchResult.diagnostics) {
 			logger.logCaught(
@@ -1093,7 +1219,7 @@ export async function runPipeline(
 	// --- 7. Cascade diagnostics (LSP only) ---
 	// Deferred: cascade errors in OTHER files are NOT shown inline — surfaced at
 	// turn_end so mid-refactor intermediate errors don't derail the agent.
-	const cascadeResult = getFlag("no-lsp")
+	const cascadeRun = getFlag("no-lsp")
 		? undefined
 		: await computeCascadeForFile(filePath, cwd, {
 				hasBlockers,
@@ -1134,7 +1260,7 @@ export async function runPipeline(
 	return {
 		output,
 		hasBlockers,
-		cascadeResult,
+		cascadeRun,
 		isError: false,
 		fileModified,
 		changedFiles,

@@ -1,0 +1,46 @@
+export type ProjectDiagnosticSeverity = "error" | "warning" | "info" | "hint";
+export type ProjectDiagnosticSemantic = "blocking" | "warning" | "none";
+export type ProjectDiagnosticSource = "lsp" | "dispatch" | "project-scan";
+export type ProjectDiagnosticsTier = "cheap" | "all";
+
+export interface ProjectDiagnostic {
+	filePath: string;
+	line?: number;
+	column?: number;
+	severity: ProjectDiagnosticSeverity;
+	semantic?: ProjectDiagnosticSemantic;
+	tool: string;
+	runner: string;
+	rule?: string;
+	code?: string;
+	message: string;
+	source: ProjectDiagnosticSource;
+}
+
+export interface ProjectDiagnosticsSnapshot {
+	version: number;
+	cwd: string;
+	tier: ProjectDiagnosticsTier;
+	scannedAt: string;
+	diagnostics: ProjectDiagnostic[];
+	filesScanned: number;
+	runners: string[];
+}
+
+export interface ProjectDiagnosticsDeltaReport {
+	version: number;
+	cwd: string;
+	generatedAt: string;
+	sessionId: string;
+	turnIndex: number;
+	projectSeqStart?: number;
+	projectSeqEnd?: number;
+	diagnostics: ProjectDiagnostic[];
+	sources: string[];
+}
+
+export interface ProjectDiagnosticsScanOptions {
+	cwd: string;
+	tier: ProjectDiagnosticsTier;
+	maxFiles?: number;
+}

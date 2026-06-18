@@ -389,13 +389,20 @@ function resolveTreeSitterLanguage(filePath: string): string | undefined {
 		".txx": "cpp",
 		".cu": "cpp",
 		".hip": "cpp",
+		".cs": "csharp",
+		".php": "php",
+		".phtml": "php",
+		".php3": "php",
+		".php4": "php",
+		".php5": "php",
+		".css": "css",
 	};
 	return EXT_TO_LANG[ext];
 }
 
 const treeSitterRunner: RunnerDefinition = {
 	id: "tree-sitter",
-	appliesTo: ["jsts", "python", "go", "rust", "ruby", "cxx"],
+	appliesTo: ["jsts", "python", "go", "rust", "ruby", "cxx", "csharp", "php", "css"],
 	priority: PRIORITY.STRUCTURAL_ANALYSIS,
 	enabledByDefault: true,
 	skipTestFiles: false, // Run on test files too (structural issues matter there)
@@ -478,7 +485,7 @@ const treeSitterRunner: RunnerDefinition = {
 					(q) =>
 						({
 							...q,
-							has_fix: false,
+							has_fix: q.has_fix ?? false,
 							filePath: q.filePath ?? "",
 						}) as TreeSitterQuery,
 				)
@@ -509,6 +516,7 @@ const treeSitterRunner: RunnerDefinition = {
 					post_filter_params: q.post_filter_params,
 					defect_class: q.defect_class,
 					inline_tier: q.inline_tier,
+					has_fix: q.has_fix,
 					filePath: q.filePath,
 				})),
 			);

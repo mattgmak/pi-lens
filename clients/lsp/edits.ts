@@ -169,6 +169,68 @@ export function flattenWorkspaceTextEdits(edit: {
 	return out;
 }
 
+function textEditKey(uri: string, edit: LSPTextEdit): string {
+	return [
+		uri,
+		edit.range.start.line,
+		edit.range.start.character,
+		edit.range.end.line,
+		edit.range.end.character,
+		edit.newText,
+	].join(":");
+}
+
+export interface MergeWorkspaceEditsResult {
+	edit: { changes: Record<string, LSPTextEdit[]> };
+	droppedConflicts: number;
+	inputEditCount: number;
+	serverIds: string[];
+}
+
+export function mergeWorkspaceTextEditsByPriority(
+	entries: Array<{
+		serverId: string;
+		edit:
+			| { changes?: Record<string, unknown[]>; documentChanges?: unknown[] }
+			| null
+			| undefined;
+	}>,
+): MergeWorkspaceEditsResult {
+	const merged = new Map<string, LSPTextEdit[]>();
+	const seenExact = new Set<string>();
+	let droppedConflicts = 0;
+	let inputEditCount = 0;
+	const serverIds: string[] = [];
+
+	for (const entry of entries) {
+		serverIds.push(entry.serverId);
+		if (!entry.edit) continue;
+		for (const [uri, edits] of flattenWorkspaceTextEdits(entry.edit)) {
+			const kept = merged.get(uri) ?? [];
+			for (const edit of edits) {
+				inputEditCount += 1;
+				const exactKey = textEditKey(uri, edit);
+				if (seenExact.has(exactKey)) continue;
+				if (
+					kept.some((existing) => rangesOverlap(existing.range, edit.range))
+				) {
+					droppedConflicts += 1;
+					continue;
+				}
+				seenExact.add(exactKey);
+				kept.push(edit);
+			}
+			if (kept.length > 0) merged.set(uri, kept);
+		}
+	}
+
+	const changes: Record<string, LSPTextEdit[]> = {};
+	for (const [uri, edits] of merged) {
+		changes[uri] = edits;
+	}
+	return { edit: { changes }, droppedConflicts, inputEditCount, serverIds };
+}
+
 function relativeToCwd(filePath: string, cwd: string): string {
 	const rel = path.relative(cwd, filePath) || path.basename(filePath);
 	return rel.replace(/\\/g, "/");
@@ -243,7 +305,10 @@ export async function applyWorkspaceEdit(
 			if (typeof change !== "object" || change === null || !("kind" in change))
 				continue;
 			const kind = (change as { kind?: unknown }).kind;
-			if (kind === "create" && typeof (change as CreateFileOp).uri === "string") {
+			if (
+				kind === "create" &&
+				typeof (change as CreateFileOp).uri === "string"
+			) {
 				const filePath = uriToPath((change as CreateFileOp).uri);
 				await fs.mkdir(path.dirname(filePath), { recursive: true });
 				await fs

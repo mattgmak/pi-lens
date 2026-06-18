@@ -8,9 +8,24 @@ import type {
 } from "../../clients/review-graph/types.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
+type ImpactHitMock = {
+	symbol: string;
+	file: string;
+	depth: number;
+	relation: string;
+};
+
 const mocks = vi.hoisted(() => ({
 	buildOrUpdateGraph: vi.fn(),
 	computeImpactCascade: vi.fn(),
+	computeTransitiveImpact: vi.fn(
+		(): {
+			seedFile: string;
+			hits: ImpactHitMock[];
+			truncated: boolean;
+			maxDepthReached: number;
+		} => ({ seedFile: "", hits: [], truncated: false, maxDepthReached: 0 }),
+	),
 	formatImpactCascade: vi.fn(),
 	getLSPService: vi.fn(),
 }));
@@ -18,6 +33,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../../clients/review-graph/service.js", () => ({
 	buildOrUpdateGraph: mocks.buildOrUpdateGraph,
 	computeImpactCascade: mocks.computeImpactCascade,
+	computeTransitiveImpact: mocks.computeTransitiveImpact,
 	formatImpactCascade: mocks.formatImpactCascade,
 }));
 
@@ -62,17 +78,28 @@ function impact(filePath: string, neighbors: string[]): ImpactCascadeResult {
 }
 
 describe("computeCascadeForFile", () => {
+	// vi.resetModules() drops the whole module cache and the dynamic re-import
+	// below pays a full cold-resolve; under full-suite parallel CPU contention
+	// that setup can exceed the default 10s hook timeout (it passes comfortably
+	// in isolation). Raise the hook budget — this is setup, not an assertion, so
+	// a longer ceiling absorbs the contention without masking a product failure.
 	beforeEach(async () => {
 		vi.resetModules();
 		mocks.buildOrUpdateGraph.mockReset().mockResolvedValue(emptyGraph());
 		mocks.computeImpactCascade.mockReset();
+		mocks.computeTransitiveImpact.mockReset().mockReturnValue({
+			seedFile: "",
+			hits: [],
+			truncated: false,
+			maxDepthReached: 0,
+		});
 		mocks.formatImpactCascade.mockReset().mockReturnValue("impact header");
 		mocks.getLSPService.mockReset();
 		const { resetDispatchBaselines } = await import(
 			"../../clients/dispatch/integration.js"
 		);
 		resetDispatchBaselines();
-	});
+	}, 30_000);
 
 	it("reads jsts neighbors from passive snapshot instead of active touching", async () => {
 		const env = setupTestEnvironment("cascade-jsts-");
@@ -108,8 +135,63 @@ describe("computeCascadeForFile", () => {
 			});
 
 			expect(touchFile).not.toHaveBeenCalled();
-			expect(result?.neighbors[0]?.diagnostics[0]?.filePath).toBe(neighbor);
-			expect(result?.formatted).toContain("neighbor.ts");
+			expect(result?.result?.neighbors[0]?.diagnostics[0]?.filePath).toBe(neighbor);
+			expect(result?.result?.formatted).toContain("neighbor.ts");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("includes bounded transitive (depth>1) dependents as neighbors", async () => {
+		const env = setupTestEnvironment("cascade-transitive-");
+		try {
+			const primary = path.join(env.tmpDir, "src", "primary.ts");
+			const direct = path.join(env.tmpDir, "src", "direct.ts");
+			const indirect = path.join(env.tmpDir, "src", "indirect.ts");
+			fs.mkdirSync(path.dirname(primary), { recursive: true });
+			fs.writeFileSync(primary, "export const x = 1;\n");
+			fs.writeFileSync(direct, "import { x } from './primary';\n");
+			fs.writeFileSync(indirect, "import './direct';\n");
+			// One-hop cascade sees only the direct importer…
+			mocks.computeImpactCascade.mockReturnValue(impact(primary, [direct]));
+			// …while the transitive walk also reaches the depth-2 dependent.
+			mocks.computeTransitiveImpact.mockReturnValue({
+				seedFile: primary,
+				hits: [
+					{ symbol: "", file: direct, depth: 1, relation: "imports" },
+					{ symbol: "", file: indirect, depth: 2, relation: "imports" },
+				],
+				truncated: false,
+				maxDepthReached: 2,
+			});
+			mocks.getLSPService.mockReturnValue({
+				getAllDiagnostics: vi.fn().mockResolvedValue(
+					new Map([
+						[
+							direct.split(path.sep).join("/"),
+							{ diags: [lspError("d")], ts: Date.now() },
+						],
+						[
+							indirect.split(path.sep).join("/"),
+							{ diags: [lspError("i")], ts: Date.now() },
+						],
+					]),
+				),
+				touchFile: vi.fn(),
+				getDiagnostics: vi.fn(),
+			});
+
+			const { computeCascadeForFile } = await import(
+				"../../clients/dispatch/integration.js"
+			);
+			const result = await computeCascadeForFile(primary, env.tmpDir, {
+				turnSeq: 1,
+				writeSeq: 1,
+			});
+			const neighborFiles = result?.result?.neighbors.map(
+				(n) => n.diagnostics[0]?.filePath,
+			);
+			expect(neighborFiles).toContain(indirect); // depth-2 dependent surfaced
 		} finally {
 			env.cleanup();
 		}
@@ -180,13 +262,13 @@ describe("computeCascadeForFile", () => {
 
 			expect(references).toHaveBeenCalledWith(normalizedPrimary, 0, 16, false);
 			expect(
-				result?.neighbors.some(
+				result?.result?.neighbors.some(
 					(n) =>
 						n.filePath.split(path.sep).join("/") ===
 						reference.split(path.sep).join("/"),
 				),
 			).toBe(true);
-			expect(result?.formatted).toContain("consumer.ts");
+			expect(result?.result?.formatted).toContain("consumer.ts");
 		} finally {
 			env.cleanup();
 		}
@@ -225,8 +307,8 @@ describe("computeCascadeForFile", () => {
 					collectDiagnostics: true,
 				}),
 			);
-			expect(result?.neighbors[0]?.lspTouched).toBe(true);
-			expect(result?.neighbors[0]?.diagnostics[0]?.message).toBe(
+			expect(result?.result?.neighbors[0]?.lspTouched).toBe(true);
+			expect(result?.result?.neighbors[0]?.diagnostics[0]?.message).toBe(
 				"python broken",
 			);
 		} finally {
@@ -275,8 +357,8 @@ describe("computeCascadeForFile", () => {
 			});
 
 			expect(touchFile).not.toHaveBeenCalled();
-			expect(result?.neighbors.some((n) => n.reason === "fallback")).toBe(true);
-			expect(result?.formatted).toContain("fallback error");
+			expect(result?.result?.neighbors.some((n) => n.reason === "fallback")).toBe(true);
+			expect(result?.result?.formatted).toContain("fallback error");
 		} finally {
 			env.cleanup();
 		}
@@ -320,8 +402,8 @@ describe("computeCascadeForFile", () => {
 					maxClientWaitMs: 1000,
 				}),
 			);
-			expect(result?.neighbors[0]?.lspTouched).toBe(true);
-			expect(result?.neighbors[0]?.diagnostics[0]?.message).toBe(
+			expect(result?.result?.neighbors[0]?.lspTouched).toBe(true);
+			expect(result?.result?.neighbors[0]?.diagnostics[0]?.message).toBe(
 				"type error in neighbor",
 			);
 		} finally {
@@ -364,8 +446,8 @@ describe("computeCascadeForFile", () => {
 
 			// Valid snapshot — no touch should happen
 			expect(touchFile).not.toHaveBeenCalled();
-			expect(result?.neighbors[0]?.lspTouched).toBe(false);
-			expect(result?.neighbors[0]?.diagnostics[0]?.message).toBe(
+			expect(result?.result?.neighbors[0]?.lspTouched).toBe(false);
+			expect(result?.result?.neighbors[0]?.diagnostics[0]?.message).toBe(
 				"existing warning",
 			);
 		} finally {
@@ -409,8 +491,8 @@ describe("computeCascadeForFile", () => {
 				writeSeq: 1,
 			});
 
-			expect(first?.formatted).toContain("same error");
-			expect(second).toBeUndefined();
+			expect(first?.result?.formatted).toContain("same error");
+			expect(second?.result).toBeUndefined();
 		} finally {
 			env.cleanup();
 		}
@@ -466,7 +548,7 @@ describe("computeCascadeForFile", () => {
 			});
 
 			expect(touchFile).toHaveBeenCalledTimes(2);
-			expect(second?.neighbors[0]?.diagnostics[0]?.message).toBe("error2");
+			expect(second?.result?.neighbors[0]?.diagnostics[0]?.message).toBe("error2");
 		} finally {
 			env.cleanup();
 		}
@@ -487,9 +569,9 @@ describe("computeCascadeForFile", () => {
 			const { computeCascadeForFile } = await import(
 				"../../clients/dispatch/integration.js"
 			);
-			await expect(
-				computeCascadeForFile(primary, env.tmpDir, { turnSeq: 1, writeSeq: 1 }),
-			).resolves.toBeUndefined();
+			const run = await computeCascadeForFile(primary, env.tmpDir, { turnSeq: 1, writeSeq: 1 });
+			expect(run.result).toBeUndefined();
+			expect(run.skipReason).toBe("no_neighbors");
 		} finally {
 			env.cleanup();
 		}

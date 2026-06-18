@@ -452,6 +452,15 @@ describe("getFormattersForFile — policy selection", () => {
 		});
 	});
 
+	it("prefers ktfmt over the ktlint default when the project opts in (#129)", async () => {
+		createTempFile(tmpDir, ".ktfmt", "");
+		await withPathShim("ktfmt", async () => {
+			const filePath = fileIn(tmpDir, "App.kt");
+			const formatters = await getFormattersForFile(filePath, tmpDir);
+			expect(formatters.map((f) => f.name)).toEqual(["ktfmt"]);
+		});
+	});
+
 	it("uses swiftformat as the smart default for Swift files when available", async () => {
 		await withPathShim("swiftformat", async () => {
 			const filePath = fileIn(tmpDir, "App.swift");
@@ -956,5 +965,39 @@ describe("oxfmt formatter — detection and policy selection", () => {
 		const filePath = fileIn(tmpDir, "index.ts");
 		const cmd = await oxfmtFormatter.resolveCommand!(filePath, tmpDir);
 		expect(cmd).toEqual([vp, "fmt", filePath, "--write"]);
+	});
+
+	const oxfmtExtensionFiles = [
+		"style.css",
+		"style.scss",
+		"app.vue",
+		"data.json",
+		"config.jsonc",
+		"config.yaml",
+		"config.yml",
+		"README.md",
+		"page.mdx",
+		"query.graphql",
+		"query.gql",
+		"config.toml",
+		"style.less",
+		"page.html",
+	];
+
+	// Cross-product: every supported extension × every oxfmt config file.
+	// Some extensions have defaultWhenUnconfigured:true formatters (yaml, html…),
+	// so we assert oxfmt is included rather than being the sole formatter.
+	it.each(
+		oxfmtExtensionFiles.flatMap((f) => [
+			[f, "oxfmt.toml", "# oxfmt config\n"] as const,
+			[f, ".oxfmtrc.json", "{}\n"] as const,
+		]),
+	)("includes oxfmt for %s when %s is present", async (fileName, configFile, configContent) => {
+		createTempFile(tmpDir, configFile, configContent);
+		const formatters = await getFormattersForFile(
+			fileIn(tmpDir, fileName),
+			tmpDir,
+		);
+		expect(formatters.map((f) => f.name)).toContain("oxfmt");
 	});
 });

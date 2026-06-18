@@ -11,19 +11,21 @@
  *   - ~/.pi-lens/*.log.* (rotated backups)
  *
  * Excluded (intentionally NOT cleaned - project-scoped or persistent):
- *   - <project-data>/worklog.jsonl        - Agent fixable diagnostics
- *   - <project-data>/metrics-history.json - Complexity trends (capped internally)
- *   - <project-data>/reviews/*            - Code review snapshots
- *   - <project-data>/turn-state.json      - Turn tracking
- *   - <project-data>/fix-session.json     - Active fix sessions
- *   - <project-data>/todo-baseline.json   - TODO baseline
+ *   - <project-data>/worklog.jsonl                - Agent fixable diagnostics
+ *   - <project-data>/code-quality-warnings.jsonl  - Non-fixable warning history
+ *   - <project-data>/actionable-warnings.jsonl    - Actionable warning history
+ *   - <project-data>/metrics-history.json         - Complexity trends (capped internally)
+ *   - <project-data>/reviews/*                    - Code review snapshots
+ *   - <project-data>/turn-state.json              - Turn tracking
+ *   - <project-data>/fix-session.json             - Active fix sessions
+ *   - <project-data>/todo-baseline.json           - TODO baseline
  */
 
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
+import { getGlobalPiLensDir } from "./file-utils.js";
 
-const LOG_DIR = path.join(os.homedir(), ".pi-lens");
+const LOG_DIR = getGlobalPiLensDir();
 const LOGS_SUBDIR = path.join(LOG_DIR, "logs");
 
 export interface LogCleanupConfig {

@@ -11,6 +11,7 @@ import {
 } from "./generated-artifacts.js";
 import {
 	collectSourceFiles,
+	collectSourceFilesAsync,
 	type SourceCollectionOptions,
 } from "./source-filter.js";
 
@@ -76,4 +77,18 @@ export function collectProjectSourceFiles(
 	options?: ProjectSourceCollectionOptions,
 ): string[] {
 	return collectSourceFiles(rootDir, options);
+}
+
+/**
+ * Async, chunked-yield twin of {@link collectProjectSourceFiles}. Produces the
+ * exact same file list (it shares `classifyEntry` with the sync collector) but
+ * yields to the event loop every N entries so a large-tree walk on a hot hook
+ * tick (e.g. the per-edit cascade graph rebuild) never holds the loop in one
+ * synchronous burst. Prefer this on the per-edit / per-cascade path.
+ */
+export function collectProjectSourceFilesAsync(
+	rootDir: string,
+	options?: ProjectSourceCollectionOptions & { yieldEvery?: number },
+): Promise<string[]> {
+	return collectSourceFilesAsync(rootDir, options);
 }

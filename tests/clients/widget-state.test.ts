@@ -1,12 +1,16 @@
+import * as path from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+	__testing,
 	clearWidgetState,
+	getFileDiagnosticSummaries,
 	recordDiagnostics,
 	recordFormatter,
 	recordLsp,
 	recordRunner,
 	renderWidget,
+	setRenderCallback,
 	setSessionLanguages,
 } from "../../clients/widget-state.ts";
 
@@ -17,6 +21,101 @@ const theme = {
 
 afterEach(() => {
 	clearWidgetState();
+});
+
+describe("getFileDiagnosticSummaries", () => {
+	it("includes the actual stored diagnostics, not just counts", () => {
+		const filePath = `${process.cwd()}/foo.ts`;
+		recordDiagnostics(filePath, [
+			{
+				severity: "error",
+				semantic: "blocking",
+				line: 12,
+				rule: "typescript:2322",
+				message: "Type 'string' is not assignable to 'number'.",
+			},
+			{
+				severity: "warning",
+				line: 30,
+				rule: "no-console",
+				tool: "eslint",
+				message: "Unexpected console statement.",
+			},
+		]);
+
+		const summaries = getFileDiagnosticSummaries();
+		const entry = summaries.find((s) => s.filePath === filePath);
+		expect(entry).toBeDefined();
+		expect(entry?.blocking).toBe(1);
+		expect(entry?.warnings).toBe(1);
+		expect(entry?.diagnostics).toHaveLength(2);
+		const messages = entry?.diagnostics.map((d) => d.message);
+		expect(messages).toContain("Type 'string' is not assignable to 'number'.");
+		expect(messages).toContain("Unexpected console statement.");
+		expect(entry?.diagnostics.find((d) => d.line === 12)?.rule).toBe(
+			"typescript:2322",
+		);
+	});
+
+	it("collapses multi-line messages to a single line (TUI render + inline-blocker safety)", () => {
+		const filePath = `${process.cwd()}/overload.ts`;
+		recordDiagnostics(filePath, [
+			{
+				severity: "error",
+				semantic: "blocking",
+				line: 162,
+				rule: "typescript:2769",
+				message:
+					"No overload matches this call.\n  The last overload gave the following error.\n    Argument of type 'X' is not assignable to parameter of type 'Y'.",
+			},
+		]);
+		const entry = getFileDiagnosticSummaries().find(
+			(s) => s.filePath === filePath,
+		);
+		const msg = entry?.diagnostics[0].message ?? "";
+		expect(msg).not.toContain("\n");
+		expect(msg).not.toContain("\t");
+		expect(msg).toBe(
+			"No overload matches this call. The last overload gave the following error. Argument of type 'X' is not assignable to parameter of type 'Y'.",
+		);
+	});
+
+	it("returns a defensive copy — mutating the result does not corrupt state", () => {
+		const filePath = `${process.cwd()}/bar.ts`;
+		recordDiagnostics(filePath, [
+			{ severity: "warning", line: 1, rule: "r", message: "m" },
+		]);
+		const first = getFileDiagnosticSummaries()[0];
+		first.diagnostics[0].message = "MUTATED";
+		const second = getFileDiagnosticSummaries()[0];
+		expect(second.diagnostics[0].message).toBe("m");
+	});
+
+	it("exposes the FULL diagnostic set, not the TUI's per-file display cap", () => {
+		const filePath = `${process.cwd()}/many.ts`;
+		// Record 30 warnings — far above MAX_STORED_DIAGNOSTICS_PER_FILE (12).
+		recordDiagnostics(
+			filePath,
+			Array.from({ length: 30 }, (_, i) => ({
+				severity: "warning" as const,
+				line: i + 1,
+				rule: "r",
+				message: `w${i}`,
+			})),
+		);
+		const entry = getFileDiagnosticSummaries().find(
+			(s) => s.filePath === filePath,
+		);
+		expect(entry?.warnings).toBe(30);
+		// The tool must see all 30, not the 12 the widget keeps for rendering.
+		expect(entry?.diagnostics).toHaveLength(30);
+
+		// ...while the TUI-facing stored list stays capped at 12 (no regression).
+		const snap = __testing
+			.getWidgetStateSnapshot()
+			.files.find((f) => f.filePath === filePath);
+		expect(snap?.storedDiagnostics).toBe(12);
+	});
 });
 
 describe("widget-state renderWidget", () => {
@@ -101,15 +200,300 @@ describe("widget-state renderWidget", () => {
 		expect(allLines).not.toContain("error in pi-lens");
 	});
 
-	it("shows formatter name when a formatter changed the file", () => {
+	it("paints the file row red when any diagnostic carries semantic=blocking, even if severity is warning", () => {
+		const filePath = `${process.cwd()}/cors.ts`;
+		recordRunner(filePath, "sonar-rules", "succeeded", 1);
+		recordDiagnostics(filePath, [
+			{
+				severity: "warning",
+				semantic: "blocking",
+				message: "CORS wildcard origin",
+				rule: "cors-wildcard",
+			},
+		]);
+
+		const lines = renderWidget(120, theme);
+		const fileRow = lines.find((l) => l.includes("cors.ts")) ?? "";
+		// red(●) — wrapped in theme color escape; assert the bullet appears
+		// before the filename and that no warning-only triangle preceded it.
+		expect(fileRow).toMatch(/●.*cors\.ts/);
+		expect(fileRow).not.toMatch(/!.*cors\.ts/);
+	});
+
+	it("falls back to severity=error when semantic is absent so plain tsc errors stay red", () => {
+		const filePath = `${process.cwd()}/legacy.ts`;
+		recordRunner(filePath, "type-safety", "failed", 1);
+		recordDiagnostics(filePath, [
+			{
+				severity: "error",
+				message: "TS2451: cannot redeclare",
+				rule: "typescript:2451",
+			},
+		]);
+
+		const lines = renderWidget(120, theme);
+		const fileRow = lines.find((l) => l.includes("legacy.ts")) ?? "";
+		expect(fileRow).toMatch(/●.*legacy\.ts/);
+	});
+
+	it("paints the file row yellow when severity=error but semantic explicitly demotes it", () => {
+		const filePath = `${process.cwd()}/advisory.ts`;
+		recordRunner(filePath, "lint", "succeeded", 1);
+		recordDiagnostics(filePath, [
+			{
+				severity: "error",
+				semantic: "warning",
+				message: "advisory error from non-blocking rule",
+				rule: "advisory-rule",
+			},
+		]);
+
+		const lines = renderWidget(120, theme);
+		const fileRow = lines.find((l) => l.includes("advisory.ts")) ?? "";
+		expect(fileRow).toMatch(/!.*advisory\.ts/);
+		expect(fileRow).not.toMatch(/●.*advisory\.ts/);
+	});
+
+	it("details block lists only blocking diagnostics and omits non-blocking ones entirely", () => {
+		const filePath = `${process.cwd()}/mixed.ts`;
+		recordRunner(filePath, "lint", "succeeded", 3);
+		recordDiagnostics(filePath, [
+			{
+				severity: "warning",
+				semantic: "warning",
+				message: "non-blocking advisory",
+				rule: "advice",
+				line: 10,
+			},
+			{
+				severity: "warning",
+				semantic: "blocking",
+				message: "blocking sonar issue",
+				rule: "cors-wildcard",
+				line: 20,
+			},
+		]);
+
+		const lines = renderWidget(120, theme);
+		const allLines = lines.join("\n");
+		expect(allLines).toContain("blocking sonar issue");
+		expect(allLines).not.toContain("non-blocking advisory");
+	});
+
+	it("omits the divider and filename header in horizontal mode (packed row already names the file)", () => {
+		const filePath = `${process.cwd()}/cors.ts`;
+		recordRunner(filePath, "sonar", "succeeded", 1);
+		recordDiagnostics(filePath, [
+			{
+				severity: "warning",
+				semantic: "blocking",
+				message: "CORS wildcard origin",
+				rule: "cors-wildcard",
+				line: 5,
+			},
+		]);
+
+		const lines = renderWidget(120, theme);
+		const allLines = lines.join("\n");
+		// No horizontal divider
+		expect(allLines).not.toMatch(/─{5,}/);
+		// The filename appears in the packed file row, but NOT as a standalone
+		// dim header line above the diagnostics.
+		const standaloneFilenameHeaders = lines.filter(
+			(l) => l.trim() === l.trim() && /^\s*\[[^m]*m?cors\.ts\[/.test(l),
+		);
+		expect(standaloneFilenameHeaders.length).toBe(0);
+	});
+
+	it("keeps the divider and filename header in vertical fallback for context", () => {
+		const filePath = `${process.cwd()}/cors.ts`;
+		recordRunner(filePath, "sonar", "succeeded", 1);
+		recordDiagnostics(filePath, [
+			{
+				severity: "warning",
+				semantic: "blocking",
+				message: "CORS wildcard origin",
+				rule: "cors-wildcard",
+				line: 5,
+			},
+		]);
+
+		const lines = renderWidget(60, theme);
+		const allLines = lines.join("\n");
+		expect(allLines).toMatch(/─{5,}/);
+	});
+
+	it("shows formatter name when a formatter changed the file (vertical fallback at narrow widths)", () => {
 		const filePath = `${process.cwd()}/app.ts`;
 		recordFormatter(filePath, "biome", true, true);
 		recordFormatter(filePath, "prettier", false, true);
 
-		const lines = renderWidget(120, theme);
+		const lines = renderWidget(60, theme);
 		const allLines = lines.join("");
 
 		expect(allLines).toContain("fmt:biome");
 		expect(allLines).not.toContain("prettier");
+	});
+
+	it("uses the ✎ glyph for formatter-only changes in the horizontal row", () => {
+		const filePath = `${process.cwd()}/app.ts`;
+		recordFormatter(filePath, "biome", true, true);
+
+		const lines = renderWidget(120, theme);
+		const allLines = lines.join("");
+
+		expect(allLines).toContain("✎");
+		expect(allLines).toContain("app.ts");
+		expect(allLines).not.toContain("fmt:biome");
+	});
+
+	it("packs multiple files into a single row at horizontal widths", () => {
+		const a = `${process.cwd()}/alpha.ts`;
+		const b = `${process.cwd()}/beta.ts`;
+		const c = `${process.cwd()}/gamma.ts`;
+		recordRunner(a, "type-safety", "failed", 1);
+		recordDiagnostics(a, [
+			{ severity: "error", semantic: "blocking", message: "boom", rule: "X" },
+		]);
+		recordRunner(b, "eslint", "succeeded", 2);
+		recordDiagnostics(b, [
+			{ severity: "warning", message: "advisory", rule: "Y" },
+			{ severity: "warning", message: "advisory", rule: "Y" },
+		]);
+		recordRunner(c, "tsc", "succeeded", 0);
+		recordDiagnostics(c, []);
+
+		const lines = renderWidget(120, theme);
+		const fileRow = lines.find(
+			(l) =>
+				l.includes("alpha.ts") &&
+				l.includes("beta.ts") &&
+				l.includes("gamma.ts"),
+		);
+		expect(fileRow).toBeDefined();
+		const idxAlpha = (fileRow ?? "").indexOf("alpha.ts");
+		const idxBeta = (fileRow ?? "").indexOf("beta.ts");
+		const idxGamma = (fileRow ?? "").indexOf("gamma.ts");
+		// Blocking-first ordering: alpha (blocking) → beta (warning) → gamma (clean)
+		expect(idxAlpha).toBeGreaterThan(0);
+		expect(idxBeta).toBeGreaterThan(idxAlpha);
+		expect(idxGamma).toBeGreaterThan(idxBeta);
+	});
+
+	it("falls back to vertical layout when width is below the horizontal threshold", () => {
+		const a = `${process.cwd()}/foo.ts`;
+		const b = `${process.cwd()}/bar.ts`;
+		recordRunner(a, "tsc", "succeeded", 0);
+		recordDiagnostics(a, []);
+		recordRunner(b, "tsc", "succeeded", 0);
+		recordDiagnostics(b, []);
+
+		const lines = renderWidget(50, theme);
+		// Vertical: each file on its own line, no packed row contains both.
+		expect(
+			lines.find((l) => l.includes("foo.ts") && l.includes("bar.ts")),
+		).toBeUndefined();
+		expect(lines.some((l) => l.includes("foo.ts"))).toBe(true);
+		expect(lines.some((l) => l.includes("bar.ts"))).toBe(true);
+	});
+
+	it("truncates basenames preserving the extension", () => {
+		const filePath = `${process.cwd()}/extremely-very-much-too-long-component-name-that-clearly-overflows-the-budget.tsx`;
+		recordRunner(filePath, "tsc", "succeeded", 0);
+		recordDiagnostics(filePath, []);
+
+		const lines = renderWidget(70, theme);
+		const allLines = lines.join("\n");
+		expect(allLines).toMatch(/…\.tsx/);
+	});
+
+	it("folds LSP spawning into the header in horizontal mode", () => {
+		recordLsp("typescript-language-server", process.cwd(), "spawn_start");
+
+		const lines = renderWidget(120, theme);
+		const allLines = lines.join("\n");
+		expect(allLines).toContain("LSP↑");
+		expect(allLines).not.toContain("LSP spawning:");
+	});
+
+	it("keeps the LSP spawning tail line in vertical fallback", () => {
+		recordLsp("typescript-language-server", process.cwd(), "spawn_start");
+
+		const lines = renderWidget(50, theme);
+		const allLines = lines.join("\n");
+		expect(allLines).toContain("LSP spawning:");
+	});
+
+	it("appends a +N overflow marker when files do not fit", () => {
+		for (let i = 0; i < 5; i++) {
+			const filePath = `${process.cwd()}/this-is-a-fairly-long-name-${i}.ts`;
+			recordRunner(filePath, "tsc", "succeeded", 0);
+			recordDiagnostics(filePath, []);
+		}
+
+		const lines = renderWidget(70, theme);
+		const allLines = lines.join("\n");
+		expect(allLines).toMatch(/\+\d+/);
+	});
+
+	it("caps stored widget diagnostics per file while preserving warning counts", () => {
+		const filePath = path.join(process.cwd(), "warning-storm.cpp");
+		recordRunner(filePath, "lsp", "succeeded", 40);
+		recordDiagnostics(
+			filePath,
+			Array.from({ length: 40 }, (_, i) => ({
+				severity: "warning",
+				message: `warning ${i + 1}`,
+				rule: "clangd:unused",
+				line: i + 1,
+			})),
+		);
+
+		const snapshot = __testing.getWidgetStateSnapshot();
+		expect(snapshot.files).toHaveLength(1);
+		expect(snapshot.files[0]).toMatchObject({
+			filePath,
+			storedDiagnostics: 12,
+			warnings: 40,
+			errors: 0,
+			blocking: 0,
+		});
+
+		const lines = renderWidget(120, theme);
+		expect(lines.join("\n")).toContain("40W");
+	});
+
+	it("does not churn through transient clean frames during warning-only cxx analysis", () => {
+		const frames: string[] = [];
+		setRenderCallback(() => {
+			frames.push(renderWidget(120, theme).join("\n"));
+		});
+
+		setSessionLanguages(["cpp"]);
+		const filePath = path.join(process.cwd(), "warning-storm.cpp");
+
+		recordLsp("cpp", process.cwd(), "spawn_start");
+		recordLsp("cpp", process.cwd(), "spawn_success", 50);
+		recordRunner(filePath, "lsp", "succeeded", 40, 50);
+		recordRunner(filePath, "cpp-check", "succeeded", 40, 80);
+		recordRunner(filePath, "tree-sitter", "succeeded", 0, 10);
+		recordDiagnostics(
+			filePath,
+			Array.from({ length: 40 }, (_, i) => ({
+				severity: "warning",
+				message: `warning ${i + 1}`,
+				rule: "clangd:unused",
+				line: i + 1,
+			})),
+		);
+
+		const nonEmptyFrames = frames.filter((frame) => frame.trim().length > 0);
+		const finalFrame = nonEmptyFrames.at(-1) ?? "";
+		const intermediateFrames = nonEmptyFrames.slice(0, -1);
+
+		expect(finalFrame).toContain("!40W");
+		expect(finalFrame).toContain("warning-storm.cpp");
+		expect(intermediateFrames.join("\n")).not.toContain("✓ clean");
+		expect(new Set(nonEmptyFrames).size).toBeLessThanOrEqual(3);
 	});
 });

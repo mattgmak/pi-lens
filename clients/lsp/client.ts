@@ -10,19 +10,28 @@
 
 import { spawn as nodeSpawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { existsSync } from "node:fs";
+import { access } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import type { MessageConnection } from "vscode-jsonrpc";
 import { logLatency } from "../latency-logger.js";
+// vscode-jsonrpc v9 ships an `exports` map exposing the Node entry as the
+// `./node` subpath (no `.js`); the old `/node.js` file path no longer resolves.
 import {
 	createMessageConnection,
 	StreamMessageReader,
 	StreamMessageWriter,
-} from "vscode-jsonrpc/node.js";
+} from "vscode-jsonrpc/node";
 
+import { applyWorkspaceEdit } from "./edits.js";
 import type { LSPProcess } from "./launch.js";
 import { normalizeMapKey, uriToPath } from "./path-utils.js";
 import { getStrategy } from "./server-strategies.js";
+
+// Opt-in publishDiagnostics trace (PILENS_PUB_DEBUG=1) — read once, negligible
+// hot-path cost. Surfaces each server's publish behavior (version + count) to
+// diagnose the clean-file affirmative-signal question (#240): which servers
+// publish an empty-with-version set on a clean scan vs go silent.
+const PUB_DEBUG = Boolean(process.env.PILENS_PUB_DEBUG);
 
 // --- Types ---
 
@@ -96,10 +105,24 @@ export interface LSPShutdownOptions {
 	 * unreferences child handles/timers instead of waiting for graceful escalation.
 	 */
 	fast?: boolean;
+	/**
+	 * Set only when the host process itself is exiting (e.g. `session_shutdown`
+	 * during `pi update`), i.e. the event loop is already closing. In that state,
+	 * spawning a child process (the Windows `taskkill /T` tree-kill) makes libuv
+	 * call `uv_async_send` on the closing loop-wakeup handle and hard-aborts
+	 * (Assertion `!(handle->flags & UV_HANDLE_CLOSING)`, `src\win\async.c`). When
+	 * set, we kill via the handle we already hold (synchronous `TerminateProcess`,
+	 * no new async handle) instead of spawning. Distinct from `fast`, which also
+	 * covers mid-session teardowns (subagent/turn boundaries) where the host keeps
+	 * running and the `/T` tree-kill is still wanted to avoid zombie accumulation.
+	 */
+	processExiting?: boolean;
 }
 
 export interface LSPOperationSupport {
 	definition: boolean;
+	typeDefinition: boolean;
+	declaration: boolean;
 	references: boolean;
 	hover: boolean;
 	signatureHelp: boolean;
@@ -164,7 +187,13 @@ export interface LSPClientInfo {
 		change(filePath: string, content: string): Promise<void>;
 	};
 	getDiagnostics(filePath: string): LSPDiagnostic[];
-	waitForDiagnostics(filePath: string, timeoutMs?: number): Promise<void>;
+	/** Monotonic counter bumped when fresh diagnostics are stored for this client. */
+	readonly diagnosticsVersion: number;
+	waitForDiagnostics(
+		filePath: string,
+		timeoutMs?: number,
+		options?: { minVersion?: number },
+	): Promise<void>;
 	/** Get all tracked diagnostics with timestamps (for cascade checking) */
 	getAllDiagnostics(): Map<string, { diags: LSPDiagnostic[]; ts: number }>;
 	pruneDiagnostics(
@@ -174,12 +203,46 @@ export interface LSPClientInfo {
 			diags: LSPDiagnostic[],
 		) => boolean,
 	): number;
+	/**
+	 * Paths of every file with tracked diagnostics. Lets callers resolve
+	 * file existence asynchronously (off the event loop) and then prune with a
+	 * synchronous, in-memory predicate — instead of a blocking `existsSync` per
+	 * file inside `pruneDiagnostics`.
+	 */
+	getTrackedDiagnosticPaths(): string[];
 	/** Capability snapshot for workspace diagnostics support */
 	getWorkspaceDiagnosticsSupport(): LSPWorkspaceDiagnosticsSupport;
 	/** Capability snapshot for navigation/edit operations */
 	getOperationSupport(): LSPOperationSupport;
+	/** Commands the server advertised for workspace/executeCommand (the allowlist) */
+	getAdvertisedCommands(): string[];
+	/** Top-level keys of the raw ServerCapabilities advertised at initialize —
+	 *  the full advertised surface (incl. providers pi-lens does not parse). */
+	getRawCapabilityKeys(): string[];
+	/**
+	 * Run a server command via workspace/executeCommand. Hardened: the command
+	 * MUST be in the server's advertised list or this rejects without sending.
+	 * Any resulting server-initiated workspace/applyEdit is applied during the
+	 * call (and only then).
+	 */
+	executeCommand(
+		command: string,
+		args?: unknown[],
+	): Promise<{ executed: boolean; result?: unknown; reason?: string }>;
 	/** Go to definition — returns Location[] */
 	definition(
+		filePath: string,
+		line: number,
+		character: number,
+	): Promise<LSPLocation[]>;
+	/** Go to the type definition of the symbol at a position */
+	typeDefinition(
+		filePath: string,
+		line: number,
+		character: number,
+	): Promise<LSPLocation[]>;
+	/** Go to the declaration of the symbol at a position */
+	declaration(
 		filePath: string,
 		line: number,
 		character: number,
@@ -222,6 +285,13 @@ export interface LSPClientInfo {
 		character: number,
 		newName: string,
 	): Promise<LSPWorkspaceEdit | null>;
+	/** Ask server for edits before a source file rename. */
+	willRenameFiles(
+		oldFilePath: string,
+		newFilePath: string,
+	): Promise<LSPWorkspaceEdit | null>;
+	/** Notify server after a source file rename. */
+	didRenameFiles(oldFilePath: string, newFilePath: string): Promise<void>;
 	/** Go to implementation */
 	implementation(
 		filePath: string,
@@ -323,17 +393,40 @@ export interface LSPClientState {
 	readonly documentPullDiagnosticTimestamps: Map<string, number>;
 	readonly pendingDiagnostics: Map<string, ReturnType<typeof setTimeout>>;
 	readonly diagnosticEmitter: EventEmitter;
+	diagnosticsVersion: number;
 	readonly documentVersions: Map<string, number>;
+	/** The LSP document version (`publishDiagnostics.version`) the cached
+	 *  diagnostics for a path were computed against. Only set when the server
+	 *  reports a version; absent entries mean "version unknown" and are treated
+	 *  as fresh so version-less servers keep working. */
+	readonly diagnosticDocVersions: Map<string, number>;
 	readonly openDocuments: Set<string>;
 	readonly pendingOpens: Set<string>;
 	/** Mutable: updated by applyDynamicCapabilities after registerCapability events */
 	workspaceDiagnosticsSupport: LSPWorkspaceDiagnosticsSupport;
 	/** Mutable: upgraded by applyDynamicCapabilities after registerCapability events */
 	operationSupport: LSPOperationSupport;
+	/** Top-level keys of the raw ServerCapabilities from initialize (sorted) —
+	 *  captured once; the full advertised surface for diagnostics/documentation. */
+	rawCapabilityKeys?: string[];
 	/** Baseline mode from static initResult — used to revert on unregister */
 	staticDiagnosticsMode: "pull" | "push-only";
 	/** Live dynamic registrations from client/registerCapability: id → method */
 	readonly dynamicRegistrations: Map<string, string>;
+	/**
+	 * Commands the server advertised it can run via workspace/executeCommand
+	 * (initialize `executeCommandProvider.commands` + any dynamically registered
+	 * `registerOptions.commands`). Mutable — dynamic registration adds to it.
+	 * This is the executeCommand allowlist: only members may be executed.
+	 */
+	advertisedCommands: Set<string>;
+	/**
+	 * Gate for server-initiated `workspace/applyEdit`. Bumped only for the
+	 * duration of an explicit executeCommand call; outside that window an
+	 * unsolicited server applyEdit is refused (a server must not push edits to
+	 * disk whenever it likes — only as the direct effect of an opted-in command).
+	 */
+	serverEditsAllowed: number;
 	readonly serverId: string;
 	readonly root: string;
 	readonly lspProcess: LSPProcess;
@@ -355,7 +448,7 @@ function disposeClientConnection(state: LSPClientState): void {
 	}
 }
 
-async function killProcessTree(
+export async function killProcessTree(
 	proc: {
 		kill(signal?: NodeJS.Signals | number): boolean;
 		unref?: () => void;
@@ -364,6 +457,20 @@ async function killProcessTree(
 	options: LSPShutdownOptions = {},
 ): Promise<void> {
 	if (process.platform === "win32" && pid > 0) {
+		// Host process is exiting (loop already closing): never spawn a child here —
+		// the spawn's uv_async_send on the closing loop-wakeup handle hard-aborts
+		// (src\win\async.c). Kill the direct child via the handle we already hold
+		// (TerminateProcess; synchronous, no async handle). Orphaned grandchildren
+		// are reaped by the OS as the host exits.
+		if (options.processExiting) {
+			try {
+				proc.kill();
+			} catch {
+				// best-effort
+			}
+			proc.unref?.();
+			return;
+		}
 		try {
 			// Absolute path avoids PATH-resolution: SystemRoot is set by Windows itself.
 			const taskkill = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\taskkill.exe`;
@@ -419,6 +526,33 @@ async function killProcessTree(
 	}
 }
 
+export function stripDiagnosticNoiseLines(message: string): string {
+	const cleaned = message
+		.split(/\r?\n/)
+		.filter((line) => {
+			const trimmed = line.trim();
+			if (/^for further information visit\b/i.test(trimmed)) return false;
+			if (/^https?:\/\/\S+$/i.test(trimmed)) return false;
+			return true;
+		})
+		.join("\n")
+		.trim();
+	return cleaned || message.trim() || message;
+}
+
+function normalizeLspDiagnostic(diagnostic: LSPDiagnostic): LSPDiagnostic {
+	const message = stripDiagnosticNoiseLines(diagnostic.message);
+	return message === diagnostic.message
+		? diagnostic
+		: { ...diagnostic, message };
+}
+
+function normalizeLspDiagnostics(
+	diagnostics: LSPDiagnostic[],
+): LSPDiagnostic[] {
+	return diagnostics.map(normalizeLspDiagnostic);
+}
+
 function mergeDiagnosticLists(
 	push: LSPDiagnostic[] | undefined,
 	pull: LSPDiagnostic[] | undefined,
@@ -468,6 +602,7 @@ function clearDiagnosticsForPath(
 	state.pushDiagnosticTimestamps?.delete(normalizedPath);
 	state.documentPullDiagnostics?.delete(normalizedPath);
 	state.documentPullDiagnosticTimestamps?.delete(normalizedPath);
+	state.diagnosticDocVersions?.delete(normalizedPath);
 	legacy.diagnostics?.delete(normalizedPath);
 	legacy.diagnosticTimestamps?.delete(normalizedPath);
 }
@@ -476,6 +611,8 @@ function clearDiagnosticsForPath(
 const DYNAMIC_OPERATION_METHOD_MAP: Record<string, keyof LSPOperationSupport> =
 	{
 		"textDocument/definition": "definition",
+		"textDocument/typeDefinition": "typeDefinition",
+		"textDocument/declaration": "declaration",
 		"textDocument/references": "references",
 		"textDocument/hover": "hover",
 		"textDocument/signatureHelp": "signatureHelp",
@@ -525,11 +662,25 @@ function setupIncomingHandlers(
 ): void {
 	state.connection.onNotification(
 		"textDocument/publishDiagnostics",
-		(params: { uri: string; diagnostics?: LSPDiagnostic[] }) => {
+		(params: { uri: string; diagnostics?: LSPDiagnostic[]; version?: number }) => {
 			const filePath = uriToPath(params.uri);
 			const normalizedPath = normalizeMapKey(filePath);
-			const newDiags: LSPDiagnostic[] = params.diagnostics || [];
+			const newDiags = normalizeLspDiagnostics(params.diagnostics || []);
+			const docVersion = params.version;
+			if (PUB_DEBUG) {
+				console.error(
+					`[lsp-pub] server=${state.serverId} pubVersion=${docVersion} docVersion=${state.documentVersions?.get(normalizedPath)} diags=${newDiags.length}`,
+				);
+			}
 			const strategy = getStrategy(state.serverId);
+			// Record the document version these diagnostics were computed against
+			// (when the server reports it) so waitForDiagnostics can reject results
+			// that lag behind the latest didChange instead of serving them as fresh.
+			const recordDocVersion = (): void => {
+				if (docVersion !== undefined) {
+					state.diagnosticDocVersions.set(normalizedPath, docVersion);
+				}
+			};
 
 			// Seed on first push for servers whose first push is known complete.
 			// Bypasses the debounce timer entirely — resolves waiting promises immediately.
@@ -539,6 +690,8 @@ function setupIncomingHandlers(
 			) {
 				state.pushDiagnostics.set(normalizedPath, newDiags);
 				state.pushDiagnosticTimestamps.set(normalizedPath, Date.now());
+				recordDocVersion();
+				state.diagnosticsVersion += 1;
 				state.diagnosticEmitter.emit("diagnostics", normalizedPath);
 				return;
 			}
@@ -549,7 +702,9 @@ function setupIncomingHandlers(
 			const timer = setTimeout(() => {
 				state.pushDiagnostics.set(normalizedPath, newDiags);
 				state.pushDiagnosticTimestamps.set(normalizedPath, Date.now());
+				recordDocVersion();
 				state.pendingDiagnostics.delete(normalizedPath);
+				state.diagnosticsVersion += 1;
 				state.diagnosticEmitter.emit("diagnostics", normalizedPath);
 			}, strategy.debounceMs);
 
@@ -563,11 +718,25 @@ function setupIncomingHandlers(
 	state.connection.onRequest(
 		"client/registerCapability",
 		async (params: {
-			registrations?: Array<{ id: string; method: string }>;
+			registrations?: Array<{
+				id: string;
+				method: string;
+				registerOptions?: { commands?: unknown };
+			}>;
 		}) => {
 			for (const reg of params?.registrations ?? []) {
 				if (reg.id && reg.method) {
 					state.dynamicRegistrations.set(reg.id, reg.method);
+				}
+				// executeCommand commands can arrive dynamically too — merge them
+				// into the allowlist so dynamically-registered commands are runnable.
+				if (
+					reg.method === "workspace/executeCommand" &&
+					Array.isArray(reg.registerOptions?.commands)
+				) {
+					for (const cmd of reg.registerOptions.commands) {
+						if (typeof cmd === "string") state.advertisedCommands.add(cmd);
+					}
 				}
 			}
 			applyDynamicCapabilities(state);
@@ -582,6 +751,31 @@ function setupIncomingHandlers(
 				}
 			}
 			applyDynamicCapabilities(state);
+		},
+	);
+	// Server-initiated edits (the mutation vector for executeCommand). Honored
+	// ONLY while an explicit executeCommand is in flight (serverEditsAllowed > 0);
+	// an unsolicited applyEdit outside that window is refused so a server can't
+	// push edits to disk at will. Applied through the same applyWorkspaceEdit path
+	// as every other edit.
+	state.connection.onRequest(
+		"workspace/applyEdit",
+		async (params: { edit?: { changes?: unknown; documentChanges?: unknown } }) => {
+			if (state.serverEditsAllowed <= 0 || !params?.edit) {
+				return { applied: false, failureReason: "edit not solicited" };
+			}
+			try {
+				await applyWorkspaceEdit(
+					params.edit as Parameters<typeof applyWorkspaceEdit>[0],
+					state.root,
+				);
+				return { applied: true };
+			} catch (err) {
+				return {
+					applied: false,
+					failureReason: err instanceof Error ? err.message : String(err),
+				};
+			}
 		},
 	);
 	state.connection.onRequest("workspace/configuration", async () => [
@@ -625,11 +819,23 @@ function setupConnectionLifecycle(state: LSPClientState): void {
 	});
 }
 
+/**
+ * Outcome of a pull-diagnostics request. Distinguishes an AFFIRMATIVE answer
+ * (the server replied — either `found` with diagnostics or an authoritative
+ * empty `clean`) from `unavailable` (dead client / no reply / thrown). #240: a
+ * failed pull must NEVER be read as clean — only an authoritative empty report
+ * is clean. A bare count conflated the two (0 = clean OR failed).
+ */
+type PullDiagnosticsOutcome =
+	| { status: "found"; count: number }
+	| { status: "clean" }
+	| { status: "unavailable" };
+
 async function clientRequestPullDiagnostics(
 	state: LSPClientState,
 	filePath: string,
-): Promise<number> {
-	if (!isClientAlive(state)) return 0;
+): Promise<PullDiagnosticsOutcome> {
+	if (!isClientAlive(state)) return { status: "unavailable" };
 	const uri = pathToFileURL(filePath).href;
 	try {
 		const report = await safeSendRequest<{
@@ -638,13 +844,14 @@ async function clientRequestPullDiagnostics(
 			relatedDocuments?: Record<string, { items?: LSPDiagnostic[] }>;
 		}>(state.connection, "textDocument/diagnostic", { textDocument: { uri } });
 
-		if (!report) return 0;
+		if (!report) return { status: "unavailable" };
 
 		const normalizedPath = normalizeMapKey(filePath);
-		const primaryItems = report.items ?? [];
+		const primaryItems = normalizeLspDiagnostics(report.items ?? []);
 		const now = Date.now();
 		state.documentPullDiagnostics.set(normalizedPath, primaryItems);
 		state.documentPullDiagnosticTimestamps.set(normalizedPath, now);
+		state.diagnosticsVersion += 1;
 		let totalCount = primaryItems.length;
 
 		if (report.relatedDocuments) {
@@ -652,7 +859,7 @@ async function clientRequestPullDiagnostics(
 				report.relatedDocuments,
 			)) {
 				const relatedPath = uriToPath(relatedUri);
-				const relatedItems = related?.items ?? [];
+				const relatedItems = normalizeLspDiagnostics(related?.items ?? []);
 				state.documentPullDiagnostics.set(
 					normalizeMapKey(relatedPath),
 					relatedItems,
@@ -666,9 +873,11 @@ async function clientRequestPullDiagnostics(
 		}
 
 		state.diagnosticEmitter.emit("diagnostics", normalizedPath);
-		return totalCount;
+		return totalCount > 0
+			? { status: "found", count: totalCount }
+			: { status: "clean" };
 	} catch {
-		return 0;
+		return { status: "unavailable" };
 	}
 }
 
@@ -676,12 +885,39 @@ export async function clientWaitForDiagnostics(
 	state: LSPClientState,
 	filePath: string,
 	timeoutMs: number,
+	options: { minVersion?: number } = {},
 ): Promise<void> {
 	const normalizedPath = normalizeMapKey(filePath);
+	const minVersion = options.minVersion;
+	const hasFreshDiagnostics = (): boolean =>
+		minVersion === undefined || state.diagnosticsVersion > minVersion;
+
+	// Version coherence: a cached push is "stale" only when the server reported
+	// the document version it computed against AND that version lags the latest
+	// didChange we sent. This prevents serving diagnostics from a superseded
+	// version as fresh (e.g. once the redundant double-push is collapsed and the
+	// dispatch wait runs without a push-counter baseline — #203). Unknown version
+	// (server omits it) is treated as current so version-less servers are
+	// unaffected, and the timeout remains the backstop.
+	const isVersionStale = (): boolean => {
+		const cachedVersion = state.diagnosticDocVersions?.get(normalizedPath);
+		if (cachedVersion === undefined) return false;
+		const currentVersion = state.documentVersions?.get(normalizedPath);
+		return currentVersion !== undefined && cachedVersion < currentVersion;
+	};
 
 	if (state.workspaceDiagnosticsSupport.mode === "pull") {
-		const firstPullCount = await clientRequestPullDiagnostics(state, filePath);
-		if (firstPullCount > 0) return;
+		// Pull is authoritative. An AFFIRMATIVE outcome — diagnostics `found`, or
+		// an authoritative empty `clean` report — ends the wait. An `unavailable`
+		// pull (dead client / no reply / thrown) is NOT clean and must not
+		// short-circuit: fall through to the push-wait/timeout backstop. This is
+		// the #240 fix — previously the early-return also fired on
+		// `hasFreshDiagnostics()`, which is unconditionally true when there is no
+		// version baseline (`minVersion === undefined`), so a failed pull returned
+		// 0 and was read as a fresh clean.
+		let outcome = await clientRequestPullDiagnostics(state, filePath);
+		if (outcome.status === "found") return;
+		let sawClean = outcome.status === "clean";
 
 		const strategy = getStrategy(state.serverId);
 		const retryBudgetMs =
@@ -689,24 +925,34 @@ export async function clientWaitForDiagnostics(
 				? Math.min(timeoutMs, strategy.pullRetryBudgetMs)
 				: 0;
 		const startedAt = Date.now();
-		let latestCount = firstPullCount;
 
-		while (latestCount === 0 && Date.now() - startedAt < retryBudgetMs) {
+		// Retry within budget to catch incremental servers whose first pull is
+		// empty while analysis is still running (rust-analyzer). A `clean` seen at
+		// any point is a valid affirmative answer for this touch.
+		while (outcome.status !== "found" && Date.now() - startedAt < retryBudgetMs) {
 			await new Promise((resolve) =>
 				setTimeout(resolve, PULL_DIAGNOSTICS_RETRY_INTERVAL_MS),
 			);
-			latestCount = await clientRequestPullDiagnostics(state, filePath);
+			outcome = await clientRequestPullDiagnostics(state, filePath);
+			if (outcome.status === "clean") sawClean = true;
 		}
-		if (latestCount > 0) return;
+		if (outcome.status === "found" || sawClean) return;
 	}
 
-	if (getMergedDiagnosticsForPath(state, normalizedPath).length > 0) return;
+	if (
+		hasFreshDiagnostics() &&
+		!isVersionStale() &&
+		getMergedDiagnosticsForPath(state, normalizedPath).length > 0
+	) {
+		return;
+	}
 
 	return new Promise<void>((resolve) => {
 		let debounceTimer: ReturnType<typeof setTimeout> | undefined;
 
 		const onDiagnostics = (fp: string) => {
 			if (normalizeMapKey(fp) !== normalizedPath) return;
+			if (!hasFreshDiagnostics() || isVersionStale()) return;
 			if (debounceTimer) clearTimeout(debounceTimer);
 
 			// Adaptive debounce: use time since last push to compute remaining
@@ -757,6 +1003,22 @@ export async function handleNotifyOpen(
 		if (!preserveDiagnostics) {
 			clearDiagnosticsForPath(state, normalizedPath);
 		}
+		// Scanners that only re-scan on a fresh open (opengrep ignores didChange):
+		// close + reopen so the re-edit actually triggers a re-scan instead of
+		// silently publishing nothing.
+		if (getStrategy(state.serverId).reopenOnResync) {
+			await safeSendNotification(state.connection, "textDocument/didClose", {
+				textDocument: { uri },
+			});
+			state.openDocuments.delete(normalizedPath);
+			state.documentVersions.set(normalizedPath, 0);
+			if (!isClientAlive(state)) return;
+			await safeSendNotification(state.connection, "textDocument/didOpen", {
+				textDocument: { uri, languageId, version: 0, text: content },
+			});
+			state.openDocuments.add(normalizedPath);
+			return;
+		}
 		await safeSendNotification(state.connection, "textDocument/didChange", {
 			textDocument: { uri, version },
 			contentChanges: [{ text: content }],
@@ -773,10 +1035,20 @@ export async function handleNotifyOpen(
 	// not reporting a real filesystem change. Avoids N project-wide
 	// rechecks on push-diagnostics LSPs (TypeScript, Python) per CR-1.
 	if (!silent) {
+		// Async existence probe (was a synchronous existsSync on the document-open
+		// path — a stat that blocks the loop during first-read/warm). The notify
+		// type is unchanged: 2 (Changed) when the file exists on disk, else 1
+		// (Created). access() rejects when absent.
+		let fileExists = true;
+		try {
+			await access(filePath);
+		} catch {
+			fileExists = false;
+		}
 		await safeSendNotification(
 			state.connection,
 			"workspace/didChangeWatchedFiles",
-			{ changes: [{ uri, type: existsSync(filePath) ? 2 : 1 }] },
+			{ changes: [{ uri, type: fileExists ? 2 : 1 }] },
 		);
 	}
 
@@ -870,6 +1142,29 @@ async function navRequest<T>(
 		}
 		throw err;
 	}) as Promise<T | undefined>;
+}
+
+async function resolveCodeActionBestEffort(
+	state: LSPClientState,
+	action: LSPCodeAction,
+): Promise<LSPCodeAction> {
+	if (!isClientAlive(state) || action.edit) return action;
+	try {
+		const resolved = await withTimeout(
+			safeSendRequest<LSPCodeAction>(
+				state.connection,
+				"codeAction/resolve",
+				action,
+			),
+			NAV_REQUEST_TIMEOUT_MS,
+		);
+		if (!resolved || typeof resolved !== "object") return action;
+		return { ...action, ...resolved };
+	} catch {
+		// codeAction/resolve is optional. Keep the original lightweight action when
+		// the server does not support resolve or fails to populate an edit.
+		return action;
+	}
 }
 
 // --- Client Factory ---
@@ -1008,7 +1303,9 @@ export async function createLSPClient(options: {
 		documentPullDiagnosticTimestamps: new Map(),
 		pendingDiagnostics: new Map(),
 		diagnosticEmitter,
+		diagnosticsVersion: 0,
 		documentVersions: new Map(),
+		diagnosticDocVersions: new Map(),
 		openDocuments: new Set(),
 		pendingOpens: new Set(),
 		// these are filled in after initialize — cast to avoid two-phase init
@@ -1017,6 +1314,8 @@ export async function createLSPClient(options: {
 		operationSupport: undefined as unknown as LSPOperationSupport,
 		staticDiagnosticsMode: "push-only",
 		dynamicRegistrations: new Map(),
+		advertisedCommands: new Set(),
+		serverEditsAllowed: 0,
 		serverId,
 		root,
 		lspProcess,
@@ -1094,6 +1393,13 @@ export async function createLSPClient(options: {
 	state.workspaceDiagnosticsSupport =
 		detectWorkspaceDiagnosticsSupport(initResult);
 	state.operationSupport = detectOperationSupport(initResult);
+	state.rawCapabilityKeys = Object.keys(
+		(initResult as { capabilities?: Record<string, unknown> })?.capabilities ??
+			{},
+	).sort((a, b) => a.localeCompare(b));
+	for (const cmd of detectExecuteCommands(initResult)) {
+		state.advertisedCommands.add(cmd);
+	}
 	state.staticDiagnosticsMode = state.workspaceDiagnosticsSupport.mode;
 
 	await safeSendNotification(connection, "initialized", {});
@@ -1158,6 +1464,15 @@ export async function createLSPClient(options: {
 			return result;
 		},
 
+		getTrackedDiagnosticPaths() {
+			return [
+				...new Set([
+					...state.pushDiagnostics.keys(),
+					...state.documentPullDiagnostics.keys(),
+				]),
+			];
+		},
+
 		pruneDiagnostics(predicate) {
 			let removed = 0;
 			const keys = new Set([
@@ -1185,17 +1500,81 @@ export async function createLSPClient(options: {
 			return state.operationSupport;
 		},
 
+		getAdvertisedCommands() {
+			return [...state.advertisedCommands];
+		},
+
+		getRawCapabilityKeys() {
+			return state.rawCapabilityKeys ?? [];
+		},
+
+		async executeCommand(command, args) {
+			if (!isClientAlive(state)) {
+				return { executed: false, reason: "lsp client not alive" };
+			}
+			// Hardening: allowlist-by-advertisement. Only commands the server
+			// itself declared (static or dynamic) may run — no arbitrary strings.
+			if (!state.advertisedCommands.has(command)) {
+				return {
+					executed: false,
+					reason: `command "${command}" is not advertised by the ${state.serverId} server`,
+				};
+			}
+			state.serverEditsAllowed += 1;
+			try {
+				const result = await safeSendRequest<unknown>(
+					state.connection,
+					"workspace/executeCommand",
+					{ command, arguments: args ?? [] },
+				);
+				return { executed: true, result };
+			} finally {
+				state.serverEditsAllowed -= 1;
+			}
+		},
+
+		get diagnosticsVersion() {
+			return state.diagnosticsVersion;
+		},
+
 		async waitForDiagnostics(
 			filePath,
 			timeoutMs = DIAGNOSTICS_WAIT_TIMEOUT_MS,
+			options,
 		) {
-			return clientWaitForDiagnostics(state, filePath, timeoutMs);
+			return clientWaitForDiagnostics(state, filePath, timeoutMs, options);
 		},
 
 		async definition(filePath, line, character) {
 			const result = await navRequest<LSPLocation | LSPLocation[]>(
 				state,
 				"textDocument/definition",
+				{
+					textDocument: { uri: pathToFileURL(filePath).href },
+					position: { line, character },
+				},
+			);
+			if (!result) return [];
+			return Array.isArray(result) ? result : [result];
+		},
+
+		async typeDefinition(filePath, line, character) {
+			const result = await navRequest<LSPLocation | LSPLocation[]>(
+				state,
+				"textDocument/typeDefinition",
+				{
+					textDocument: { uri: pathToFileURL(filePath).href },
+					position: { line, character },
+				},
+			);
+			if (!result) return [];
+			return Array.isArray(result) ? result : [result];
+		},
+
+		async declaration(filePath, line, character) {
+			const result = await navRequest<LSPLocation | LSPLocation[]>(
+				state,
+				"textDocument/declaration",
 				{
 					textDocument: { uri: pathToFileURL(filePath).href },
 					position: { line, character },
@@ -1278,9 +1657,12 @@ export async function createLSPClient(options: {
 				},
 			);
 			if (!result || !Array.isArray(result)) return [];
-			return result.filter(
+			const actions = result.filter(
 				(item): item is LSPCodeAction =>
 					typeof item === "object" && item !== null && "title" in item,
+			);
+			return Promise.all(
+				actions.map((action) => resolveCodeActionBestEffort(state, action)),
 			);
 		},
 
@@ -1295,6 +1677,34 @@ export async function createLSPClient(options: {
 				},
 			);
 			return result ?? null;
+		},
+
+		async willRenameFiles(oldFilePath, newFilePath) {
+			const result = await navRequest<LSPWorkspaceEdit>(
+				state,
+				"workspace/willRenameFiles",
+				{
+					files: [
+						{
+							oldUri: pathToFileURL(oldFilePath).href,
+							newUri: pathToFileURL(newFilePath).href,
+						},
+					],
+				},
+			);
+			return result ?? null;
+		},
+
+		async didRenameFiles(oldFilePath, newFilePath) {
+			if (!isClientAlive(state)) return;
+			await safeSendNotification(state.connection, "workspace/didRenameFiles", {
+				files: [
+					{
+						oldUri: pathToFileURL(oldFilePath).href,
+						newUri: pathToFileURL(newFilePath).href,
+					},
+				],
+			});
 		},
 
 		async implementation(filePath, line, character) {
@@ -1477,6 +1887,18 @@ function detectWorkspaceDiagnosticsSupport(
 	};
 }
 
+function detectExecuteCommands(initResult: unknown): string[] {
+	const capabilities =
+		typeof initResult === "object" && initResult !== null
+			? (initResult as { capabilities?: Record<string, unknown> }).capabilities
+			: undefined;
+	const provider = capabilities?.executeCommandProvider;
+	if (typeof provider !== "object" || provider === null) return [];
+	const commands = (provider as { commands?: unknown }).commands;
+	if (!Array.isArray(commands)) return [];
+	return commands.filter((cmd): cmd is string => typeof cmd === "string");
+}
+
 function detectOperationSupport(initResult: unknown): LSPOperationSupport {
 	const capabilities =
 		typeof initResult === "object" && initResult !== null
@@ -1492,6 +1914,8 @@ function detectOperationSupport(initResult: unknown): LSPOperationSupport {
 
 	return {
 		definition: hasProvider("definitionProvider"),
+		typeDefinition: hasProvider("typeDefinitionProvider"),
+		declaration: hasProvider("declarationProvider"),
 		references: hasProvider("referencesProvider"),
 		hover: hasProvider("hoverProvider"),
 		signatureHelp: hasProvider("signatureHelpProvider"),

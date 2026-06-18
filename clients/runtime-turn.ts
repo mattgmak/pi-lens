@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import {
+	appendActionableWarningsHistory,
 	buildActionableWarningsReport,
 	formatActionableWarningsAdvisory,
 	writeActionableWarningsReport,
@@ -20,7 +21,15 @@ import {
 	toRunnerDisplayPath,
 } from "./dispatch/runner-context.js";
 import { getKnipIgnorePatterns } from "./file-utils.js";
+import type { GitleaksResult } from "./gitleaks-client.js";
+import type { GovulncheckResult } from "./govulncheck-client.js";
 import type { KnipClient, KnipIssue, KnipResult } from "./knip-client.js";
+import {
+	PROJECT_DIAGNOSTICS_CACHE_VERSION,
+	writeProjectDiagnosticsDeltaReport,
+} from "./project-diagnostics/cache.js";
+import { knipIssuesToProjectDiagnostics } from "./project-diagnostics/runner-adapters/knip.js";
+import type { ProjectDiagnostic } from "./project-diagnostics/types.js";
 import { logLatency } from "./latency-logger.js";
 import { emitLensTurnFindings } from "./lens-events.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
@@ -144,6 +153,8 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	const turnEndStart = Date.now();
 	const blockerParts: string[] = [];
 	const advisoryParts: string[] = [];
+	const projectDiagnosticsDelta: ProjectDiagnostic[] = [];
+	const projectDiagnosticsSources = new Set<string>();
 
 	// Re-surface inline blockers from this turn that the agent didn't fix.
 	// These were shown inline during write/edit but the agent moved on without resolving them.
@@ -161,7 +172,10 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	//   2. Neighbor-level: each neighbor is claimed by the latest cascade result
 	//      that covers it — suppresses stale neighbor state from earlier writes.
 	const t0 = Date.now();
-	const cascadeResults = runtime.consumeCascadeResults();
+	const cascadeRuns = runtime.consumeCascadeRuns();
+	const cascadeResults = cascadeRuns.flatMap((r) =>
+		r.result ? [r.result] : [],
+	);
 	if (cascadeResults.length > 0) {
 		const seen = new Map<string, (typeof cascadeResults)[number]>();
 		for (const result of cascadeResults) {
@@ -227,13 +241,29 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			},
 		});
 	}
+	const cascadeSkipped = {
+		blockers: 0,
+		non_code: 0,
+		no_neighbors: 0,
+		clean: 0,
+	};
+	for (const r of cascadeRuns) {
+		if (r.skipReason)
+			cascadeSkipped[r.skipReason] = (cascadeSkipped[r.skipReason] ?? 0) + 1;
+	}
 	logLatency({
 		type: "phase",
 		toolName: "turn_end",
 		filePath: cwd,
 		phase: "cascade_merge",
 		durationMs: Date.now() - t0,
-		metadata: { resultCount: cascadeResults.length },
+		metadata: {
+			runsTotal: cascadeRuns.length,
+			resultCount: cascadeResults.length,
+			neighborCount: cascadeRuns.reduce((s, r) => s + r.neighborCount, 0),
+			diagnosticCount: cascadeRuns.reduce((s, r) => s + r.diagnosticCount, 0),
+			skipped: cascadeSkipped,
+		},
 	});
 
 	const t2 = Date.now();
@@ -290,6 +320,12 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					return modifiedSet.has(abs);
 				});
 				knipMeta.newIssues = newIssues.length;
+				if (newIssues.length > 0) {
+					projectDiagnosticsDelta.push(
+						...knipIssuesToProjectDiagnostics(cwd, newIssues),
+					);
+					projectDiagnosticsSources.add("knip");
+				}
 
 				const blockerIssues = newIssues.filter(
 					(i) => i.type === "unlisted" || i.type === "bin",
@@ -338,6 +374,53 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		durationMs: Date.now() - t2,
 		metadata: knipMeta,
 	});
+
+	// govulncheck — surface session_start-cached Go CVE findings as advisory.
+	// No per-turn re-run in this slice; the cache refreshes at next session_start.
+	const govCacheEntry = cacheManager.readCache<GovulncheckResult>(
+		"govulncheck",
+		cwd,
+	);
+	if (govCacheEntry?.data?.findings?.length) {
+		const findings = govCacheEntry.data.findings.slice(0, 5);
+		let report =
+			"🛡️ Go CVEs reachable from this code (govulncheck) — upgrade where possible:\n";
+		for (const f of findings) {
+			const callSite = f.trace.find((t) => t.filename);
+			const where = callSite?.filename
+				? `${toRunnerDisplayPath(cwd, callSite.filename)}${callSite.line ? `:${callSite.line}` : ""}`
+				: (f.module ?? f.packageName ?? "(module)");
+			const fix = f.fixedVersion
+				? ` — upgrade to ${f.fixedVersion} or later`
+				: " — no fix yet, track upstream";
+			report += `  ${f.osv} (${where})${fix}\n`;
+		}
+		if (govCacheEntry.data.findings.length > findings.length) {
+			report += `  … and ${govCacheEntry.data.findings.length - findings.length} more\n`;
+		}
+		advisoryParts.push(report);
+	}
+
+	// gitleaks — surface session_start-cached committed-secret findings.
+	// Treated as a BLOCKER (not advisory) because committed credentials
+	// are real production risk and need rotation before merge.
+	const gitleaksCacheEntry = cacheManager.readCache<GitleaksResult>(
+		"gitleaks",
+		cwd,
+	);
+	if (gitleaksCacheEntry?.data?.findings?.length) {
+		const findings = gitleaksCacheEntry.data.findings.slice(0, 5);
+		let report =
+			"🔴 STOP — committed secrets detected (gitleaks). Rotate the credentials and remove from source:\n";
+		for (const f of findings) {
+			const where = `${toRunnerDisplayPath(cwd, f.file)}:${f.startLine}`;
+			report += `  ${where} — ${f.ruleId}${f.description ? `: ${f.description}` : ""}\n`;
+		}
+		if (gitleaksCacheEntry.data.findings.length > findings.length) {
+			report += `  … and ${gitleaksCacheEntry.data.findings.length - findings.length} more\n`;
+		}
+		blockerParts.push(report);
+	}
 
 	const t3 = Date.now();
 	if (await depChecker.ensureAvailable()) {
@@ -465,6 +548,22 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	// Session summaries are intentionally suppressed at turn_end to avoid
 	// distracting the agent with non-blocking telemetry.
 
+	if (projectDiagnosticsDelta.length > 0) {
+		writeProjectDiagnosticsDeltaReport(cwd, {
+			version: PROJECT_DIAGNOSTICS_CACHE_VERSION,
+			cwd,
+			generatedAt: new Date().toISOString(),
+			sessionId: runtime.telemetrySessionId,
+			turnIndex: runtime.turnIndex,
+			projectSeqStart: runtime.turnStartProjectSeq,
+			projectSeqEnd: runtime.projectSeq,
+			diagnostics: projectDiagnosticsDelta,
+			sources: [...projectDiagnosticsSources].sort((a, b) =>
+				a.localeCompare(b),
+			),
+		});
+	}
+
 	const t4 = Date.now();
 	const modifiedRangesByFile = new Map(
 		Object.entries(turnState.files).map(([file, state]) => [
@@ -497,6 +596,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				dbg,
 			});
 			writeActionableWarningsReport(cacheManager, cwd, report);
+			appendActionableWarningsHistory(cwd, report);
 			const advisory = formatActionableWarningsAdvisory(report);
 			if (advisory) advisoryParts.push(advisory);
 			logActionableWarningsEvent({
@@ -528,6 +628,35 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					error: err instanceof Error ? err.message : String(err),
 				},
 			});
+		}
+	}
+
+	// Call-graph impact analysis — surface WillBreak/MayBreak callers for modified symbols
+	if (runtime.callGraph && files.length > 0) {
+		try {
+			const { impact, formatImpact } = await import("./call-graph.js");
+			const impactLines: string[] = [];
+			for (const filePath of files.slice(0, 5)) {
+				// Find callee keys for this file in the call graph
+				const fileCallerKeys = [...runtime.callGraph.callers.keys()].filter(
+					(k) => k.startsWith(`${filePath}:`),
+				);
+				for (const calleeKey of fileCallerKeys.slice(0, 3)) {
+					const results = impact(runtime.callGraph, calleeKey);
+					if (results.length > 0) {
+						const summary = formatImpact(results, cwd);
+						if (summary)
+							impactLines.push(`  ${calleeKey.split(":").pop()}: ${summary}`);
+					}
+				}
+			}
+			if (impactLines.length > 0) {
+				advisoryParts.push(
+					`📊 Call-graph impact (changed symbols have callers):\n${impactLines.join("\n")}`,
+				);
+			}
+		} catch {
+			// Non-fatal — call graph is best-effort
 		}
 	}
 

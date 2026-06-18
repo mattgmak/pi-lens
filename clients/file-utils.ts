@@ -43,6 +43,22 @@ export function getProjectDataDir(cwd: string): string {
 }
 
 /**
+ * Machine-global pi-lens directory: `~/.pi-lens/`.
+ *
+ * Used for logs (latency, cascade, read-guard, tree-sitter, actionable-warnings,
+ * sessionstart), tool binaries (`~/.pi-lens/tools/`, `~/.pi-lens/bin/`), LSP
+ * server storage, and other state that is intentionally NOT project-scoped
+ * — it spans every project pi-lens has touched.
+ *
+ * Distinct from `getProjectDataDir(cwd)`, which respects `PILENS_DATA_DIR`
+ * and produces per-project subdirectories. Callers writing project caches,
+ * snapshots, or worklogs should use `getProjectDataDir(cwd)` instead.
+ */
+export function getGlobalPiLensDir(): string {
+	return path.join(os.homedir(), ".pi-lens");
+}
+
+/**
  * Directories to exclude from all scans (build outputs, dependencies, caches).
  * Used consistently across all scanners to avoid noise from generated files.
  */
@@ -259,17 +275,33 @@ function buildProjectIgnoreMatcher(
 		return nextPatterns;
 	};
 
+	// Per-matcher path → boolean memo. The matcher itself is cached by
+	// `getProjectIgnoreMatcher` keyed on `.gitignore` mtime, so this Map's
+	// lifetime is bounded to a single set of ignore rules — when any
+	// `.gitignore` changes, the matcher is rebuilt and the memo is dropped
+	// with it. Without this memo, every background scan (comment scan, knip,
+	// jscpd, call-graph, source-filter, pipeline) recomputes O(ancestorDirs ×
+	// patterns) per file, multiplying into 2-3s of pure CPU on a 2k-file
+	// project. With it, the second visitor of the same path is O(1).
+	const isIgnoredMemo = new Map<string, boolean>();
+
 	return {
 		rootDir: resolvedRoot,
 		patterns,
 		isIgnored(filePath: string, isDirectory = false): boolean {
 			const resolved = path.resolve(filePath);
+			// Two namespaces (D: for directory queries, F: for file queries)
+			// because gitignore semantics differ for trailing-slash patterns.
+			const memoKey = (isDirectory ? "D:" : "F:") + resolved;
+			const cached = isIgnoredMemo.get(memoKey);
+			if (cached !== undefined) return cached;
 			const rootRelative = path.relative(resolvedRoot, resolved);
 			if (
 				!rootRelative ||
 				rootRelative.startsWith("..") ||
 				path.isAbsolute(rootRelative)
 			) {
+				isIgnoredMemo.set(memoKey, false);
 				return false;
 			}
 
@@ -289,6 +321,7 @@ function buildProjectIgnoreMatcher(
 					ignored = !pattern.negated;
 				}
 			}
+			isIgnoredMemo.set(memoKey, ignored);
 			return ignored;
 		},
 	};

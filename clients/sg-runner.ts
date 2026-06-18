@@ -9,12 +9,9 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import {
-	getSgCommand,
-	isSgAvailable,
-} from "./dispatch/runners/utils/runner-helpers.js";
+import { getSgCommand } from "./dispatch/runners/utils/runner-helpers.js";
 import { getProjectIgnoreGlobs } from "./file-utils.js";
-import { safeSpawn, safeSpawnAsync } from "./safe-spawn.js";
+import { safeSpawnAsync } from "./safe-spawn.js";
 
 /**
  * Escape an argument for Windows cmd.exe shell execution.
@@ -28,11 +25,34 @@ function escapeWindowsArg(arg: string): string {
 	return `"${arg.replace(/"/g, '""')}"`;
 }
 
+/**
+ * Build the `bash -c` argv that runs `cmd` with `allArgs` as POSITIONAL
+ * parameters. The script is the constant `"$0" "$@"`, so bash re-emits the
+ * command and every arg verbatim — no parameter expansion, no word-splitting.
+ *
+ * Two properties this guarantees, neither of which string-interpolation could:
+ *  - ast-grep `$METAVAR` patterns reach the binary literally (not shell-expanded).
+ *  - an environment-derived command path (PATH-resolved `ast-grep`/`sg`/`npx`)
+ *    cannot inject shell — it's argv[0], never part of the script string
+ *    (CodeQL js/shell-command-injection-from-environment).
+ */
+export function buildBashRunArgs(cmd: string, allArgs: string[]): string[] {
+	return ["-c", '"$0" "$@"', cmd, ...allArgs];
+}
+
 function sgExcludeArgsForProject(rootDir: string): string[] {
 	return getProjectIgnoreGlobs(rootDir).flatMap((glob) => [
 		"--globs",
 		`!${glob}`,
 	]);
+}
+
+interface SgMetaVarNode {
+	text: string;
+	range: {
+		start: { line: number; column: number };
+		end: { line: number; column: number };
+	};
 }
 
 export interface SgMatch {
@@ -42,7 +62,14 @@ export interface SgMatch {
 		end: { line: number; column: number };
 	};
 	text: string;
+	lines?: string;
+	language?: string;
 	replacement?: string;
+	metaVariables?: {
+		single: Record<string, SgMetaVarNode>;
+		multi: Record<string, SgMetaVarNode[]>;
+		transformed: Record<string, string>;
+	};
 }
 
 export interface SgResult {
@@ -52,11 +79,48 @@ export interface SgResult {
 	error?: string;
 }
 
+export interface SgRawResult {
+	stdout: string;
+	stderr: string;
+	status: number | null;
+	error?: string;
+}
+
+/**
+ * Format metavariable captures for display below a match line.
+ * Single captures: $VAR=x  $NAME=foo
+ * Multi captures:  $$$ARGS=a,b,c
+ * Returns undefined when there are no meaningful captures.
+ */
+function formatMetaVarCaptures(
+	mv: SgMatch["metaVariables"],
+): string | undefined {
+	if (!mv) return undefined;
+	const parts: string[] = [];
+
+	for (const [name, node] of Object.entries(mv.single)) {
+		if (node.text) parts.push(`$${name}=${node.text}`);
+	}
+	for (const [name, nodes] of Object.entries(mv.multi)) {
+		if (nodes.length > 0) {
+			const joined = nodes.map((n) => n.text).join("");
+			if (joined) parts.push(`$$$${name}=${joined}`);
+		}
+	}
+	for (const [name, value] of Object.entries(mv.transformed)) {
+		if (value) parts.push(`@${name}=${value}`);
+	}
+
+	if (parts.length === 0) return undefined;
+	return `  ${parts.join("  ")}`;
+}
+
 export class SgRunner {
 	private log: (msg: string) => void;
 	private sgPath: string | null = null;
 	private sgArgsPrefix: string[] = [];
 	private available: boolean | null = null;
+	private ensureInFlight: Promise<boolean> | null = null;
 
 	constructor(verbose = false) {
 		this.log = verbose
@@ -65,14 +129,29 @@ export class SgRunner {
 	}
 
 	/**
-	 * Check if ast-grep CLI is available, auto-install if not
+	 * Check if ast-grep CLI is available, auto-install if not.
+	 *
+	 * Re-entrancy safe: concurrent first-time callers share a single
+	 * `ensureInFlight` promise so probing/auto-install isn't duplicated
+	 * across session-start tasks. Mirrors the dedupe pattern in
+	 * `KnipClient.ensureAvailable` and `DependencyChecker.ensureAvailable`.
 	 */
 	async ensureAvailable(): Promise<boolean> {
-		// Fast path: already checked
+		// Fast path: already checked.
 		if (this.available !== null) return this.available;
+		if (this.ensureInFlight) return this.ensureInFlight;
 
-		// Check PATH first. Prefer the canonical ast-grep binary; on Linux,
-		// /usr/bin/sg is the util-linux group-switch command and is not ast-grep.
+		this.ensureInFlight = this.doEnsureAvailable();
+		try {
+			return await this.ensureInFlight;
+		} finally {
+			this.ensureInFlight = null;
+		}
+	}
+
+	private async doEnsureAvailable(): Promise<boolean> {
+		// Step 1: PATH — canonical binary names + npx fallback.
+		// Prefer ast-grep over sg on Linux: /usr/bin/sg is util-linux, not ast-grep.
 		const pathCommand = await this.probeCommandCandidates([
 			{ cmd: "ast-grep", argsPrefix: [] },
 			{ cmd: "sg", argsPrefix: [] },
@@ -82,11 +161,35 @@ export class SgRunner {
 			this.sgPath = pathCommand.cmd;
 			this.sgArgsPrefix = pathCommand.argsPrefix;
 			this.available = true;
-			this.log(`ast-grep found: ${pathCommand.cmd}`);
+			this.log(`ast-grep found on PATH: ${pathCommand.cmd}`);
 			return true;
 		}
 
-		// Auto-install via pi-lens installer
+		// Step 2: platform-specific npm package binaries.
+		// Covers setups where @ast-grep/cli-{os}-{arch} is installed but the binary
+		// directory is not on PATH (common with pnpm, Yarn PnP, or isolated installs).
+		const platformBinary = await this.probePlatformPackageBinary();
+		if (platformBinary) {
+			this.sgPath = platformBinary;
+			this.sgArgsPrefix = [];
+			this.available = true;
+			this.log(`ast-grep found via platform package: ${platformBinary}`);
+			return true;
+		}
+
+		// Step 3: Homebrew (macOS only).
+		if (process.platform === "darwin") {
+			const brewBinary = await this.probeHomebrew();
+			if (brewBinary) {
+				this.sgPath = brewBinary;
+				this.sgArgsPrefix = [];
+				this.available = true;
+				this.log(`ast-grep found via Homebrew: ${brewBinary}`);
+				return true;
+			}
+		}
+
+		// Step 4: auto-install via pi-lens installer.
 		this.log("ast-grep not found, attempting auto-install...");
 		const { ensureTool } = await import("./installer/index.js");
 		const installedPath = await ensureTool("ast-grep");
@@ -104,14 +207,70 @@ export class SgRunner {
 	}
 
 	/**
-	 * Check if ast-grep CLI is available (legacy sync method)
-	 * Prefer ensureAvailable() for auto-install behavior
+	 * Probe platform-specific @ast-grep/cli-{os}-{arch} npm packages.
+	 * These ship the binary at the package root (sg / sg.exe).
 	 */
-	isAvailable(): boolean {
-		if (this.available !== null) return this.available;
+	private async probePlatformPackageBinary(): Promise<string | undefined> {
+		const { platform, arch } = process;
+		const exeName = platform === "win32" ? "sg.exe" : "sg";
 
-		this.available = isSgAvailable();
-		return this.available;
+		// Map Node.js platform/arch to @ast-grep/cli package suffix.
+		const pkgSuffixes: string[] = [];
+		if (platform === "linux" && arch === "x64") pkgSuffixes.push("linux-x64-gnu");
+		if (platform === "linux" && arch === "arm64") pkgSuffixes.push("linux-arm64-gnu");
+		if (platform === "darwin" && arch === "arm64") pkgSuffixes.push("darwin-arm64");
+		if (platform === "darwin" && arch === "x64") pkgSuffixes.push("darwin-x64");
+		if (platform === "win32" && arch === "x64") pkgSuffixes.push("win32-x64-msvc");
+		if (platform === "win32" && arch === "arm64") pkgSuffixes.push("win32-arm64-msvc");
+
+		// Search roots: local node_modules and any parent node_modules directories.
+		const searchRoots: string[] = [];
+		let dir = process.cwd();
+		for (let depth = 0; depth < 5; depth++) {
+			searchRoots.push(path.join(dir, "node_modules"));
+			const parent = path.dirname(dir);
+			if (parent === dir) break;
+			dir = parent;
+		}
+
+		for (const suffix of pkgSuffixes) {
+			const pkgName = `@ast-grep/cli-${suffix}`;
+			for (const root of searchRoots) {
+				const candidate = path.join(root, pkgName, exeName);
+				try {
+					if (fs.existsSync(candidate) && (await this.probeCommand(candidate, []))) {
+						return candidate;
+					}
+				} catch {
+					// not found or not executable — try next
+				}
+			}
+		}
+		return undefined;
+	}
+
+	/**
+	 * Probe Homebrew installation (macOS only).
+	 * Runs `brew --prefix ast-grep` and checks the resulting bin directory.
+	 */
+	private async probeHomebrew(): Promise<string | undefined> {
+		try {
+			const result = await safeSpawnAsync("brew", ["--prefix", "ast-grep"], {
+				timeout: 3000,
+			});
+			if (result.error || result.status !== 0) return undefined;
+			const prefix = result.stdout.trim();
+			if (!prefix) return undefined;
+			for (const name of ["ast-grep", "sg"]) {
+				const candidate = path.join(prefix, "bin", name);
+				if (fs.existsSync(candidate) && (await this.probeCommand(candidate, []))) {
+					return candidate;
+				}
+			}
+		} catch {
+			// brew not installed or timed out
+		}
+		return undefined;
 	}
 
 	private isAstGrepVersionOutput(output: string): boolean {
@@ -153,6 +312,21 @@ export class SgRunner {
 		};
 	}
 
+	async execRaw(args: string[], timeout = 30000): Promise<SgRawResult> {
+		const command = this.getSgCommand();
+		const result = await safeSpawnAsync(
+			command.cmd,
+			[...command.argsPrefix, ...args],
+			{ timeout },
+		);
+		return {
+			stdout: result.stdout,
+			stderr: result.stderr,
+			status: result.status,
+			error: result.error?.message,
+		};
+	}
+
 	/**
 	 * Run ast-grep asynchronously, return parsed matches
 	 */
@@ -167,24 +341,15 @@ export class SgRunner {
 
 			let proc;
 			if (isWindows && hasBash) {
-				// Use bash -c with properly escaped command
-				// In bash, use single quotes around arguments containing $ to prevent expansion
-				const escapedArgs = allArgs.map((arg) => {
-					// For bash, wrap $-containing args in single quotes
-					if (arg.includes("$")) {
-						return `'${arg.replace(/'/g, "'\\''")}'`;
-					}
-					// For other args with spaces/special chars, use double quotes
-					if (/[\s"]/.test(arg)) {
-						return `"${arg.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
-					}
-					return arg;
-				});
-				const escapedCmd = /[\s"]/g.test(command.cmd)
-					? `"${command.cmd.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
-					: command.cmd;
-				const bashCommand = `${escapedCmd} ${escapedArgs.join(" ")}`;
-				proc = spawn("bash", ["-c", bashCommand], {
+				// Run via bash (Git Bash/MSYS2) so $-metavariables in ast-grep
+				// patterns aren't shell-expanded. Pass the command + args as
+				// POSITIONAL parameters (`"$0"`/`"$@"`) instead of interpolating
+				// them into the -c string: bash re-emits `"$@"` verbatim — no
+				// parameter expansion, no word-splitting — so patterns stay literal
+				// AND an environment-derived command path cannot inject shell
+				// (fixes CodeQL js/shell-command-injection-from-environment). This
+				// also removes the brittle hand-rolled quoting it replaced.
+				proc = spawn("bash", buildBashRunArgs(command.cmd, allArgs), {
 					stdio: ["ignore", "pipe", "pipe"],
 					windowsHide: true,
 				});
@@ -288,23 +453,6 @@ export class SgRunner {
 		});
 	}
 
-	/**
-	 * Run ast-grep synchronously (for simple scans)
-	 */
-	execSync(args: string[]): { output: string; error?: string } {
-		const { cmd: sgCmd, args: sgPre } = getSgCommand();
-		const result = safeSpawn(sgCmd, [...sgPre, ...args], {
-			timeout: 30000,
-		});
-
-		if (result.error) {
-			return { output: "", error: result.error.message };
-		}
-
-		const output = result.stdout || result.stderr || "";
-		return { output };
-	}
-
 	// --- Shared helpers for temp-dir rule scans ---
 
 	private prepareTempScan(
@@ -340,39 +488,6 @@ export class SgRunner {
 		}
 	}
 
-	/**
-	 * Run a temporary rule scan (creates temp dir with rule file)
-	 */
-	tempScan(
-		dir: string,
-		ruleId: string,
-		ruleYaml: string,
-		timeout = 30000,
-	): SgMatch[] {
-		const { sessionDir, configFile } = this.prepareTempScan(ruleId, ruleYaml);
-		try {
-			const { cmd: sgCmd, args: sgPre } = getSgCommand();
-			const result = safeSpawn(
-				sgCmd,
-				[
-					...sgPre,
-					"scan",
-					"--config",
-					configFile,
-					"--json",
-					...sgExcludeArgsForProject(dir),
-					dir,
-				],
-				{ timeout },
-			);
-			return this.parseScanOutput(result.stdout || result.stderr || "");
-		} catch {
-			return [];
-		} finally {
-			this.cleanupTempScan(sessionDir);
-		}
-	}
-
 	async tempScanAsync(
 		dir: string,
 		ruleId: string,
@@ -403,9 +518,57 @@ export class SgRunner {
 		}
 	}
 
-	/** Run a rule file scan — delegates to tempScan with a fixed rule id. */
-	scanWithRule(ruleYaml: string, dir: string, timeout = 30000): SgMatch[] {
-		return this.tempScan(dir, "rule", ruleYaml, timeout);
+	/**
+	 * Run a rule scan with optional fix application.
+	 * Dry-run: --json (returns matches for preview).
+	 * Apply:   --update-all (writes fixes defined in the YAML `fix:` field).
+	 */
+	async tempScanWithFixAsync(
+		dir: string,
+		ruleId: string,
+		ruleYaml: string,
+		applyFixes: boolean,
+		timeout = 30000,
+	): Promise<{ matches: SgMatch[]; error?: string }> {
+		const { sessionDir, configFile } = this.prepareTempScan(ruleId, ruleYaml);
+		try {
+			const { cmd: sgCmd, args: sgPre } = getSgCommand();
+			if (!applyFixes) {
+				const result = await safeSpawnAsync(
+					sgCmd,
+					[...sgPre, "scan", "--config", configFile, "--json",
+						...sgExcludeArgsForProject(dir), dir],
+					{ timeout },
+				);
+				return { matches: this.parseScanOutput(result.stdout || result.stderr || "") };
+			}
+			// Apply: capture matches BEFORE writing — once --update-all applies
+			// the fix the rule no longer matches, so a post-apply json pass would
+			// report zero even on a successful apply. Count first, then write.
+			const jsonResult = await safeSpawnAsync(
+				sgCmd,
+				[...sgPre, "scan", "--config", configFile, "--json",
+					...sgExcludeArgsForProject(dir), dir],
+				{ timeout },
+			);
+			const matches = this.parseScanOutput(
+				jsonResult.stdout || jsonResult.stderr || "",
+			);
+			const applyResult = await safeSpawnAsync(
+				sgCmd,
+				[...sgPre, "scan", "--config", configFile, "--update-all",
+					...sgExcludeArgsForProject(dir), dir],
+				{ timeout },
+			);
+			if (applyResult.error) {
+				return { matches: [], error: applyResult.error.message };
+			}
+			return { matches };
+		} catch (err) {
+			return { matches: [], error: String(err) };
+		} finally {
+			this.cleanupTempScan(sessionDir);
+		}
 	}
 
 	/**
@@ -421,7 +584,7 @@ export class SgRunner {
 			if (showModeIndicator) {
 				return isDryRun
 					? "[DRY-RUN] No matches found."
-					: "[APPLIED] No changes made (no matches found).";
+					: "[NOT APPLIED] No matches found — nothing was changed. Run ast_grep_search to confirm the pattern matches before applying.";
 			}
 			return "No matches found";
 		}
@@ -430,9 +593,13 @@ export class SgRunner {
 		const lines = shown.map((m) => {
 			const loc = `${m.file}:${m.range.start.line + 1}:${m.range.start.column + 1}`;
 			const text = m.text.length > 100 ? `${m.text.slice(0, 100)}...` : m.text;
-			return isDryRun && m.replacement
-				? `${loc}\n  - ${text}\n  + ${m.replacement}`
-				: `${loc}: ${text}`;
+			const langSuffix = m.language ? `  [${m.language}]` : "";
+			const base =
+				isDryRun && m.replacement
+					? `${loc}\n  - ${text}\n  + ${m.replacement}`
+					: `${loc}: ${text}${langSuffix}`;
+			const captures = formatMetaVarCaptures(m.metaVariables);
+			return captures ? `${base}\n${captures}` : base;
 		});
 
 		if (matches.length > maxItems) {

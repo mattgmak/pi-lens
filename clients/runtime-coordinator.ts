@@ -1,11 +1,12 @@
 import { randomBytes } from "node:crypto";
 import * as path from "node:path";
 import type { ActionableWarningRecord } from "./actionable-warnings.js";
-import type { CascadeResult } from "./cascade-types.js";
+import type { FunctionCallGraph } from "./call-graph.js";
+import type { WordIndex } from "./word-index.js";
+import type { CascadeRun } from "./cascade-types.js";
 import type { CodeQualityWarningRecord } from "./code-quality-warnings.js";
 import type { FileComplexity } from "./complexity-client.js";
 import { normalizeMapKey } from "./path-utils.js";
-import type { ProjectIndex } from "./project-index.js";
 import { ReadGuard } from "./read-guard.js";
 import type { RuleScanResult } from "./rules-scanner.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
@@ -25,8 +26,13 @@ export interface DeferredFormatRecord {
 	filePath: string;
 	/** Formatter/language cwd captured when the edit was analyzed. */
 	cwd: string;
-	/** Workspace/project cwd used for turn-state and change-log bookkeeping. */
-	turnStateCwd?: string;
+	/**
+	 * Workspace/project cwd used for turn-state and change-log bookkeeping.
+	 * Required: omitting it silently routes bookkeeping through `record.cwd`
+	 * (the language root), which is the monorepo-cwd-mismatch bug PR #105
+	 * fixed. The agent-end consumer trusts this is set.
+	 */
+	turnStateCwd: string;
 	firstTouchedAt: number;
 	lastTouchedAt: number;
 	toolNames: Set<"write" | "edit">;
@@ -39,9 +45,8 @@ export class RuntimeCoordinator {
 	private _errorDebtBaseline: ErrorDebtBaseline | null = null;
 	private _pipelineCrashCounts = new Map<string, number>();
 	private _cachedExports = new Map<string, string>();
-	private _cachedProjectIndex: ProjectIndex | null = null;
 	private _startupScansInFlight = new Map<string, number>();
-	private _cascadeResults: CascadeResult[] = [];
+	private _cascadeRuns: CascadeRun[] = [];
 	private _cascadeSessionStats: CascadeSessionStats = {
 		runs: 0,
 		diagnosticsSurfaced: 0,
@@ -55,6 +60,8 @@ export class RuntimeCoordinator {
 		hasCustomRules: false,
 	};
 	private _telemetrySessionId = `lens-${Date.now().toString(36)}`;
+	private _lifecycleReason: string | undefined;
+	private _hasStableSessionId = false;
 	private _telemetryModel = "unknown";
 	private _turnIndex = 0;
 	private _writeIndex = 0;
@@ -63,6 +70,8 @@ export class RuntimeCoordinator {
 	private readonly _fileSeq = new Map<string, number>();
 	private _gitGuardHasBlockers = false;
 	private _gitGuardSummary = "";
+	callGraph: FunctionCallGraph | null = null;
+	wordIndex: WordIndex | null = null;
 	private _readGuard: ReadGuard | null = null;
 	private readonly _pendingDeferredFormatFiles = new Map<
 		string,
@@ -91,9 +100,9 @@ export class RuntimeCoordinator {
 		this._complexityBaselines.clear();
 		this._pipelineCrashCounts.clear();
 		this._cachedExports.clear();
-		this._cachedProjectIndex = null;
+		this.wordIndex = null;
 		this._startupScansInFlight.clear();
-		this._cascadeResults = [];
+		this._cascadeRuns = [];
 		this._cascadeSessionStats = {
 			runs: 0,
 			diagnosticsSurfaced: 0,
@@ -102,6 +111,7 @@ export class RuntimeCoordinator {
 		this._fixedThisTurn.clear();
 		this._reportedThisTurn.clear();
 		this._telemetrySessionId = `lens-${Date.now().toString(36)}-${randomBytes(4).toString("hex")}`;
+		this._hasStableSessionId = false;
 		this._telemetryModel = "unknown";
 		this._turnIndex = 0;
 		this._writeIndex = 0;
@@ -160,7 +170,7 @@ export class RuntimeCoordinator {
 	}
 
 	beginTurn(): void {
-		this._cascadeResults = [];
+		this._cascadeRuns = [];
 		this._pendingInlineBlockers.clear();
 		this._actionableWarningsThisTurn.clear();
 		this._codeQualityWarningsThisTurn.clear();
@@ -204,6 +214,33 @@ export class RuntimeCoordinator {
 
 	get telemetrySessionId(): string {
 		return this._telemetrySessionId;
+	}
+
+	/**
+	 * Pin the session identity to pi's STABLE session id and record why this
+	 * session started (#190). Called AFTER {@link resetForSession} (which assigns
+	 * a fresh random id), so the stable id — when pi provides one via
+	 * `ctx.sessionManager.getSessionId()` — wins and survives a quit→resume.
+	 */
+	setSessionLifecycle(args: {
+		sessionId?: string;
+		reason?: string;
+	}): void {
+		if (args.sessionId && args.sessionId.trim()) {
+			this._telemetrySessionId = args.sessionId.trim();
+			this._hasStableSessionId = true;
+		}
+		this._lifecycleReason = args.reason;
+	}
+
+	/** Why the current session started: new | resume | fork | reload | startup. */
+	get sessionLifecycleReason(): string | undefined {
+		return this._lifecycleReason;
+	}
+
+	/** True once a stable pi session id has been pinned (vs the random fallback). */
+	get hasStableSessionId(): boolean {
+		return this._hasStableSessionId;
 	}
 
 	get telemetryModel(): string {
@@ -320,22 +357,14 @@ export class RuntimeCoordinator {
 		return this._cachedExports;
 	}
 
-	get cachedProjectIndex(): ProjectIndex | null {
-		return this._cachedProjectIndex;
+	appendCascadeRun(run: CascadeRun): void {
+		this._cascadeRuns.push(run);
 	}
 
-	set cachedProjectIndex(value: ProjectIndex | null) {
-		this._cachedProjectIndex = value;
-	}
-
-	appendCascadeResult(result: CascadeResult): void {
-		this._cascadeResults.push(result);
-	}
-
-	consumeCascadeResults(): CascadeResult[] {
-		const results = this._cascadeResults;
-		this._cascadeResults = [];
-		return results;
+	consumeCascadeRuns(): CascadeRun[] {
+		const runs = this._cascadeRuns;
+		this._cascadeRuns = [];
+		return runs;
 	}
 
 	recordInlineBlockers(filePath: string, summary: string): void {
@@ -408,7 +437,7 @@ export class RuntimeCoordinator {
 		filePath: string,
 		cwd: string,
 		toolName: "write" | "edit",
-		turnStateCwd?: string,
+		turnStateCwd: string,
 	): void {
 		const key = path.resolve(filePath);
 		const now = Date.now();
@@ -416,7 +445,7 @@ export class RuntimeCoordinator {
 		if (existing) {
 			existing.lastTouchedAt = now;
 			existing.cwd = cwd;
-			existing.turnStateCwd = turnStateCwd ?? existing.turnStateCwd;
+			existing.turnStateCwd = turnStateCwd;
 			existing.toolNames.add(toolName);
 			return;
 		}

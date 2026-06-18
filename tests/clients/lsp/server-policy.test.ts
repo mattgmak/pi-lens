@@ -49,102 +49,6 @@ describe("lsp server policy", () => {
 		expect(missing).toEqual([]);
 	});
 
-	it("does not activate eslint LSP for package.json-only JS packages", async () => {
-		const { ESLintServer } = await import("../../../clients/lsp/server.js");
-		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-eslint-empty-"));
-		dirs.push(tmp);
-
-		const file = path.join(tmp, "src", "index.js");
-		fs.mkdirSync(path.dirname(file), { recursive: true });
-		fs.writeFileSync(
-			path.join(tmp, "package.json"),
-			JSON.stringify({ name: "plain" }),
-		);
-		fs.writeFileSync(file, "console.log('ok');\n");
-
-		await expect(ESLintServer.root(file)).resolves.toBeUndefined();
-	});
-
-	it("activates eslint LSP when an eslint config file exists", async () => {
-		const { ESLintServer } = await import("../../../clients/lsp/server.js");
-		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-eslint-file-"));
-		dirs.push(tmp);
-
-		const file = path.join(tmp, "src", "index.js");
-		fs.mkdirSync(path.dirname(file), { recursive: true });
-		fs.writeFileSync(
-			path.join(tmp, "package.json"),
-			JSON.stringify({ name: "configured" }),
-		);
-		fs.writeFileSync(
-			path.join(tmp, "eslint.config.js"),
-			"export default [];\n",
-		);
-		fs.writeFileSync(file, "console.log('ok');\n");
-
-		await expect(ESLintServer.root(file)).resolves.toBe(tmp);
-	});
-
-	it("activates eslint LSP when package.json declares eslint config", async () => {
-		const { ESLintServer } = await import("../../../clients/lsp/server.js");
-		const tmp = fs.mkdtempSync(
-			path.join(os.tmpdir(), "pi-lens-eslint-config-"),
-		);
-		dirs.push(tmp);
-
-		const file = path.join(tmp, "src", "index.js");
-		fs.mkdirSync(path.dirname(file), { recursive: true });
-		fs.writeFileSync(
-			path.join(tmp, "package.json"),
-			JSON.stringify({ name: "configured", eslintConfig: { root: true } }),
-		);
-		fs.writeFileSync(file, "console.log('ok');\n");
-
-		await expect(ESLintServer.root(file)).resolves.toBe(tmp);
-	});
-
-	it("activates eslint LSP when nearest package depends on eslint", async () => {
-		const { ESLintServer } = await import("../../../clients/lsp/server.js");
-		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-eslint-dep-"));
-		dirs.push(tmp);
-
-		const file = path.join(tmp, "src", "index.js");
-		fs.mkdirSync(path.dirname(file), { recursive: true });
-		fs.writeFileSync(
-			path.join(tmp, "package.json"),
-			JSON.stringify({
-				name: "configured",
-				devDependencies: { eslint: "^9.0.0" },
-			}),
-		);
-		fs.writeFileSync(file, "console.log('ok');\n");
-
-		await expect(ESLintServer.root(file)).resolves.toBe(tmp);
-	});
-
-	it("does not let parent eslint config activate a nested package without eslint", async () => {
-		const { ESLintServer } = await import("../../../clients/lsp/server.js");
-		const tmp = fs.mkdtempSync(
-			path.join(os.tmpdir(), "pi-lens-eslint-boundary-"),
-		);
-		dirs.push(tmp);
-
-		const nested = path.join(tmp, "packages", "plain");
-		const file = path.join(nested, "src", "index.js");
-		fs.mkdirSync(path.dirname(file), { recursive: true });
-		fs.writeFileSync(
-			path.join(tmp, "eslint.config.js"),
-			"export default [];\n",
-		);
-		fs.writeFileSync(
-			path.join(nested, "package.json"),
-			JSON.stringify({ name: "plain" }),
-		);
-		fs.writeFileSync(file, "console.log('ok');\n");
-
-		await expect(ESLintServer.root(file)).resolves.toBeUndefined();
-	});
-
 	it("prioritizes go.work root over go.mod", async () => {
 		const { PriorityRoot } = await import("../../../clients/lsp/server.js");
 		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-go-root-"));
@@ -1071,4 +975,35 @@ describe("lsp server policy", () => {
 			expect(forceCalls).toHaveLength(0);
 		});
 	});
+});
+
+describe("heavy workspace servers do not fall back to per-file dirs (#201)", () => {
+	it("RustServer.root → undefined when no Cargo manifest exists", async () => {
+		const { RustServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-rust-nomanifest-"));
+		dirs.push(tmp);
+		const file = path.join(tmp, "src", "main.rs");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, "fn main() {}\n");
+
+		// Previously fell back to FileDirRoot (the file's dir) → one rust-analyzer
+		// per directory while scaffolding. Now no manifest ⇒ no spawn.
+		await expect(RustServer.root(file)).resolves.toBeUndefined();
+	});
+
+	it("RustServer.root → the crate root when a Cargo.toml exists", async () => {
+		const { RustServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-rust-manifest-"));
+		dirs.push(tmp);
+		const file = path.join(tmp, "src", "main.rs");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(path.join(tmp, "Cargo.toml"), '[package]\nname = "x"\n');
+		fs.writeFileSync(file, "fn main() {}\n");
+
+		await expect(RustServer.root(file)).resolves.toBe(tmp);
+	});
+
+	// C# is intentionally NOT changed here (#201): its markers are matched by
+	// exact filename, so `.csproj` never matches a real `Foo.csproj` and C# still
+	// depends on the FileDirRoot fallback. See the standalone-csharp test above.
 });

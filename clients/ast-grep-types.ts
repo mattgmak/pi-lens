@@ -43,6 +43,14 @@ export interface SgResult {
 // DIAGNOSTICS
 // =============================================================================
 
+interface AstGrepMetaVarNode {
+	text: string;
+	range: {
+		start: { line: number; column: number };
+		end: { line: number; column: number };
+	};
+}
+
 export interface AstGrepMatch {
 	file: string;
 	range: {
@@ -50,7 +58,14 @@ export interface AstGrepMatch {
 		end: { line: number; column: number };
 	};
 	text: string;
+	lines?: string;
+	language?: string;
 	replacement?: string;
+	metaVariables?: {
+		single: Record<string, AstGrepMetaVarNode>;
+		multi: Record<string, AstGrepMetaVarNode[]>;
+		transformed: Record<string, string>;
+	};
 	labels?: Array<{
 		range: {
 			start: { line: number; column: number };

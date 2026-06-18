@@ -25,7 +25,7 @@ vi.mock("../../clients/pipeline.js", () => ({
 		hasBlockers: false,
 		isError: false,
 		fileModified: false,
-		cascadeResult: undefined,
+		cascadeRun: undefined,
 	})),
 }));
 
@@ -79,8 +79,8 @@ describe("runtime event flow", () => {
 					ensureAvailable: async () => false,
 				},
 				testRunnerClient: { detectRunner: () => null, runTestFile: () => ({}) },
-				goClient: { isGoAvailable: () => false },
-				rustClient: { isAvailable: () => false },
+				goClient: { isGoAvailableAsync: async () => false },
+				rustClient: { isAvailableAsync: async () => false },
 				ensureTool: async () => null,
 				cleanStaleTsBuildInfo: () => [],
 				resetDispatchBaselines: () => {},
@@ -114,8 +114,8 @@ describe("runtime event flow", () => {
 				env.tmpDir,
 			);
 
-			// cascadeResult is undefined (mock returns undefined) — no accumulation
-			expect(runtime.consumeCascadeResults()).toHaveLength(0);
+			// cascadeRun is undefined (mock returns undefined) — no accumulation
+			expect(runtime.consumeCascadeRuns()).toHaveLength(0);
 
 			await handleTurnEnd({
 				ctxCwd: env.tmpDir,

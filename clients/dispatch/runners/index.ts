@@ -35,12 +35,10 @@ import pythonSlopRunner from "./python-slop.js";
 import rubocopRunner from "./rubocop.js";
 import ruffRunner from "./ruff.js";
 import rustClippyRunner from "./rust-clippy.js";
-import semgrepRunner from "./semgrep.js";
+import spotbugsRunner from "./spotbugs.js";
 import shellcheckRunner from "./shellcheck.js";
 import fishIndentRunner from "./fish-indent.js";
 import shfmtRunner from "./shfmt.js";
-// Import similarity runner
-import similarityRunner from "./similarity.js";
 import spellcheckRunner from "./spellcheck.js";
 import sqlfluffRunner from "./sqlfluff.js";
 import stylelintRunner from "./stylelint.js";
@@ -51,7 +49,6 @@ import valeRunner from "./vale.js";
 // Import tree-sitter runner
 import treeSitterRunner from "./tree-sitter.js";
 import tsLspRunner from "./ts-lsp.js";
-import typeSafetyRunner from "./type-safety.js";
 import yamllintRunner from "./yamllint.js";
 import zigCheckRunner from "./zig-check.js";
 
@@ -68,12 +65,10 @@ export function registerDefaultRunners(registry: RunnerRegistry): void {
 	registry.register(treeSitterRunner); // Tree-sitter structural analysis (priority 14)
 	registry.register(ruffRunner); // Python linting (priority 10)
 	registry.register(pythonSlopRunner); // Python slop via CLI (priority 25)
-	registry.register(typeSafetyRunner); // Type safety checks (priority 20)
 	registry.register(shellcheckRunner); // Shell script linting (priority 20)
-	registry.register(semgrepRunner); // Semgrep security/deep static analysis (config/flag-gated, priority 50)
+	registry.register(spotbugsRunner); // SpotBugs bytecode bug-patterns for Java/Kotlin (flag-gated via withSpotbugsGroup, priority 50)
 	// DISABLED: registerRunner(astGrepRunner); // Replaced by ast-grep-napi for dispatch
 	// CLI ast-grep kept for ast_grep_search/ast_grep_replace tools only
-	registry.register(similarityRunner); // Semantic reuse detection (priority 35)
 	registry.register(eslintRunner); // ESLint (priority 12, jsts, config-gated)
 	registry.register(oxlintRunner); // Oxlint (priority 12, jsts, config-aware default fallback)
 	registry.register(golangciRunner); // golangci-lint (priority 20, go, config-gated)

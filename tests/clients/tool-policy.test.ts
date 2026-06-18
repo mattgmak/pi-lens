@@ -21,7 +21,10 @@ import {
 	hasClangFormatConfig,
 	hasCljfmtConfig,
 	hasCmakeFormatConfig,
+	findCompiledClassesDir,
 	hasDetektConfig,
+	hasJavaBuildDescriptor,
+	hasKtfmtConfig,
 	hasEslintConfig,
 	hasGolangciConfig,
 	hasGoogleJavaFormatConfig,
@@ -89,13 +92,13 @@ describe("tool-policy", () => {
 		expect(getSmartDefaultFormatterName("/tmp/file.md")).toBeUndefined();
 		expect(getSmartDefaultFormatterName("/tmp/file.mdx")).toBeUndefined();
 		expect(getFormatterPolicyForFile("/tmp/file.md")).toMatchObject({
-			formatterNames: ["prettier"],
+			formatterNames: ["prettier", "oxfmt"],
 			defaultFormatter: "prettier",
 			defaultWhenUnconfigured: false,
 			gate: "smart-default",
 		});
 		expect(getFormatterPolicyForFile("/tmp/file.mdx")).toMatchObject({
-			formatterNames: ["prettier"],
+			formatterNames: ["prettier", "oxfmt"],
 			defaultFormatter: "prettier",
 			defaultWhenUnconfigured: false,
 			gate: "smart-default",
@@ -224,7 +227,39 @@ describe("tool-policy", () => {
 			preferredTools: ["ktlint"],
 			safe: true,
 		});
-		expect(getAutofixPolicyForFile("/tmp/file.go", {})).toBeUndefined();
+		// detekt is the config-first Kotlin alternate.
+		expect(
+			getAutofixPolicyForFile("/tmp/file.kt", { hasDetektConfig: true }),
+		).toMatchObject({ preferredTools: ["detekt"], gate: "config-first" });
+		// ktfmt is config-first and outranks both detekt and the ktlint default
+		// when the project opts in (#129).
+		expect(
+			getAutofixPolicyForFile("/tmp/file.kt", { hasKtfmtConfig: true }),
+		).toMatchObject({ preferredTools: ["ktfmt"], gate: "config-first" });
+		expect(
+			getAutofixPolicyForFile("/tmp/file.kt", {
+				hasKtfmtConfig: true,
+				hasDetektConfig: true,
+			}),
+		).toMatchObject({ preferredTools: ["ktfmt"], gate: "config-first" });
+		// markdownlint is smart-default (no config needed).
+		expect(getAutofixPolicyForFile("/tmp/file.md", {})).toMatchObject({
+			preferredTools: ["markdownlint"],
+			gate: "smart-default",
+		});
+		// oxlint mirrors the JS lint precedence when configured.
+		expect(
+			getAutofixPolicyForFile("/tmp/file.ts", { hasOxlintConfig: true }),
+		).toMatchObject({ preferredTools: ["oxlint"] });
+		// Go autofix is config-first: a policy exists, but selects nothing until a
+		// .golangci.* config opts in.
+		expect(getAutofixPolicyForFile("/tmp/file.go", {})).toMatchObject({
+			preferredTools: [],
+			gate: "config-first",
+		});
+		expect(
+			getAutofixPolicyForFile("/tmp/file.go", { hasGolangciConfig: true }),
+		).toMatchObject({ preferredTools: ["golangci-lint"] });
 	});
 
 	it("exposes centralized autofix capability metadata", () => {
@@ -268,6 +303,23 @@ describe("tool-policy", () => {
 			preferredRunners: ["markdownlint"],
 			gate: "smart-default",
 		});
+		// Kotlin: ktlint is the smart-default linter. Opting into ktfmt (a pure
+		// formatter wired as autofix, NOT a lint runner) makes ktlint's lint step
+		// aside so it won't conflict, while detekt's semantic lint is unaffected (#129).
+		expect(getLinterPolicyForFile("/tmp/file.kt", {})).toMatchObject({
+			preferredRunners: ["ktlint"],
+			defaultRunner: "ktlint",
+			gate: "smart-default",
+		});
+		expect(
+			getLinterPolicyForFile("/tmp/file.kt", { hasKtfmtConfig: true }),
+		).toMatchObject({ preferredRunners: [], gate: "config-first" });
+		expect(
+			getLinterPolicyForFile("/tmp/file.kt", {
+				hasKtfmtConfig: true,
+				hasDetektConfig: true,
+			}),
+		).toMatchObject({ preferredRunners: ["detekt"], gate: "config-first" });
 		expect(getLinterPolicyForFile("/tmp/file.html", {})).toMatchObject({
 			preferredRunners: ["htmlhint"],
 			gate: "smart-default",
@@ -719,6 +771,79 @@ describe("tool-policy", () => {
 			const subDir = path.join(env.tmpDir, "src");
 			fs.mkdirSync(subDir, { recursive: true });
 			expect(hasDetektConfig(subDir)).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("hasKtfmtConfig detects the .ktfmt opt-in marker in a parent directory", () => {
+		const env = setupTestEnvironment("pi-lens-tool-policy-ktfmt-marker-");
+		try {
+			createTempFile(env.tmpDir, ".ktfmt", "");
+			const subDir = path.join(env.tmpDir, "src");
+			fs.mkdirSync(subDir, { recursive: true });
+			expect(hasKtfmtConfig(subDir)).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("hasKtfmtConfig detects the ktfmt gradle plugin in build.gradle.kts", () => {
+		const env = setupTestEnvironment("pi-lens-tool-policy-ktfmt-gradle-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"build.gradle.kts",
+				'plugins {\n  id("com.ncorti.ktfmt.gradle") version "0.21.0"\n}\n',
+			);
+			expect(hasKtfmtConfig(env.tmpDir)).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("hasKtfmtConfig is false for a plain Kotlin project (ktlint stays default)", () => {
+		const env = setupTestEnvironment("pi-lens-tool-policy-ktfmt-absent-");
+		try {
+			createTempFile(env.tmpDir, "build.gradle.kts", "plugins {\n}\n");
+			expect(hasKtfmtConfig(env.tmpDir)).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("hasJavaBuildDescriptor detects pom.xml / build.gradle{.kts} walking up (#133)", () => {
+		for (const descriptor of ["pom.xml", "build.gradle", "build.gradle.kts"]) {
+			const env = setupTestEnvironment("pi-lens-java-descriptor-");
+			try {
+				createTempFile(env.tmpDir, descriptor, "");
+				const subDir = path.join(env.tmpDir, "src", "main", "java");
+				fs.mkdirSync(subDir, { recursive: true });
+				expect(hasJavaBuildDescriptor(subDir), descriptor).toBe(true);
+			} finally {
+				env.cleanup();
+			}
+		}
+	});
+
+	it("hasJavaBuildDescriptor is false for a non-Java project (#133)", () => {
+		const env = setupTestEnvironment("pi-lens-java-none-");
+		try {
+			createTempFile(env.tmpDir, "package.json", "{}");
+			expect(hasJavaBuildDescriptor(env.tmpDir)).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("findCompiledClassesDir returns the compiled dir when present, else undefined (#133)", () => {
+		const env = setupTestEnvironment("pi-lens-java-classes-");
+		try {
+			// No compiled output yet → undefined (runner skips with a dbg note).
+			expect(findCompiledClassesDir(env.tmpDir)).toBeUndefined();
+			const classes = path.join(env.tmpDir, "target", "classes");
+			fs.mkdirSync(classes, { recursive: true });
+			expect(findCompiledClassesDir(env.tmpDir)).toBe(classes);
 		} finally {
 			env.cleanup();
 		}

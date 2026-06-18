@@ -3,6 +3,49 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CacheManager } from "../clients/cache-manager.js";
+import { createPiMock } from "./support/pi-mock.js";
+
+// This suite predates the consolidated harness and is written against the
+// legacy `{ pi, handlers, commands }` shape. Adapt the canonical createPiMock
+// to that shape so there is a single mock recorder (the old tests/support/
+// mock-pi.ts is removed), and preserve the default flags these tests assume.
+// Call sites can move to the native createPiMock API (getHandlers/emit)
+// opportunistically (#171).
+type IntegrationHook = (event: unknown, ctx: unknown) => unknown;
+function createMockPi(overrides: Record<string, boolean> = {}) {
+	const mock = createPiMock({
+		"lens-lsp": true,
+		"no-lsp": false,
+		"lens-guard": false,
+		...overrides,
+	});
+	return {
+		pi: mock.asExtensionAPI(),
+		handlers: new Proxy({} as Record<string, IntegrationHook[]>, {
+			get: (_target, prop) =>
+				typeof prop === "string" ? mock.handlers.get(prop) : undefined,
+		}),
+		commands: {
+			// Legacy call sites invoke handlers as `handler(event, ctx)` with loose
+			// args; expose that signature (the adapter is the compatibility layer).
+			get: (name: string) =>
+				mock.getCommand(name) as
+					| {
+							handler?: (args: unknown, ctx: unknown) => unknown;
+							description?: string;
+					  }
+					| undefined,
+		},
+		tools: mock.tools,
+		async trigger(event: string, ev: unknown, ctx: unknown = {}) {
+			const results: unknown[] = [];
+			for (const handler of mock.getHandlers(event)) {
+				results.push(await handler(ev, ctx));
+			}
+			return results;
+		},
+	};
+}
 
 // Mock read-guard for integration tests to avoid dynamic require issues
 vi.mock("../clients/read-guard.js", () => ({
@@ -63,53 +106,6 @@ vi.mock("../clients/read-guard.js", () => ({
 		})(),
 }));
 
-type Handler = (event: any, ctx: any) => unknown;
-
-interface MockPi {
-	registerTool: ReturnType<typeof vi.fn>;
-	registerCommand: ReturnType<typeof vi.fn>;
-	registerFlag: ReturnType<typeof vi.fn>;
-	on: ReturnType<typeof vi.fn>;
-	getFlag: ReturnType<typeof vi.fn>;
-}
-
-function createMockPi(flagOverrides: Record<string, boolean> = {}): {
-	pi: MockPi;
-	handlers: Record<string, Handler[]>;
-	commands: Map<string, { handler?: Handler; description?: string }>;
-} {
-	const handlers: Record<string, Handler[]> = {};
-	const commands = new Map<
-		string,
-		{ handler?: Handler; description?: string }
-	>();
-	const flags = new Map<string, boolean>([
-		["lens-lsp", true],
-		["no-lsp", false],
-		["lens-guard", false],
-		...Object.entries(flagOverrides),
-	]);
-
-	const pi: MockPi = {
-		registerTool: vi.fn(),
-		registerCommand: vi.fn(
-			(name: string, config: { handler?: Handler; description?: string }) => {
-				commands.set(name, config);
-			},
-		),
-		registerFlag: vi.fn((name: string, config: { default?: boolean }) => {
-			if (!flags.has(name) && typeof config?.default === "boolean") {
-				flags.set(name, config.default);
-			}
-		}),
-		on: vi.fn((event: string, handler: Handler) => {
-			(handlers[event] ??= []).push(handler);
-		}),
-		getFlag: vi.fn((name: string) => flags.get(name) ?? false),
-	};
-
-	return { pi, handlers, commands };
-}
 
 describe("index.ts integration", () => {
 	let tmpDir: string;
@@ -154,8 +150,8 @@ describe("index.ts integration", () => {
 				typeCoverageClient: { isAvailable: () => false },
 				depChecker: { isAvailable: () => false },
 				testRunnerClient: { detectRunner: () => null },
-				goClient: { isGoAvailable: () => false },
-				rustClient: { isAvailable: () => false },
+				goClient: { isGoAvailableAsync: async () => false },
+				rustClient: { isAvailableAsync: async () => false },
 				agentBehaviorClient: {
 					recordToolCall: () => {},
 					formatWarnings: () => "",
@@ -203,7 +199,13 @@ describe("index.ts integration", () => {
 		const shutdown = handlers.session_shutdown?.[0];
 		expect(shutdown).toBeTypeOf("function");
 		shutdown?.({ reason: "quit" }, { cwd: tmpDir });
-		expect(resetLSPService).toHaveBeenCalledWith({ fast: true });
+		// processExiting:true is required alongside fast — at session_shutdown the
+		// event loop is closing, so killProcessTree must terminate via the held
+		// handle instead of spawning taskkill (Windows libuv abort, #234 / caf2ee8).
+		expect(resetLSPService).toHaveBeenCalledWith({
+			fast: true,
+			processExiting: true,
+		});
 	}, 15_000);
 
 	it("context handler prepends injected guidance before the user prompt", async () => {
@@ -240,153 +242,6 @@ describe("index.ts integration", () => {
 		});
 	}, 15_000);
 
-	it("tool_call handler executes captureSnapshot and similarity paths without crashing", async () => {
-		const captureSnapshotMock = vi.fn();
-		const touchFileMock = vi.fn().mockResolvedValue(undefined);
-		const sourceFile = path.join(tmpDir, "src", "feature.ts");
-		const similarTarget = path.join(tmpDir, "src", "existing.ts");
-		fs.mkdirSync(path.dirname(sourceFile), { recursive: true });
-		fs.writeFileSync(
-			sourceFile,
-			"export function freshFeature() { return 1; }\n",
-		);
-		fs.writeFileSync(
-			similarTarget,
-			"export function oldFeature() { return 2; }\n",
-		);
-
-		vi.doMock("../clients/bootstrap.js", () => ({
-			loadBootstrapClients: async () => ({
-				metricsClient: { reset: () => {} },
-				todoScanner: {},
-				biomeClient: { isAvailable: () => false },
-				ruffClient: { isAvailable: () => false },
-				knipClient: { isAvailable: () => false },
-				jscpdClient: { isAvailable: () => false },
-				typeCoverageClient: { isAvailable: () => false },
-				depChecker: { isAvailable: () => false },
-				testRunnerClient: { detectRunner: () => null },
-				goClient: { isGoAvailable: () => false },
-				rustClient: { isAvailable: () => false },
-				agentBehaviorClient: {
-					recordToolCall: () => {},
-					formatWarnings: () => "",
-				},
-				complexityClient: {
-					isSupportedFile: () => true,
-					analyzeFile: () => ({
-						maintainabilityIndex: 88,
-						cognitiveComplexity: 3,
-						maxNestingDepth: 1,
-						linesOfCode: 10,
-						maxCyclomaticComplexity: 2,
-						codeEntropy: 1.2,
-					}),
-				},
-			}),
-		}));
-		vi.doMock("../clients/runtime-session.js", () => ({
-			handleSessionStart: async (deps: any) => {
-				deps.runtime.projectRoot = tmpDir;
-				deps.runtime.cachedExports.set("otherExport", similarTarget);
-				deps.runtime.cachedProjectIndex = {
-					entries: new Map([["existing", { id: "existing" }]]),
-				};
-			},
-		}));
-		vi.doMock("../clients/metrics-history.js", () => ({
-			captureSnapshot: captureSnapshotMock,
-		}));
-		vi.doMock("../clients/lsp/index.js", async () => {
-			const actual = await vi.importActual<
-				typeof import("../clients/lsp/index.js")
-			>("../clients/lsp/index.js");
-			return {
-				...actual,
-				getLSPService: () => ({ touchFile: touchFileMock }),
-			};
-		});
-		vi.doMock("../clients/dispatch/runners/similarity.js", async () => {
-			const actual = await vi.importActual<
-				typeof import("../clients/dispatch/runners/similarity.js")
-			>("../clients/dispatch/runners/similarity.js");
-			const ts = await import("typescript");
-			return {
-				...actual,
-				extractFunctions: () => [
-					{
-						name: "freshFeature",
-						transitionCount: 42,
-						matrix: [[1]],
-						kind: ts.SyntaxKind.FunctionDeclaration,
-					},
-				],
-			};
-		});
-		vi.doMock("../clients/project-index.js", async () => {
-			const actual = await vi.importActual<
-				typeof import("../clients/project-index.js")
-			>("../clients/project-index.js");
-			return {
-				...actual,
-				findSimilarFunctions: () => [
-					{
-						targetId: `src/existing.ts:oldFeature`,
-						targetName: "oldFeature",
-						targetLocation: similarTarget + ":1",
-						similarity: 0.95,
-						signature: "() => number",
-						targetTransitionCount: 42,
-					},
-				],
-			};
-		});
-
-		const { default: registerExtension } = await import("../index.ts");
-		const { pi, handlers } = createMockPi({
-			"lens-lsp": true,
-			"no-lsp": false,
-		});
-		registerExtension(pi as any);
-
-		const notify = vi.fn();
-		await handlers.session_start?.[0]?.({}, { cwd: tmpDir, ui: { notify } });
-
-		const toolCall = handlers.tool_call?.[0];
-		expect(toolCall).toBeTypeOf("function");
-
-		const result = await toolCall?.(
-			{
-				toolName: "write",
-				input: {
-					path: sourceFile,
-					content: "export function freshFeature() { return 1; }\n",
-				},
-			},
-			{ cwd: tmpDir },
-		);
-
-		expect(captureSnapshotMock).toHaveBeenCalledTimes(1);
-		expect(captureSnapshotMock).toHaveBeenCalledWith(
-			sourceFile,
-			expect.objectContaining({
-				maintainabilityIndex: 88,
-				cognitiveComplexity: 3,
-				maxNestingDepth: 1,
-				linesOfCode: 10,
-				maxCyclomatic: 2,
-				entropy: 1.2,
-			}),
-		);
-		expect(touchFileMock).toHaveBeenCalled();
-		expect(result).toEqual(
-			expect.objectContaining({
-				block: false,
-				reason: expect.stringContaining("Potential structural similarity"),
-			}),
-		);
-	}, 15_000);
-
 	it("tool_call records full-file reads from read.path with full line coverage", async () => {
 		const recordRead = vi.fn();
 		const mockReadGuard = {
@@ -407,7 +262,6 @@ describe("index.ts integration", () => {
 				turnIndex = 0;
 				complexityBaselines = new Map();
 				cachedExports = new Map();
-				cachedProjectIndex = null;
 				readGuard = mockReadGuard;
 				shouldWarmLspOnRead() {
 					return true;
@@ -438,8 +292,8 @@ describe("index.ts integration", () => {
 				typeCoverageClient: { isAvailable: () => false },
 				depChecker: { isAvailable: () => false },
 				testRunnerClient: { detectRunner: () => null },
-				goClient: { isGoAvailable: () => false },
-				rustClient: { isAvailable: () => false },
+				goClient: { isGoAvailableAsync: async () => false },
+				rustClient: { isAvailableAsync: async () => false },
 				agentBehaviorClient: {
 					recordToolCall: () => {},
 					formatWarnings: () => "",
@@ -492,7 +346,6 @@ describe("index.ts integration", () => {
 				turnIndex = 0;
 				complexityBaselines = new Map();
 				cachedExports = new Map();
-				cachedProjectIndex = null;
 				readGuard = {
 					recordRead: () => {},
 					getReadHistory: () => [],
@@ -530,8 +383,8 @@ describe("index.ts integration", () => {
 				typeCoverageClient: { isAvailable: () => false },
 				depChecker: { isAvailable: () => false },
 				testRunnerClient: { detectRunner: () => null },
-				goClient: { isGoAvailable: () => false },
-				rustClient: { isAvailable: () => false },
+				goClient: { isGoAvailableAsync: async () => false },
+				rustClient: { isAvailableAsync: async () => false },
 				agentBehaviorClient: {
 					recordToolCall: () => {},
 					formatWarnings: () => "",
@@ -589,7 +442,6 @@ describe("index.ts integration", () => {
 				turnIndex = 0;
 				complexityBaselines = new Map();
 				cachedExports = new Map();
-				cachedProjectIndex = null;
 				readGuard = {
 					recordRead: () => {},
 					getReadHistory: () => [],
@@ -627,8 +479,8 @@ describe("index.ts integration", () => {
 				typeCoverageClient: { isAvailable: () => false },
 				depChecker: { isAvailable: () => false },
 				testRunnerClient: { detectRunner: () => null },
-				goClient: { isGoAvailable: () => false },
-				rustClient: { isAvailable: () => false },
+				goClient: { isGoAvailableAsync: async () => false },
+				rustClient: { isAvailableAsync: async () => false },
 				agentBehaviorClient: {
 					recordToolCall: () => {},
 					formatWarnings: () => "",
@@ -701,7 +553,6 @@ describe("index.ts integration", () => {
 				turnIndex = 0;
 				complexityBaselines = new Map();
 				cachedExports = new Map();
-				cachedProjectIndex = null;
 				readGuard = {
 					recordRead: () => {},
 					getReadHistory: () => [],
@@ -737,8 +588,8 @@ describe("index.ts integration", () => {
 				typeCoverageClient: { isAvailable: () => false },
 				depChecker: { isAvailable: () => false },
 				testRunnerClient: { detectRunner: () => null },
-				goClient: { isGoAvailable: () => false },
-				rustClient: { isAvailable: () => false },
+				goClient: { isGoAvailableAsync: async () => false },
+				rustClient: { isAvailableAsync: async () => false },
 				agentBehaviorClient: {
 					recordToolCall: () => {},
 					formatWarnings: () => "",
@@ -793,7 +644,6 @@ describe("index.ts integration", () => {
 				turnIndex = 0;
 				complexityBaselines = new Map();
 				cachedExports = new Map();
-				cachedProjectIndex = null;
 				readGuard = {
 					recordRead: () => {},
 					getReadHistory: () => [],
@@ -829,8 +679,8 @@ describe("index.ts integration", () => {
 				typeCoverageClient: { isAvailable: () => false },
 				depChecker: { isAvailable: () => false },
 				testRunnerClient: { detectRunner: () => null },
-				goClient: { isGoAvailable: () => false },
-				rustClient: { isAvailable: () => false },
+				goClient: { isGoAvailableAsync: async () => false },
+				rustClient: { isAvailableAsync: async () => false },
 				agentBehaviorClient: {
 					recordToolCall: () => {},
 					formatWarnings: () => "",
@@ -880,7 +730,6 @@ describe("index.ts integration", () => {
 				turnIndex = 0;
 				complexityBaselines = new Map();
 				cachedExports = new Map();
-				cachedProjectIndex = null;
 				readGuard = {
 					recordRead: () => {},
 					getReadHistory: () => [],
@@ -916,8 +765,8 @@ describe("index.ts integration", () => {
 				typeCoverageClient: { isAvailable: () => false },
 				depChecker: { isAvailable: () => false },
 				testRunnerClient: { detectRunner: () => null },
-				goClient: { isGoAvailable: () => false },
-				rustClient: { isAvailable: () => false },
+				goClient: { isGoAvailableAsync: async () => false },
+				rustClient: { isAvailableAsync: async () => false },
 				agentBehaviorClient: {
 					recordToolCall: () => {},
 					formatWarnings: () => "",
@@ -966,7 +815,6 @@ describe("index.ts integration", () => {
 				complexityBaselines = new Map();
 				projectRulesScan = { hasCustomRules: false, rules: [] };
 				cachedExports = new Map();
-				cachedProjectIndex = null;
 				errorDebtBaseline = null;
 				sessionStartedAt = Date.now() - 5 * 60_000;
 				readGuard = {
@@ -1047,8 +895,8 @@ describe("index.ts integration", () => {
 				typeCoverageClient: { isAvailable: () => false },
 				depChecker: { isAvailable: () => false },
 				testRunnerClient: { detectRunner: () => null },
-				goClient: { isGoAvailable: () => false },
-				rustClient: { isAvailable: () => false },
+				goClient: { isGoAvailableAsync: async () => false },
+				rustClient: { isAvailableAsync: async () => false },
 				agentBehaviorClient: {
 					recordToolCall: () => {},
 					formatWarnings: () => "",

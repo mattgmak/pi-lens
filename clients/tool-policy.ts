@@ -1,6 +1,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { logLatency } from "./latency-logger.js";
+import { findNearestContaining, walkUpDirs } from "./path-utils.js";
+import type { ProjectConventions } from "./project-conventions.js";
+import { loadProjectSnapshot } from "./project-snapshot.js";
 
 export type ToolGate = "config-first" | "smart-default" | "mixed";
 
@@ -231,9 +234,12 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		},
 	],
 	[
+		// ktfmt is offered alongside ktlint but only wins when the project opts in
+		// (hasExplicitFormatterConfig("ktfmt")); otherwise ktlint stays the
+		// smart-default. #129
 		".kt",
 		{
-			formatterNames: ["ktlint"],
+			formatterNames: ["ktfmt", "ktlint"],
 			defaultFormatter: "ktlint",
 			defaultWhenUnconfigured: true,
 			gate: "smart-default",
@@ -242,7 +248,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 	[
 		".kts",
 		{
-			formatterNames: ["ktlint"],
+			formatterNames: ["ktfmt", "ktlint"],
 			defaultFormatter: "ktlint",
 			defaultWhenUnconfigured: true,
 			gate: "smart-default",
@@ -646,6 +652,36 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 	],
 ]);
 
+// oxfmt supports these extensions — registered as a candidate formatter for each.
+// Using a post-processing pass avoids repeating the same modification across
+// many map entries (and keeps SonarCloud's duplication gate happy).
+const OXFMT_SUPPORTED_EXTENSIONS = new Set([
+	".js", ".jsx", ".mjs", ".cjs",
+	".ts", ".tsx", ".mts", ".cts",
+	".vue",
+	".css", ".scss", ".less",
+	".html", ".htm",
+	".json", ".jsonc",
+	".yaml", ".yml",
+	".md", ".mdx",
+	".graphql", ".gql",
+	".toml",
+]);
+
+// Add .vue entry (no prior formatter policy existed for this extension)
+FORMATTER_POLICY_BY_EXTENSION.set(".vue", {
+	formatterNames: ["prettier"],
+	defaultFormatter: "prettier",
+	defaultWhenUnconfigured: false,
+	gate: "config-first",
+});
+
+for (const [ext, policy] of FORMATTER_POLICY_BY_EXTENSION) {
+	if (OXFMT_SUPPORTED_EXTENSIONS.has(ext) && !policy.formatterNames.includes("oxfmt")) {
+		policy.formatterNames.push("oxfmt");
+	}
+}
+
 const AUTO_INSTALLABLE_DEFAULT_FORMATTERS = new Map<string, string>([
 	["biome", "biome"],
 	["ruff", "ruff"],
@@ -697,6 +733,13 @@ export function getAutofixCapability(
 	return AUTOFIX_CAPABILITIES.get(toolId);
 }
 
+/** Tool ids declared as safe pipeline-autofix capable (for consistency guards). */
+export function listSafePipelineAutofixTools(): string[] {
+	return [...AUTOFIX_CAPABILITIES.entries()]
+		.filter(([, cap]) => cap.safePipelineAutofix)
+		.map(([id]) => id);
+}
+
 export function canToolAutoFix(toolId: string): boolean {
 	return getAutofixCapability(toolId)?.toolSupportsFix ?? false;
 }
@@ -719,8 +762,13 @@ export type AutofixToolName =
 	| "sqlfluff"
 	| "rubocop"
 	| "ktlint"
+	| "ktfmt"
 	| "rust-clippy"
-	| "dart-analyze";
+	| "dart-analyze"
+	| "golangci-lint"
+	| "detekt"
+	| "markdownlint"
+	| "oxlint";
 
 export type LintRunnerName =
 	| JstsLintRunnerName
@@ -758,6 +806,15 @@ export interface LinterPolicy {
 	defaultRunner?: LintRunnerName;
 	defaultWhenUnconfigured: boolean;
 	gate: ToolGate;
+	/**
+	 * Framework IDs that were detected for this project (via the cached
+	 * `ProjectConventions` snapshot, populated by #118). Informational for
+	 * downstream consumers — future PRs will use it to gate runner-specific
+	 * rules (e.g. React-aware oxlint plugins, Next.js-specific tree-sitter
+	 * rules). The field is undefined when no snapshot is available; consumers
+	 * should treat undefined as "unknown" rather than "no frameworks".
+	 */
+	frameworkHints?: string[];
 }
 
 export interface AutofixPolicy {
@@ -817,11 +874,31 @@ const AUTOFIX_CAPABILITIES = new Map<string, AutofixCapability>([
 		{ toolSupportsFix: true, safePipelineAutofix: true, fixKind: "pipeline" },
 	],
 	[
+		"ktfmt",
+		{ toolSupportsFix: true, safePipelineAutofix: true, fixKind: "pipeline" },
+	],
+	[
 		"rust-clippy",
 		{ toolSupportsFix: true, safePipelineAutofix: true, fixKind: "pipeline" },
 	],
 	[
 		"dart-analyze",
+		{ toolSupportsFix: true, safePipelineAutofix: true, fixKind: "pipeline" },
+	],
+	[
+		"golangci-lint",
+		{ toolSupportsFix: true, safePipelineAutofix: true, fixKind: "pipeline" },
+	],
+	[
+		"detekt",
+		{ toolSupportsFix: true, safePipelineAutofix: true, fixKind: "pipeline" },
+	],
+	[
+		"markdownlint",
+		{ toolSupportsFix: true, safePipelineAutofix: true, fixKind: "pipeline" },
+	],
+	[
+		"oxlint",
 		{ toolSupportsFix: true, safePipelineAutofix: true, fixKind: "pipeline" },
 	],
 ]);
@@ -841,7 +918,19 @@ const TOOL_EXECUTION_POLICY = new Map<string, ToolExecutionPolicy>([
 	["hadolint", { gate: "smart-default", autoInstall: true }],
 	["htmlhint", { gate: "smart-default", autoInstall: true }],
 	["ktlint", { gate: "smart-default", autoInstall: true }],
+	// ktfmt is opt-in (a project's explicit formatting choice), so it only runs
+	// when its config marker is present — config-first, but auto-installable via
+	// the maven-JAR strategy once elected (#129).
+	["ktfmt", { gate: "config-first", autoInstall: true }],
 	["golangci-lint", { gate: "config-first", autoInstall: true }],
+	// SpotBugs is opt-in (lens-spotbugs flag) + config-first (needs a Java build
+	// descriptor + compiled .class files), auto-installed via the archive
+	// strategy when elected (#133).
+	["spotbugs", { gate: "config-first", autoInstall: true }],
+	// Opengrep is opt-in (lens-opengrep flag or a discovered rule file) and
+	// config-first, but auto-installable via the GitHub single-binary strategy
+	// once elected — no login/token required, unlike Semgrep (#111).
+	["opengrep", { gate: "config-first", autoInstall: true }],
 	["phpstan", { gate: "config-first", autoInstall: false }],
 	["eslint", { gate: "config-first", autoInstall: false }],
 	["prettier", { gate: "smart-default", autoInstall: true }],
@@ -1124,6 +1213,7 @@ export interface LinterPolicyContext {
 	hasPhpstanConfig?: boolean;
 	hasMypyConfig?: boolean;
 	hasDetektConfig?: boolean;
+	hasKtfmtConfig?: boolean;
 }
 
 export interface AutofixPolicyContext {
@@ -1132,6 +1222,10 @@ export interface AutofixPolicyContext {
 	hasSqlfluffConfig?: boolean;
 	hasRubocopConfig?: boolean;
 	hasBiomeConfig?: boolean;
+	hasGolangciConfig?: boolean;
+	hasDetektConfig?: boolean;
+	hasOxlintConfig?: boolean;
+	hasKtfmtConfig?: boolean;
 }
 
 export function getLinterPolicyForFile(
@@ -1239,14 +1333,23 @@ export function getLinterPolicyForFile(
 	}
 
 	if ([".kt", ".kts"].includes(ext)) {
-		const preferredRunners: LintRunnerName[] = ["ktlint"];
+		// When the project opts into ktfmt, ktfmt (a pure formatter wired as a safe
+		// autofix) owns Kotlin formatting; ktlint's lint steps aside so its style
+		// suggestions don't conflict with ktfmt's output. detekt's *semantic* lint
+		// still runs when configured. #129
+		const preferredRunners: LintRunnerName[] = [];
+		if (!context.hasKtfmtConfig) preferredRunners.push("ktlint");
 		if (context.hasDetektConfig) preferredRunners.push("detekt");
 		return {
 			runnerNames: ["ktlint", "detekt"],
 			preferredRunners,
-			defaultRunner: "ktlint",
+			defaultRunner: preferredRunners[0],
 			defaultWhenUnconfigured: true,
-			gate: context.hasDetektConfig ? "mixed" : "smart-default",
+			gate: context.hasKtfmtConfig
+				? "config-first"
+				: context.hasDetektConfig
+					? "mixed"
+					: "smart-default",
 		};
 	}
 
@@ -1383,6 +1486,22 @@ export function getLinterPolicyForFile(
 	return undefined;
 }
 
+/**
+ * Returns the cached `ProjectConventions` for `cwd` if a project snapshot
+ * exists, otherwise `undefined`. Reads from the snapshot file rather than
+ * re-running the detector so the hot path (per-file dispatch) stays cheap.
+ *
+ * The snapshot is refreshed by `saveRuntimeProjectSnapshot` during the
+ * normal runtime lifecycle, so consumers see a value updated at session-
+ * start / project-seq bumps rather than on every read.
+ */
+export function getCachedProjectConventions(
+	cwd: string,
+): ProjectConventions | undefined {
+	const snapshot = loadProjectSnapshot(cwd);
+	return snapshot?.conventions;
+}
+
 export function getLinterPolicyForCwd(
 	filePath: string,
 	cwd: string,
@@ -1400,8 +1519,15 @@ export function getLinterPolicyForCwd(
 		hasPhpstanConfig: hasPhpstanConfig(cwd),
 		hasMypyConfig: hasMypyConfig(cwd),
 		hasDetektConfig: hasDetektConfig(cwd),
+		hasKtfmtConfig: hasKtfmtConfig(cwd),
 	};
 	const policy = getLinterPolicyForFile(filePath, context);
+	if (policy) {
+		const conventions = getCachedProjectConventions(cwd);
+		if (conventions && conventions.frameworks.length > 0) {
+			policy.frameworkHints = conventions.frameworks.map((f) => f.id);
+		}
+	}
 	logLatency({
 		type: "phase",
 		phase: "linter_selected",
@@ -1412,6 +1538,7 @@ export function getLinterPolicyForCwd(
 			gate: policy?.gate ?? null,
 			cwd,
 			context,
+			frameworkHints: policy?.frameworkHints ?? null,
 		},
 	});
 	return policy;
@@ -1424,9 +1551,12 @@ export function getAutofixPolicyForFile(
 	const ext = path.extname(filePath).toLowerCase();
 
 	if ([".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"].includes(ext)) {
+		// Mirror the JS/TS lint policy's precedence: eslint (config-first) →
+		// oxlint (config-first) → biome (smart-default). oxlint is config-gated so
+		// it never conflicts with the biome default.
 		if (context.hasEslintConfig) {
 			return {
-				toolNames: ["eslint", "biome"],
+				toolNames: ["eslint", "oxlint", "biome"],
 				preferredTools: ["eslint"],
 				defaultTool: "eslint",
 				defaultWhenUnconfigured: false,
@@ -1434,8 +1564,20 @@ export function getAutofixPolicyForFile(
 				safe: true,
 			};
 		}
+		if (context.hasOxlintConfig) {
+			return {
+				toolNames: ["eslint", "oxlint", "biome"],
+				preferredTools: ["oxlint"],
+				defaultTool: "oxlint",
+				defaultWhenUnconfigured: false,
+				// Mirror the JS lint policy, which gates on eslint only (oxlint vs
+				// biome are both "smart-default" there).
+				gate: "smart-default",
+				safe: true,
+			};
+		}
 		return {
-			toolNames: ["eslint", "biome"],
+			toolNames: ["eslint", "oxlint", "biome"],
 			preferredTools: ["biome"],
 			defaultTool: "biome",
 			defaultWhenUnconfigured: true,
@@ -1503,10 +1645,61 @@ export function getAutofixPolicyForFile(
 	}
 
 	if ([".kt", ".kts"].includes(ext)) {
+		// ktfmt is config-first and the project's explicit formatting choice, so it
+		// wins over both detekt and the ktlint smart-default when opted in (#129).
+		if (context.hasKtfmtConfig) {
+			return {
+				toolNames: ["ktfmt", "detekt", "ktlint"],
+				preferredTools: ["ktfmt"],
+				defaultTool: "ktfmt",
+				defaultWhenUnconfigured: false,
+				gate: "config-first",
+				safe: true,
+			};
+		}
+		// detekt --auto-correct is config-first; with a detekt config present it
+		// wins over the ktlint smart-default (and is the autofix path on Windows,
+		// where ktlint's install is currently broken, #218).
+		if (context.hasDetektConfig) {
+			return {
+				toolNames: ["detekt", "ktlint"],
+				preferredTools: ["detekt"],
+				defaultTool: "detekt",
+				defaultWhenUnconfigured: false,
+				gate: "config-first",
+				safe: true,
+			};
+		}
 		return {
-			toolNames: ["ktlint"],
+			toolNames: ["ktlint", "detekt"],
 			preferredTools: ["ktlint"],
 			defaultTool: "ktlint",
+			defaultWhenUnconfigured: true,
+			gate: "smart-default",
+			safe: true,
+		};
+	}
+
+	if (ext === ".go") {
+		// golangci-lint run --fix is config-first: only apply when the project
+		// opted in with a .golangci.* config.
+		return {
+			toolNames: ["golangci-lint"],
+			preferredTools: context.hasGolangciConfig ? ["golangci-lint"] : [],
+			defaultTool: "golangci-lint",
+			defaultWhenUnconfigured: false,
+			gate: "config-first",
+			safe: true,
+		};
+	}
+
+	if ([".md", ".mdx"].includes(ext)) {
+		// markdownlint --fix is a smart-default (deterministic MD### fixes run with
+		// built-in rules; config optional) — matches the markdownlint lint policy.
+		return {
+			toolNames: ["markdownlint"],
+			preferredTools: ["markdownlint"],
+			defaultTool: "markdownlint",
 			defaultWhenUnconfigured: true,
 			gate: "smart-default",
 			safe: true,
@@ -1558,27 +1751,11 @@ const ESLINT_CONFIGS = [
 	"eslint.config.ts",
 ];
 
-function walkUpDirs(cwd: string): string[] {
-	const dirs: string[] = [];
-	let dir = cwd;
-	const root = path.parse(dir).root;
-	while (true) {
-		dirs.push(dir);
-		if (dir === root) break;
-		const parent = path.dirname(dir);
-		if (parent === dir) break;
-		dir = parent;
-	}
-	return dirs;
-}
-
-function walkUpDirsUntilPackageJson(cwd: string): string[] {
-	const dirs: string[] = [];
+function* walkUpDirsUntilPackageJson(cwd: string): Generator<string> {
 	for (const dir of walkUpDirs(cwd)) {
-		dirs.push(dir);
-		if (fs.existsSync(path.join(dir, "package.json"))) break;
+		yield dir;
+		if (fs.existsSync(path.join(dir, "package.json"))) return;
 	}
-	return dirs;
 }
 
 function findNearestPackageJsonPath(cwd: string): string | undefined {
@@ -1661,9 +1838,7 @@ export function getBiomeConfigPath(cwd: string): string | undefined {
 }
 
 export function hasOxfmtConfig(cwd: string): boolean {
-	let dir = cwd;
-	const root = path.parse(dir).root;
-	while (true) {
+	for (const dir of walkUpDirs(cwd)) {
 		if (fs.existsSync(path.join(dir, "oxfmt.toml"))) return true;
 		if (fs.existsSync(path.join(dir, ".oxfmtrc.json"))) return true;
 		if (hasVitePlusConfig(dir)) return true;
@@ -1678,13 +1853,10 @@ export function hasOxfmtConfig(cwd: string): boolean {
 					...(pkg.dependencies as Record<string, unknown> | undefined),
 					...(pkg.devDependencies as Record<string, unknown> | undefined),
 				};
-				if (deps["@oxc-project/oxfmt"]) return true;
+				// Published package is `oxfmt`; the scoped name does not exist on npm.
+				if (deps["oxfmt"] || deps["@oxc-project/oxfmt"]) return true;
 			} catch {}
 		}
-		if (dir === root) break;
-		const parent = path.dirname(dir);
-		if (parent === dir) break;
-		dir = parent;
 	}
 	return false;
 }
@@ -1820,9 +1992,7 @@ export function hasYamllintConfig(cwd: string): boolean {
 }
 
 export function hasMarkdownlintConfig(cwd: string): boolean {
-	return walkUpDirs(cwd).some((dir) =>
-		MARKDOWNLINT_CONFIGS.some((cfg) => fs.existsSync(path.join(dir, cfg))),
-	);
+	return findNearestContaining(cwd, MARKDOWNLINT_CONFIGS) !== undefined;
 }
 
 export function hasPrettierConfig(cwd: string): boolean {
@@ -1882,62 +2052,53 @@ export function hasRuffConfig(cwd: string): boolean {
 }
 
 export function hasGolangciConfig(cwd: string): boolean {
-	return walkUpDirs(cwd).some((dir) =>
-		GOLANGCI_CONFIGS.some((cfg) => fs.existsSync(path.join(dir, cfg))),
-	);
+	return findNearestContaining(cwd, GOLANGCI_CONFIGS) !== undefined;
 }
 
 export function hasClangFormatConfig(cwd: string): boolean {
-	return walkUpDirs(cwd).some((dir) =>
-		[".clang-format", "_clang-format"].some((cfg) =>
-			fs.existsSync(path.join(dir, cfg)),
-		),
+	return (
+		findNearestContaining(cwd, [".clang-format", "_clang-format"]) !== undefined
 	);
 }
 
 export function hasPhpCsFixerConfig(cwd: string): boolean {
-	return walkUpDirs(cwd).some((dir) =>
-		[".php-cs-fixer.php", ".php-cs-fixer.dist.php"].some((cfg) =>
-			fs.existsSync(path.join(dir, cfg)),
-		),
+	return (
+		findNearestContaining(cwd, [
+			".php-cs-fixer.php",
+			".php-cs-fixer.dist.php",
+		]) !== undefined
 	);
 }
 
 export function hasStyluaConfig(cwd: string): boolean {
-	return walkUpDirs(cwd).some((dir) =>
-		["stylua.toml", ".stylua.toml"].some((cfg) =>
-			fs.existsSync(path.join(dir, cfg)),
-		),
+	return (
+		findNearestContaining(cwd, ["stylua.toml", ".stylua.toml"]) !== undefined
 	);
 }
 
 export function hasOcamlformatConfig(cwd: string): boolean {
-	return walkUpDirs(cwd).some((dir) =>
-		fs.existsSync(path.join(dir, ".ocamlformat")),
-	);
+	return findNearestContaining(cwd, [".ocamlformat"]) !== undefined;
 }
 
 export function hasGoogleJavaFormatConfig(cwd: string): boolean {
 	// google-java-format has no standard config file — gate on .editorconfig
 	// with indent_size defined (common Java project signal) or explicit opt-in marker.
-	return walkUpDirs(cwd).some(
-		(dir) =>
-			fs.existsSync(path.join(dir, ".google-java-format")) ||
-			fs.existsSync(path.join(dir, ".editorconfig")),
+	return (
+		findNearestContaining(cwd, [".google-java-format", ".editorconfig"]) !==
+		undefined
 	);
 }
 
 export function hasCljfmtConfig(cwd: string): boolean {
-	return walkUpDirs(cwd).some((dir) =>
-		[".cljfmt.edn", "cljfmt.edn", ".cljfmt"].some((cfg) =>
-			fs.existsSync(path.join(dir, cfg)),
-		),
+	return (
+		findNearestContaining(cwd, [".cljfmt.edn", "cljfmt.edn", ".cljfmt"]) !==
+		undefined
 	);
 }
 
 export function hasCmakeFormatConfig(cwd: string): boolean {
-	return walkUpDirs(cwd).some((dir) =>
-		[
+	return (
+		findNearestContaining(cwd, [
 			".cmake-format",
 			".cmake-format.yaml",
 			".cmake-format.yml",
@@ -1945,14 +2106,12 @@ export function hasCmakeFormatConfig(cwd: string): boolean {
 			".cmake-format.py",
 			"cmake-format.yaml",
 			"cmake-format.yml",
-		].some((cfg) => fs.existsSync(path.join(dir, cfg))),
+		]) !== undefined
 	);
 }
 
 export function hasPhpstanConfig(cwd: string): boolean {
-	return walkUpDirs(cwd).some((dir) =>
-		PHPSTAN_CONFIGS.some((cfg) => fs.existsSync(path.join(dir, cfg))),
-	);
+	return findNearestContaining(cwd, PHPSTAN_CONFIGS) !== undefined;
 }
 
 const DETEKT_CONFIGS = [
@@ -1968,6 +2127,73 @@ export function hasDetektConfig(cwd: string): boolean {
 			return true;
 	}
 	return false;
+}
+
+// ktfmt has no native config file format; these are pi-lens opt-in markers plus
+// the gradle-plugin signal, so a project that uses ktfmt elects it as its Kotlin
+// formatter instead of the ktlint smart-default (#129).
+const KTFMT_CONFIG_FILES = [".ktfmt", ".ktfmt.kts"];
+const KTFMT_GRADLE_FILES = [
+	"build.gradle.kts",
+	"build.gradle",
+	"settings.gradle.kts",
+	"settings.gradle",
+];
+
+export function hasKtfmtConfig(cwd: string): boolean {
+	for (const dir of walkUpDirs(cwd)) {
+		if (KTFMT_CONFIG_FILES.some((cfg) => fs.existsSync(path.join(dir, cfg))))
+			return true;
+		for (const gradle of KTFMT_GRADLE_FILES) {
+			const p = path.join(dir, gradle);
+			if (fs.existsSync(p)) {
+				try {
+					// Match the gradle plugin id / artifact, not a stray substring.
+					if (/ktfmt|com\.facebook\.ktfmt/i.test(fs.readFileSync(p, "utf-8")))
+						return true;
+				} catch {}
+			}
+		}
+	}
+	return false;
+}
+
+// SpotBugs (#133) analyzes compiled bytecode, so it needs BOTH a Java build
+// descriptor AND a compiled-classes dir. These two helpers gate the runner.
+const JAVA_BUILD_DESCRIPTORS = [
+	"pom.xml",
+	"build.gradle",
+	"build.gradle.kts",
+	"settings.gradle",
+	"settings.gradle.kts",
+];
+
+// Common compiled-output dirs: Maven (target/classes), Gradle (build/classes),
+// IntelliJ (out/production), Eclipse (bin/main).
+const COMPILED_CLASSES_DIRS = [
+	path.join("target", "classes"),
+	path.join("build", "classes"),
+	path.join("out", "production"),
+	path.join("bin", "main"),
+];
+
+export function hasJavaBuildDescriptor(cwd: string): boolean {
+	for (const dir of walkUpDirs(cwd)) {
+		if (JAVA_BUILD_DESCRIPTORS.some((d) => fs.existsSync(path.join(dir, d))))
+			return true;
+	}
+	return false;
+}
+
+/** First existing compiled-classes dir at/above cwd, or undefined. */
+export function findCompiledClassesDir(cwd: string): string | undefined {
+	for (const dir of walkUpDirs(cwd)) {
+		for (const rel of COMPILED_CLASSES_DIRS) {
+			const candidate = path.join(dir, rel);
+			if (fs.existsSync(candidate)) return candidate;
+		}
+	}
+	return undefined;
 }
 
 export function hasStandardrbConfig(cwd: string): boolean {

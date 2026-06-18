@@ -28,6 +28,39 @@ export interface SafeSpawnOptions {
 	cwd?: string;
 	env?: NodeJS.ProcessEnv;
 	signal?: AbortSignal;
+	/**
+	 * Opt out of the ambient turn abort signal (which is otherwise the default).
+	 * Set this for long, side-effecting operations like tool installs that should
+	 * run to completion even if the agent turn is interrupted — matching the old
+	 * uncancellable sync `safeSpawn` they replaced (so a half-finished
+	 * `gem install` / `go install` can't be left behind by an Esc). An explicit
+	 * `signal` still takes precedence over both.
+	 */
+	ignoreAmbientSignal?: boolean;
+}
+
+// ============================================================================
+// AMBIENT TURN ABORT SIGNAL
+// ============================================================================
+
+/**
+ * The current turn's abort signal, published by the lifecycle handlers from
+ * pi's `ctx.signal`. Threading the signal explicitly through every
+ * dispatch → runner → spawn call site would be invasive, so instead
+ * `safeSpawnAsync` defaults to this ambient signal when a call doesn't pass its
+ * own. The effect: pressing Esc mid-turn aborts in-flight linter / formatter /
+ * type-checker child processes (process-tree kill on Windows) instead of letting
+ * them run to their timeout.
+ *
+ * Each spawn captures the signal at call time (attaching its own abort listener),
+ * so clearing this after a handler returns only affects *future* spawns — work
+ * already in flight keeps the signal it started with.
+ */
+let ambientAbortSignal: AbortSignal | undefined;
+
+/** Publish (or clear, with `undefined`) the current turn's abort signal. */
+export function setAmbientAbortSignal(signal: AbortSignal | undefined): void {
+	ambientAbortSignal = signal;
 }
 
 // ============================================================================
@@ -41,6 +74,26 @@ export interface SafeSpawnOptions {
 function cmdEscapeArg(arg: string): string {
 	if (!/[\s"&|<>^()]/.test(arg)) return arg;
 	return `"${arg.replace(/"/g, '""')}"`;
+}
+
+/**
+ * Build the cmd.exe command string used for Windows `shell:true` spawning.
+ *
+ * The COMMAND must be escaped the same way as the args — escaping only the args
+ * (the bug behind #214) means a tool whose resolved path contains a space (e.g.
+ * `C:\Program Files\Go\bin\go.exe`) makes cmd.exe parse `C:\Program` as the
+ * command and fail with "'C:\Program' is not recognized". `cmdEscapeArg` is a
+ * no-op for space-free commands, so this is safe for the npm/.pi-lens tool paths
+ * that already worked. The `chcp 65001` prefix forces the UTF-8 code page (so
+ * tool output isn't mangled by the system code page) and, as a side benefit,
+ * keeps the (possibly quoted) command off the front of the line, avoiding
+ * cmd.exe's `/s` outer-quote-stripping quirk.
+ */
+export function buildWindowsShellCommand(
+	command: string,
+	args: string[],
+): string {
+	return `chcp 65001 >nul 2>&1 && ${[command, ...args].map(cmdEscapeArg).join(" ")}`;
 }
 
 // ============================================================================
@@ -65,7 +118,12 @@ export async function safeSpawnAsync(
 	options?: SafeSpawnOptions,
 ): Promise<SpawnResult> {
 	const timeout = options?.timeout ?? 30000;
-	const abortSignal = options?.signal;
+	// Fall back to the current turn's ambient signal (set from ctx.signal) so an
+	// Esc/abort mid-turn cancels dispatches that didn't thread a signal of their
+	// own — unless the caller opts out (installs, which must run to completion).
+	const abortSignal =
+		options?.signal ??
+		(options?.ignoreAmbientSignal ? undefined : ambientAbortSignal);
 
 	return new Promise((resolve) => {
 		// Check for early abort
@@ -88,8 +146,12 @@ export async function safeSpawnAsync(
 		// On Windows, use shell mode for .cmd files (like pyright, biome).
 		// Bake args into the command string when shell:true to avoid DEP0190.
 		const isWindows = process.platform === "win32";
+		// On Windows, prefix with `chcp 65001` to force UTF-8 code page for the
+		// cmd.exe session. Without this, tools that output UTF-8 (sg, biome, ruff,
+		// etc.) have their bytes decoded as the system code page (CP850/CP1252/
+		// CP936/CP932), producing garbled characters in stderr error messages.
 		const spawnCmd = isWindows
-			? [command, ...args.map(cmdEscapeArg)].join(" ")
+			? buildWindowsShellCommand(command, args)
 			: command;
 		const spawnArgs = isWindows ? [] : args;
 		const child = spawn(spawnCmd, spawnArgs, {

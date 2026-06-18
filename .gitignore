@@ -58,6 +58,10 @@ migrate-*.js
 !docs/AST_GREP_RULES.md
 !docs/TREE_SITTER_RULES.md
 !docs/WRITING_NEW_AST_GREP_RULES.md
+!docs/custom-rules.md
+!docs/lsp-latency-benchmark.md
+!docs/lsp-capability-matrix.md
+!docs/servercapabilities.md
 !skills/**/*.md
 
 # Local-only docs (not in git or npm)
@@ -81,6 +85,16 @@ BUG_*.md
 *_GAPS.md
 
 # Dev log
+# Tool-smoke fixtures (#209) — real per-language projects with intentional
+# defects; must be tracked despite the global *.js / *.md / *.sh ignores above.
+!tests/fixtures/tool-smoke/**
+# Format-smoke fixtures (#209 --format layer) — deliberately mis-formatted but
+# otherwise valid files; the formatter must reformat them.
+!tests/fixtures/format-smoke/**
+# Autofix-smoke fixtures (#209 --autofix layer) — files with a safely-autofixable
+# lint violation; the pipeline's safe-autofix phase must fix them.
+!tests/fixtures/autofix-smoke/**
+
 clients/dispatch/debug.log
 clients/lsp/.intelephense/
 AGENTS.md
@@ -88,3 +102,4 @@ AGENTS.md
 .claude/settings.local.json
 autoresearch.jsonl
 coverage/
+PR_issues_Audit.md
