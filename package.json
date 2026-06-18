@@ -65,6 +65,7 @@
 		"banner.png"
 	],
 	"dependencies": {
+		"@ast-grep/cli": "^0.43.0",
 		"@ast-grep/napi": "^0.43.0",
 		"@earendil-works/pi-tui": "^0.79.1",
 		"js-yaml": "^4.1.1",
@@ -86,7 +87,6 @@
 		"web-tree-sitter": "0.25.10"
 	},
 	"devDependencies": {
-		"@ast-grep/cli": "^0.43.0",
 		"@biomejs/biome": "^2.4.10",
 		"@earendil-works/pi-coding-agent": "^0.79.4",
 		"@types/js-yaml": "^4.0.9",
