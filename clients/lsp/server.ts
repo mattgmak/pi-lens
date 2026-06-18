@@ -2100,8 +2100,11 @@ export const OpengrepServer: LSPServerInfo = {
 // keys on that marker — no sgconfig ⇒ undefined root ⇒ it never attaches and the
 // existing napi ast-grep runner remains the path (Phase 1 of #239; the no-sgconfig
 // baseline via `--config` + shipped rules is Phase 2). When present, it surfaces
-// the team's OWN curated rules (warm, full-engine, with codeAction fixes) — which
-// the napi subset interpreter cannot evaluate faithfully.
+// the team's OWN curated rules with codeAction fixes. NOTE: the napi runner is NOT
+// a subset — it delegates to napi's native engine via root.findAll({rule}) (#206),
+// the SAME Rust core as this LSP and the ast-grep CLI, so rule semantics are
+// identical across all three. The LSP's edge over napi is engine-driven codeAction
+// fixes + native sgconfig discovery, not faithfulness of matching.
 const AST_GREP_KINDS = [
 	"csharp",
 	"cxx",
