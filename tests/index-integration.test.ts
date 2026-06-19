@@ -11,6 +11,15 @@ import { createPiMock } from "./support/pi-mock.js";
 // mock-pi.ts is removed), and preserve the default flags these tests assume.
 // Call sites can move to the native createPiMock API (getHandlers/emit)
 // opportunistically (#171).
+// Each test does `vi.resetModules()` + `await import("../index.ts")`, so every
+// case cold-evaluates the WHOLE extension dependency graph. That's inherently
+// heavy, and under full-suite parallel-transform contention the first/most
+// complex case (the session_start closure test) can exceed a tight per-test
+// budget — it passes in ~3s isolated but was flaking at 15s under load. This is
+// a time-budget issue, not a hang, so give these import-bound integration tests
+// generous headroom; a genuine deadlock still fails, just later.
+const INTEGRATION_TIMEOUT_MS = 45_000;
+
 type IntegrationHook = (event: unknown, ctx: unknown) => unknown;
 function createMockPi(overrides: Record<string, boolean> = {}) {
 	const mock = createPiMock({
@@ -180,7 +189,7 @@ describe("index.ts integration", () => {
 
 		expect(handleSessionStartMock).toHaveBeenCalledTimes(1);
 		expect(ensureToolMock).toHaveBeenCalledWith("typescript-language-server");
-	}, 15_000);
+	}, INTEGRATION_TIMEOUT_MS);
 
 	it("session_shutdown uses fast LSP reset so teardown does not wait on graceful shutdown", async () => {
 		const resetLSPService = vi.fn();
@@ -206,7 +215,7 @@ describe("index.ts integration", () => {
 			fast: true,
 			processExiting: true,
 		});
-	}, 15_000);
+	}, INTEGRATION_TIMEOUT_MS);
 
 	it("context handler prepends injected guidance before the user prompt", async () => {
 		const { default: registerExtension } = await import("../index.ts");
@@ -240,7 +249,7 @@ describe("index.ts integration", () => {
 				userMessage,
 			],
 		});
-	}, 15_000);
+	}, INTEGRATION_TIMEOUT_MS);
 
 	it("tool_call records full-file reads from read.path with full line coverage", async () => {
 		const recordRead = vi.fn();
@@ -332,7 +341,7 @@ describe("index.ts integration", () => {
 				effectiveLimit: 6,
 			}),
 		);
-	}, 15_000);
+	}, INTEGRATION_TIMEOUT_MS);
 
 	it("tool_call auto-patches safe indentation-only oldText before read-guard edit checks", async () => {
 		const checkEdit = vi.fn(() => ({ action: "allow" as const }));
@@ -425,7 +434,7 @@ describe("index.ts integration", () => {
 			"function foo() {\n\treturn 2;\n}",
 		);
 		expect(checkEdit).toHaveBeenCalled();
-	}, 15_000);
+	}, INTEGRATION_TIMEOUT_MS);
 
 	it("tool_call auto-patches all safe indentation-only oldText entries in multi-edit calls", async () => {
 		const checkEdit = vi.fn(() => ({ action: "allow" as const }));
@@ -531,7 +540,7 @@ describe("index.ts integration", () => {
 			"function bar() {\n\treturn 20;\n}",
 		);
 		expect(checkEdit).toHaveBeenCalled();
-	}, 15_000);
+	}, INTEGRATION_TIMEOUT_MS);
 
 	it("tool_call only warms LSP on the first read until warm state is cleared", async () => {
 		const touchFileMock = vi.fn().mockResolvedValue([]);
@@ -629,7 +638,7 @@ describe("index.ts integration", () => {
 		expect(markLspReadWarmStarted).toHaveBeenCalledTimes(2);
 		expect(markLspReadWarmCompleted).toHaveBeenCalledTimes(2);
 		expect(clearLspReadWarmState).not.toHaveBeenCalled();
-	}, 15_000);
+	}, INTEGRATION_TIMEOUT_MS);
 
 	it("tool_call does not warm LSP for unknown non-code file kinds", async () => {
 		const touchFileMock = vi.fn().mockResolvedValue(undefined);
@@ -715,7 +724,7 @@ describe("index.ts integration", () => {
 
 		expect(shouldWarmLspOnRead).not.toHaveBeenCalled();
 		expect(touchFileMock).not.toHaveBeenCalled();
-	}, 15_000);
+	}, INTEGRATION_TIMEOUT_MS);
 
 	it("tool_call does not warm LSP for internal support artifacts", async () => {
 		const touchFileMock = vi.fn().mockResolvedValue(undefined);
@@ -801,7 +810,7 @@ describe("index.ts integration", () => {
 
 		expect(shouldWarmLspOnRead).not.toHaveBeenCalled();
 		expect(touchFileMock).not.toHaveBeenCalled();
-	}, 15_000);
+	}, INTEGRATION_TIMEOUT_MS);
 
 	it("lens-health command reports crash, latency, diagnostics, and slop telemetry", async () => {
 		vi.doMock("../clients/runtime-coordinator.js", () => ({
@@ -942,5 +951,5 @@ describe("index.ts integration", () => {
 		expect(message).toContain("Cascade runs: 5");
 		expect(message).toContain("Cascade diagnostics surfaced: 3");
 		expect(message).toContain("Cold-snapshot touches: 2");
-	}, 15_000);
+	}, INTEGRATION_TIMEOUT_MS);
 });
