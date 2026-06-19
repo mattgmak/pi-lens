@@ -462,6 +462,17 @@ SYMBOL_QUERIES.tsx = SYMBOL_QUERIES.typescript;
 // symbols still extract). Each query captures the import source text as
 // @importSource. jsts/cxx are intentionally absent — their imports are extracted
 // by the review-graph builder's dedicated paths (importFactProvider / #include).
+//
+// Call/builtin-based languages (ruby/zig/elixir/bash) express imports as
+// ordinary function/macro calls, so their queries use a `#match?` predicate to
+// keep only the import call out of every call in the file. web-tree-sitter 0.25's
+// `Query.matches()` DOES apply these predicates (probed on the shipped grammars):
+// an unpredicated ruby `require` query over-matches `puts`/`foo`, the predicated
+// one returns only the require args.
+// lua is intentionally absent: its grammar parses to ERROR trees once a 2nd
+// grammar loads into the shared WASM Module (#255), so neither its symbols nor a
+// lua import query work in the real review-graph client. The validated lua query
+// is recorded on #255 and lands once the parse corruption is fixed.
 const IMPORT_QUERIES: Record<string, string> = {
 	python: `
       (import_statement name: (dotted_name) @importSource)
@@ -481,6 +492,31 @@ const IMPORT_QUERIES: Record<string, string> = {
 	php: `(namespace_use_clause (name) @importSource)`,
 	ocaml: `(open_module (module_path) @importSource)`,
 	dart: `(import_specification (configurable_uri (uri (string_literal) @importSource)))`,
+	// require "x" / require_relative "x" — covers both via the "^require" prefix.
+	ruby: `
+      (call
+        method: (identifier) @_m
+        (argument_list (string (string_content) @importSource))
+        (#match? @_m "^require"))
+    `,
+	// @import("std") — a builtin call, not a statement.
+	zig: `
+      (builtin_function (builtin_identifier) @_m
+        (arguments (string (string_content) @importSource))
+        (#match? @_m "^@import$"))
+    `,
+	// import/alias/require/use Foo — macro calls; excludes defmodule and friends.
+	elixir: `
+      (call target: (identifier) @_m
+        (arguments (alias) @importSource)
+        (#match? @_m "^(import|alias|require|use)$"))
+    `,
+	// source ./x.sh and . ./x.sh — the two POSIX file-include builtins.
+	bash: `
+      (command (command_name (word) @_m)
+        (word) @importSource
+        (#match? @_m "^(source|\\.)$"))
+    `,
 };
 
 export interface ImportRef {

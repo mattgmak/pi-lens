@@ -55,6 +55,30 @@ const CASES: Record<string, ImportCase> = {
 	php: { file: "a.php", src: "<?php\nuse App;\n", expect: ["App"] },
 	ocaml: { file: "a.ml", src: "open Core\n", expect: ["Core"] },
 	dart: { file: "a.dart", src: 'import "dart:io";\n', expect: ["dart:io"] },
+	// Call/builtin-based imports (#249 coverage expansion) — predicate-filtered.
+	// lua is omitted on purpose: its tree parses to ERROR once a 2nd grammar
+	// loads into the shared WASM Module (#255), so it can't be exercised through
+	// the shared client here. Its validated import query is recorded on #255.
+	ruby: {
+		file: "a.rb",
+		src: 'require "json"\nrequire_relative "./foo"\nputs "hi"\n',
+		expect: ["json", "./foo"],
+	},
+	zig: {
+		file: "a.zig",
+		src: 'const std = @import("std");\nconst f = @import("foo.zig");\n',
+		expect: ["std", "foo.zig"],
+	},
+	elixir: {
+		file: "a.ex",
+		src: "defmodule M do\n  import Foo\n  alias Bar.Baz\n  require Logger\n  use GenServer\nend\n",
+		expect: ["Foo", "Bar.Baz", "Logger", "GenServer"],
+	},
+	bash: {
+		file: "a.sh",
+		src: "source ./lib.sh\n. ./other.sh\necho hi\n",
+		expect: ["./lib.sh", "./other.sh"],
+	},
 };
 
 let client: TreeSitterClient;
