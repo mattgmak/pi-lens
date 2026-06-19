@@ -324,8 +324,16 @@ const WARMUP_SOURCE_EXTS = new Set([
 	".cs",
 ]);
 
-async function collectSourceFilesForWarmup(
+// Language detection needs which languages are PRESENT, not every file — so the
+// warmup walk is hard-capped. Without this, a walk rooted at a too-broad directory
+// (e.g. $HOME, if startup-scan's canWarmCaches guard is bypassed) traverses the
+// entire tree — #250's multi-hour home-dir scans. Generous enough to detect every
+// language present in any real project (mirrors startup-scan's 2000 limit).
+const MAX_WARMUP_SOURCE_FILES = 2000;
+
+export async function collectSourceFilesForWarmup(
 	rootDir: string,
+	maxFiles = MAX_WARMUP_SOURCE_FILES,
 	yieldEvery = 100,
 ): Promise<string[]> {
 	const root = path.resolve(rootDir);
@@ -356,6 +364,8 @@ async function collectSourceFilesForWarmup(
 				const ext = path.extname(entry.name).toLowerCase();
 				if (!WARMUP_SOURCE_EXTS.has(ext)) continue;
 				out.push(fullPath);
+				// Hard cap — language detection only needs presence (#250).
+				if (out.length >= maxFiles) return out;
 			}
 			if (++processedSinceYield % yieldEvery === 0) {
 				// See countSourceFilesWithinLimitAsync for why setImmediate.

@@ -851,6 +851,18 @@ export async function handleSessionStart(
 					warmupDbg(
 						`warmup: scan-context done in ${Date.now() - warmupStartedAt}ms (canWarm=${scan.canWarmCaches})`,
 					);
+					// Respect the startup-scan guard (#250): canWarmCaches is false for
+					// home-dir / no-project-root / too-many-source-files. Proceeding into
+					// the language-profile source walk in those cases lets it root at an
+					// ancestor (e.g. a marker in $HOME when pi runs in ~/tmp) and traverse
+					// the entire home tree — multi-hour scans. Nothing to warm anyway when
+					// the guard says caches can't be warmed.
+					if (!scan.canWarmCaches) {
+						warmupDbg(
+							`warmup: skipping language-profile (canWarm=false, reason=${scan.reason ?? "unknown"})`,
+						);
+						return;
+					}
 					const languageRoot = scan.projectRoot ?? warmupCwd;
 					const languageProfileStartedAt = Date.now();
 					await languageProfileModule.detectProjectLanguageProfileAsync(
