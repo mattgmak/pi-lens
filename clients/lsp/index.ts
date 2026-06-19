@@ -13,7 +13,11 @@ import * as nodeFs from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { isTestMode } from "../env-utils.js";
-import { getGlobalPiLensDir } from "../file-utils.js";
+import {
+	getGlobalPiLensDir,
+	getProjectIgnoreMatcher,
+	isExcludedDirName,
+} from "../file-utils.js";
 import { recordLsp } from "../widget-state.js";
 import { logLatency } from "../latency-logger.js";
 import { normalizeMapKey, uriToPath } from "../path-utils.js";
@@ -212,35 +216,45 @@ export interface LSPWorkspaceDiagnosticResult {
 	error?: string;
 }
 
-const WORKSPACE_DIAGNOSTICS_SKIP_DIRS = new Set([
-	"node_modules",
-	".git",
-	"dist",
-	"build",
-	".next",
-	"out",
-	"target",
-	"coverage",
-	"__pycache__",
-	".venv",
-	"venv",
-]);
-
 const WORKSPACE_DIAGNOSTICS_CONCURRENCY = 8;
+
+// Hard cap on the workspace-diagnostics walk. Even though this is an explicit,
+// user-invoked project-wide tool, the walk must be bounded so a misrooted run
+// (e.g. cwd that resolves to $HOME) can't enumerate an entire home tree (#250).
+// Generous — real projects are well under this; override for monorepos.
+const DEFAULT_MAX_WORKSPACE_DIAGNOSTIC_FILES = 5000;
+
+function getMaxWorkspaceDiagnosticFiles(): number {
+	const override = Number.parseInt(
+		process.env.PI_LENS_LSP_WORKSPACE_MAX_FILES ?? "",
+		10,
+	);
+	return Number.isFinite(override) && override > 0
+		? override
+		: DEFAULT_MAX_WORKSPACE_DIAGNOSTIC_FILES;
+}
 
 /**
  * Async, event-loop-yielding walk of the workspace to find LSP-supported source
  * files. Uses `fs.promises.readdir` so each directory read hands control back to
  * the loop — a synchronous `readdirSync` recursion blocks the loop for the whole
- * O(N) enumeration (~44ms at 1.4k files, scaling linearly on monorepos). The
- * file set, skip-dirs, symlink handling and server-config filter are identical
- * to the previous synchronous version — only the I/O is async now.
+ * O(N) enumeration (~44ms at 1.4k files, scaling linearly on monorepos).
+ *
+ * Directory/file exclusion goes through the SAME ignore matcher every other scan
+ * surface uses: `isExcludedDirName` for default dependency/build dirs plus the
+ * project's `.pi-lens.json` / `.gitignore` patterns via `getProjectIgnoreMatcher`.
+ * Previously this walk used its own hardcoded skip-dir set, which silently
+ * dropped user `"ignore": [...]` patterns and diverged from the canonical list
+ * (#243). The walk is also hard-capped (#250).
  */
 async function collectWorkspaceDiagnosticFiles(
 	root: string,
+	maxFiles: number = getMaxWorkspaceDiagnosticFiles(),
 ): Promise<string[]> {
 	const files: string[] = [];
+	const ignoreMatcher = getProjectIgnoreMatcher(root);
 	async function walk(current: string): Promise<void> {
+		if (files.length >= maxFiles) return;
 		let entries: nodeFs.Dirent[];
 		try {
 			entries = await nodeFs.promises.readdir(current, {
@@ -250,12 +264,16 @@ async function collectWorkspaceDiagnosticFiles(
 			return;
 		}
 		for (const entry of entries) {
+			if (files.length >= maxFiles) return;
 			if (entry.isSymbolicLink()) continue;
 			const full = path.join(current, entry.name);
 			if (entry.isDirectory()) {
-				if (!WORKSPACE_DIAGNOSTICS_SKIP_DIRS.has(entry.name)) await walk(full);
+				if (isExcludedDirName(entry.name)) continue;
+				if (ignoreMatcher.isIgnored(full, true)) continue;
+				await walk(full);
 			} else if (
 				entry.isFile() &&
+				!ignoreMatcher.isIgnored(full, false) &&
 				getServersForFileWithConfig(full).length > 0
 			) {
 				files.push(full);
@@ -1996,6 +2014,9 @@ export function resetLSPService(options: LSPShutdownOptions = {}): void {
  */
 export function __collectWorkspaceDiagnosticFilesForTest(
 	root: string,
+	maxFiles?: number,
 ): Promise<string[]> {
-	return collectWorkspaceDiagnosticFiles(path.resolve(root));
+	return maxFiles === undefined
+		? collectWorkspaceDiagnosticFiles(path.resolve(root))
+		: collectWorkspaceDiagnosticFiles(path.resolve(root), maxFiles);
 }

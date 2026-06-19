@@ -238,6 +238,46 @@ describe("review graph service", () => {
 		}
 	});
 
+	it("does not skip when non-graph files (JSON/MD) push the raw count over the cap", async () => {
+		// The walk is capped at maxGraphFiles+1, but scoped to graph-relevant
+		// extensions — so a repo heavy in JSON/YAML/Markdown does NOT trip the
+		// too_many_files skip on files the graph would have filtered out anyway
+		// (#250 regression guard: a naive cap on the unscoped walk would skip here).
+		const env = setupTestEnvironment("pi-lens-review-graph-scope-");
+		const previous = process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES;
+		process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES = "5";
+		try {
+			const changedPath = createTempFile(
+				env.tmpDir,
+				"src/changed.ts",
+				"export function changed() { return 1; }\n",
+			);
+			createTempFile(
+				env.tmpDir,
+				"src/helper.ts",
+				"export function helper() { return 2; }\n",
+			);
+			// 20 non-graph files — well over the cap of 5, but not graph-relevant.
+			for (let i = 0; i < 20; i += 1) {
+				createTempFile(env.tmpDir, `docs/d${i}.md`, `# doc ${i}\n`);
+				createTempFile(env.tmpDir, `cfg/c${i}.json`, `{ "k": ${i} }\n`);
+			}
+
+			const facts = new FactStore();
+			const graph = await buildOrUpdateGraph(env.tmpDir, [changedPath], facts);
+
+			// 2 main-kind files <= cap of 5 → builds, does not skip.
+			expect(getLastGraphBuildInfo().skipReason).toBeUndefined();
+			expect(getLastGraphBuildInfo().mode).not.toBe("skipped");
+			expect(graph.nodes.size).toBeGreaterThan(0);
+		} finally {
+			if (previous === undefined)
+				delete process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES;
+			else process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES = previous;
+			env.cleanup();
+		}
+	});
+
 	it("rebuilds indexes on workspace cache hit so impact cascade still works", async () => {
 		const env = setupTestEnvironment("pi-lens-review-graph-cache-");
 		try {

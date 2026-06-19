@@ -101,6 +101,47 @@ describe("collectSourceFilesAsync — event-loop budget", () => {
 	});
 });
 
+describe("maxFiles cap (#250) — bounds the walk", () => {
+	it("collectSourceFilesAsync stops at maxFiles", async () => {
+		generateSourceTree(tmpDir, 300);
+		const uncapped = await collectSourceFilesAsync(tmpDir);
+		// Sanity: the fixture must have more files than the cap, or the test
+		// proves nothing.
+		expect(uncapped.length).toBeGreaterThan(10);
+
+		const capped = await collectSourceFilesAsync(tmpDir, { maxFiles: 10 });
+		expect(capped.length).toBe(10);
+	});
+
+	it("collectSourceFiles (sync) stops at maxFiles", () => {
+		generateSourceTree(tmpDir, 300);
+		const uncapped = collectSourceFiles(tmpDir);
+		expect(uncapped.length).toBeGreaterThan(10);
+
+		const capped = collectSourceFiles(tmpDir, { maxFiles: 10 });
+		expect(capped.length).toBe(10);
+	});
+
+	it("treats a non-positive / non-finite maxFiles as unbounded", async () => {
+		generateSourceTree(tmpDir, 120);
+		const uncapped = await collectSourceFilesAsync(tmpDir);
+		// 0, negative, and NaN must NOT cap to zero — they mean "no cap".
+		for (const bad of [0, -5, Number.NaN]) {
+			const result = await collectSourceFilesAsync(tmpDir, { maxFiles: bad });
+			expect(result.length).toBe(uncapped.length);
+		}
+	});
+
+	it("a cap larger than the tree returns everything (cap is a ceiling)", async () => {
+		generateSourceTree(tmpDir, 80);
+		const uncapped = await collectSourceFilesAsync(tmpDir);
+		const capped = await collectSourceFilesAsync(tmpDir, {
+			maxFiles: uncapped.length + 1000,
+		});
+		expect(new Set(capped)).toEqual(new Set(uncapped));
+	});
+});
+
 describe("generated-header read memo", () => {
 	it("reuses the header verdict on a repeat scan of unchanged files", async () => {
 		generateSourceTree(tmpDir, 400);

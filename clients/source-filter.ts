@@ -73,6 +73,14 @@ export interface SourceCollectionOptions {
 	includeDeclarationFiles?: boolean;
 	/** Inspect a small header prefix for generated-code banners (default: true) */
 	inspectGeneratedHeaders?: boolean;
+	/**
+	 * Hard cap on the number of source files collected. When set, the walk stops
+	 * as soon as this many files are kept — so an over-broad root (e.g. one that
+	 * climbed to $HOME) can't enumerate the whole tree before a caller decides to
+	 * bail on count. Callers that only need "are there more than N?" should pass
+	 * `N + 1`. Unset = unbounded (default). Refs #250.
+	 */
+	maxFiles?: number;
 }
 
 function shouldSkipGeneratedOrArtifact(
@@ -183,6 +191,7 @@ interface ResolvedCollectionConfig {
 	ignoreMatcher: ReturnType<typeof getProjectIgnoreMatcher>;
 	extraExcludePatterns: string[];
 	extensions: Set<string>;
+	maxFiles: number;
 	options?: SourceCollectionOptions;
 }
 
@@ -190,10 +199,15 @@ function resolveCollectionConfig(
 	rootDir: string,
 	options?: SourceCollectionOptions,
 ): ResolvedCollectionConfig {
+	const rawMax = options?.maxFiles;
 	return {
 		ignoreMatcher: getProjectIgnoreMatcher(rootDir),
 		extraExcludePatterns: options?.excludeDirs ?? [],
 		extensions: new Set(options?.extensions || ALL_SCANNABLE_EXTENSIONS),
+		maxFiles:
+			typeof rawMax === "number" && Number.isFinite(rawMax) && rawMax > 0
+				? Math.floor(rawMax)
+				: Number.POSITIVE_INFINITY,
 		options,
 	};
 }
@@ -244,6 +258,7 @@ export function collectSourceFiles(
 	const files: string[] = [];
 
 	function scan(currentDir: string) {
+		if (files.length >= cfg.maxFiles) return; // hard cap (#250)
 		let entries: fs.Dirent[] = [];
 		try {
 			entries = fs.readdirSync(currentDir, { withFileTypes: true });
@@ -252,6 +267,7 @@ export function collectSourceFiles(
 		}
 
 		for (const entry of entries) {
+			if (files.length >= cfg.maxFiles) return;
 			const fullPath = path.join(currentDir, entry.name);
 			const { recurseInto, keepFile } = classifyEntry(entry, fullPath, cfg);
 			if (recurseInto) scan(recurseInto);
@@ -310,7 +326,10 @@ export async function collectSourceFilesAsync(
 			const fullPath = path.join(currentDir, entry.name);
 			const { recurseInto, keepFile } = classifyEntry(entry, fullPath, cfg);
 			if (recurseInto) subDirs.push(recurseInto);
-			else if (keepFile) files.push(keepFile);
+			else if (keepFile) {
+				files.push(keepFile);
+				if (files.length >= cfg.maxFiles) return files; // hard cap (#250)
+			}
 			if (++processedSinceYield >= yieldEvery) {
 				processedSinceYield = 0;
 				await new Promise<void>((resolve) => setImmediate(resolve));

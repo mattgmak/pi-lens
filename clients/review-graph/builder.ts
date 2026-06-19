@@ -13,7 +13,7 @@ import {
 } from "../dispatch/facts/import-facts.js";
 import type { DispatchContext } from "../dispatch/types.js";
 import { featureHintMetadata } from "../feature-hints.js";
-import { detectFileKind } from "../file-kinds.js";
+import { detectFileKind, KIND_EXTENSIONS } from "../file-kinds.js";
 import { detectFileRole } from "../file-role.js";
 import { getProjectDataDir } from "../file-utils.js";
 import { normalizeMapKey } from "../path-utils.js";
@@ -47,6 +47,14 @@ const MAIN_KINDS = new Set([
 	"zig",
 	"shell",
 ]);
+
+// File extensions for the kinds the graph actually ingests. Scoping the source
+// walk to these means the maxGraphFiles cap counts only graph-relevant files —
+// so a repo heavy in JSON/YAML/Markdown doesn't trip the cap on files the graph
+// would have filtered out anyway (the cap is on the walk, not on noise). #250.
+const MAIN_KIND_EXTENSIONS: string[] = Array.from(MAIN_KINDS).flatMap(
+	(kind) => KIND_EXTENSIONS[kind as keyof typeof KIND_EXTENSIONS] ?? [],
+);
 const CHANGED_SYMBOLS_PREFIX = "session.reviewGraph.changedSymbols:";
 const treeSitterClient = new TreeSitterClient();
 const extractorCache = new Map<string, TreeSitterSymbolExtractor>();
@@ -299,7 +307,24 @@ function isWithinReviewGraphSizeLimit(file: string): boolean {
 async function getGraphSourceFiles(cwd: string): Promise<string[]> {
 	// Async, chunked-yield walk (identical output to the sync collector) so the
 	// per-edit cascade graph rebuild doesn't block the event loop on a large repo.
-	const collected = await collectProjectSourceFilesAsync(cwd);
+	//
+	// Cap the walk at maxGraphFiles+1: an over-limit repo (or a root that climbed
+	// to $HOME) short-circuits collection instead of enumerating the entire tree
+	// and paying a statSync per file before the caller bails on count (#250). When
+	// the cap is hit the caller skips the build on count alone, so the unfiltered
+	// over-limit list is all it needs — see _doBuildGraph's too_many_files branch.
+	const maxGraphFiles = getReviewGraphMaxFiles();
+	const collected = await collectProjectSourceFilesAsync(cwd, {
+		// Only walk graph-relevant extensions so the cap counts what the graph
+		// keeps (post-filter), not JSON/YAML/MD noise it would discard anyway.
+		extensions: MAIN_KIND_EXTENSIONS,
+		maxFiles: maxGraphFiles + 1,
+	});
+	if (collected.length > maxGraphFiles) {
+		// Contents are unused by the too_many_files branch; return the capped list
+		// so the caller's `length > maxGraphFiles` check still trips.
+		return collected;
+	}
 	const result: string[] = [];
 	let sinceYield = 0;
 	for (const raw of collected) {
