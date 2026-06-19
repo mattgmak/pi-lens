@@ -1,10 +1,6 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { FactStore } from "../../clients/dispatch/fact-store.js";
-import {
-	_resetModuleReportConfigForTests,
-	moduleReport,
-	readSymbol,
-} from "../../clients/module-report.js";
+import { moduleReport, readSymbol } from "../../clients/module-report.js";
 import {
 	buildOrUpdateGraph,
 	clearReviewGraphWorkspaceCache,
@@ -12,28 +8,11 @@ import {
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
 // module_report consumes the cached review graph read-only (#256) — it never
-// builds. Production warms the cache via the edit pipeline; tests must do the
-// same before asserting graph-derived who-uses-this / imports.
+// builds and never calls an LSP server. Production warms the cache via the edit
+// pipeline; tests must do the same before asserting graph-derived who-uses-this.
 async function warmGraph(cwd: string): Promise<void> {
 	await buildOrUpdateGraph(cwd, [], new FactStore());
 }
-
-// These tests exercise the tree-sitter + review-graph tiers. Disable the live-LSP
-// tier (budget 0) so they never spawn a real language server — the bounded-LSP
-// behavior has its own mocked suite in module-report-lsp.test.ts.
-const prevBudget = process.env.PI_LENS_MODULE_REPORT_LSP_BUDGET_MS;
-beforeAll(() => {
-	process.env.PI_LENS_MODULE_REPORT_LSP_BUDGET_MS = "0";
-	_resetModuleReportConfigForTests();
-});
-afterAll(() => {
-	if (prevBudget === undefined) {
-		delete process.env.PI_LENS_MODULE_REPORT_LSP_BUDGET_MS;
-	} else {
-		process.env.PI_LENS_MODULE_REPORT_LSP_BUDGET_MS = prevBudget;
-	}
-	_resetModuleReportConfigForTests();
-});
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -172,6 +151,39 @@ describe("moduleReport — review-graph who-uses-this", () => {
 		expect(foo?.usedBy?.some((u) => u.file.endsWith("b.ts"))).toBe(true);
 		// recommendedReads should surface the referenced, exported symbol.
 		expect(report.recommendedReads.some((r) => r.symbol === "foo")).toBe(true);
+	});
+
+	it("Tier 3: serves who-uses-this from the persisted disk snapshot when the in-memory cache is cold (cross-process)", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"a.ts",
+			"export function foo(x: number): number {\n  return x + 1;\n}\n",
+		);
+		createTempFile(
+			env.tmpDir,
+			"b.ts",
+			[
+				'import { foo } from "./a.js";',
+				"export function callsFoo(): number {",
+				"  return foo(41);",
+				"}",
+			].join("\n"),
+		);
+		await warmGraph(env.tmpDir); // builds + persists to disk (async)
+
+		// Simulate a fresh process (the edit pipeline persisted; module_report runs
+		// elsewhere with an empty in-memory cache). persistGraph writes async, so
+		// clear in-memory and poll until the disk snapshot lands.
+		let foo: { usedBy?: Array<{ file: string }> } | undefined;
+		for (let attempt = 0; attempt < 20; attempt++) {
+			clearReviewGraphWorkspaceCache(); // force the disk (Tier 3) path
+			const report = await moduleReport("a.ts", env.tmpDir);
+			foo = report.api.find((e) => e.name === "foo");
+			if (foo?.usedBy?.length) break;
+			await new Promise((r) => setTimeout(r, 50));
+		}
+		expect(foo?.usedBy?.some((u) => u.file.endsWith("b.ts"))).toBe(true);
 	});
 
 	it("populates imports for a non-jsts language (python) via graph import edges (#249)", async () => {

@@ -113,9 +113,28 @@ export function getLastGraphBuildInfo(): GraphBuildInfo {
  * navigation read).
  */
 export function getCachedReviewGraph(cwd: string): ReviewGraph | undefined {
-	const cached = _workspaceGraphCache.get(normalizeMapKey(cwd));
-	if (!cached) return undefined;
-	const graph = cloneGraph(cached.graph);
+	const key = normalizeMapKey(cwd);
+	const cached = _workspaceGraphCache.get(key);
+	if (cached) {
+		const graph = cloneGraph(cached.graph);
+		rebuildIndexes(graph);
+		return graph;
+	}
+	// Tier 3: the persisted disk snapshot. This is the cross-PROCESS path — the
+	// edit pipeline (one process) persists the graph; a separate module_report
+	// process reads it here instead of seeing an empty in-memory cache (the
+	// "graph: cold" symptom). Possibly a few edits stale, which is fine for a
+	// navigation read. Warm the in-memory cache so repeat reads in this process
+	// skip the disk read.
+	const disk = loadPersistedGraph(cwd);
+	if (!disk) return undefined;
+	_workspaceGraphCache.set(key, {
+		signature: disk.signature,
+		fileSignatures: disk.fileSignatures,
+		fileHashes: disk.fileHashes,
+		graph: disk.graph,
+	});
+	const graph = cloneGraph(disk.graph);
 	rebuildIndexes(graph);
 	return graph;
 }

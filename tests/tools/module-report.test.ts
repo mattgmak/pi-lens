@@ -1,25 +1,12 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { _resetModuleReportConfigForTests } from "../../clients/module-report.js";
+import { describe, expect, it } from "vitest";
 import {
 	createModuleReportTool,
 	createReadSymbolTool,
 } from "../../tools/module-report.js";
 import { createTempFile, setupTestEnvironment } from "../clients/test-utils.js";
 
-// Disable the live-LSP tier so these tool tests don't spawn a language server.
-const prevBudget = process.env.PI_LENS_MODULE_REPORT_LSP_BUDGET_MS;
-beforeAll(() => {
-	process.env.PI_LENS_MODULE_REPORT_LSP_BUDGET_MS = "0";
-	_resetModuleReportConfigForTests();
-});
-afterAll(() => {
-	if (prevBudget === undefined) {
-		delete process.env.PI_LENS_MODULE_REPORT_LSP_BUDGET_MS;
-	} else {
-		process.env.PI_LENS_MODULE_REPORT_LSP_BUDGET_MS = prevBudget;
-	}
-	_resetModuleReportConfigForTests();
-});
+// module_report is read-only (no graph build, no LSP — #256), so these tool
+// tests need no LSP-disabling guard.
 
 type Recorded = {
 	filePath: string;

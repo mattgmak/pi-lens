@@ -12,16 +12,16 @@
  * merged onto entries by symbol name; that enrichment is additive and varies by
  * language (e.g. complexity exists for jsts), which is honest rather than faked.
  *
- * Single mode (no depth knob — #256). Every call does the same tiered work and
- * returns whatever resolved, degrading gracefully:
- *   1. tree-sitter extract (always; cold-safe structure).
- *   2. review graph load (3-tier cached) for who-uses-this / flags / imports.
- *   3. live-LSP enrichment (`references` + `implementation`) for exported symbols,
- *      issued in parallel under ONE wall-clock deadline
- *      (PI_LENS_MODULE_REPORT_LSP_BUDGET_MS, default 3000ms). Partial-on-timeout;
- *      skipped entirely when no LSP server is configured for the file's language.
- * `semantic.source` reports the truth: "live-lsp" when LSP data resolved, else
- * "none". LSP-derived who-uses-this overrides the AST graph's (provenance-tagged).
+ * Single mode (no depth knob — #256). READ-ONLY by contract — it never builds a
+ * graph and never calls an LSP server on this path (both repeatedly OOM'd pi when
+ * an agent fanned out reports). Every call:
+ *   1. tree-sitter extract of THE one file (always; cold-safe structure).
+ *   2. read the already-built review graph (in-memory, else the persisted disk
+ *      snapshot) for who-uses-this / flags / imports — never a build. Cold cache
+ *      → outline only.
+ * `semantic.source` is always "none" here; live-LSP enrichment is re-homed to
+ * #236, where LSP writes provenance-tagged edges INTO the graph (once, persisted)
+ * for this path to read. The enrichment logic lives in clients/module-report-lsp.ts.
  *
  * Guard integrity: moduleReport injects NO read records — an outline is not
  * "having seen the body". readSymbol returns the actual body lines so the host
@@ -32,16 +32,17 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { detectFileKind } from "./file-kinds.js";
 import { logLatency } from "./latency-logger.js";
-import { enrichModuleReportWithLsp } from "./module-report-lsp.js";
 import { normalizeMapKey } from "./path-utils.js";
 import type { Symbol as ExtractedSymbol } from "./symbol-types.js";
 import { TreeSitterClient } from "./tree-sitter-client.js";
 import { TreeSitterSymbolExtractor } from "./tree-sitter-symbol-extractor.js";
 import type { ReviewGraph, ReviewGraphEdgeKind } from "./review-graph/types.js";
 
-// Live-LSP enrichment lives in its own module (warm-only, bounded) — see #256.
-// Re-exported so the tool/test surface that imports it from here keeps working.
-export { _resetModuleReportConfigForTests } from "./module-report-lsp.js";
+// NOTE: live-LSP enrichment is NO LONGER called on this read path (#256). Firing
+// LSP per read — speculatively, on the agent's fan-out path — repeatedly OOM'd
+// pi. The enrichment logic is kept as a separate module (clients/module-report-
+// lsp.ts) to be re-homed in #236, where LSP writes provenance-tagged edges INTO
+// the review graph (computed once, persisted) so this path just reads them.
 
 export interface ModuleReportOptions {
 	/** Cap on who-uses-this entries per symbol. */
@@ -391,8 +392,7 @@ export async function moduleReport(
 
 	const kind = detectFileKind(absPath);
 	const languageId = tsLangForFile(absPath, kind);
-	const lines = content.split(/\r?\n/);
-	const lineCount = lines.length;
+	const lineCount = content.split(/\r?\n/).length;
 
 	const extracted = languageId
 		? await extractFileSymbols(absPath, languageId, content)
@@ -412,22 +412,6 @@ export async function moduleReport(
 	const entries = extracted.map((sym) =>
 		toEntry(sym, absPath, normalizedPath, graph, maxRefs),
 	);
-
-	// Live-LSP enrichment of exported symbols — on-demand but file-scoped (only
-	// this file's symbols are queried) and bounded (concurrency + symbol caps)
-	// inside one wall-clock budget. Disabled by default until validated (#256
-	// OOM); opt in via PI_LENS_MODULE_REPORT_LSP_BUDGET_MS.
-	const targets = extracted.filter((_sym, i) => entries[i]?.exported);
-	const lsp = await enrichModuleReportWithLsp(absPath, lines, targets, maxRefs);
-	for (let i = 0; i < extracted.length; i++) {
-		const entry = entries[i];
-		const data = lsp.byName.get(extracted[i].name);
-		if (!entry || !data) continue;
-		if (data.usedBy && data.usedBy.length > 0) entry.usedBy = data.usedBy;
-		if (data.hasImpl && !entry.flags.includes("has implementations")) {
-			entry.flags.push("has implementations");
-		}
-	}
 
 	const api = entries.filter((entry) => entry.exported);
 	const internal = entries.filter((entry) => !entry.exported);
@@ -454,15 +438,16 @@ export async function moduleReport(
 		internal,
 		recommendedReads: rankRecommendedReads(entries),
 		semantic: {
-			source: lsp.source,
-			references: lsp.references || hasGraphNode,
-			implementations: lsp.implementations,
+			// No live LSP on the read path (#256 → re-homed to #236 graph-lsp edges).
+			source: "none",
+			references: hasGraphNode,
+			implementations: false,
 		},
 	};
 
-	// Observability (#256): record graph source (cached vs cold) + LSP tier outcome
-	// so a future OOM/latency regression is attributable per call. This path must
-	// stay read-only — "graph: cached|cold", never a build.
+	// Observability (#256): record graph source (cached vs cold) so a future
+	// regression is attributable per call. This path is read-only by contract —
+	// "graph: cached|cold", never a build, never an LSP call.
 	logLatency({
 		type: "phase",
 		phase: "module_report",
@@ -472,8 +457,6 @@ export async function moduleReport(
 			graph: graph ? "cached" : "cold",
 			symbols: entries.length,
 			exported: api.length,
-			lspSource: lsp.source,
-			lspSymbolsEnriched: lsp.byName.size,
 		},
 	});
 

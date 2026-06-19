@@ -9,8 +9,9 @@
  *     own symbols. Reference *targets* are recorded as locations, never re-queried,
  *     so the blast radius is one server + this file (a sweep amortizes to one
  *     spawn per project root — clients are keyed by root and reused).
- *   - BOUNDED: a worker pool caps concurrency (2) and a symbol cap (20) so a file
- *     with many exports cannot flood the server; each probe is clipped to the
+ *   - BOUNDED: a process-local queue serializes module_report LSP sweeps, then a
+ *     worker pool caps per-sweep concurrency (2) and a symbol cap (20) so parallel
+ *     report fan-out cannot flood the server; each probe is clipped to the
  *     remaining wall-clock budget.
  *   - OPT-IN: disabled by default (budget 0) until validated in a real pi session;
  *     enable with PI_LENS_MODULE_REPORT_LSP_BUDGET_MS.
@@ -22,10 +23,12 @@ import { uriToPath } from "./path-utils.js";
 import type { Symbol as ExtractedSymbol } from "./symbol-types.js";
 
 let _lspBudgetMs: number | undefined;
+let lspEnrichmentTail: Promise<void> = Promise.resolve();
 
-/** Test seam: clear the memoized LSP budget so an env override takes effect. */
+/** Test seam: clear memoized config/queue state so env overrides take effect. */
 export function _resetModuleReportConfigForTests(): void {
 	_lspBudgetMs = undefined;
+	lspEnrichmentTail = Promise.resolve();
 }
 
 function getLspBudgetMs(): number {
@@ -41,7 +44,8 @@ function getLspBudgetMs(): number {
 
 // Keep defaults conservative: module_report is a read substitute, not a bulk
 // references tool. These caps bound concurrent/in-flight language-server work
-// inside the wall-clock budget.
+// inside the wall-clock budget. The process-level queue prevents N parallel
+// reports from multiplying this per-report worker pool into a reference storm.
 const MAX_LSP_SYMBOLS = 20;
 const LSP_SYMBOL_CONCURRENCY = 2;
 
@@ -122,6 +126,23 @@ function sleep(ms: number): Promise<void> {
 	});
 }
 
+async function runWithExclusiveLspSweep<T>(work: () => Promise<T>): Promise<T> {
+	const previous = lspEnrichmentTail.catch(() => undefined);
+	let release!: () => void;
+	lspEnrichmentTail = previous.then(
+		() =>
+			new Promise<void>((resolve) => {
+				release = resolve;
+			}),
+	);
+	await previous;
+	try {
+		return await work();
+	} finally {
+		release();
+	}
+}
+
 /** Resolve `promise`, or `undefined` once the shared deadline passes. */
 async function withinRemaining<T>(
 	promise: Promise<T>,
@@ -151,7 +172,18 @@ export async function enrichModuleReportWithLsp(
 	budgetMs = getLspBudgetMs(),
 ): Promise<ModuleReportLspEnrichment> {
 	if (targets.length === 0 || budgetMs <= 0) return NO_LSP;
+	return runWithExclusiveLspSweep(() =>
+		enrichModuleReportWithLspNow(absPath, lines, targets, maxRefs, budgetMs),
+	);
+}
 
+async function enrichModuleReportWithLspNow(
+	absPath: string,
+	lines: string[],
+	targets: ExtractedSymbol[],
+	maxRefs: number,
+	budgetMs: number,
+): Promise<ModuleReportLspEnrichment> {
 	let getServersForFileWithConfig: (f: string) => unknown[];
 	let getLSPService: () => LspServiceLike;
 	try {
