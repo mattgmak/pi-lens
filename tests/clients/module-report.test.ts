@@ -145,6 +145,42 @@ describe("moduleReport — standard depth (graph who-uses-this)", () => {
 		// recommendedReads should surface the referenced, exported symbol.
 		expect(report.recommendedReads.some((r) => r.symbol === "foo")).toBe(true);
 	});
+
+	it("populates imports for a non-jsts language (python) via graph import edges (#249)", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"app.py",
+			"import os\nimport requests\nfrom . import helper\n\ndef go():\n    return os.getcwd()\n",
+		);
+		createTempFile(env.tmpDir, "helper.py", "def h():\n    return 1\n");
+
+		const report = await moduleReport("app.py", env.tmpDir, {
+			depth: "standard",
+		});
+
+		expect(report.available).toBe(true);
+		// External package imports come through the new tree-sitter import edges.
+		expect(report.imports.external).toContain("os");
+		expect(report.imports.external).toContain("requests");
+		expect(report.summary.imports).toBeGreaterThan(0);
+	});
+
+	it("imports stay empty at outline depth (no graph) — but symbols still extract", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"app.py",
+			"import os\n\ndef go():\n    return os.getcwd()\n",
+		);
+		const report = await moduleReport("app.py", env.tmpDir, {
+			depth: "outline",
+		});
+		expect(report.imports.external).toHaveLength(0);
+		expect([...report.api, ...report.internal].some((e) => e.name === "go")).toBe(
+			true,
+		);
+	});
 });
 
 describe("readSymbol — verbatim body for guard-satisfying reads", () => {

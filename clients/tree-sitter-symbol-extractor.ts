@@ -474,18 +474,66 @@ const SYMBOL_QUERIES: Record<string, { defs: string; refs: string }> = {
 // symbol-extraction coverage to the grammar set we actually ship.
 SYMBOL_QUERIES.tsx = SYMBOL_QUERIES.typescript;
 
+// Per-language import-source extraction (#249). Optional and independent of
+// SYMBOL_QUERIES: a language without an entry simply yields no imports (its
+// symbols still extract). Each query captures the import source text as
+// @importSource. jsts/cxx are intentionally absent — their imports are extracted
+// by the review-graph builder's dedicated paths (importFactProvider / #include).
+const IMPORT_QUERIES: Record<string, string> = {
+	python: `
+      (import_statement name: (dotted_name) @importSource)
+      (import_statement name: (aliased_import name: (dotted_name) @importSource))
+      (import_from_statement module_name: (dotted_name) @importSource)
+      (import_from_statement module_name: (relative_import) @importSource)
+    `,
+	go: `(import_spec path: (interpreted_string_literal) @importSource)`,
+	rust: `(use_declaration argument: (_) @importSource)`,
+	java: `(import_declaration (scoped_identifier) @importSource)`,
+	kotlin: `(import_header (identifier) @importSource)`,
+	csharp: `
+      (using_directive (identifier) @importSource)
+      (using_directive (qualified_name) @importSource)
+    `,
+	swift: `(import_declaration (identifier) @importSource)`,
+	php: `(namespace_use_clause (name) @importSource)`,
+	ocaml: `(open_module (module_path) @importSource)`,
+	dart: `(import_specification (configurable_uri (uri (string_literal) @importSource)))`,
+};
+
+export interface ImportRef {
+	/** Raw import source (quotes/whitespace stripped), e.g. "os.path", "fmt". */
+	source: string;
+	/** 1-based line of the import. */
+	line: number;
+}
+
 export interface ExtractedSymbols {
 	symbols: Symbol[];
 	refs: SymbolRef[];
+	imports: ImportRef[];
+}
+
+// biome-ignore lint/suspicious/noExplicitAny: tree-sitter match type
+function parseImportMatch(match: any): ImportRef | null {
+	for (const capture of match.captures) {
+		if (capture.name !== "importSource") continue;
+		const raw = String(capture.node.text ?? "").trim();
+		const source = raw.replace(/^["'`]+|["'`]+$/g, "");
+		if (!source) continue;
+		return { source, line: capture.node.startPosition.row + 1 };
+	}
+	return null;
 }
 
 export class TreeSitterSymbolExtractor {
 	private languageId: string;
 	private client: TreeSitterClient;
 	// biome-ignore lint/suspicious/noExplicitAny: Query type from web-tree-sitter
-	private defQuery: any;
+	private defQuery: any = null;
 	// biome-ignore lint/suspicious/noExplicitAny: Query type from web-tree-sitter
-	private refQuery: any;
+	private refQuery: any = null;
+	// biome-ignore lint/suspicious/noExplicitAny: Query type from web-tree-sitter
+	private importQuery: any = null;
 
 	constructor(languageId: string, client: TreeSitterClient) {
 		this.languageId = languageId;
@@ -499,20 +547,44 @@ export class TreeSitterSymbolExtractor {
 			if (!language) return false;
 
 			const { Query } = await import("web-tree-sitter");
+			// Compile each query INDEPENDENTLY: a single malformed query — e.g. a
+			// grammar update that breaks the symbol `defs` pattern (a cross-language
+			// smoke test caught exactly this for kotlin) — must not disable the
+			// others. A language with a broken symbol query can still yield imports,
+			// and vice versa; the extractor degrades partially, not to nothing.
 			const queries = SYMBOL_QUERIES[this.languageId];
-			if (!queries) return false;
-
-			// biome-ignore lint/suspicious/noExplicitAny: Language type
-			this.defQuery = new Query(language as any, queries.defs);
-			// biome-ignore lint/suspicious/noExplicitAny: Language type
-			this.refQuery = new Query(language as any, queries.refs);
-			return true;
+			if (queries) {
+				this.defQuery = this.compileQuery(Query, language, queries.defs, "defs");
+				this.refQuery = this.compileQuery(Query, language, queries.refs, "refs");
+			}
+			const importQuerySrc = IMPORT_QUERIES[this.languageId];
+			if (importQuerySrc) {
+				this.importQuery = this.compileQuery(
+					Query,
+					language,
+					importQuerySrc,
+					"imports",
+				);
+			}
+			return Boolean(this.defQuery || this.importQuery);
 		} catch (err) {
 			console.error(
 				`[symbol-extractor] Failed to init ${this.languageId}:`,
 				err,
 			);
 			return false;
+		}
+	}
+
+	// biome-ignore lint/suspicious/noExplicitAny: web-tree-sitter Query/Language types
+	private compileQuery(Query: any, language: any, src: string, label: string) {
+		try {
+			return new Query(language, src);
+		} catch (err) {
+			console.error(
+				`[symbol-extractor] ${this.languageId} ${label} query failed: ${(err as Error).message}`,
+			);
+			return null;
 		}
 	}
 
@@ -530,21 +602,33 @@ export class TreeSitterSymbolExtractor {
 
 		const relativePath = path.relative(process.cwd(), filePath);
 
-		// Extract definitions
-		const defMatches = this.defQuery.matches(tree.rootNode);
-		for (const match of defMatches) {
-			const symbol = this.parseDefMatch(match, relativePath, content);
-			if (symbol) symbols.push(symbol);
+		// Extract definitions (guarded — a language's defs query may have failed to
+		// compile while its imports query succeeded, or vice versa).
+		if (this.defQuery) {
+			for (const match of this.defQuery.matches(tree.rootNode)) {
+				const symbol = this.parseDefMatch(match, relativePath, content);
+				if (symbol) symbols.push(symbol);
+			}
 		}
 
 		// Extract references
-		const refMatches = this.refQuery.matches(tree.rootNode);
-		for (const match of refMatches) {
-			const ref = this.parseRefMatch(match, relativePath);
-			if (ref) refs.push(ref);
+		if (this.refQuery) {
+			for (const match of this.refQuery.matches(tree.rootNode)) {
+				const ref = this.parseRefMatch(match, relativePath);
+				if (ref) refs.push(ref);
+			}
 		}
 
-		return { symbols, refs };
+		// Extract imports (optional — only for languages with an IMPORT_QUERIES entry)
+		const imports: ImportRef[] = [];
+		if (this.importQuery) {
+			for (const match of this.importQuery.matches(tree.rootNode)) {
+				const ref = parseImportMatch(match);
+				if (ref) imports.push(ref);
+			}
+		}
+
+		return { symbols, refs, imports };
 	}
 
 	// biome-ignore lint/suspicious/noExplicitAny: Match type

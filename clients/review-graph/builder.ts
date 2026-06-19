@@ -639,7 +639,7 @@ async function extractTreeSitterSymbols(
 	filePath: string,
 	languageId: string,
 ): Promise<ExtractedSymbols> {
-	const empty: ExtractedSymbols = { symbols: [], refs: [] };
+	const empty: ExtractedSymbols = { symbols: [], refs: [], imports: [] };
 	const initialized = await treeSitterClient.init();
 	if (!initialized) return empty;
 	const tree = await treeSitterClient.parseFile(filePath, languageId);
@@ -703,6 +703,30 @@ function addTreeSitterFile(
 			to: targetId,
 			kind: "references",
 			metadata: { line: ref.line, column: ref.column },
+		});
+	}
+
+	// #249: import edges for tree-sitter languages (python/go/rust/java first).
+	// Sources are kept UNRESOLVED here — external for package-ish sources, module
+	// for relative ones (`.`-prefixed). Resolving a relative source to a project
+	// file is language-specific (Python dotted modules, Rust `use` crates) and is
+	// a follow-up; until then these mirror addJsTsFile's unresolved import branch.
+	for (const imp of extracted.imports) {
+		const isRelative = imp.source.startsWith(".");
+		const targetId = `${isRelative ? "module" : "external"}:${imp.source}`;
+		if (!graph.nodes.has(targetId)) {
+			addNode(graph, {
+				id: targetId,
+				kind: isRelative ? "module" : "external",
+				language: languageId,
+				metadata: { source: imp.source },
+			});
+		}
+		addEdge(graph, {
+			from: fileNodeId,
+			to: targetId,
+			kind: "imports",
+			metadata: { line: imp.line },
 		});
 	}
 }

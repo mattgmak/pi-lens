@@ -222,9 +222,18 @@ function resolveUsedBy(
 	return out;
 }
 
+function toDisplayImportPath(p: string, projectRoot: string): string {
+	if (!path.isAbsolute(p)) return p;
+	const rel = path.relative(projectRoot, p);
+	return rel && !rel.startsWith("..")
+		? rel.replace(/\\/g, "/")
+		: p.replace(/\\/g, "/");
+}
+
 function collectImports(
 	graph: ReviewGraph,
 	normalizedPath: string,
+	projectRoot: string,
 ): { external: string[]; internal: string[] } {
 	const fileNodeId = graph.fileNodes.get(normalizedPath);
 	const external = new Set<string>();
@@ -237,7 +246,7 @@ function collectImports(
 			if (target.kind === "external") {
 				external.add(String(target.metadata?.source ?? edge.to));
 			} else if (target.filePath) {
-				internal.add(target.filePath);
+				internal.add(toDisplayImportPath(target.filePath, projectRoot));
 			} else {
 				internal.add(String(target.metadata?.source ?? edge.to));
 			}
@@ -390,7 +399,7 @@ export async function moduleReport(
 	const api = entries.filter((entry) => entry.exported);
 	const internal = entries.filter((entry) => !entry.exported);
 	const imports = graph
-		? collectImports(graph, normalizedPath)
+		? collectImports(graph, normalizedPath, cwd)
 		: { external: [], internal: [] };
 
 	const hasGraphNode = graph?.fileNodes.has(normalizedPath) ?? false;
