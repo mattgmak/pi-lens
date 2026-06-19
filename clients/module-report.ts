@@ -31,12 +31,16 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { detectFileKind } from "./file-kinds.js";
-import type { LSPLocation } from "./lsp/client.js";
-import { normalizeMapKey, uriToPath } from "./path-utils.js";
+import { enrichModuleReportWithWarmLsp } from "./module-report-lsp.js";
+import { normalizeMapKey } from "./path-utils.js";
 import type { Symbol as ExtractedSymbol } from "./symbol-types.js";
 import { TreeSitterClient } from "./tree-sitter-client.js";
 import { TreeSitterSymbolExtractor } from "./tree-sitter-symbol-extractor.js";
 import type { ReviewGraph, ReviewGraphEdgeKind } from "./review-graph/types.js";
+
+// Live-LSP enrichment lives in its own module (warm-only, bounded) — see #256.
+// Re-exported so the tool/test surface that imports it from here keeps working.
+export { _resetModuleReportConfigForTests } from "./module-report-lsp.js";
 
 export interface ModuleReportOptions {
 	/** Cap on who-uses-this entries per symbol. */
@@ -346,175 +350,6 @@ function rankRecommendedReads(
 		});
 }
 
-// --- Live-LSP enrichment (#256) ---------------------------------------------
-// On-demand, single-file LSP relationship resolution. Bounded by ONE wall-clock
-// deadline across all symbols (not per call — a 200-symbol file must not cost
-// 200×budget). Skipped when no server is configured for the language; degrades
-// to AST-only on timeout/absence. This is `live-lsp`, distinct from #236's
-// persisted `graph-lsp` edge merge.
-
-let _lspBudgetMs: number | undefined;
-
-/** Test seam: clear the memoized LSP budget so an env override takes effect. */
-export function _resetModuleReportConfigForTests(): void {
-	_lspBudgetMs = undefined;
-}
-
-function getLspBudgetMs(): number {
-	if (_lspBudgetMs === undefined) {
-		const raw = Number(process.env.PI_LENS_MODULE_REPORT_LSP_BUDGET_MS);
-		// >=0 honored (0 disables live-LSP entirely); anything else → default 3000.
-		_lspBudgetMs = Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 3000;
-	}
-	return _lspBudgetMs;
-}
-
-// Kinds whose implementers are worth an LSP `implementation` probe.
-const INTERFACE_LIKE_KINDS = new Set(["interface", "class", "type"]);
-
-interface LspEnrichment {
-	source: "live-lsp" | "none";
-	/** Reference data resolved from a live LSP server. */
-	references: boolean;
-	/** At least one symbol had implementers. */
-	implementations: boolean;
-	byName: Map<string, { usedBy?: ModuleSymbolUsedBy[]; hasImpl?: boolean }>;
-}
-
-const NO_LSP: LspEnrichment = {
-	source: "none",
-	references: false,
-	implementations: false,
-	byName: new Map(),
-};
-
-/**
- * LSP positions are 0-based and must land on the symbol's *identifier*. The
- * extractor records `column` at the declaration start (e.g. `export`/`function`),
- * so search the start line for the name from there to find the identifier column.
- */
-function lspPosition(
-	sym: ExtractedSymbol,
-	lines: string[],
-): { line: number; character: number } {
-	const lineIdx = Math.max(0, sym.line - 1);
-	const text = lines[lineIdx] ?? "";
-	const fromCol = Math.max(0, (sym.column ?? 1) - 1);
-	let character = text.indexOf(sym.name, fromCol);
-	if (character < 0) character = text.indexOf(sym.name);
-	if (character < 0) character = fromCol;
-	return { line: lineIdx, character };
-}
-
-function lspLocationsToUsedBy(
-	locs: LSPLocation[],
-	cap: number,
-): ModuleSymbolUsedBy[] {
-	const out: ModuleSymbolUsedBy[] = [];
-	const seen = new Set<string>();
-	for (const loc of locs) {
-		const file = loc.uri ? uriToPath(loc.uri) : "";
-		if (!file) continue;
-		const line = (loc.range?.start?.line ?? 0) + 1;
-		const key = `${file}:${line}`;
-		if (seen.has(key)) continue;
-		seen.add(key);
-		out.push({ file, symbol: "", line, relation: "references", provenance: "lsp" });
-		if (out.length >= cap) break;
-	}
-	return out;
-}
-
-async function enrichWithLsp(
-	absPath: string,
-	lines: string[],
-	targets: ExtractedSymbol[],
-	maxRefs: number,
-	budgetMs: number,
-): Promise<LspEnrichment> {
-	if (targets.length === 0 || budgetMs <= 0) return NO_LSP;
-
-	let getServersForFileWithConfig: (f: string) => unknown[];
-	let getLSPService: () => {
-		references: (
-			f: string,
-			line: number,
-			character: number,
-			includeDeclaration?: boolean,
-		) => Promise<LSPLocation[]>;
-		implementation: (
-			f: string,
-			line: number,
-			character: number,
-		) => Promise<LSPLocation[]>;
-	};
-	try {
-		({ getServersForFileWithConfig } = await import("./lsp/config.js"));
-		({ getLSPService } = await import("./lsp/index.js"));
-	} catch {
-		return NO_LSP;
-	}
-
-	// Gate: no configured server for this language → don't pay the client wait.
-	try {
-		if (getServersForFileWithConfig(absPath).length === 0) return NO_LSP;
-	} catch {
-		return NO_LSP;
-	}
-
-	const lsp = getLSPService();
-	const byName = new Map<
-		string,
-		{ usedBy?: ModuleSymbolUsedBy[]; hasImpl?: boolean }
-	>();
-	let resolvedWithData = false;
-	let sawImpl = false;
-
-	const tasks: Promise<void>[] = [];
-	for (const sym of targets) {
-		const { line, character } = lspPosition(sym, lines);
-		tasks.push(
-			lsp
-				.references(absPath, line, character, false)
-				.then((locs) => {
-					if (!locs || locs.length === 0) return;
-					const usedBy = lspLocationsToUsedBy(locs, maxRefs);
-					if (usedBy.length === 0) return;
-					byName.set(sym.name, { ...byName.get(sym.name), usedBy });
-					resolvedWithData = true;
-				})
-				.catch(() => {}),
-		);
-		if (INTERFACE_LIKE_KINDS.has(sym.kind)) {
-			tasks.push(
-				lsp
-					.implementation(absPath, line, character)
-					.then((locs) => {
-						if (!locs || locs.length === 0) return;
-						byName.set(sym.name, { ...byName.get(sym.name), hasImpl: true });
-						sawImpl = true;
-						resolvedWithData = true;
-					})
-					.catch(() => {}),
-			);
-		}
-	}
-
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	const deadline = new Promise<void>((resolve) => {
-		timer = setTimeout(resolve, budgetMs);
-	});
-	await Promise.race([Promise.allSettled(tasks), deadline]);
-	if (timer) clearTimeout(timer);
-
-	return {
-		source: resolvedWithData ? "live-lsp" : "none",
-		references: resolvedWithData,
-		implementations: sawImpl,
-		byName,
-	};
-}
-
 function unavailableReport(displayPath: string): ModuleReport {
 	return {
 		available: false,
@@ -574,14 +409,16 @@ export async function moduleReport(
 		toEntry(sym, absPath, normalizedPath, graph, maxRefs),
 	);
 
-	// Live-LSP enrichment of exported symbols, bounded by one wall-clock deadline.
+	// Live-LSP enrichment of exported symbols — warm-only (never cold-spawns a
+	// language server) and bounded (concurrency + symbol caps) inside one
+	// wall-clock budget. Disabled by default until validated (#256 OOM); opt in
+	// via PI_LENS_MODULE_REPORT_LSP_BUDGET_MS.
 	const targets = extracted.filter((_sym, i) => entries[i]?.exported);
-	const lsp = await enrichWithLsp(
+	const lsp = await enrichModuleReportWithWarmLsp(
 		absPath,
 		lines,
 		targets,
 		maxRefs,
-		getLspBudgetMs(),
 	);
 	for (let i = 0; i < extracted.length; i++) {
 		const entry = entries[i];
