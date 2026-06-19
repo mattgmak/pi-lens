@@ -245,6 +245,11 @@ const SYMBOL_QUERIES: Record<string, { defs: string; refs: string }> = {
     `,
 	},
 	kotlin: {
+		// #251: class_declaration's name is type_identifier; the old extra
+		// `(class_declaration (simple_identifier) @className)` was a bad pattern that
+		// failed query compilation (taking the whole language down). Call refs use
+		// no field name in the shipped grammar (the old `calleeExpression:` field
+		// also failed to compile).
 		defs: `
       (function_declaration
         (simple_identifier) @funcName) @funcDef
@@ -254,44 +259,28 @@ const SYMBOL_QUERIES: Record<string, { defs: string; refs: string }> = {
 
       (object_declaration
         (type_identifier) @className) @classDef
-
-      (class_declaration
-        (simple_identifier) @className) @classDef
     `,
 		refs: `
       (call_expression
-        calleeExpression: (simple_identifier) @callIdent) @callRef
+        (simple_identifier) @callIdent) @callRef
 
-      (call_expression
-        calleeExpression: (navigation_expression
-          selectorExpression: (simple_identifier) @callMethod)) @callMethodRef
-
-      (user_type (type_reference (simple_identifier) @typeIdent)) @typeRef
+      (user_type (type_identifier) @typeIdent)
     `,
 	},
 	dart: {
+		// #251: function_signature/class_definition take their name/params as direct
+		// children in the shipped grammar — the old `name:`/`parameters:` fields did
+		// not exist and failed query compilation. method bodies' inner
+		// function_signature also matches @funcDef (methods surface as functions).
 		defs: `
       (function_signature
-        name: (identifier) @funcName
-        parameters: (formal_parameter_list) @funcParams) @funcDef
-
-      (method_signature
-        name: (identifier) @methodName
-        parameters: (formal_parameter_list) @methodParams) @methodDef
+        (identifier) @funcName
+        (formal_parameter_list) @funcParams) @funcDef
 
       (class_definition
-        name: (identifier) @className) @classDef
-
-      (mixin_declaration
-        name: (identifier) @className) @classDef
-
-      (extension_declaration
-        name: (identifier) @className) @classDef
+        (identifier) @className) @classDef
     `,
 		refs: `
-      (function_expression_body
-        (identifier) @callIdent) @callRef
-
       (type_identifier) @typeIdent
     `,
 	},
@@ -378,7 +367,7 @@ const SYMBOL_QUERIES: Record<string, { defs: string; refs: string }> = {
         name: (name) @callMethod) @callMethodRef
 
       (object_creation_expression
-        class_name: (name) @newIdent) @newRef
+        (name) @newIdent) @newRef
     `,
 	},
 	swift: {
@@ -403,36 +392,31 @@ const SYMBOL_QUERIES: Record<string, { defs: string; refs: string }> = {
     `,
 	},
 	lua: {
+		// #251: this grammar names function defs function_definition_statement /
+		// local_function_definition_statement (name as a direct child), and calls
+		// `call (variable (identifier))` — the old function_declaration /
+		// local_function / function_call node names don't exist (zero symbols).
 		defs: `
-      (function_declaration
-        name: (identifier) @funcName
-        parameters: (parameters) @funcParams) @funcDef
+      (function_definition_statement
+        (identifier) @funcName) @funcDef
 
-      (local_function
-        name: (identifier) @funcName
-        parameters: (parameters) @funcParams) @funcDef
+      (local_function_definition_statement
+        (identifier) @funcName) @funcDef
     `,
 		refs: `
-      (function_call
-        (identifier) @callIdent) @callRef
-
-      (function_call
-        (method_index_expression
-          method: (identifier) @callMethod)) @callMethodRef
+      (call (variable (identifier) @callIdent)) @callRef
     `,
 	},
 	ocaml: {
+		// #251: let_binding holds value_name as a direct child (no `pattern:` /
+		// value_pattern wrapper), and module_binding's module_name is a direct child
+		// (no `name:` field) — the old patterns failed query compilation.
 		defs: `
       (value_definition
-        (let_binding
-          pattern: (value_pattern (value_name) @funcName))) @funcDef
+        (let_binding (value_name) @funcName)) @funcDef
 
       (module_definition
-        (module_binding
-          name: (module_name) @moduleName)) @moduleDef
-
-      (type_definition
-        (type_constructor) @typeName) @typeDef
+        (module_binding (module_name) @moduleName)) @moduleDef
     `,
 		refs: `
       (application_expression
@@ -446,12 +430,11 @@ const SYMBOL_QUERIES: Record<string, { defs: string; refs: string }> = {
       (function_declaration
         (identifier) @funcName) @funcDef
     `,
+		// #251: the old `field_access` node name doesn't exist in this grammar and
+		// failed to compile; call_expression refs are valid.
 		refs: `
       (call_expression
         (identifier) @callIdent) @callRef
-
-      (field_access
-        (identifier) @callMethod) @callMethodRef
     `,
 	},
 	bash: {
