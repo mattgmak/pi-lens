@@ -4,7 +4,7 @@
  * Runs `cargo clippy` for Rust files to catch common mistakes.
  */
 
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { findNearestContaining } from "../../path-utils.js";
 import { RustClient } from "../../rust-client.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
@@ -94,10 +94,12 @@ const rustClippyRunner: RunnerDefinition = {
 			return { status: "succeeded", diagnostics: [], semantic: "none" };
 		}
 
-		// Parse JSON output
-		const diagnostics = parseClippyOutput(raw, ctx.filePath);
+		// Parse JSON output. span.file is relative to the package root, so pass
+		// the cargo dir to resolve diagnostics to absolute paths for filtering.
+		const cargoDir = cargoToml.replace("Cargo.toml", "");
+		const allDiagnostics = parseClippyOutput(raw, ctx.filePath, cargoDir);
 
-		if (diagnostics.length === 0) {
+		if (allDiagnostics.length === 0) {
 			// Non-parseable output
 			return {
 				status: "failed",
@@ -107,11 +109,24 @@ const rustClippyRunner: RunnerDefinition = {
 			};
 		}
 
+		// Lint-style policy (#265 B1): `cargo clippy` compiles the whole crate, so
+		// a crate-mate's pre-existing diagnostic must NOT fail the edited file's
+		// turn. Filter to the edited file like golangci-lint — if the edited file
+		// is clean, this turn succeeds even when siblings carry warnings/errors.
+		const absEdited = resolve(ctx.filePath);
+		const diagnostics = allDiagnostics.filter(
+			(d) => resolve(d.filePath) === absEdited,
+		);
+
 		const hasErrors = diagnostics.some((d) => d.semantic === "blocking");
 		return {
 			status: hasErrors ? "failed" : "succeeded",
 			diagnostics,
-			semantic: hasErrors ? "blocking" : "warning",
+			semantic: hasErrors
+				? "blocking"
+				: diagnostics.length > 0
+					? "warning"
+					: "none",
 		};
 	},
 };
@@ -160,7 +175,11 @@ function findMachineApplicableSpan(
 	);
 }
 
-export function parseClippyOutput(raw: string, filePath: string): Diagnostic[] {
+export function parseClippyOutput(
+	raw: string,
+	fallbackPath: string,
+	cargoDir?: string,
+): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
 	const lines = raw.split("\n").filter((l) => l.trim());
 
@@ -179,10 +198,19 @@ export function parseClippyOutput(raw: string, filePath: string): Diagnostic[] {
 
 			const fixableSpan = findMachineApplicableSpan(spans);
 
+			// span.file is relative to the package root; resolve to absolute when
+			// the cargo dir is known so callers can filter by edited file (#265 B1).
+			const rawFile = span.file || span.file_name;
+			const filePath = rawFile
+				? cargoDir && !isAbsolute(rawFile)
+					? resolve(cargoDir, rawFile)
+					: rawFile
+				: fallbackPath;
+
 			diagnostics.push({
 				id: `clippy-${message.code?.code || "unknown"}`,
 				message: message.message || "Clippy warning",
-				filePath: span.file || span.file_name || filePath,
+				filePath,
 				line: span.line_start || 0,
 				column: span.column_start || 0,
 				severity: message.level === "error" ? "error" : "warning",

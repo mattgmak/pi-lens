@@ -30,12 +30,27 @@ interface PhpstanOutput {
 	errors: string[];
 }
 
-function parsePhpstanJson(raw: string, filePath: string): Diagnostic[] {
+// phpstan analyses the target file PLUS its dependency closure and keys errors
+// by the real file in `output.files`. Attribute each diagnostic to that key
+// (resolved against cwd) rather than blanket-stamping ctx.filePath — otherwise a
+// cross-file regression is mis-located onto the edited file (#265 A3). We do NOT
+// filter to the edited file: surfacing the cross-file impact is the point.
+export function parsePhpstanJson(
+	raw: string,
+	fallbackPath: string,
+	cwd: string,
+): Diagnostic[] {
 	try {
 		const output: PhpstanOutput = JSON.parse(raw);
 		const diagnostics: Diagnostic[] = [];
 
-		for (const [, fileErrors] of Object.entries(output.files ?? {})) {
+		for (const [file, fileErrors] of Object.entries(output.files ?? {})) {
+			const filePath =
+				file && file.trim()
+					? path.isAbsolute(file)
+						? file
+						: path.resolve(cwd, file)
+					: fallbackPath;
 			for (const err of fileErrors.errors ?? []) {
 				diagnostics.push({
 					id: `phpstan:${err.line ?? 1}:${err.message.slice(0, 40)}`,
@@ -101,7 +116,7 @@ const phpstanRunner: RunnerDefinition = {
 			return { status: "succeeded", diagnostics: [], semantic: "none" };
 		}
 
-		const diagnostics = parsePhpstanJson(result.stdout ?? "", ctx.filePath);
+		const diagnostics = parsePhpstanJson(result.stdout ?? "", ctx.filePath, cwd);
 		if (diagnostics.length === 0) {
 			return { status: "succeeded", diagnostics: [], semantic: "none" };
 		}
