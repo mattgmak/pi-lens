@@ -16,6 +16,7 @@ import {
 } from "../clients/lsp/edits.js";
 import { getLSPService } from "../clients/lsp/index.js";
 import type { SearchReadLocation } from "../clients/search-read-registration.js";
+import { buildLspNavigationEnvelope } from "./lsp-structured-output.js";
 
 const VALID_OPERATIONS = [
 	"definition",
@@ -38,6 +39,17 @@ const VALID_OPERATIONS = [
 	"workspaceDiagnostics",
 	"capabilities",
 ] as const;
+
+const NAVIGABLE_SYMBOL_KINDS = new Set([
+	5, // Class
+	6, // Method
+	8, // Field
+	11, // Interface
+	12, // Function
+	13, // Variable
+	22, // EnumMember
+	23, // Struct
+]);
 
 type LspNavigationOperation = (typeof VALID_OPERATIONS)[number];
 
@@ -464,8 +476,8 @@ function dedupeWorkspaceSymbols<T extends SymbolNode>(symbols: T[]): T[] {
 }
 
 type RangeLike = {
-	start?: { line?: unknown };
-	end?: { line?: unknown };
+	start?: { line?: unknown; character?: unknown };
+	end?: { line?: unknown; character?: unknown };
 };
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -929,8 +941,25 @@ export function createLspNavigationTool(
 					},
 				});
 
+				const text = payload.content[0]?.text ?? "";
+				const envelope = buildLspNavigationEnvelope({
+					operation: meta.operation,
+					filePath: meta.filePath,
+					failureKind: meta.failureKind,
+					resultCount: meta.resultCount,
+					text,
+					isError: payload.isError,
+					details: payload.details,
+				});
+
 				return {
 					...payload,
+					content: [
+						{
+							type: "text" as const,
+							text: JSON.stringify(envelope, null, 2),
+						},
+					],
 					details: {
 						...(payload.details ?? {}),
 						failureKind: meta.failureKind,
@@ -1307,6 +1336,56 @@ export function createLspNavigationTool(
 			const lspEndLine = (endLine ?? line ?? 1) - 1;
 			const lspEndChar = (endCharacter ?? resolvedCharacter.character) - 1;
 
+			const runWorkspaceSymbolOperation = async (): Promise<SymbolNode[]> => {
+				supported = operationSupportStatus(
+					operation,
+					await lspService.getOperationSupport(rawPath ? filePath : undefined),
+				);
+				if (supported === false) {
+					throw new Error(
+						"__UNSUPPORTED__ Active LSP server does not advertise support for workspaceSymbol",
+					);
+				}
+				if (!query || query.trim().length === 0) {
+					throw new Error(
+						"__BADINPUT__ query parameter required for workspaceSymbol",
+					);
+				}
+				if (rawPath) {
+					await openFileBestEffort(lspService, filePath);
+				}
+				try {
+					const raw = await lspService.workspaceSymbol(
+						query ?? "",
+						rawPath ? filePath : undefined,
+					);
+					const filtered = (Array.isArray(raw) ? raw : [raw]).filter(
+						(s) =>
+							typeof s === "object" &&
+							s !== null &&
+							(!s.kind || NAVIGABLE_SYMBOL_KINDS.has(s.kind)),
+					) as SymbolNode[];
+					return dedupeWorkspaceSymbols(filtered).slice(0, 15);
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : String(err);
+					if (rawPath && /No Project/i.test(msg)) {
+						await openFileBestEffort(lspService, filePath);
+						await new Promise((resolve) => setTimeout(resolve, 120));
+						const retryRaw = await lspService.workspaceSymbol(
+							query ?? "",
+							filePath,
+						);
+						const retrySymbols = (
+							Array.isArray(retryRaw) ? retryRaw : [retryRaw]
+						).filter(
+							(s) => typeof s === "object" && s !== null,
+						) as SymbolNode[];
+						return dedupeWorkspaceSymbols(retrySymbols);
+					}
+					throw err;
+				}
+			};
+
 			const runOperation = async (): Promise<unknown> => {
 				switch (operation) {
 					case "definition":
@@ -1344,66 +1423,7 @@ export function createLspNavigationTool(
 						});
 					}
 					case "workspaceSymbol":
-						supported = operationSupportStatus(
-							operation,
-							await lspService.getOperationSupport(
-								rawPath ? filePath : undefined,
-							),
-						);
-						if (supported === false) {
-							throw new Error(
-								"__UNSUPPORTED__ Active LSP server does not advertise support for workspaceSymbol",
-							);
-						}
-						if (!query || query.trim().length === 0) {
-							throw new Error(
-								"__BADINPUT__ query parameter required for workspaceSymbol",
-							);
-						}
-						if (rawPath) {
-							await openFileBestEffort(lspService, filePath);
-						}
-						try {
-							const raw = await lspService.workspaceSymbol(
-								query ?? "",
-								rawPath ? filePath : undefined,
-							);
-							// Filter to navigable symbol kinds and cap results to save context tokens
-							const NAVIGABLE_KINDS = new Set([
-								5, // Class
-								6, // Method
-								8, // Field
-								11, // Interface
-								12, // Function
-								13, // Variable
-								22, // EnumMember
-								23, // Struct
-							]);
-							const filtered = (Array.isArray(raw) ? raw : [raw]).filter(
-								(s) =>
-									typeof s === "object" &&
-									s !== null &&
-									(!s.kind || NAVIGABLE_KINDS.has(s.kind)),
-							) as SymbolNode[];
-							return dedupeWorkspaceSymbols(filtered).slice(0, 15);
-						} catch (err) {
-							const msg = err instanceof Error ? err.message : String(err);
-							if (rawPath && /No Project/i.test(msg)) {
-								await openFileBestEffort(lspService, filePath);
-								await new Promise((resolve) => setTimeout(resolve, 120));
-								const retryRaw = await lspService.workspaceSymbol(
-									query ?? "",
-									filePath,
-								);
-								const retrySymbols = (
-									Array.isArray(retryRaw) ? retryRaw : [retryRaw]
-								).filter(
-									(s) => typeof s === "object" && s !== null,
-								) as SymbolNode[];
-								return dedupeWorkspaceSymbols(retrySymbols);
-							}
-							throw err;
-						}
+						return runWorkspaceSymbolOperation();
 					case "codeAction":
 						return lspService.codeAction(
 							filePath,

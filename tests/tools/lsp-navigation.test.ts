@@ -16,6 +16,20 @@ import { createLspNavigationTool } from "../../tools/lsp-navigation.js";
 
 const tmpPath = (name: string): string => path.join(os.tmpdir(), name);
 const tmpFileUrl = (name: string): string => pathToFileURL(tmpPath(name)).href;
+const parseToolJson = (result: {
+	content: Array<{ text?: string }>;
+}): Record<string, unknown> => {
+	try {
+		return JSON.parse(String(result.content[0]?.text)) as Record<
+			string,
+			unknown
+		>;
+	} catch (error) {
+		throw new Error(
+			`Expected parseable lsp_navigation JSON: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+};
 
 describe("lsp_navigation tool", () => {
 	beforeEach(() => {
@@ -113,6 +127,14 @@ describe("lsp_navigation tool", () => {
 		);
 
 		expect(result.isError).toBeUndefined();
+		const envelope = parseToolJson(result);
+		expect(envelope).toMatchObject({
+			tool: "lsp_navigation",
+			operation: "capabilities",
+			ok: true,
+			status: "success",
+			resultCount: 1,
+		});
 		expect(String(result.content[0]?.text)).toContain(
 			"typescript (/workspace)",
 		);
@@ -141,6 +163,26 @@ describe("lsp_navigation tool", () => {
 		expect(result.isError).toBeUndefined();
 		expect(String(result.content[0]?.text)).toContain("No active LSP server");
 		expect(result.details?.resultCount).toBe(0);
+	});
+
+	it("returns structured JSON for LSP-disabled errors", async () => {
+		const tool = createLspNavigationTool((flag) => flag === "no-lsp");
+		const result = await tool.execute(
+			"disabled",
+			{ operation: "definition", filePath: "x.ts", line: 1, character: 1 },
+			new AbortController().signal,
+			null,
+			{ cwd: "." },
+		);
+
+		expect(result.isError).toBe(true);
+		expect(parseToolJson(result)).toMatchObject({
+			tool: "lsp_navigation",
+			operation: "precheck",
+			ok: false,
+			status: "lsp_disabled",
+			resultCount: 0,
+		});
 	});
 
 	it("allows incomingCalls without filePath when callHierarchyItem exists", async () => {
@@ -187,8 +229,13 @@ describe("lsp_navigation tool", () => {
 		);
 
 		expect(result.isError).toBeUndefined();
+		const envelope = parseToolJson(result);
+		expect(envelope.status).toBe("empty");
+		expect(envelope.hints).toEqual([
+			"provide filePath to scope workspaceSymbol to the active language server/root.",
+		]);
 		expect(String(result.content[0]?.text)).toContain(
-			"Hint: provide filePath to scope workspaceSymbol",
+			"provide filePath to scope workspaceSymbol",
 		);
 		expect(
 			(mocked.service as { workspaceSymbol: ReturnType<typeof vi.fn> })
@@ -279,6 +326,16 @@ describe("lsp_navigation tool", () => {
 
 		expect(result.isError).toBeUndefined();
 		expect(result.details?.operation).toBe("typeDefinition");
+		expect(parseToolJson(result).locations).toEqual([
+			{
+				uri: tmpFileUrl("types.ts"),
+				filePath: tmpPath("types.ts"),
+				range: {
+					start: { line: 10, character: 1 },
+					end: { line: 10, character: 5 },
+				},
+			},
+		]);
 		expect(
 			(mocked.service as { typeDefinition: ReturnType<typeof vi.fn> })
 				.typeDefinition,
@@ -901,6 +958,11 @@ describe("lsp_navigation tool", () => {
 			);
 
 			expect(result.isError).toBeUndefined();
+			const envelope = parseToolJson(result);
+			expect(envelope.status).toBe("success");
+			expect(envelope.notes).toEqual([
+				"filePath mode requests pull diagnostics for this file and returns the aggregated result.",
+			]);
 			expect(result.details?.coverage).toBe("requested-file");
 			expect(result.details?.resultCount).toBe(1);
 			expect(
