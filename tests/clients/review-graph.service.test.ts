@@ -8,6 +8,8 @@ import {
 } from "../../clients/review-graph/service.js";
 import {
 	clearGraphCache,
+	clearReviewGraphWorkspaceCache,
+	getCachedReviewGraph,
 	getLastGraphBuildInfo,
 } from "../../clients/review-graph/builder.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
@@ -100,6 +102,35 @@ describe("review graph service", () => {
 			);
 			expect(g2.fileNodes.has(normalizeMapKey(testPath))).toBe(false);
 		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("getCachedReviewGraph returns a shared, indexed object — no per-call clone (#260)", async () => {
+		const env = setupTestEnvironment("pi-lens-review-graph-shared-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"src/a.ts",
+				"export function alpha() {\n  return 1;\n}\n",
+			);
+			createTempFile(
+				env.tmpDir,
+				"src/b.ts",
+				"import { alpha } from './a';\nexport function beta() {\n  return alpha();\n}\n",
+			);
+			await buildOrUpdateGraph(env.tmpDir, [], new FactStore()); // warm cache
+
+			const g1 = getCachedReviewGraph(env.tmpDir);
+			const g2 = getCachedReviewGraph(env.tmpDir);
+			expect(g1).toBeDefined();
+			// Same reference across calls → the read path no longer clones (B/#260).
+			expect(g1).toBe(g2);
+			// And it's already indexed (who-uses-this works without a rebuild).
+			expect(g1!.edgesByFrom.size).toBeGreaterThan(0);
+			expect(g1!.fileNodes.size).toBeGreaterThan(0);
+		} finally {
+			clearReviewGraphWorkspaceCache();
 			env.cleanup();
 		}
 	});

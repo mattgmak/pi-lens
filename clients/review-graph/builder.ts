@@ -28,7 +28,11 @@ import {
 } from "../tree-sitter-symbol-extractor.js";
 import type { ReviewGraph, ReviewGraphEdge, ReviewGraphNode } from "./types.js";
 
-const REVIEW_GRAPH_VERSION = "v2";
+// v3 (#260): test files are no longer indexed. Bumping the version makes
+// loadPersistedGraph reject any v2 snapshot (which still contains test-file
+// nodes/edges) → a clean tests-free rebuild on first load after upgrade, for
+// every project, without anyone deleting the cache by hand.
+const REVIEW_GRAPH_VERSION = "v3";
 const MAIN_KINDS = new Set([
 	"jsts",
 	"python",
@@ -113,20 +117,36 @@ export function getLastGraphBuildInfo(): GraphBuildInfo {
  * is almost always present (possibly a few edits stale, which is fine for a
  * navigation read).
  */
+// Stored snapshots are cloned with EMPTY index maps (see cloneGraph). Build them
+// once, in place, so the read accessor can hand back the cached object directly
+// instead of clone+reindex on every call (#260: module_report was burning
+// 200-425ms each over a 13.5MB graph). The snapshot is never mutated after
+// caching — a new build replaces the map entry rather than editing in place — so
+// the populated indexes stay valid and the object is safe to share read-only.
+function ensureIndexed(graph: ReviewGraph): void {
+	if (graph.edges.length > 0 && graph.edgesByFrom.size === 0) {
+		rebuildIndexes(graph);
+	}
+}
+
+/**
+ * READ-ONLY accessor. Returns the cached graph as a SHARED, already-indexed
+ * object — callers (module_report, symbolImpact) must not mutate it. No clone,
+ * no per-call reindex.
+ */
 export function getCachedReviewGraph(cwd: string): ReviewGraph | undefined {
 	const key = normalizeMapKey(cwd);
 	const cached = _workspaceGraphCache.get(key);
 	if (cached) {
-		const graph = cloneGraph(cached.graph);
-		rebuildIndexes(graph);
-		return graph;
+		ensureIndexed(cached.graph);
+		return cached.graph;
 	}
 	// Tier 3: the persisted disk snapshot. This is the cross-PROCESS path — the
 	// edit pipeline (one process) persists the graph; a separate module_report
 	// process reads it here instead of seeing an empty in-memory cache (the
 	// "graph: cold" symptom). Possibly a few edits stale, which is fine for a
 	// navigation read. Warm the in-memory cache so repeat reads in this process
-	// skip the disk read.
+	// skip the disk read. loadPersistedGraph already rebuilt the indexes.
 	const disk = loadPersistedGraph(cwd);
 	if (!disk) return undefined;
 	_workspaceGraphCache.set(key, {
@@ -135,9 +155,7 @@ export function getCachedReviewGraph(cwd: string): ReviewGraph | undefined {
 		fileHashes: disk.fileHashes,
 		graph: disk.graph,
 	});
-	const graph = cloneGraph(disk.graph);
-	rebuildIndexes(graph);
-	return graph;
+	return disk.graph;
 }
 
 function makeCtx(
