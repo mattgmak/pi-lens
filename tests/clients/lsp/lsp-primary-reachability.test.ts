@@ -85,6 +85,12 @@ describe("LSP primary reachability", () => {
 		expect(defaultPrimary(".mdx")).toBe("marksman");
 	});
 
+	it("PowerShell Editor Services is the primary server for .ps1/.psm1/.psd1 (#278)", () => {
+		expect(defaultPrimary(".ps1")).toBe("powershell");
+		expect(defaultPrimary(".psm1")).toBe("powershell");
+		expect(defaultPrimary(".psd1")).toBe("powershell");
+	});
+
 	it("each declared alternate is wired behind its default and is the next pick when predecessors drop out", () => {
 		for (const { id, defaultId, ext } of ALTERNATES) {
 			const chain = primaryCandidates(ext).map((s) => s.id);

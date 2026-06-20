@@ -369,6 +369,16 @@ const LSP_FIXTURES = [
 		serverHint: "rust-analyzer",
 		tools: ["rust-analyzer"],
 	},
+	{
+		// #278: PowerShell Editor Services — a pwsh-bootstrapped module bundle
+		// (archive tree bundle), not a binary. Needs pwsh on the runner (present on
+		// the nightly ubuntu image); installs the bundle via the archive strategy.
+		lang: "powershell",
+		dir: "tests/fixtures/tool-smoke/powershell",
+		file: "bad.ps1",
+		serverHint: "PowerShell Editor Services (pwsh Start-EditorServices.ps1 -Stdio)",
+		tools: ["powershell-editor-services"],
+	},
 	// Capability-matrix fixtures (#240): one fixture per remaining registered
 	// server so `characterize-lsp.mjs` can record each server's diagnostic mode
 	// (pull vs push). The mode comes from the server's advertised capabilities at

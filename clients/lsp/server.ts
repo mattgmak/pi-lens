@@ -14,7 +14,11 @@ import path from "node:path";
 import { isTestMode } from "../env-utils.js";
 import { getGlobalPiLensDir } from "../file-utils.js";
 import { KIND_EXTENSIONS } from "../file-kinds.js";
-import { ensureTool, getToolEnvironment } from "../installer/index.js";
+import {
+	ensureTool,
+	getToolEnvironment,
+	getToolPath,
+} from "../installer/index.js";
 import { resolveOpengrepConfig } from "../opengrep-config.js";
 import { logLatency } from "../latency-logger.js";
 import { findLocalSgconfig, resolveBaselineSgconfig } from "../sgconfig.js";
@@ -438,6 +442,81 @@ export async function resolveAndLaunch(
 	}
 
 	return undefined;
+}
+
+interface BundledServerLaunchSpec {
+	/** Runtime interpreters to try, in order (first on PATH wins), e.g.
+	 *  ["pwsh", "powershell"]. The bundle is launched THROUGH this runtime. */
+	runtimeCandidates: string[];
+	/** Managed archive TREE-BUNDLE tool id (installStrategy "archive", no
+	 *  launcher); resolves to the extracted bundle directory. */
+	bundleToolId: string;
+	cwd: string;
+	/** Build the runtime args from the resolved bundle directory. */
+	args: (bundleDir: string) => string[];
+	env?: Record<string, string>;
+}
+
+/**
+ * Launch a language server that ships as a multi-folder MODULE BUNDLE driven by a
+ * separate runtime (e.g. PowerShell Editor Services via `pwsh ...
+ * Start-EditorServices.ps1 -Stdio`), rather than a single executable on PATH.
+ *
+ * Resolution order: (1) a runtime interpreter must be on PATH — else GRACEFUL
+ * SKIP (returns undefined → the runner's coverage notice, never a hard fail);
+ * (2) the bundle must be installed (already-extracted, or installed now when
+ * `allowInstall`) — else graceful skip; (3) launch the runtime against the
+ * bundle over stdio. A launch failure is logged and also degrades to a skip.
+ */
+async function resolveAndLaunchBundle(
+	spec: BundledServerLaunchSpec,
+	allowInstall: boolean | undefined,
+): Promise<{ process: LSPProcess; source: "managed" } | undefined> {
+	// 1. Resolve the runtime interpreter on PATH (don't spawn it bare — that would
+	// hang; just probe). No runtime → graceful skip (coverage notice).
+	let runtime: string | undefined;
+	for (const candidate of spec.runtimeCandidates) {
+		if (await isOnPath(candidate)) {
+			runtime = candidate;
+			break;
+		}
+	}
+	if (!runtime) {
+		logSessionStart(
+			`lsp launch bundle skip tool=${spec.bundleToolId}: no runtime on PATH (tried ${spec.runtimeCandidates.join(", ")})`,
+		);
+		return undefined;
+	}
+
+	// 2. Resolve the bundle directory: already installed, else install when allowed.
+	let bundleDir = await getToolPath(spec.bundleToolId);
+	if (!bundleDir && canInstall(allowInstall)) {
+		bundleDir = await ensureTool(spec.bundleToolId);
+	}
+	if (!bundleDir) {
+		logSessionStart(
+			`lsp launch bundle skip tool=${spec.bundleToolId}: bundle not installed (allowInstall=${allowInstall !== false})`,
+		);
+		return undefined;
+	}
+
+	// 3. Launch the runtime against the bundle over stdio.
+	try {
+		const proc = await launchLSP(runtime, spec.args(bundleDir), {
+			cwd: spec.cwd,
+			env: spec.env,
+		});
+		logSessionStart(
+			`lsp launch bundle success tool=${spec.bundleToolId} runtime=${runtime} bundle=${bundleDir}`,
+		);
+		return { process: proc, source: "managed" };
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		logSessionStart(
+			`lsp launch bundle failed tool=${spec.bundleToolId} runtime=${runtime} error=${message}`,
+		);
+		return undefined;
+	}
 }
 
 function nodeBinCandidates(root: string, baseName: string): string[] {
@@ -1465,6 +1544,84 @@ export const PHPServer: LSPServerInfo = {
 	},
 };
 
+// PowerShell Editor Services bootstrap (#278). Builds the `pwsh`/`powershell`
+// args that launch the bundled Start-EditorServices.ps1 over stdio. Param set
+// verified against the PSES v4.6.0 bundle. Each spawn gets a private session dir
+// for the required Log/SessionDetails paths.
+function buildPsesArgs(bundleDir: string): string[] {
+	const script = path.join(
+		bundleDir,
+		"PowerShellEditorServices",
+		"Start-EditorServices.ps1",
+	);
+	const sessionDir = path.join(
+		getGlobalPiLensDir(),
+		"pses",
+		`${process.pid}-${Date.now()}`,
+	);
+	mkdirSync(sessionDir, { recursive: true });
+	const logPath = path.join(sessionDir, "pses.log");
+	const sessionDetailsPath = path.join(sessionDir, "session.json");
+	// Use -File with each PSES parameter as a SEPARATE argv element (the canonical
+	// editor launch form). This deliberately avoids `-Command "& '...'"`: pwsh.exe
+	// commonly lives under "C:\Program Files\…" (a space), which forces launchLSP's
+	// Windows shell path, and an embedded `&`/quotes in a single -Command string
+	// gets mangled by cmd.exe. Plain argv tokens survive shell escaping (our paths
+	// are under ~/.pi-lens, no spaces). -Stdio makes PSES speak LSP over this
+	// process's stdin/stdout; -LanguageServiceOnly skips the debug adapter.
+	return [
+		"-NoLogo",
+		"-NoProfile",
+		"-NonInteractive",
+		// Unsigned bundled script + mark-of-the-web on Windows — Bypass so it runs;
+		// ignored by non-Windows pwsh.
+		"-ExecutionPolicy",
+		"Bypass",
+		"-File",
+		script,
+		"-HostName",
+		"pi-lens",
+		"-HostProfileId",
+		"pi-lens",
+		"-HostVersion",
+		"1.0.0",
+		"-BundledModulesPath",
+		bundleDir,
+		"-LogPath",
+		logPath,
+		"-LogLevel",
+		"Warning",
+		"-SessionDetailsPath",
+		sessionDetailsPath,
+		"-Stdio",
+		"-LanguageServiceOnly",
+	];
+}
+
+export const PowerShellServer: LSPServerInfo = {
+	id: "powershell",
+	name: "PowerShell Editor Services",
+	extensions: KIND_EXTENSIONS["powershell"],
+	// Index at the workspace (script modules reference siblings); fall back to the
+	// file dir.
+	root: RootWithFallback(createRootDetector([".git"])),
+	spawn(root, options) {
+		// PSES is a module bundle launched via pwsh, not a binary on PATH. Resolve
+		// pwsh/powershell + the managed bundle, then launch the bootstrap over
+		// stdio. Graceful skip (→ coverage notice) when pwsh or the bundle is
+		// unavailable; psscriptanalyzer remains the fallback in the dispatch group.
+		return resolveAndLaunchBundle(
+			{
+				runtimeCandidates: ["pwsh", "powershell"],
+				bundleToolId: "powershell-editor-services",
+				cwd: root,
+				args: buildPsesArgs,
+			},
+			options?.allowInstall,
+		);
+	},
+};
+
 export const CSharpServer: LSPServerInfo = {
 	id: "csharp",
 	name: "csharp-ls",
@@ -2198,7 +2355,7 @@ export const LSP_SERVERS: LSPServerInfo[] = [
 	RustServer,
 	RubyServer,
 	PHPServer,
-	// PowerShellServer — not included; no viable LSP binary, coverage notice fires instead
+	PowerShellServer, // PowerShell Editor Services — pwsh-bootstrapped module bundle (#278)
 	CSharpServer,
 	OmniSharpServer,
 	FSharpServer,

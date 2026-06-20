@@ -141,9 +141,27 @@ export interface ArchiveSpec {
 	/**
 	 * Launcher path relative to the archive's top-level dir (which is stripped on
 	 * extraction), e.g. "bin/spotbugs". On win32 the installer resolves the
-	 * sibling `.bat`.
+	 * sibling `.bat`. OMIT for a TREE BUNDLE (a multi-folder module distribution
+	 * with no single launcher binary, e.g. PowerShellEditorServices) — the whole
+	 * extracted tree is the artifact and the install resolves to the extract dir
+	 * (`~/.pi-lens/tools/<id>`) rather than a shim. The consuming server then
+	 * launches a runtime (pwsh/java/node) against a bootstrap inside the tree.
 	 */
-	launcher: string;
+	launcher?: string;
+	/**
+	 * Components to strip on extraction. Default 1: drops a single versioned
+	 * top-level dir so launcher paths are stable (spotbugs-X.Y.Z/bin → bin). Set 0
+	 * for a multi-folder bundle that has NO wrapping dir (PSES extracts several
+	 * sibling module folders at the root — stripping would flatten/merge them).
+	 */
+	stripComponents?: number;
+	/**
+	 * For a tree bundle (no launcher), a path relative to the extract dir that must
+	 * exist after extraction to confirm success, e.g.
+	 * "PowerShellEditorServices/Start-EditorServices.ps1". Used in place of the
+	 * launcher-existence check.
+	 */
+	treeMarker?: string;
 }
 
 export interface ToolDefinition {
@@ -645,6 +663,28 @@ export const TOOLS: ToolDefinition[] = [
 			url: "https://github.com/spotbugs/spotbugs/releases/download/4.10.2/spotbugs-4.10.2.tgz",
 			kind: "tgz",
 			launcher: "bin/spotbugs",
+		},
+	},
+	{
+		// PowerShell Editor Services (#278). NOT a single binary — a multi-folder
+		// PowerShell MODULE BUNDLE launched via `pwsh Start-EditorServices.ps1
+		// -Stdio` (see PowerShellServer.spawn). archive TREE BUNDLE: the release zip
+		// extracts sibling module dirs (PowerShellEditorServices/, PSReadLine/,
+		// PSScriptAnalyzer/) at the root with no wrapping dir, so stripComponents:0
+		// + no launcher — the whole tree is kept and resolved to its extract dir.
+		// checkCommand "pwsh" documents the runtime but is unused for resolution
+		// (tree bundles resolve only via the extract dir + treeMarker).
+		id: "powershell-editor-services",
+		name: "PowerShell Editor Services",
+		checkCommand: "pwsh",
+		checkArgs: ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"],
+		installStrategy: "archive",
+		binaryName: "powershell-editor-services",
+		archive: {
+			url: "https://github.com/PowerShell/PowerShellEditorServices/releases/download/v4.6.0/PowerShellEditorServices.zip",
+			kind: "zip",
+			stripComponents: 0,
+			treeMarker: "PowerShellEditorServices/Start-EditorServices.ps1",
 		},
 	},
 	{
@@ -1235,6 +1275,19 @@ export async function getAllToolStatuses(): Promise<ToolStatus[]> {
 			strategy: tool.installStrategy,
 		};
 
+		// 0. Tree-bundle archives resolve ONLY to their extract dir — never via a
+		// PATH/global probe (the runtime may be present while the bundle is absent).
+		if (tool.installStrategy === "archive" && !tool.archive?.launcher) {
+			const bundleDir = await getArchiveTreeBundlePath(tool);
+			if (bundleDir) {
+				status.installed = true;
+				status.source = "archive-dist";
+				status.path = bundleDir;
+			}
+			statuses.push(status);
+			continue;
+		}
+
 		// 1. Check if in PATH (global)
 		if (await isCommandAvailable(tool.checkCommand, tool.checkArgs)) {
 			status.installed = true;
@@ -1346,11 +1399,42 @@ export async function isToolInstalled(toolId: string): Promise<boolean> {
 }
 
 /**
+ * Resolve an installed archive TREE BUNDLE (an `archive` tool with no launcher)
+ * to its extract dir, confirmed via the tree marker. Returns undefined when the
+ * tool isn't a tree bundle or isn't extracted yet.
+ */
+async function getArchiveTreeBundlePath(
+	tool: ToolDefinition,
+): Promise<string | undefined> {
+	if (tool.installStrategy !== "archive" || tool.archive?.launcher) {
+		return undefined;
+	}
+	const extractDir = path.join(TOOLS_DIR, tool.id);
+	const marker = tool.archive?.treeMarker
+		? path.join(extractDir, ...tool.archive.treeMarker.split("/"))
+		: extractDir;
+	try {
+		await fs.access(marker);
+		return extractDir;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * Get the path to a tool (global or local)
  */
 export async function getToolPath(toolId: string): Promise<string | undefined> {
 	const tool = TOOLS.find((t) => t.id === toolId);
 	if (!tool) return undefined;
+
+	// Tree-bundle archives (no launcher) are "installed" ONLY when extracted — the
+	// extract dir is authoritative. No PATH/global/npm fallback: the runtime that
+	// drives the bundle (e.g. pwsh) may be on PATH while the bundle itself is
+	// absent, which must NOT read as installed (else the bundle never downloads).
+	if (tool.installStrategy === "archive" && !tool.archive?.launcher) {
+		return getArchiveTreeBundlePath(tool);
+	}
 
 	// Fast path: check local npm install first (where auto-install places tools).
 	// This avoids the ~2-5s overhead of spawning npm global probes and PATH
@@ -2144,15 +2228,20 @@ async function installArchiveTool(
 		await fs.mkdir(extractDir, { recursive: true });
 		await fs.writeFile(tmpArchive, archiveBuffer);
 
-		// `--strip-components=1` drops the versioned top-level dir so the launcher
-		// path is stable (bin/… not spotbugs-X.Y.Z/bin/…). bsdtar handles both
-		// .tgz and .zip with -xf.
+		// `--strip-components=N` drops N leading path components. Default 1 drops a
+		// versioned top-level dir so a launcher path stays stable (bin/… not
+		// spotbugs-X.Y.Z/bin/…). A TREE BUNDLE (stripComponents:0) has no wrapping
+		// dir — stripping would flatten/merge its sibling module folders — so the
+		// flag is omitted. bsdtar handles both .tgz and .zip with -xf.
+		const stripComponents = spec.stripComponents ?? 1;
 		const tarArgs = [
 			spec.kind === "tgz" ? "-xzf" : "-xf",
 			archiveName,
 			"-C",
 			extractName,
-			"--strip-components=1",
+			...(stripComponents > 0
+				? [`--strip-components=${stripComponents}`]
+				: []),
 		];
 		// Resolve `tar` to an absolute path on Windows (System32\tar.exe is the
 		// bsdtar shipped with Windows 10+) so extraction can't be hijacked via a
@@ -2187,6 +2276,28 @@ async function installArchiveTool(
 				`archive-install ${tool.id}: extraction failed: ${extracted.stderr}`,
 			);
 			return undefined;
+		}
+
+		// Tree bundle (no launcher): the whole extracted tree IS the artifact. Verify
+		// the marker exists and resolve to the extract dir — the consuming server
+		// launches a runtime against a bootstrap inside it (e.g. PSES via pwsh).
+		if (!spec.launcher) {
+			const marker = spec.treeMarker
+				? path.join(extractDir, ...spec.treeMarker.split("/"))
+				: extractDir;
+			try {
+				await fs.access(marker);
+			} catch {
+				logSessionStart(
+					`archive-install ${tool.id}: tree marker not found at ${marker} after extraction`,
+				);
+				return undefined;
+			}
+			logSessionStart(
+				`archive-install ${tool.id}: installed tree bundle → ${extractDir} (extracted ${archiveBuffer.length} bytes)`,
+			);
+			debugLog(`[archive] installed ${tool.name} bundle → ${extractDir}`);
+			return extractDir;
 		}
 
 		// The launcher inside the extracted tree (e.g. bin/spotbugs[.bat]).
