@@ -1429,25 +1429,14 @@ export const RubyServer: LSPServerInfo = {
 	},
 };
 
-export const RubySolargraphServer: LSPServerInfo = {
-	id: "ruby-solargraph",
-	name: "Solargraph",
-	extensions: KIND_EXTENSIONS["ruby"],
-	root: RootWithFallback(
-		PriorityRoot([["Gemfile", ".ruby-version"], [".git"]]),
-	),
-	async spawn(root) {
-		for (const command of ["solargraph", ...rubyBinCandidates("solargraph")]) {
-			try {
-				const proc = await launchLSP(command, ["stdio"], { cwd: root });
-				return { process: proc, source: "direct" };
-			} catch {
-				// try next candidate
-			}
-		}
-		return undefined;
-	},
-};
+// NOTE: Ruby's Solargraph + RuboCop fallbacks live INSIDE RubyServer.spawn
+// (ruby-lsp → solargraph → rubocop --lsp). Primary selection is first-success-
+// wins (one server per file, see LSPService.getClientForFile), so a separate
+// solargraph sibling server could never be reached — RubyServer only returns
+// undefined when solargraph is also absent. A standalone RubySolargraphServer
+// would therefore be dead code; it intentionally does not exist. If a future
+// user-selectable preferred-server config lands, refactor RubyServer to a
+// single binary and register the alternatives as siblings (cf. python/jedi).
 
 export const PHPServer: LSPServerInfo = {
 	id: "php",
