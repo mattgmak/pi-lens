@@ -16,6 +16,7 @@ import { featureHintMetadata } from "../feature-hints.js";
 import { detectFileKind, KIND_EXTENSIONS } from "../file-kinds.js";
 import { detectFileRole } from "../file-role.js";
 import { getProjectDataDir } from "../file-utils.js";
+import { logLatency } from "../latency-logger.js";
 import { normalizeMapKey } from "../path-utils.js";
 import { collectProjectSourceFilesAsync } from "../project-scan-policy.js";
 import { resolveImportToFiles } from "./import-resolvers.js";
@@ -470,6 +471,109 @@ function loadPersistedGraph(cwd: string): {
 	}
 }
 
+// --- Throttled, size-guarded graph persistence (circuit-breaker, #260) ---
+// The whole graph is serialized as one blob. Doing that synchronously on every
+// edit turn — `JSON.stringify` of a multi-MB graph plus number formatting for
+// every line/complexity/fanout — spiked the host into a `Fatal ... Zone` OOM,
+// especially when it overlapped the next build or the host's tsc. Two guards:
+//   1. Coalesce: a burst of edits schedules ONE write after a quiet window,
+//      instead of one full serialize per turn (the spike multiplier).
+//   2. Ceiling: refuse to serialize a graph above an element cap (fail-safe —
+//      log + skip rather than OOM the host; same fail-closed spirit as the
+//      read-guard).
+const GRAPH_PERSIST_DEBOUNCE_MS_DEFAULT = 1500;
+const GRAPH_PERSIST_MAX_ELEMENTS_DEFAULT = 200_000;
+
+function graphPersistDebounceMs(): number {
+	const raw = Number(process.env.PI_LENS_GRAPH_PERSIST_DEBOUNCE_MS);
+	return Number.isFinite(raw) && raw >= 0
+		? raw
+		: GRAPH_PERSIST_DEBOUNCE_MS_DEFAULT;
+}
+
+function graphPersistMaxElements(): number {
+	const raw = Number(process.env.PI_LENS_GRAPH_PERSIST_MAX_ELEMENTS);
+	return Number.isFinite(raw) && raw > 0
+		? raw
+		: GRAPH_PERSIST_MAX_ELEMENTS_DEFAULT;
+}
+
+interface PendingPersist {
+	cacheDir: string;
+	cachePath: string;
+	data: PersistedGraphData;
+	elementCount: number;
+}
+const _pendingPersist = new Map<string, PendingPersist>();
+const _persistTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function writePending(key: string): void {
+	const pending = _pendingPersist.get(key);
+	if (!pending) return;
+	_pendingPersist.delete(key);
+	const timer = _persistTimers.get(key);
+	if (timer) {
+		clearTimeout(timer);
+		_persistTimers.delete(key);
+	}
+	const startedAt = Date.now();
+	let json: string;
+	try {
+		json = JSON.stringify(pending.data);
+	} catch (err) {
+		console.error(
+			"[review-graph] cache serialize failed:",
+			(err as Error).message,
+		);
+		return;
+	}
+	logLatency({
+		type: "phase",
+		phase: "review_graph_persist",
+		filePath: pending.cachePath,
+		durationMs: Date.now() - startedAt,
+		metadata: { elements: pending.elementCount, bytes: json.length },
+	});
+	fs.mkdir(pending.cacheDir, { recursive: true }, (mkdirErr) => {
+		if (mkdirErr) {
+			console.error(
+				"[review-graph] cache dir creation failed:",
+				mkdirErr.message,
+			);
+			return;
+		}
+		fs.writeFile(pending.cachePath, json, "utf-8", (writeErr) => {
+			if (writeErr) {
+				console.error("[review-graph] cache write failed:", writeErr.message);
+			}
+		});
+	});
+}
+
+// Flush any pending writes synchronously at process teardown so a debounced
+// snapshot isn't lost. Sync writes only (no child spawn — see the teardown
+// libuv hazard); best-effort.
+let _persistExitHookInstalled = false;
+function ensurePersistExitHook(): void {
+	if (_persistExitHookInstalled) return;
+	_persistExitHookInstalled = true;
+	process.once("exit", () => {
+		for (const [, pending] of _pendingPersist) {
+			try {
+				fs.mkdirSync(pending.cacheDir, { recursive: true });
+				fs.writeFileSync(
+					pending.cachePath,
+					JSON.stringify(pending.data),
+					"utf-8",
+				);
+			} catch {
+				// Teardown is best-effort; a missed persist just re-confirms next start.
+			}
+		}
+		_pendingPersist.clear();
+	});
+}
+
 function persistGraph(
 	cwd: string,
 	signature: string,
@@ -477,8 +581,24 @@ function persistGraph(
 	fileHashes: Map<string, string> | undefined,
 	graph: ReviewGraph,
 ): void {
+	const elementCount = graph.nodes.size + graph.edges.length;
+	const cap = graphPersistMaxElements();
+	if (elementCount > cap) {
+		// Fail-safe: a runaway graph would OOM the host on serialize. Skip + log.
+		logLatency({
+			type: "phase",
+			phase: "review_graph_persist",
+			filePath: cwd,
+			durationMs: 0,
+			metadata: { skipped: "size_cap", elements: elementCount, cap },
+		});
+		return;
+	}
 	const cacheDir = path.join(getProjectDataDir(cwd), "cache");
 	const cachePath = path.join(cacheDir, GRAPH_CACHE_FILENAME);
+	// Build the serializable shape now (cheap array views over the snapshot the
+	// caller already cloned), but defer the expensive stringify+write to the
+	// debounced flush so a burst of edits collapses to a single write.
 	const data: PersistedGraphData = {
 		version: graph.version,
 		builtAt: graph.builtAt,
@@ -488,21 +608,26 @@ function persistGraph(
 		nodes: Array.from(graph.nodes.entries()),
 		edges: graph.edges,
 	};
-	const json = JSON.stringify(data);
-	fs.mkdir(cacheDir, { recursive: true }, (mkdirErr) => {
-		if (mkdirErr) {
-			console.error(
-				"[review-graph] cache dir creation failed:",
-				mkdirErr.message,
-			);
-			return;
-		}
-		fs.writeFile(cachePath, json, "utf-8", (writeErr) => {
-			if (writeErr) {
-				console.error("[review-graph] cache write failed:", writeErr.message);
-			}
-		});
-	});
+	const key = normalizeMapKey(cwd);
+	_pendingPersist.set(key, { cacheDir, cachePath, data, elementCount });
+	ensurePersistExitHook();
+
+	const debounce = graphPersistDebounceMs();
+	const existing = _persistTimers.get(key);
+	if (existing) clearTimeout(existing);
+	if (debounce === 0) {
+		writePending(key);
+		return;
+	}
+	const timer = setTimeout(() => writePending(key), debounce);
+	// Don't keep the event loop alive solely for a cache write.
+	if (typeof timer.unref === "function") timer.unref();
+	_persistTimers.set(key, timer);
+}
+
+/** Test hook: force any pending debounced persist to write immediately. */
+export function flushReviewGraphPersistsForTests(): void {
+	for (const key of [..._pendingPersist.keys()]) writePending(key);
 }
 
 function localImportToFile(
@@ -1086,7 +1211,10 @@ async function _doBuildGraph(
 				fileHashes: hashes,
 				graph: cloneGraph(memCached.graph),
 			});
-			persistGraph(cwd, signature, fileSignatures, hashes, cloneGraph(graph));
+			// #260: pure drift (mtime/size changed, content identical) — the graph
+			// is unchanged, so do NOT rewrite the whole disk blob. The in-memory
+			// cache above carries the refreshed signature; a cold start just
+			// re-confirms the drift cheaply (content hash of the drifted files).
 			_lastGraphBuildInfo = { reused: true, mode: "cached" };
 			facts.setSessionFact("session.reviewGraph", graph);
 			return graph;
@@ -1153,7 +1281,10 @@ async function _doBuildGraph(
 				fileHashes: hashes,
 				graph: cloneGraph(diskCached.graph),
 			});
-			persistGraph(cwd, signature, fileSignatures, hashes, cloneGraph(graph));
+			// #260: pure drift (mtime/size changed, content identical) — the graph
+			// is unchanged, so do NOT rewrite the whole disk blob. The in-memory
+			// cache above carries the refreshed signature; a cold start just
+			// re-confirms the drift cheaply (content hash of the drifted files).
 			_lastGraphBuildInfo = { reused: true, mode: "cached" };
 			facts.setSessionFact("session.reviewGraph", graph);
 			return graph;
