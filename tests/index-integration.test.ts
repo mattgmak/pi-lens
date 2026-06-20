@@ -197,6 +197,7 @@ describe("index.ts integration", () => {
 			getLSPService: () => ({
 				touchFile: vi.fn(),
 				getAliveClientCount: () => 0,
+				getAliveServerIds: () => [],
 			}),
 			resetLSPService,
 		}));
@@ -838,6 +839,7 @@ describe("index.ts integration", () => {
 		vi.doMock("../clients/lsp/index.js", () => ({
 			getLSPService: () => ({
 				getAliveClientCount: () => 1,
+				getAliveServerIds: () => ["typescript"],
 				getStatus: () => [
 					{ serverId: "typescript", root: tmpDir, connected: true },
 				],

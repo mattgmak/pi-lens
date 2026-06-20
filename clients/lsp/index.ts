@@ -31,7 +31,10 @@ import { createLSPClient } from "./client.js";
 import { getServersForFileWithConfig } from "./config.js";
 import { getLanguageId } from "./language.js";
 import type { LSPServerInfo } from "./server.js";
-import { isDirectLspCommandTemporarilyUnavailable } from "./server.js";
+import {
+	LSP_SERVERS,
+	isDirectLspCommandTemporarilyUnavailable,
+} from "./server.js";
 import { getStrategy } from "./server-strategies.js";
 import { raceToCompletion } from "./aggregation.js";
 import {
@@ -1986,6 +1989,27 @@ export class LSPService {
 			if (client.isAlive()) count++;
 		}
 		return count;
+	}
+
+	/**
+	 * Distinct serverIds of currently-alive clients, ordered primary-first then
+	 * auxiliary (cross-cutting scanners like opengrep/ast-grep), stable within
+	 * each group. Deduped across roots — one warm server serving two roots
+	 * collapses to a single id. Lightweight: does not spawn or wait. (#267)
+	 */
+	getAliveServerIds(): string[] {
+		const primary: string[] = [];
+		const aux: string[] = [];
+		const seen = new Set<string>();
+		for (const client of this.state.clients.values()) {
+			if (!client.isAlive()) continue;
+			const id = client.serverId;
+			if (seen.has(id)) continue;
+			seen.add(id);
+			const role = LSP_SERVERS.find((s) => s.id === id)?.role;
+			(role === "auxiliary" ? aux : primary).push(id);
+		}
+		return [...primary, ...aux];
 	}
 }
 

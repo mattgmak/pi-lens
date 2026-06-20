@@ -416,9 +416,12 @@ export default function (pi: ExtensionAPI) {
 		},
 	) {
 		try {
-			const count = getLSPService().getAliveClientCount();
-			if (count > 0) {
-				setStatus("pi-lens-lsp", theme.fg("success", `LSP Active (${count})`));
+			const serverIds = getLSPService().getAliveServerIds();
+			if (serverIds.length > 0) {
+				setStatus(
+					"pi-lens-lsp",
+					theme.fg("success", `LSP Active: ${serverIds.join(", ")}`),
+				);
 			} else {
 				// Inactive is a passive state (no server running for this file, or the
 				// idle timer released them) — not a fault. Render it neutral/grey, not
