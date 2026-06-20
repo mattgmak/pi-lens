@@ -60,6 +60,15 @@ const EXT_TO_LANG: Record<string, string> = {
 	".bash": "bash",
 };
 
+/**
+ * Canonical set of source-code file extensions pi-lens understands, derived
+ * from the same {@link EXT_TO_LANG} map the read-coverage path uses. Exported as
+ * the single source of truth so language-spanning scanners (e.g.
+ * production-readiness) cover every supported language instead of a hardcoded
+ * subset (#262).
+ */
+export const CODE_FILE_EXTENSIONS: readonly string[] = Object.keys(EXT_TO_LANG);
+
 /** AST node types considered "enclosing symbols" for coverage purposes. */
 const ENCLOSING_TYPES: Record<string, string[]> = {
 	typescript: [

@@ -9,6 +9,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { detectFileRole } from "./file-role.js";
+import { CODE_FILE_EXTENSIONS } from "./read-expansion.js";
 import { collectSourceFiles } from "./source-filter.js";
 
 // --- Types ---
@@ -372,20 +373,11 @@ function scoreToGrade(score: number): "A" | "B" | "C" | "D" | "F" {
 	return "F";
 }
 
-// Extensions production-readiness scores. Superset of the central
-// ALL_SCANNABLE_EXTENSIONS (which omits .java/.py-adjacent compiled langs), so
-// we pass them explicitly to the shared collector.
-const READINESS_EXTS = [
-	".ts",
-	".tsx",
-	".js",
-	".jsx",
-	".mjs",
-	".py",
-	".go",
-	".rs",
-	".java",
-];
+// Extensions production-readiness scores. Sourced from the canonical
+// CODE_FILE_EXTENSIONS (every language pi-lens understands) rather than a
+// hardcoded JS/TS-centric subset, so the score spans all supported languages
+// (#262).
+const READINESS_EXTS = CODE_FILE_EXTENSIONS as string[];
 
 // Hard cap so a misrooted target (or a target that climbed to a huge tree)
 // can't enumerate the whole filesystem (#262 / #250).

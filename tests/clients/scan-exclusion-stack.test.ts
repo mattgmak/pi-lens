@@ -44,13 +44,19 @@ beforeEach(() => {
 	tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-scan-exclude-"));
 	resetProjectLensConfigCache();
 
-	// The fixture every surface scans.
+	// The fixture every surface scans — deliberately multi-language so the
+	// exclusion guarantee is shown to be language-agnostic, not TS-only (#262).
 	write("src/real.ts");
+	write("src/real.go");
+	write("src/real.rs");
 	write("src/real.test.ts");
+	write("src/util_test.go"); // Go-style test naming
 	write("node_modules/dep/index.ts");
 	write("dist/out.ts");
 	write("gitignored/x.ts");
+	write("gitignored/x.go"); // ignored, non-TS
 	write("lensignored/y.ts");
+	write("lensignored/y.rs"); // ignored, non-TS
 	write("noise.ts");
 	fs.writeFileSync(path.join(tmpDir, ".gitignore"), "gitignored/\n");
 	fs.writeFileSync(
@@ -73,10 +79,14 @@ const ALWAYS_EXCLUDED = [
 	"noise.ts",
 ];
 
+// Test files in the fixture (every role-filtered surface must drop all of them).
+const TEST_FILES = ["src/real.test.ts", "src/util_test.go"];
+
 interface Surface {
 	name: string;
 	collect: () => string[];
-	mustInclude: string;
+	/** Real (non-test) source files this surface must surface. */
+	mustInclude: string[];
 	/** Whether this surface applies the test/generated role filter. */
 	excludesTests: boolean;
 }
@@ -86,7 +96,8 @@ function surfaces(): Surface[] {
 		{
 			name: "collectSourceFiles (canonical collector)",
 			collect: () => collectSourceFiles(tmpDir),
-			mustInclude: "src/real.ts",
+			// No role filter, multi-language default extension set.
+			mustInclude: ["src/real.ts", "src/real.go", "src/real.rs"],
 			excludesTests: false,
 		},
 		{
@@ -95,13 +106,14 @@ function surfaces(): Surface[] {
 				// collectFiles is private; the walk needs no grammars loaded.
 				// biome-ignore lint/suspicious/noExplicitAny: private method under test
 				(new TreeSitterClient() as any).collectFiles(tmpDir, "typescript"),
-			mustInclude: "src/real.ts",
+			// Language-scoped by design — only the requested language's files.
+			mustInclude: ["src/real.ts"],
 			excludesTests: false,
 		},
 		{
-			name: "production-readiness findSourceFiles (role-filtered)",
+			name: "production-readiness findSourceFiles (role-filtered, all langs)",
 			collect: () => __readinessWalkersForTest.findSourceFiles(tmpDir),
-			mustInclude: "src/real.ts",
+			mustInclude: ["src/real.ts", "src/real.go", "src/real.rs"],
 			excludesTests: true,
 		},
 	];
@@ -110,11 +122,12 @@ function surfaces(): Surface[] {
 describe("#262 — exclusion stack is respected by every scan surface", () => {
 	for (const s of surfaces()) {
 		describe(s.name, () => {
-			it("includes the real source file", () => {
-				expect(relUnix(s.collect())).toContain(s.mustInclude);
+			it("includes the real source file(s)", () => {
+				const rel = relUnix(s.collect());
+				for (const inc of s.mustInclude) expect(rel).toContain(inc);
 			});
 
-			it("excludes dependency/build dirs + .gitignore + .pi-lens.json ignores", () => {
+			it("excludes dependency/build dirs + .gitignore + .pi-lens.json ignores (any language)", () => {
 				const rel = relUnix(s.collect());
 				for (const excluded of ALWAYS_EXCLUDED) {
 					expect(
@@ -126,11 +139,17 @@ describe("#262 — exclusion stack is respected by every scan surface", () => {
 
 			it(
 				s.excludesTests
-					? "excludes test files (role filter)"
-					: "retains test files (no role filter by design)",
+					? "excludes test files of every language (role filter)"
+					: "retains the TS test file (no role filter by design)",
 				() => {
 					const rel = relUnix(s.collect());
-					expect(rel.includes("src/real.test.ts")).toBe(!s.excludesTests);
+					if (s.excludesTests) {
+						for (const t of TEST_FILES) expect(rel).not.toContain(t);
+					} else {
+						// Non-filtered surfaces keep tests; assert at least the TS one
+						// (language-scoped surfaces won't carry the Go test file).
+						expect(rel).toContain("src/real.test.ts");
+					}
 				},
 			);
 		});
@@ -147,6 +166,22 @@ describe("#262 — exclusion stack is respected by every scan surface", () => {
 				);
 			}
 		});
+	});
+
+	it("excludes ignored files regardless of language (.go/.rs under ignored dirs)", () => {
+		// The exclusion stack keys on path/dir, not extension — a non-TS file
+		// under an ignored dir must be dropped just like a TS one.
+		for (const collect of [
+			() => collectSourceFiles(tmpDir),
+			() => __readinessWalkersForTest.findSourceFiles(tmpDir),
+		]) {
+			const rel = relUnix(collect());
+			expect(rel).not.toContain("gitignored/x.go");
+			expect(rel).not.toContain("lensignored/y.rs");
+			// ...while real non-TS sources outside ignored paths survive.
+			expect(rel).toContain("src/real.go");
+			expect(rel).toContain("src/real.rs");
+		}
 	});
 
 	it("isTestFile catches Go/Java/Python test-naming styles the role classifier alone misses", () => {
