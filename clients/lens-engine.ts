@@ -178,10 +178,24 @@ export async function symbolImpact(
 		maxHits?: number;
 	},
 ): Promise<SymbolImpactResult> {
-	const { buildOrUpdateGraph } = await import("./review-graph/builder.js");
+	// READ-ONLY (#260): consume the already-built review graph, never build one.
+	// buildOrUpdateGraph(cwd, [], freshFactStore) defeats the incremental path
+	// (empty changedFiles → Tier-3 full rebuild on any drift) and races the edit
+	// pipeline's build under a separate _buildCache key — an OOM vector. Cold
+	// cache → available:false until a scan/edit warms it (same contract as
+	// module_report, #256).
+	const { getCachedReviewGraph } = await import("./review-graph/builder.js");
 	const { computeTransitiveImpact } = await import("./review-graph/query.js");
-	const { FactStore } = await import("./dispatch/fact-store.js");
-	const graph = await buildOrUpdateGraph(cwd, [], new FactStore());
+	const graph = getCachedReviewGraph(cwd);
+	if (!graph) {
+		return {
+			available: false,
+			seedFile: path.resolve(cwd, file),
+			hits: [],
+			truncated: false,
+			maxDepthReached: 0,
+		};
+	}
 	const result = computeTransitiveImpact(
 		graph,
 		path.resolve(cwd, file),
