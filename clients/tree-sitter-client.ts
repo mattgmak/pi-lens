@@ -30,6 +30,11 @@ import {
 	TreeSitterQueryLoader,
 } from "./tree-sitter-query-loader.js";
 
+// Hard cap on a single structural-search file walk. Bounds a misrooted scan so
+// it can't enumerate an unbounded tree synchronously before result collection
+// short-circuits (#262).
+const TREE_SITTER_MAX_SCAN_FILES = 20_000;
+
 // --- Type Declarations (local, no import needed) ---
 
 // biome-ignore lint/suspicious/noExplicitAny: Language from web-tree-sitter
@@ -1447,10 +1452,16 @@ export class TreeSitterClient {
 		const rootDir = path.resolve(dir);
 		const ignoreMatcher = getProjectIgnoreMatcher(rootDir);
 
+		// Hard cap on the walk itself (not just result collection). The per-file
+		// `maxResults` break upstream only stops gathering matches *after* the walk
+		// has already enumerated the whole tree — so a misrooted structuralSearch
+		// would still synchronously read every directory. Bound the walk (#262).
 		const scan = (d: string) => {
+			if (files.length >= TREE_SITTER_MAX_SCAN_FILES) return;
 			try {
 				const entries = fs.readdirSync(d, { withFileTypes: true });
 				for (const entry of entries) {
+					if (files.length >= TREE_SITTER_MAX_SCAN_FILES) return;
 					const full = path.join(d, entry.name);
 					if (entry.isDirectory()) {
 						if (isExcludedDirName(entry.name)) continue;

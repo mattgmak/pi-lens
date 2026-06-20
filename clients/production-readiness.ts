@@ -8,7 +8,8 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { isExcludedDirName } from "./file-utils.js";
+import { detectFileRole } from "./file-role.js";
+import { collectSourceFiles } from "./source-filter.js";
 
 // --- Types ---
 
@@ -371,75 +372,66 @@ function scoreToGrade(score: number): "A" | "B" | "C" | "D" | "F" {
 	return "F";
 }
 
+// Extensions production-readiness scores. Superset of the central
+// ALL_SCANNABLE_EXTENSIONS (which omits .java/.py-adjacent compiled langs), so
+// we pass them explicitly to the shared collector.
+const READINESS_EXTS = [
+	".ts",
+	".tsx",
+	".js",
+	".jsx",
+	".mjs",
+	".py",
+	".go",
+	".rs",
+	".java",
+];
+
+// Hard cap so a misrooted target (or a target that climbed to a huge tree)
+// can't enumerate the whole filesystem (#262 / #250).
+const READINESS_MAX_FILES = 50_000;
+
+/**
+ * Test-file predicate. `detectFileRole` (the shared classifier, also used by the
+ * review graph #260) catches `.test.`/`.spec.`/`test_`/`spec_` and test dirs;
+ * the extra regex preserves the Go (`foo_test.go`) and Java (`FooTest.java`)
+ * styles the original prod-readiness walker matched.
+ */
+function isTestFile(filePath: string): boolean {
+	if (detectFileRole(filePath) === "test") return true;
+	const base = path.basename(filePath);
+	return /(?:_test|_spec)\.[^.]+$|(?:Test|Spec)\.[^.]+$/.test(base);
+}
+
+/**
+ * Enumerate candidate files once through the shared collector so the full
+ * exclusion stack applies (dir excludes + global ignore + `.gitignore` +
+ * project `.pi-lens.json` `ignore` + the maxFiles cap) — the hand-rolled walk
+ * this replaced ignored `getProjectIgnoreMatcher` entirely (#262).
+ */
+function collectReadinessFiles(root: string): string[] {
+	return collectSourceFiles(root, {
+		extensions: READINESS_EXTS,
+		maxFiles: READINESS_MAX_FILES,
+	});
+}
+
 function findSourceFiles(root: string): string[] {
-	const files: string[] = [];
-	const exts = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".py", ".go", ".rs", ".java"];
-
-	const scan = (dir: string) => {
-		try {
-			const entries = fs.readdirSync(dir, { withFileTypes: true });
-			for (const entry of entries) {
-				const full = path.join(dir, entry.name);
-				if (entry.isDirectory()) {
-					if (isExcludedDirName(entry.name)) continue;
-					scan(full);
-				} else if (exts.some(ext => entry.name.endsWith(ext)) && !entry.name.includes(".test.") && !entry.name.includes(".spec.")) {
-					files.push(full);
-				}
-			}
-		} catch {}
-	};
-
-	scan(root);
-	return files;
+	// Exclude test files — production anti-pattern counts shouldn't include test
+	// fixtures (console.log/`as any` in a test is not a prod-readiness defect).
+	return collectReadinessFiles(root).filter((f) => !isTestFile(f));
 }
 
 function findTestFiles(root: string): string[] {
-	const files: string[] = [];
-	const testPatterns = [".test.", ".spec.", "_test.", "_spec.", "Test.", "Spec."];
-	const testDirs = ["__tests__", "tests", "test", "specs", "spec"];
-
-	const scan = (dir: string) => {
-		try {
-			const entries = fs.readdirSync(dir, { withFileTypes: true });
-			for (const entry of entries) {
-				const full = path.join(dir, entry.name);
-				if (entry.isDirectory()) {
-					if (isExcludedDirName(entry.name)) continue;
-					// Check if it's a test directory
-					if (testDirs.includes(entry.name) || entry.name.endsWith("-tests")) {
-						// Collect all files in test directories
-						const testFiles = findAllFiles(full);
-						files.push(...testFiles);
-					} else {
-						scan(full);
-					}
-				} else if (testPatterns.some(p => entry.name.includes(p))) {
-					files.push(full);
-				}
-			}
-		} catch {}
-	};
-
-	scan(root);
-	return [...new Set(files)]; // Deduplicate
+	return collectReadinessFiles(root).filter((f) => isTestFile(f));
 }
 
-function findAllFiles(dir: string): string[] {
-	const files: string[] = [];
-	try {
-		const entries = fs.readdirSync(dir, { withFileTypes: true });
-		for (const entry of entries) {
-			const full = path.join(dir, entry.name);
-			if (entry.isDirectory()) {
-				files.push(...findAllFiles(full));
-			} else {
-				files.push(full);
-			}
-		}
-	} catch {}
-	return files;
-}
+/** @internal Test-only access to the exclusion-aware walkers (#262 guard). */
+export const __readinessWalkersForTest = {
+	findSourceFiles,
+	findTestFiles,
+	isTestFile,
+};
 
 function detectTestFramework(root: string): string | null {
 	const pkgPath = path.join(root, "package.json");
