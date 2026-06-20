@@ -66,6 +66,44 @@ describe("review graph service", () => {
 		}
 	});
 
+	it("excludes test files from the graph (#260)", async () => {
+		const env = setupTestEnvironment("pi-lens-review-graph-notests-");
+		try {
+			const aPath = createTempFile(
+				env.tmpDir,
+				"src/a.ts",
+				"export function alpha() {\n  return 1;\n}\n",
+			);
+			const testPath = createTempFile(
+				env.tmpDir,
+				"src/a.test.ts",
+				"import { alpha } from './a';\nalpha();\n",
+			);
+
+			// Full build (empty changedFiles → walks the project source set).
+			const graph = await buildOrUpdateGraph(env.tmpDir, [], new FactStore());
+			expect(graph.fileNodes.has(normalizeMapKey(aPath))).toBe(true);
+			// The *.test.ts file is not graph-relevant: no node, no edges.
+			expect(graph.fileNodes.has(normalizeMapKey(testPath))).toBe(false);
+			expect(
+				graph.edges.some(
+					(e) => e.from === `file:${normalizeMapKey(testPath)}`,
+				),
+			).toBe(false);
+
+			// Incremental guard: passing the test file as a changed file must not
+			// add it either (the per-file chokepoint skips it).
+			const g2 = await buildOrUpdateGraph(
+				env.tmpDir,
+				[testPath],
+				new FactStore(),
+			);
+			expect(g2.fileNodes.has(normalizeMapKey(testPath))).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("builds file-level graphs for python/go/rust/ruby without crashing", async () => {
 		const env = setupTestEnvironment("pi-lens-review-graph-langs-");
 		try {

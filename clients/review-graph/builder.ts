@@ -372,7 +372,15 @@ async function getGraphSourceFiles(cwd: string): Promise<string[]> {
 		const kind = detectFileKind(file);
 		// isWithinReviewGraphSizeLimit does a statSync per file — yield periodically
 		// so the size-limit filter (one stat each) can't hold the loop in one burst.
-		if (!!kind && MAIN_KINDS.has(kind) && isWithinReviewGraphSizeLimit(file)) {
+		// #260: test files are NOT graph-relevant (a heavily-tested repo was ~56%
+		// tests, bloating the graph + every build/clone/serialize). The role check
+		// is pure string work, so it also short-circuits the per-file statSync.
+		if (
+			!!kind &&
+			MAIN_KINDS.has(kind) &&
+			detectFileRole(file) !== "test" &&
+			isWithinReviewGraphSizeLimit(file)
+		) {
 			result.push(file);
 		}
 		if (++sinceYield >= STAT_YIELD_EVERY) {
@@ -661,6 +669,8 @@ function upsertChangedSymbols(
 	facts: FactStore,
 	filePath: string,
 ): void {
+	// #260: tests aren't in the graph, so don't track their changed symbols.
+	if (detectFileRole(filePath) === "test") return;
 	const normalized = normalizeMapKey(filePath);
 	const changed = facts.getSessionFact<string[]>(
 		`${CHANGED_SYMBOLS_PREFIX}${normalized}`,
@@ -1069,6 +1079,9 @@ async function addFileToGraph(
 ): Promise<void> {
 	const kind = detectFileKind(file);
 	if (!kind || !MAIN_KINDS.has(kind)) return;
+	// #260: tests aren't graph-relevant — guard the per-file chokepoint too so
+	// the incremental/cascade path (a changed *.test.ts) never adds them either.
+	if (detectFileRole(file) === "test") return;
 	if (kind === "jsts") {
 		await ensureTsFacts(file, cwd, facts);
 		addJsTsFile(graph, cwd, file, facts);
