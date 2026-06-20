@@ -55,6 +55,66 @@ beforeAll(async () => {
 	await client.init();
 });
 
+describe("export-scope correctness (#256) — module exports vs function locals", () => {
+	async function extract(src: string) {
+		const env = setupTestEnvironment("pi-lens-export-scope-");
+		try {
+			const fp = createTempFile(env.tmpDir, "a.ts", src);
+			const tree = await client.parseFile(fp, "typescript");
+			const extractor = new TreeSitterSymbolExtractor("typescript", client);
+			await extractor.init();
+			return extractor.extract(tree!, fp, src).symbols;
+		} finally {
+			env.cleanup();
+		}
+	}
+
+	it("does NOT mark a function-local declaration as exported", async () => {
+		// The #256 false-API bug: `log` lived inside an exported function and the
+		// ancestor walk reached the function's own `export` → wrongly exported.
+		const symbols = await extract(
+			[
+				"export function readSymbol(): void {",
+				"  const log = (n: number) => n + 1;",
+				"  log(1);",
+				"}",
+			].join("\n"),
+		);
+		const log = symbols.find((s) => s.name === "log");
+		expect(log).toBeDefined();
+		expect(log?.isExported).toBe(false);
+		const fn = symbols.find((s) => s.name === "readSymbol");
+		expect(fn?.isExported).toBe(true);
+	});
+
+	it("keeps members of an exported class exported, but not method-locals", async () => {
+		const symbols = await extract(
+			[
+				"export class Service {",
+				"  run(): number {",
+				"    const helper = () => 2;",
+				"    return helper();",
+				"  }",
+				"}",
+			].join("\n"),
+		);
+		expect(symbols.find((s) => s.name === "run")?.isExported).toBe(true);
+		expect(symbols.find((s) => s.name === "helper")?.isExported).toBe(false);
+	});
+
+	it("does not export members of a non-exported class", async () => {
+		const symbols = await extract("class Internal {\n  go(): void {}\n}\n");
+		expect(symbols.find((s) => s.name === "go")?.isExported).toBe(false);
+	});
+
+	it("does not treat a mid-line 'export' substring as an export (anchored keyword)", async () => {
+		// Pre-#256, `line.includes("export")` flagged any declaration whose line
+		// merely contained the substring (here, a trailing comment).
+		const symbols = await extract("function helper() {} // not an export\n");
+		expect(symbols.find((s) => s.name === "helper")?.isExported).toBe(false);
+	});
+});
+
 describe("tree-sitter symbol extraction (#251) — per supported grammar", () => {
 	for (const [lang, c] of Object.entries(CASES)) {
 		it(`extracts symbols for ${lang}`, async () => {

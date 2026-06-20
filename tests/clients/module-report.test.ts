@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { FactStore } from "../../clients/dispatch/fact-store.js";
 import { moduleReport, readSymbol } from "../../clients/module-report.js";
@@ -146,11 +147,34 @@ describe("moduleReport — review-graph who-uses-this", () => {
 
 		expect(report.available).toBe(true);
 		expect(report.staleness).toBe("fresh");
+		// Provenance is honest: who-uses-this came from the AST review graph (#256).
+		expect(report.semantic.source).toBe("review-graph");
 		const foo = report.api.find((e) => e.name === "foo");
 		expect(foo).toBeDefined();
 		expect(foo?.usedBy?.some((u) => u.file.endsWith("b.ts"))).toBe(true);
+		// usedBy paths are cwd-relative for scanning (not absolute) (#256).
+		expect(foo?.usedBy?.every((u) => !path.isAbsolute(u.file))).toBe(true);
 		// recommendedReads should surface the referenced, exported symbol.
 		expect(report.recommendedReads.some((r) => r.symbol === "foo")).toBe(true);
+	});
+
+	it("routes a function-local declaration to internal, not api (#256)", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"nested.ts",
+			[
+				"export function outer(): number {",
+				"  const localHelper = (n: number) => n * 2;",
+				"  return localHelper(21);",
+				"}",
+			].join("\n"),
+		);
+		const report = await moduleReport(file, env.tmpDir);
+		// outer is the only module export; localHelper is a function-local.
+		expect(report.api.some((e) => e.name === "outer")).toBe(true);
+		expect(report.api.some((e) => e.name === "localHelper")).toBe(false);
+		expect(report.internal.some((e) => e.name === "localHelper")).toBe(true);
 	});
 
 	it("Tier 3: serves who-uses-this from the persisted disk snapshot when the in-memory cache is cold (cross-process)", async () => {

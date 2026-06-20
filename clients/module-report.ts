@@ -19,9 +19,10 @@
  *   2. read the already-built review graph (in-memory, else the persisted disk
  *      snapshot) for who-uses-this / flags / imports — never a build. Cold cache
  *      → outline only.
- * `semantic.source` is always "none" here; live-LSP enrichment is re-homed to
+ * `semantic.source` reflects who-uses-this provenance: "review-graph" when the
+ * cached graph backs it, else "none" (cold). Live-LSP enrichment is re-homed to
  * #236, where LSP writes provenance-tagged edges INTO the graph (once, persisted)
- * for this path to read. The enrichment logic lives in clients/module-report-lsp.ts.
+ * for this path to read as "graph-lsp". That logic lives in clients/module-report-lsp.ts.
  *
  * Guard integrity: moduleReport injects NO read records — an outline is not
  * "having seen the body". readSymbol returns the actual body lines so the host
@@ -97,7 +98,9 @@ export interface ModuleReport {
 	internal: ModuleSymbolEntry[];
 	recommendedReads: RecommendedRead[];
 	semantic: {
-		source: "graph-lsp" | "live-lsp" | "none";
+		/** Provenance of who-uses-this: AST review graph, future graph-LSP edges
+		 * (#236), or none (cold cache). */
+		source: "review-graph" | "graph-lsp" | "none";
 		references: boolean;
 		implementations: boolean;
 	};
@@ -205,16 +208,18 @@ function resolveUsedBy(
 	graph: ReviewGraph,
 	symbolNodeId: string,
 	cap: number,
+	projectRoot: string,
 ): ModuleSymbolUsedBy[] {
 	const out: ModuleSymbolUsedBy[] = [];
 	const seen = new Set<string>();
 	for (const edge of graph.edgesByTo.get(symbolNodeId) ?? []) {
 		if (edge.kind !== "calls" && edge.kind !== "references") continue;
 		const from = graph.nodes.get(edge.from);
-		const file =
+		const rawFile =
 			from?.filePath ??
 			(edge.from.startsWith("file:") ? edge.from.slice("file:".length) : "");
-		if (!file) continue;
+		if (!rawFile) continue;
+		const file = toDisplayPath(rawFile, projectRoot);
 		const symbol = from?.symbolName ?? "";
 		// Caller line: a symbol caller node carries metadata.line; a file-level
 		// `references` edge carries the line on the edge metadata.
@@ -234,8 +239,12 @@ function resolveUsedBy(
 	return out;
 }
 
-function toDisplayImportPath(p: string, projectRoot: string): string {
-	if (!path.isAbsolute(p)) return p;
+// Human-facing path: cwd-relative + forward-slashed when the file sits under the
+// project root, else the absolute (slash-normalized) path. Machine fields (the
+// `read` args) keep the absolute path so the host's Read tool resolves them
+// unambiguously; only display fields (`path`, `usedBy.file`, imports) relativize.
+function toDisplayPath(p: string, projectRoot: string): string {
+	if (!path.isAbsolute(p)) return p.replace(/\\/g, "/");
 	const rel = path.relative(projectRoot, p);
 	return rel && !rel.startsWith("..")
 		? rel.replace(/\\/g, "/")
@@ -258,7 +267,7 @@ function collectImports(
 			if (target.kind === "external") {
 				external.add(String(target.metadata?.source ?? edge.to));
 			} else if (target.filePath) {
-				internal.add(toDisplayImportPath(target.filePath, projectRoot));
+				internal.add(toDisplayPath(target.filePath, projectRoot));
 			} else {
 				internal.add(String(target.metadata?.source ?? edge.to));
 			}
@@ -276,6 +285,7 @@ function toEntry(
 	normalizedPath: string,
 	graph: ReviewGraph | undefined,
 	maxRefs: number,
+	projectRoot: string,
 ): ModuleSymbolEntry {
 	const startLine = sym.line;
 	const endLine = sym.endLine ?? sym.line;
@@ -301,7 +311,7 @@ function toEntry(
 	if (metadata.isBoundaryWrapper) flags.push("boundary wrapper");
 
 	const usedBy = graph
-		? resolveUsedBy(graph, symbolNodeId, maxRefs)
+		? resolveUsedBy(graph, symbolNodeId, maxRefs, projectRoot)
 		: undefined;
 
 	return {
@@ -387,7 +397,7 @@ export async function moduleReport(
 	try {
 		content = fs.readFileSync(absPath, "utf-8");
 	} catch {
-		return unavailableReport(absPath);
+		return unavailableReport(toDisplayPath(absPath, cwd));
 	}
 
 	const kind = detectFileKind(absPath);
@@ -410,7 +420,7 @@ export async function moduleReport(
 	}
 
 	const entries = extracted.map((sym) =>
-		toEntry(sym, absPath, normalizedPath, graph, maxRefs),
+		toEntry(sym, absPath, normalizedPath, graph, maxRefs, cwd),
 	);
 
 	const api = entries.filter((entry) => entry.exported);
@@ -425,7 +435,7 @@ export async function moduleReport(
 		available: entries.length > 0 || hasGraphNode,
 		staleness:
 			entries.length === 0 && !hasGraphNode ? "unavailable" : "fresh",
-		path: absPath,
+		path: toDisplayPath(absPath, cwd),
 		language: kind ?? undefined,
 		lineCount,
 		summary: {
@@ -438,8 +448,10 @@ export async function moduleReport(
 		internal,
 		recommendedReads: rankRecommendedReads(entries),
 		semantic: {
-			// No live LSP on the read path (#256 → re-homed to #236 graph-lsp edges).
-			source: "none",
+			// Provenance of who-uses-this / references. The AST review graph is the
+			// only source on this read path; "graph-lsp" is reserved for #236 (LSP
+			// writes provenance edges INTO the graph). Cold cache → "none".
+			source: hasGraphNode ? "review-graph" : "none",
 			references: hasGraphNode,
 			implementations: false,
 		},

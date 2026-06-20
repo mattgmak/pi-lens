@@ -768,18 +768,26 @@ export class TreeSitterSymbolExtractor {
 
 	// biome-ignore lint/suspicious/noExplicitAny: Node type
 	private isExported(node: any, content: string): boolean {
-		// Simple heuristic: check for "export" keyword before the node
+		// A symbol is exported only at module scope. Anchor the keyword at the
+		// START of the declaration line (so `const exportName = …`, or "export"
+		// inside a comment, doesn't count), and require the AST walk to reach an
+		// export statement WITHOUT crossing a function body.
 		const lines = content.split("\n");
 		const lineIdx = node.startPosition.row;
 		const line = lines[lineIdx] || "";
-		return line.includes("export") || this.hasExportModifier(node, content);
+		return /^\s*export\b/.test(line) || this.hasExportModifier(node, content);
 	}
 
 	// biome-ignore lint/suspicious/noExplicitAny: Node type
 	private hasExportModifier(node: any, _content: string): boolean {
-		// Walk up the tree to find if this node is inside an export statement
+		// Walk up to an export statement, but bail the moment we cross a function
+		// or block body (`statement_block`): a symbol nested inside an exported
+		// function is a LOCAL, not a module export (the #256 false-API bug). Class
+		// members stay exported — they live in a `class_body`, not a
+		// `statement_block`, on the path to the enclosing export.
 		let current = node.parent;
 		while (current) {
+			if (current.type === "statement_block") return false;
 			if (
 				current.type === "export_statement" ||
 				current.type === "export_declaration"
