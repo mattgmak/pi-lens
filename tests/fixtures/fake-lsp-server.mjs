@@ -87,7 +87,19 @@ function handle(raw) {
 	if (data.method === "textDocument/didOpen") return;
 	if (data.method === "textDocument/didChange") return;
 	if (data.method === "workspace/didChangeConfiguration") return;
-	if (data.method === "workspace/didChangeWatchedFiles") return;
+	if (data.method === "workspace/didChangeWatchedFiles") {
+		// #271 smoke: echo each received batch back so an integration test can
+		// assert the client coalesced N file opens into ONE wire frame. Off by
+		// default (the bulk of tests neither send nor care about watched-files).
+		if (process.env.FAKE_LSP_ECHO_WATCHED_FILES) {
+			send({
+				jsonrpc: "2.0",
+				method: "$/test/watchedFilesReceived",
+				params: { changes: data.params?.changes ?? [] },
+			});
+		}
+		return;
+	}
 	if (data.method === "textDocument/publishDiagnostics") return;
 	if (data.method === "exit") {
 		process.exit(0);

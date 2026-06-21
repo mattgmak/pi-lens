@@ -356,3 +356,90 @@ describe("LSP Client Integration — stale navigation drop (#276)", () => {
 		expect(locations.length).toBeGreaterThanOrEqual(1);
 	});
 });
+
+describe("LSP Client Integration — batched watched-files (#271)", () => {
+	const prev = process.env.FAKE_LSP_ECHO_WATCHED_FILES;
+	let proc: Awaited<ReturnType<typeof launchLSP>> | undefined;
+	let client: Awaited<ReturnType<typeof createLSPClient>> | undefined;
+	// Frames the fake SERVER actually received over the wire (one entry = one
+	// didChangeWatchedFiles notification), echoed back via $/test/watchedFilesReceived.
+	let received: Array<Array<{ uri: string; type: number }>> = [];
+
+	beforeEach(async () => {
+		received = [];
+		proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+			cwd: process.cwd(),
+			env: { ...process.env, FAKE_LSP_ECHO_WATCHED_FILES: "1" },
+		});
+		client = await createLSPClient({
+			serverId: "fake-watch",
+			process: proc,
+			root: process.cwd(),
+		});
+		client.connection.onNotification(
+			"$/test/watchedFilesReceived",
+			(params: { changes: Array<{ uri: string; type: number }> }) => {
+				received.push(params.changes);
+			},
+		);
+	});
+
+	afterEach(async () => {
+		try {
+			if (client) await client.shutdown();
+		} catch {
+			/* ignore */
+		}
+		try {
+			if (proc) await stopLSP(proc);
+		} catch {
+			/* ignore */
+		}
+		client = undefined;
+		proc = undefined;
+		if (prev === undefined) delete process.env.FAKE_LSP_ECHO_WATCHED_FILES;
+		else process.env.FAKE_LSP_ECHO_WATCHED_FILES = prev;
+	});
+
+	// Poll until the server has echoed at least one frame (the flush is on a
+	// ~100ms debounce + a stdio round-trip), with a generous ceiling.
+	const waitForEcho = async () => {
+		for (let i = 0; i < 60 && received.length === 0; i++) {
+			await new Promise((r) => setTimeout(r, 25));
+		}
+	};
+
+	it("coalesces N rapid file opens into ONE wire frame with N changes", async () => {
+		const files = ["wf-a.ts", "wf-b.ts", "wf-c.ts"].map((f) =>
+			path.join(process.cwd(), f),
+		);
+		// Open three distinct files within the debounce window.
+		for (const f of files) {
+			await client!.notify.open(f, "const x = 1;", "typescript");
+		}
+
+		await waitForEcho();
+
+		// Exactly one notification reached the server for the whole burst…
+		expect(received).toHaveLength(1);
+		// …carrying all three URIs (deduped, insertion order).
+		expect(received[0]).toHaveLength(3);
+		const uris = received[0].map((c) => c.uri);
+		for (const f of files) {
+			expect(uris).toContain(pathToFileURL(f).href);
+		}
+	});
+
+	it("does not emit a frame for a silent open (cascade read)", async () => {
+		await client!.notify.open(
+			path.join(process.cwd(), "wf-silent.ts"),
+			"const x = 1;",
+			"typescript",
+			false,
+			true, // silent
+		);
+		// Wait out the debounce window — nothing should have been enqueued/sent.
+		await new Promise((r) => setTimeout(r, 200));
+		expect(received).toHaveLength(0);
+	});
+});
