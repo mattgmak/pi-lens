@@ -33,6 +33,7 @@ import {
 	type PositionEncoding,
 } from "./position-encoding.js";
 import { getStrategy } from "./server-strategies.js";
+import { WatchedFilesQueue } from "./watch-queue.js";
 
 // Opt-in publishDiagnostics trace (PILENS_PUB_DEBUG=1) — read once, negligible
 // hot-path cost. Surfaces each server's publish behavior (version + count) to
@@ -488,6 +489,12 @@ export interface LSPClientState {
 	readonly serverId: string;
 	readonly root: string;
 	readonly lspProcess: LSPProcess;
+	/**
+	 * Per-client debounced `workspace/didChangeWatchedFiles` batcher (#271).
+	 * Two-phase init (needs `state` for its flush closure) — assigned right after
+	 * the state literal, like `workspaceDiagnosticsSupport`.
+	 */
+	watchQueue: WatchedFilesQueue;
 }
 
 function isClientAlive(state: LSPClientState): boolean {
@@ -1103,11 +1110,12 @@ export async function handleNotifyOpen(
 		} catch {
 			fileExists = false;
 		}
-		await safeSendNotification(
-			state.connection,
-			"workspace/didChangeWatchedFiles",
-			{ changes: [{ uri, type: fileExists ? 2 : 1 }] },
-		);
+		// #271: enqueue instead of sending now — the per-client queue coalesces a
+		// turn's file opens into a single notification, so push-diagnostics servers
+		// re-analyze the project once per burst rather than once per file. didOpen
+		// (below) still carries this file's content immediately, so the open
+		// document is analyzed without waiting on the batched watcher notify.
+		state.watchQueue.enqueue(uri, fileExists ? 2 : 1);
 	}
 
 	if (!isClientAlive(state)) return;
@@ -1162,6 +1170,9 @@ export async function clientShutdown(
 	state.pendingDiagnostics.clear();
 	state.pendingOpens.clear();
 	state.openDocuments.clear();
+	// #271: drop any pending watched-files batch + its timer (a dying client's
+	// queued FS changes are moot, and the timer must not outlive the connection).
+	state.watchQueue?.cancel();
 	state.diagnosticEmitter.removeAllListeners();
 	if (!options.fast) {
 		try {
@@ -1439,7 +1450,20 @@ export async function createLSPClient(options: {
 		serverId,
 		root,
 		lspProcess,
+		// two-phase: the flush closure needs `state` (below)
+		watchQueue: undefined as unknown as WatchedFilesQueue,
 	};
+
+	// #271: batch per-file workspace/didChangeWatchedFiles into one notification
+	// per debounce window, so an N-file turn re-indexes the server once, not N×.
+	state.watchQueue = new WatchedFilesQueue((changes) => {
+		if (!isClientAlive(state)) return;
+		void safeSendNotification(
+			state.connection,
+			"workspace/didChangeWatchedFiles",
+			{ changes },
+		);
+	});
 
 	setupIncomingHandlers(state, initialization);
 	connection.listen();

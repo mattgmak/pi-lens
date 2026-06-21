@@ -19,6 +19,7 @@ import {
 	type LSPClientState,
 } from "../../../clients/lsp/client.js";
 import { normalizeMapKey } from "../../../clients/path-utils.js";
+import { WatchedFilesQueue } from "../../../clients/lsp/watch-queue.js";
 
 const TEST_FILE = "/project/app.ts";
 const TEST_KEY = normalizeMapKey(TEST_FILE);
@@ -93,7 +94,7 @@ function createMockLspProcess() {
 function createMockState(overrides?: Partial<LSPClientState>): LSPClientState {
 	const diagnosticEmitter = new EventEmitter();
 	diagnosticEmitter.setMaxListeners(50);
-	return {
+	const state: LSPClientState = {
 		isConnected: true,
 		isDestroyed: false,
 		connectionDisposed: false,
@@ -137,8 +138,20 @@ function createMockState(overrides?: Partial<LSPClientState>): LSPClientState {
 		serverId: "test-server",
 		root: "/project",
 		lspProcess: createMockLspProcess() as any,
+		watchQueue: undefined as unknown as WatchedFilesQueue,
 		...overrides,
 	};
+	// #271: mirror production — the queue flushes a batched didChangeWatchedFiles
+	// through the (mock) connection. Tests drive it via state.watchQueue.flush().
+	if (!state.watchQueue) {
+		state.watchQueue = new WatchedFilesQueue((changes) => {
+			void state.connection.sendNotification(
+				"workspace/didChangeWatchedFiles",
+				{ changes },
+			);
+		});
+	}
+	return state;
 }
 
 describe("stripDiagnosticNoiseLines", () => {
@@ -205,14 +218,47 @@ describe("handleNotifyOpen", () => {
 		expect(calls.some((c) => c[0] === "textDocument/didOpen")).toBe(true);
 	});
 
-	it("sends didChangeWatchedFiles in normal open mode", async () => {
+	it("batches didChangeWatchedFiles via the watch queue in normal open mode (#271)", async () => {
 		const state = createMockState();
 		await handleNotifyOpen(state, TEST_FILE, "const x = 1;", "typescript");
 
-		const calls = vi.mocked(state.connection.sendNotification).mock.calls;
+		// #271: the notify is now enqueued, not sent inline — not yet on the wire.
+		let calls = vi.mocked(state.connection.sendNotification).mock.calls;
 		expect(calls.some((c) => c[0] === "workspace/didChangeWatchedFiles")).toBe(
-			true,
+			false,
 		);
+		expect(state.watchQueue.size).toBe(1);
+
+		// flushing the debounce window emits a single batched notification.
+		state.watchQueue.flush();
+		calls = vi.mocked(state.connection.sendNotification).mock.calls;
+		const watched = calls.find(
+			(c) => c[0] === "workspace/didChangeWatchedFiles",
+		);
+		expect(watched).toBeDefined();
+		expect((watched?.[1] as { changes: unknown[] }).changes).toHaveLength(1);
+	});
+
+	it("coalesces multiple file opens into ONE didChangeWatchedFiles (#271)", async () => {
+		const state = createMockState();
+		await handleNotifyOpen(state, TEST_FILE, "const x = 1;", "typescript");
+		await handleNotifyOpen(
+			state,
+			`${TEST_FILE}.other.ts`,
+			"const y = 2;",
+			"typescript",
+		);
+		expect(state.watchQueue.size).toBe(2);
+
+		state.watchQueue.flush();
+		const watchedCalls = vi
+			.mocked(state.connection.sendNotification)
+			.mock.calls.filter((c) => c[0] === "workspace/didChangeWatchedFiles");
+		// one notification for the whole burst, carrying both URIs
+		expect(watchedCalls).toHaveLength(1);
+		expect(
+			(watchedCalls[0][1] as { changes: unknown[] }).changes,
+		).toHaveLength(2);
 	});
 
 	it("sends didChange on re-open", async () => {
