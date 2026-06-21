@@ -31,7 +31,10 @@ import type {
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
-import { createAvailabilityChecker } from "./utils/runner-helpers.js";
+import {
+	createAvailabilityChecker,
+	lspPrimaryCoversFile,
+} from "./utils/runner-helpers.js";
 
 const shellcheck = createAvailabilityChecker("shellcheck", ".exe");
 
@@ -139,6 +142,20 @@ const shellcheckRunner: RunnerDefinition = {
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		const cwd = ctx.cwd || process.cwd();
+
+		// #233: bash-language-server runs shellcheck internally. When the `bash` LSP
+		// covers this file AND shellcheck is on PATH (so the LSP actually emits its
+		// findings), the warm server already produces these diagnostics — skip the
+		// redundant CLI scan. Stays active when the LSP or shellcheck is absent so
+		// shell coverage never regresses.
+		if (
+			lspPrimaryCoversFile(ctx, "bash") &&
+			(await ctx.hasTool("bash-language-server")) &&
+			(await ctx.hasTool("shellcheck"))
+		) {
+			return { status: "skipped", diagnostics: [], semantic: "none" };
+		}
+
 		let cmd: string | null = null;
 		if (await (shellcheck.isAvailableAsync(cwd))) {
 			cmd = shellcheck.getCommand(cwd);

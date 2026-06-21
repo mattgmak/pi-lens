@@ -12,11 +12,40 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getGlobalPiLensDir } from "../../../file-utils.js";
 import { ensureTool } from "../../../installer/index.js";
+import {
+	getServersForFileWithConfig,
+	isServerDisabled,
+} from "../../../lsp/config.js";
 import { safeSpawnAsync } from "../../../safe-spawn.js";
 import {
 	getToolCommandSpec,
 	shouldAutoInstallTool,
 } from "../../../tool-policy.js";
+import type { DispatchContext } from "../../types.js";
+
+/**
+ * True when the LSP runner will cover `ctx.filePath` via the given PRIMARY server
+ * id. Used by CLI runners that duplicate a linter a warm LSP already wraps
+ * (taplo↔`toml` LSP = `taplo lsp`; shellcheck↔`bash` LSP runs shellcheck
+ * internally) so they SELF-SKIP and stop double-reporting the same findings (#233)
+ * — the same dormant-when-LSP-covers pattern the ast-grep napi runner uses.
+ *
+ * Non-spawning and conservative: honors the `no-lsp` kill switch + per-server
+ * disable/config, and only matches when this server is the SELECTED primary for
+ * the file (first non-auxiliary candidate). The caller additionally gates on tool
+ * availability, so coverage never regresses when the LSP is absent/disabled.
+ */
+export function lspPrimaryCoversFile(
+	ctx: DispatchContext,
+	serverId: string,
+): boolean {
+	if (ctx.pi?.getFlag?.("no-lsp")) return false;
+	if (isServerDisabled(serverId, ctx.filePath)) return false;
+	const primary = getServersForFileWithConfig(ctx.filePath).find(
+		(s) => s.role !== "auxiliary",
+	);
+	return primary?.id === serverId;
+}
 
 /**
  * Walk up from startDir until we find a directory containing node_modules/.bin.

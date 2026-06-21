@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	createAvailabilityChecker,
+	lspPrimaryCoversFile,
 	resolveCommandArgsWithInstallFallback,
 	resolveCommandWithInstallFallback,
 	resolveNodeToolCommand,
@@ -10,6 +11,7 @@ import {
 	resolveToolCommandWithInstallFallback,
 	resolveVendorToolCommand,
 } from "../../../../clients/dispatch/runners/utils/runner-helpers.ts";
+import type { DispatchContext } from "../../../../clients/dispatch/types.ts";
 import { setupTestEnvironment } from "../../test-utils.js";
 
 vi.mock("../../../../clients/safe-spawn.js", () => ({
@@ -171,6 +173,38 @@ describe("runner-helpers availability checker", () => {
 		const checker = createAvailabilityChecker("sometool");
 		expect(await checker.isAvailableAsync(process.cwd())).toBe(true);
 		expect(probedArgs).toEqual(["--version"]);
+	});
+
+	it("lspPrimaryCoversFile: true when the named server is the file's primary (#233)", () => {
+		const ctx = {
+			filePath: "/proj/config.toml",
+			pi: { getFlag: () => false },
+		} as unknown as DispatchContext;
+		// the `toml` LSP server (taplo lsp) is the sole primary for .toml
+		expect(lspPrimaryCoversFile(ctx, "toml")).toBe(true);
+		const sh = {
+			filePath: "/proj/deploy.sh",
+			pi: { getFlag: () => false },
+		} as unknown as DispatchContext;
+		expect(lspPrimaryCoversFile(sh, "bash")).toBe(true);
+	});
+
+	it("lspPrimaryCoversFile: false when no-lsp kills the runner (#233)", () => {
+		const ctx = {
+			filePath: "/proj/config.toml",
+			pi: { getFlag: (f: string) => f === "no-lsp" },
+		} as unknown as DispatchContext;
+		expect(lspPrimaryCoversFile(ctx, "toml")).toBe(false);
+	});
+
+	it("lspPrimaryCoversFile: false when the server is not this file's primary (#233)", () => {
+		// a .py file's primary is the python server, not toml — so the taplo CLI
+		// must NOT self-skip on it.
+		const ctx = {
+			filePath: "/proj/main.py",
+			pi: { getFlag: () => false },
+		} as unknown as DispatchContext;
+		expect(lspPrimaryCoversFile(ctx, "toml")).toBe(false);
 	});
 
 	it("caches availability per cwd (does not leak false across projects)", async () => {
