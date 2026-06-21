@@ -116,27 +116,49 @@ describe("TOOLS registry consistency", () => {
 			}
 		});
 
-		it("archive tools declare an archive spec (https url + kind + launcher OR tree-bundle marker) + binaryName, no packageName/github/maven", () => {
+		it("archive tools declare an archive spec (https url|resolver + kind + launcher OR tree-bundle marker) + binaryName, no packageName/github/maven", () => {
 			// relative path inside the archive — no leading slash / drive letter.
 			const relPath = /^[\w.-]+(\/[\w.-]+)*$/;
+			// Probe a representative platform/arch matrix; a resolver must yield an
+			// https URL for at least one (else the tool is uninstallable everywhere),
+			// and every URL it DOES yield must be https.
+			const PROBE: Array<[string, string]> = [
+				["linux", "x64"],
+				["darwin", "arm64"],
+				["win32", "x64"],
+			];
 			for (const t of TOOLS.filter((x) => x.installStrategy === "archive")) {
 				expect(t.archive, `${t.id} archive spec`).toBeDefined();
-				expect(t.archive?.url, `${t.id} archive url`).toMatch(/^https:\/\//);
-				expect(["tgz", "zip"], `${t.id} archive kind`).toContain(t.archive?.kind);
-				if (t.archive?.launcher !== undefined) {
+				const spec = t.archive!;
+				if (typeof spec.url === "function") {
+					const resolve = spec.url;
+					const resolved = PROBE.map(([p, a]) => resolve(p, a)).filter(
+						(u): u is string => Boolean(u),
+					);
+					expect(
+						resolved.length,
+						`${t.id} archive url resolver yields nothing on any probed platform`,
+					).toBeGreaterThan(0);
+					for (const u of resolved)
+						expect(u, `${t.id} archive url`).toMatch(/^https:\/\//);
+				} else {
+					expect(spec.url, `${t.id} archive url`).toMatch(/^https:\/\//);
+				}
+				expect(["tgz", "zip"], `${t.id} archive kind`).toContain(spec.kind);
+				if (spec.launcher !== undefined) {
 					// Launcher-style archive (a single binary/shim inside the tree).
-					expect(t.archive.launcher, `${t.id} launcher`).toMatch(relPath);
+					expect(spec.launcher, `${t.id} launcher`).toMatch(relPath);
 				} else {
 					// Tree bundle: no launcher → must declare a treeMarker (existence
-					// check) and strip 0 components (sibling folders must not be
-					// flattened/merged).
-					expect(t.archive?.treeMarker, `${t.id} treeMarker (tree bundle)`).toMatch(
+					// check). stripComponents must be explicit: 0 for a no-wrapping-dir
+					// bundle (PSES), ≥1 to drop a version dir (clangd's clangd_<ver>/).
+					expect(spec.treeMarker, `${t.id} treeMarker (tree bundle)`).toMatch(
 						relPath,
 					);
 					expect(
-						t.archive?.stripComponents,
-						`${t.id} tree bundle must set stripComponents (0 for a no-wrapping-dir bundle)`,
-					).toBe(0);
+						typeof spec.stripComponents,
+						`${t.id} tree bundle must set stripComponents explicitly`,
+					).toBe("number");
 				}
 				expect(t.binaryName, `${t.id} binaryName`).toBeTruthy();
 				expect(t.packageName, `${t.id} archive tool should not carry packageName`).toBeUndefined();

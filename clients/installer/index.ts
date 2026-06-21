@@ -134,8 +134,17 @@ export interface MavenJarSpec {
 }
 
 export interface ArchiveSpec {
-	/** Download URL for the distribution archive (.tgz/.zip). */
-	url: string;
+	/**
+	 * Download URL for the distribution archive (.tgz/.zip). Either a single
+	 * platform-agnostic string (e.g. PowerShell Editor Services, a .NET bundle) or
+	 * a resolver `(platform, arch) => url | undefined` for servers that ship a
+	 * per-platform (and sometimes per-arch) archive — clangd, lua-language-server,
+	 * etc. Returning `undefined` marks the current platform/arch unsupported, and
+	 * the install degrades to "unavailable" (never a hard failure).
+	 *   platform: "linux" | "darwin" | "win32"
+	 *   arch:     "x64" | "arm64" | ...
+	 */
+	url: string | ((platform: string, arch: string) => string | undefined);
 	/** Archive kind — both extracted via `tar` (Windows bsdtar handles zip too). */
 	kind: "tgz" | "zip";
 	/**
@@ -685,6 +694,37 @@ export const TOOLS: ToolDefinition[] = [
 			kind: "zip",
 			stripComponents: 0,
 			treeMarker: "PowerShellEditorServices/Start-EditorServices.ps1",
+		},
+	},
+	{
+		// clangd (C/C++/Obj-C LSP, #241) — a self-contained native TREE BUNDLE: the
+		// release zip wraps `clangd_<ver>/{bin,lib}` (bin/clangd[.exe] + the bundled
+		// libclang headers under lib/), so stripComponents:1 drops the version dir and
+		// the whole tree is kept (no launcher). Unlike PSES there is no external
+		// runtime — CppServer launches `<bundle>/bin/clangd` directly. checkCommand
+		// documents the binary but is unused for resolution (tree bundles resolve only
+		// via the extract dir + treeMarker). Platform-matched url: clangd ships x64
+		// prebuilts; arm runs the x64 build under Rosetta/emulation (darwin/win32),
+		// while linux/arm64 has no official build → undefined (graceful unavailable).
+		id: "clangd",
+		name: "clangd",
+		checkCommand: "clangd",
+		checkArgs: ["--version"],
+		installStrategy: "archive",
+		binaryName: "clangd",
+		archive: {
+			url: (platform, arch) => {
+				const version = "22.1.0";
+				const base = `https://github.com/clangd/clangd/releases/download/${version}`;
+				if (platform === "linux")
+					return arch === "x64" ? `${base}/clangd-linux-${version}.zip` : undefined;
+				if (platform === "darwin") return `${base}/clangd-mac-${version}.zip`;
+				if (platform === "win32") return `${base}/clangd-windows-${version}.zip`;
+				return undefined;
+			},
+			kind: "zip",
+			stripComponents: 1,
+			treeMarker: "bin",
 		},
 	},
 	{
@@ -2193,6 +2233,20 @@ async function installMavenTool(
  * so the tool resolves like any other via findGitHubToolPath. Extraction uses
  * `tar` (present on Windows 10+ as bsdtar, which also reads .zip).
  */
+/**
+ * Resolve an {@link ArchiveSpec} download URL for the current platform/arch.
+ * A string URL is platform-agnostic; a function resolves per platform/arch and
+ * may return `undefined` (unsupported → caller degrades to "unavailable").
+ * Exported for the tool-registry contract test.
+ */
+export function resolveArchiveUrl(
+	spec: ArchiveSpec,
+	platform: string = process.platform,
+	arch: string = process.arch,
+): string | undefined {
+	return typeof spec.url === "function" ? spec.url(platform, arch) : spec.url;
+}
+
 async function installArchiveTool(
 	tool: ToolDefinition,
 ): Promise<string | undefined> {
@@ -2201,10 +2255,18 @@ async function installArchiveTool(
 	const binaryName = tool.binaryName ?? tool.id;
 	const isWindows = process.platform === "win32";
 
-	logSessionStart(`archive-install ${tool.id}: downloading ${spec.url}`);
+	const url = resolveArchiveUrl(spec);
+	if (!url) {
+		logSessionStart(
+			`archive-install ${tool.id}: no archive for ${process.platform}/${process.arch} — unsupported, skipping`,
+		);
+		return undefined;
+	}
+
+	logSessionStart(`archive-install ${tool.id}: downloading ${url}`);
 	let archiveBuffer: Buffer;
 	try {
-		archiveBuffer = await httpsGet(spec.url);
+		archiveBuffer = await httpsGet(url);
 	} catch (err) {
 		logSessionStart(
 			`archive-install ${tool.id}: download failed: ${(err as Error).message}`,

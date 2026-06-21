@@ -519,6 +519,83 @@ async function resolveAndLaunchBundle(
 	}
 }
 
+interface TreeBinaryLaunchSpec {
+	/** PATH candidates to try FIRST — a user/system install wins (fast, already
+	 *  on PATH), e.g. ["clangd"]. */
+	candidates: string[];
+	/** Managed archive TREE-BUNDLE tool id (installStrategy "archive", no
+	 *  launcher); resolves to the extracted bundle directory. */
+	bundleToolId: string;
+	/** Path to the executable INSIDE the bundle, relative + POSIX-separated,
+	 *  WITHOUT the platform suffix (".exe" is appended on win32), e.g.
+	 *  "bin/clangd". */
+	binRelPath: string;
+	cwd: string;
+	args: string[];
+	env?: Record<string, string>;
+}
+
+/**
+ * Launch a language server that ships as a self-contained native TREE BUNDLE with
+ * its executable INSIDE the extracted tree (e.g. clangd: `<bundle>/bin/clangd`
+ * plus the bundled libclang headers under `lib/`), as opposed to a single binary
+ * on PATH or a runtime-driven module bundle (see {@link resolveAndLaunchBundle}).
+ *
+ * Resolution order: (1) PATH candidates first — a system install wins; (2) the
+ * managed bundle (already-extracted, or installed now when `allowInstall`), then
+ * launch the bin within it. No external runtime. Anything missing → GRACEFUL SKIP
+ * (returns undefined → the runner's coverage notice, never a hard fail).
+ */
+async function resolveAndLaunchTreeBinary(
+	spec: TreeBinaryLaunchSpec,
+	allowInstall: boolean | undefined,
+): Promise<{ process: LSPProcess; source: "direct" | "managed" } | undefined> {
+	// 1. PATH-first — a system install wins (user-managed, no 150MB download).
+	for (const command of spec.candidates) {
+		try {
+			const proc = await launchLSP(command, spec.args, {
+				cwd: spec.cwd,
+				env: spec.env,
+			});
+			return { process: proc, source: "direct" };
+		} catch {
+			// not on PATH (or broken) — fall through to the managed bundle
+		}
+	}
+
+	// 2. Managed tree bundle: already-extracted, else install when allowed.
+	let bundleDir = await getToolPath(spec.bundleToolId);
+	if (!bundleDir && canInstall(allowInstall)) {
+		bundleDir = await ensureTool(spec.bundleToolId);
+	}
+	if (!bundleDir) {
+		logSessionStart(
+			`lsp launch tree-bin skip tool=${spec.bundleToolId}: not on PATH and bundle not installed (allowInstall=${allowInstall !== false})`,
+		);
+		return undefined;
+	}
+
+	const suffix = process.platform === "win32" ? ".exe" : "";
+	const binPath =
+		path.join(bundleDir, ...spec.binRelPath.split("/")) + suffix;
+	try {
+		const proc = await launchLSP(binPath, spec.args, {
+			cwd: spec.cwd,
+			env: spec.env,
+		});
+		logSessionStart(
+			`lsp launch tree-bin success tool=${spec.bundleToolId} bin=${binPath}`,
+		);
+		return { process: proc, source: "managed" };
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		logSessionStart(
+			`lsp launch tree-bin failed tool=${spec.bundleToolId} bin=${binPath} error=${message}`,
+		);
+		return undefined;
+	}
+}
+
 function nodeBinCandidates(root: string, baseName: string): string[] {
 	const localBase = path.join(root, "node_modules", ".bin", baseName);
 	if (process.platform === "win32") {
@@ -1750,7 +1827,7 @@ export const LuaServer = createInteractiveServer({
 	command: "lua-language-server",
 });
 
-export const CppServer = createInteractiveServer({
+export const CppServer: LSPServerInfo = {
 	id: "cpp",
 	name: "clangd",
 	extensions: KIND_EXTENSIONS["cxx"],
@@ -1762,10 +1839,23 @@ export const CppServer = createInteractiveServer({
 			"Makefile",
 		]),
 	),
-	language: "cpp",
-	command: "clangd",
-	args: ["--background-index"],
-});
+	spawn(root, options) {
+		// clangd ships a self-contained native tree bundle (bin/clangd + bundled
+		// libclang headers). Prefer a system clangd on PATH; else auto-install the
+		// managed bundle (#241) and launch bin/clangd within it. Graceful skip when
+		// neither is available (→ coverage notice); cpp-check stays the fallback.
+		return resolveAndLaunchTreeBinary(
+			{
+				candidates: ["clangd"],
+				bundleToolId: "clangd",
+				binRelPath: "bin/clangd",
+				cwd: root,
+				args: ["--background-index"],
+			},
+			options?.allowInstall,
+		);
+	},
+};
 
 export const ZigServer: LSPServerInfo = {
 	id: "zig",
