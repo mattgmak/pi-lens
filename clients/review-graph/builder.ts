@@ -320,18 +320,37 @@ async function confirmContentChanged(
 	return { trulyChanged, hashes };
 }
 
-function changedSignatureFiles(
+interface SignatureDelta {
+	added: string[];
+	removed: string[];
+	changed: string[];
+}
+
+/**
+ * #202: structural delta between two source-signature maps. The predecessor
+ * (changedSignatureFiles) returned undefined on ANY count change, so a single
+ * newly-created file forced a full whole-repo rebuild — the dominant cause of
+ * the multi-second graph_build spikes during a burst of new files (pi-lens has
+ * no fs-watcher, so it learns of N new sibling files all at once on the next
+ * edit). Reporting added / removed / changed explicitly lets an add-only or
+ * change-only delta be applied incrementally — see {@link tryIncrementalFromCache}.
+ */
+function diffSignatureMaps(
 	previous: Map<string, string>,
 	next: Map<string, string>,
-): string[] | undefined {
-	if (previous.size !== next.size) return undefined;
+): SignatureDelta {
+	const added: string[] = [];
 	const changed: string[] = [];
 	for (const [file, signature] of next) {
 		const oldSignature = previous.get(file);
-		if (oldSignature === undefined) return undefined;
-		if (oldSignature !== signature) changed.push(file);
+		if (oldSignature === undefined) added.push(file);
+		else if (oldSignature !== signature) changed.push(file);
 	}
-	return changed;
+	const removed: string[] = [];
+	for (const file of previous.keys()) {
+		if (!next.has(file)) removed.push(file);
+	}
+	return { added, removed, changed };
 }
 
 function getReviewGraphMaxFiles(): number {
@@ -1216,6 +1235,108 @@ function resolveDeferredSymbolEdges(graph: ReviewGraph): void {
 	rebuildIndexes(graph);
 }
 
+interface CachedGraphEntry {
+	signature: string;
+	fileSignatures: Map<string, string>;
+	fileHashes?: Map<string, string>;
+	graph: ReviewGraph;
+}
+
+interface IncrementalCtx {
+	cwd: string;
+	normalizedCwd: string;
+	normalizedChanged: string[];
+	fileSignatures: Map<string, string>;
+	signature: string;
+	facts: FactStore;
+}
+
+/**
+ * #202: satisfy a build from a cached graph entry incrementally when the source
+ * file set changed only by ADDITIONS and/or CONTENT changes (no removals).
+ * Returns the query-ready graph, or undefined when an incremental update doesn't
+ * apply (a file was removed, the cache has no signatures to diff, or nothing
+ * actually changed) and the caller must fall through.
+ *
+ * This is the lever that keeps a burst of newly-created files off the
+ * full-rebuild path. `updateGraphFiles` re-parses each target from disk and is a
+ * remove-then-add that no-ops the remove for a not-yet-present file, so adding
+ * the new files (plus any hash-confirmed content changes) incrementally is
+ * correct regardless of whether the file was in this edit's changed set —
+ * dropping the old `.every(in changedSet)` restriction that bailed to a full
+ * rebuild for a sibling that changed on disk outside the current edit.
+ */
+async function tryIncrementalFromCache(
+	cached: CachedGraphEntry,
+	ctx: IncrementalCtx,
+): Promise<ReviewGraph | undefined> {
+	if (cached.fileSignatures.size === 0) return undefined;
+	const { added, removed, changed } = diffSignatureMaps(
+		cached.fileSignatures,
+		ctx.fileSignatures,
+	);
+	// A removal must prune nodes/edges and can dangle incoming edges; that's rare
+	// on an edit burst — fall through to a correct full rebuild.
+	if (removed.length > 0) return undefined;
+	if (added.length === 0 && changed.length === 0) return undefined;
+
+	// Confirm size/mtime-changed EXISTING files by content hash so pure drift
+	// (formatter no-op, git checkout, re-save) neither reparses nor forces a full
+	// build. Added files are genuinely new — no prior hash to compare.
+	const { trulyChanged, hashes } = await confirmContentChanged(
+		changed,
+		cached.fileHashes,
+	);
+	const filesToUpdate = [...added, ...trulyChanged];
+
+	if (filesToUpdate.length === 0) {
+		// Pure drift on existing files only — reuse the cached graph as-is.
+		const graph = cloneGraph(cached.graph);
+		rebuildIndexes(graph);
+		graph.changedSymbolsByFile.clear();
+		for (const file of ctx.normalizedChanged) {
+			upsertChangedSymbols(graph, ctx.facts, file);
+		}
+		_workspaceGraphCache.set(ctx.normalizedCwd, {
+			signature: ctx.signature,
+			fileSignatures: new Map(ctx.fileSignatures),
+			fileHashes: hashes,
+			graph: cloneGraph(cached.graph),
+		});
+		// #260: pure drift leaves the graph unchanged — don't rewrite the disk blob.
+		_lastGraphBuildInfo = { reused: true, mode: "cached" };
+		ctx.facts.setSessionFact("session.reviewGraph", graph);
+		return graph;
+	}
+
+	// Record content hashes for the newly-added files too, so the next run can
+	// tell their future drift from a real change (otherwise they would re-confirm
+	// as changed on every build until the next full rebuild).
+	for (const file of added) {
+		hashes.set(file, contentHashEntry(file));
+	}
+
+	const graph = cloneGraph(cached.graph);
+	await updateGraphFiles(graph, ctx.cwd, filesToUpdate, ctx.facts);
+	const graphSnapshot = cloneGraph(graph);
+	_workspaceGraphCache.set(ctx.normalizedCwd, {
+		signature: ctx.signature,
+		fileSignatures: new Map(ctx.fileSignatures),
+		fileHashes: hashes,
+		graph: graphSnapshot,
+	});
+	persistGraph(
+		ctx.cwd,
+		ctx.signature,
+		ctx.fileSignatures,
+		hashes,
+		graphSnapshot,
+	);
+	_lastGraphBuildInfo = { reused: true, mode: "incremental" };
+	ctx.facts.setSessionFact("session.reviewGraph", graph);
+	return graph;
+}
+
 async function _doBuildGraph(
 	cwd: string,
 	changedFiles: string[],
@@ -1259,55 +1380,16 @@ async function _doBuildGraph(
 		facts.setSessionFact("session.reviewGraph", graph);
 		return graph;
 	}
-	const memChanged = memCached
-		? changedSignatureFiles(memCached.fileSignatures, fileSignatures)
-		: undefined;
-	if (memCached && memChanged !== undefined && memChanged.length > 0) {
-		// #202: a file's size/mtime can drift without its content changing
-		// (formatter no-op, re-save, git checkout). Confirm by content hash so
-		// such drift neither forces a re-parse nor kicks us out of the cheap
-		// reuse path into a full rebuild.
-		const { trulyChanged, hashes } = await confirmContentChanged(
-			memChanged,
-			memCached.fileHashes,
-		);
-		if (trulyChanged.length === 0) {
-			// Pure drift — reuse the cached graph as-is.
-			const graph = cloneGraph(memCached.graph);
-			rebuildIndexes(graph);
-			graph.changedSymbolsByFile.clear();
-			for (const file of normalizedChanged) {
-				upsertChangedSymbols(graph, facts, file);
-			}
-			_workspaceGraphCache.set(normalizedCwd, {
-				signature,
-				fileSignatures: new Map(fileSignatures),
-				fileHashes: hashes,
-				graph: cloneGraph(memCached.graph),
-			});
-			// #260: pure drift (mtime/size changed, content identical) — the graph
-			// is unchanged, so do NOT rewrite the whole disk blob. The in-memory
-			// cache above carries the refreshed signature; a cold start just
-			// re-confirms the drift cheaply (content hash of the drifted files).
-			_lastGraphBuildInfo = { reused: true, mode: "cached" };
-			facts.setSessionFact("session.reviewGraph", graph);
-			return graph;
-		}
-		if (trulyChanged.every((file) => normalizedChangedSet.has(file))) {
-			const graph = cloneGraph(memCached.graph);
-			await updateGraphFiles(graph, cwd, trulyChanged, facts);
-			const graphSnapshot = cloneGraph(graph);
-			_workspaceGraphCache.set(normalizedCwd, {
-				signature,
-				fileSignatures: new Map(fileSignatures),
-				fileHashes: hashes,
-				graph: graphSnapshot,
-			});
-			persistGraph(cwd, signature, fileSignatures, hashes, graphSnapshot);
-			_lastGraphBuildInfo = { reused: true, mode: "incremental" };
-			facts.setSessionFact("session.reviewGraph", graph);
-			return graph;
-		}
+	if (memCached) {
+		const incremental = await tryIncrementalFromCache(memCached, {
+			cwd,
+			normalizedCwd,
+			normalizedChanged,
+			fileSignatures,
+			signature,
+			facts,
+		});
+		if (incremental) return incremental;
 	}
 
 	// Tier 2: disk cache (cold start — files unchanged since last persist)
@@ -1329,55 +1411,28 @@ async function _doBuildGraph(
 		facts.setSessionFact("session.reviewGraph", graph);
 		return graph;
 	}
-	const diskChanged =
-		diskCached && diskCached.fileSignatures.size > 0
-			? changedSignatureFiles(diskCached.fileSignatures, fileSignatures)
-			: undefined;
-	if (diskCached && diskChanged !== undefined && diskChanged.length > 0) {
-		// #202: same content-hash confirm as the in-memory tier. This is where
-		// it pays off most — on cold start, git/checkout mtime drift can make
-		// `diskChanged` large while content is unchanged; confirming lets us
-		// reuse the persisted graph instead of a full rebuild.
-		const { trulyChanged, hashes } = await confirmContentChanged(
-			diskChanged,
-			diskCached.fileHashes,
+	if (diskCached) {
+		// #202: same incremental path as the in-memory tier. This is where it pays
+		// off most — on cold start, git/checkout mtime drift or a burst of new
+		// files since the last persist would otherwise force a full whole-repo
+		// rebuild; the delta + content-hash confirm reuses the persisted graph.
+		const incremental = await tryIncrementalFromCache(
+			{
+				signature: diskCached.signature,
+				fileSignatures: diskCached.fileSignatures,
+				fileHashes: diskCached.fileHashes,
+				graph: diskCached.graph,
+			},
+			{
+				cwd,
+				normalizedCwd,
+				normalizedChanged,
+				fileSignatures,
+				signature,
+				facts,
+			},
 		);
-		if (trulyChanged.length === 0) {
-			const graph = cloneGraph(diskCached.graph);
-			rebuildIndexes(graph);
-			graph.changedSymbolsByFile.clear();
-			for (const file of normalizedChanged) {
-				upsertChangedSymbols(graph, facts, file);
-			}
-			_workspaceGraphCache.set(normalizedCwd, {
-				signature,
-				fileSignatures: new Map(fileSignatures),
-				fileHashes: hashes,
-				graph: cloneGraph(diskCached.graph),
-			});
-			// #260: pure drift (mtime/size changed, content identical) — the graph
-			// is unchanged, so do NOT rewrite the whole disk blob. The in-memory
-			// cache above carries the refreshed signature; a cold start just
-			// re-confirms the drift cheaply (content hash of the drifted files).
-			_lastGraphBuildInfo = { reused: true, mode: "cached" };
-			facts.setSessionFact("session.reviewGraph", graph);
-			return graph;
-		}
-		if (trulyChanged.every((file) => normalizedChangedSet.has(file))) {
-			const graph = cloneGraph(diskCached.graph);
-			await updateGraphFiles(graph, cwd, trulyChanged, facts);
-			const graphSnapshot = cloneGraph(graph);
-			_workspaceGraphCache.set(normalizedCwd, {
-				signature,
-				fileSignatures: new Map(fileSignatures),
-				fileHashes: hashes,
-				graph: graphSnapshot,
-			});
-			persistGraph(cwd, signature, fileSignatures, hashes, graphSnapshot);
-			_lastGraphBuildInfo = { reused: true, mode: "incremental" };
-			facts.setSessionFact("session.reviewGraph", graph);
-			return graph;
-		}
+		if (incremental) return incremental;
 	}
 
 	// Tier 3: full build
