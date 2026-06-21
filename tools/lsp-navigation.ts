@@ -746,7 +746,7 @@ export function createLspNavigationTool(
 			"- signatureHelp: Show callable signatures at cursor\n" +
 			"- documentSymbol: List all symbols (functions/classes/vars) in a file\n" +
 			"- findSymbol: Search document symbols in a file by name/detail with optional kind/top-level/exact filters\n" +
-			"- workspaceSymbol: Search symbols across the whole project (best with filePath context)\n" +
+			"- workspaceSymbol: Search symbols across the whole project (best with path context)\n" +
 			"- codeAction: Find available quick fixes/refactors at a range\n" +
 			"- rename: Compute or apply workspace edits for renaming a symbol\n" +
 			"- rename_file: Preview/apply LSP-aware source file rename notifications\n" +
@@ -758,15 +758,14 @@ export function createLspNavigationTool(
 			"- workspaceDiagnostics: List all diagnostics tracked by active LSP clients\n" +
 			"- capabilities: Show cached operation support for active LSP servers\n\n" +
 			"Line and character are 1-based (as shown in editors). For position-based operations, prefer passing symbol when you know the line but not the exact character; character can be omitted or -1 and pi-lens will resolve the symbol column. Use symbol#N for repeated symbols on the same line (1-based occurrence).",
-		promptSnippet:
-			"Use lsp_navigation to find definitions, references, and hover info via LSP",
+		promptSnippet: "Find definitions, references, and hover info via LSP",
 		parameters: Type.Object({
 			operation: Type.String({
 				description:
 					"LSP operation to perform. Valid values: " +
 					VALID_OPERATIONS.join(", "),
 			}),
-			filePath: Type.Optional(
+			path: Type.Optional(
 				Type.String({
 					description:
 						"Absolute or relative file path. Required for file-scoped operations; optional for workspaceSymbol/workspaceDiagnostics.",
@@ -989,7 +988,7 @@ export function createLspNavigationTool(
 
 			const {
 				operation: rawOperation,
-				filePath: rawPath,
+				path: rawPath,
 				line,
 				character,
 				symbol,
@@ -1008,7 +1007,7 @@ export function createLspNavigationTool(
 				callHierarchyItem,
 			} = params as {
 				operation: string;
-				filePath?: string;
+				path?: string;
 				line?: number;
 				character?: number;
 				symbol?: string;
@@ -1069,7 +1068,7 @@ export function createLspNavigationTool(
 						content: [
 							{
 								type: "text" as const,
-								text: `filePath is required for ${operation}`,
+								text: `path is required for ${operation}`,
 							},
 						],
 						isError: true,
@@ -1163,7 +1162,7 @@ export function createLspNavigationTool(
 						},
 					];
 					const noteMap: Record<string, string> = {
-						pull: "Note: filePath mode requests pull diagnostics for this file and returns the aggregated result",
+						pull: "Note: path mode requests pull diagnostics for this file and returns the aggregated result",
 						"push-only":
 							"Note: server is push-only; result depends on published diagnostics for this file",
 					};
@@ -1206,7 +1205,7 @@ export function createLspNavigationTool(
 				const noteMap2: Record<string, string> = {
 					"push-only":
 						"Note: push-only tracked diagnostics snapshot (not full workspace pull diagnostics).",
-					pull: "Note: tracked diagnostics snapshot from active clients. Provide filePath to force file-level diagnostics collection",
+					pull: "Note: tracked diagnostics snapshot from active clients. Provide path to force file-level diagnostics collection",
 				};
 				const note =
 					noteMap2[diagnosticsMode] ??
@@ -1242,7 +1241,7 @@ export function createLspNavigationTool(
 						content: [
 							{
 								type: "text" as const,
-								text: `filePath must be a source file, got directory: ${filePath}. Pass a source file path, or omit filePath for workspace-level operations.`,
+								text: `path must be a source file, got directory: ${filePath}. Pass a source file path, or omit path for workspace-level operations.`,
 							},
 						],
 						isError: true,
@@ -1658,7 +1657,7 @@ export function createLspNavigationTool(
 				: JSON.stringify(result);
 			if (isEmpty && operation === "workspaceSymbol" && !rawPath) {
 				output +=
-					"\nHint: provide filePath to scope workspaceSymbol to the active language server/root.";
+					"\nHint: provide path to scope workspaceSymbol to the active language server/root.";
 			}
 			if (usedDocumentSymbolFallback) {
 				output +=

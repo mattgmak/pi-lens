@@ -50,7 +50,7 @@ export function createAstGrepReplaceTool(astGrepClient: AstGrepClient) {
 			'  - Missing parentheses: use it($TEST) not it"text"\n' +
 			"  - Incomplete code fragments\n\n" +
 			"Always use 'paths' to scope to specific files/folders. Dry-run first to preview changes.",
-		promptSnippet: "Use ast_grep_replace for AST-aware find-and-replace",
+		promptSnippet: "AST-aware structural find-and-replace",
 		parameters: Type.Object({
 			pattern: Type.String({
 				description: "AST pattern to match (be specific with context)",

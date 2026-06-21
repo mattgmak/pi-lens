@@ -162,7 +162,7 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 			"Use 'paths' to scope to specific files/folders. " +
 			"Avoid 'selector' unless you know the exact AST node kind; it narrows search roots and does not extract fields. " +
 			"Use 'context' to show surrounding lines. If zero matches, retry once with a simpler AST pattern before falling back to grep.",
-		promptSnippet: "Use ast_grep_search for AST-aware code search",
+		promptSnippet: "AST-aware structural code search",
 		parameters: Type.Object({
 			pattern: Type.String({
 				description: "AST pattern (use function/class/call context, not text)",

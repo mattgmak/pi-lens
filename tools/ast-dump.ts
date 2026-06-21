@@ -8,8 +8,7 @@ export function createAstDumpTool(astGrepClient: AstGrepClient) {
 		label: "AST Dump",
 		description:
 			"Dump the tree-sitter AST for a source snippet using ast-grep CLI. Use this when ast_grep_search returns zero matches and you need to discover exact node kinds, field names, or nesting. Named nodes only by default; includeAnonymous=true shows punctuation/CST nodes too.",
-		promptSnippet:
-			"Use ast_dump to inspect AST node kinds before writing difficult ast-grep patterns",
+		promptSnippet: "Inspect AST node kinds before writing ast-grep patterns",
 		parameters: Type.Object({
 			source: Type.String({
 				description: "Source code snippet to parse and dump",

@@ -48,7 +48,7 @@ describe("lsp_diagnostics tool", () => {
 		try {
 			const result = (await tool.execute(
 				"diag-batch",
-				{ filePaths: [good, bad], severity: "all", concurrency: 2 },
+				{ paths: [good, bad], severity: "all", concurrency: 2 },
 				new AbortController().signal,
 				null,
 				{ cwd: "." },
@@ -68,7 +68,7 @@ describe("lsp_diagnostics tool", () => {
 		}
 	});
 
-	it("requires either filePath or filePaths", async () => {
+	it("requires either path or paths", async () => {
 		const tool = createLspDiagnosticsTool();
 		const result = (await tool.execute(
 			"diag-missing",
@@ -80,7 +80,7 @@ describe("lsp_diagnostics tool", () => {
 
 		expect(result.isError).toBe(true);
 		expect(String(result.content[0]?.text)).toContain(
-			"filePath or filePaths is required",
+			"path or paths is required",
 		);
 	});
 });

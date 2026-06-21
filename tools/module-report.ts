@@ -29,9 +29,9 @@ export function createModuleReportTool(getProjectRoot: () => string) {
 			"Single mode: tree-sitter outline + review-graph who-uses-this + bounded live-LSP enrichment (exact references/implementations for exported symbols, time-boxed; degrades to graph-only when no LSP server is available). `semantic.source` reports whether LSP data was used.\n" +
 			"Returns JSON. An outline shows shape, not bodies — it does NOT count as having read a symbol's body for editing; use read_symbol for that.",
 		promptSnippet:
-			"Use module_report to understand a file's API/structure before reading it in full",
+			"Navigable file outline — a cheap substitute for reading a whole file",
 		parameters: Type.Object({
-			filePath: Type.String({
+			path: Type.String({
 				description: "Absolute or workspace-relative path to the source file.",
 			}),
 			maxRefsPerSymbol: Type.Optional(
@@ -42,14 +42,14 @@ export function createModuleReportTool(getProjectRoot: () => string) {
 		}),
 		async execute(
 			_toolCallId: string,
-			params: { filePath: string; maxRefsPerSymbol?: number },
+			params: { path: string; maxRefsPerSymbol?: number },
 			_signal: AbortSignal | undefined,
 			_onUpdate: unknown,
 			ctx: { cwd?: string },
 		) {
 			// Resolve the file against the agent's cwd (sibling-tool convention); build
 			// the review graph at the project root so cross-file who-uses-this is whole.
-			const absFile = resolveFile(params.filePath, ctx.cwd);
+			const absFile = resolveFile(params.path, ctx.cwd);
 			const cwd = getProjectRoot() || ctx.cwd || ".";
 			const report = await moduleReport(absFile, cwd, {
 				maxRefsPerSymbol: params.maxRefsPerSymbol,
@@ -86,9 +86,9 @@ export function createReadSymbolTool(
 		description:
 			"Return the verbatim source of a single named symbol (function/class/method/interface/type) in a file — a targeted, cheap alternative to reading the whole file. Pair with module_report: module_report finds the symbol, read_symbol shows its body. Unlike an outline, this delivers the actual lines, so it counts as having read that symbol for the read-before-edit guard.",
 		promptSnippet:
-			"Use read_symbol to read one symbol's body instead of the whole file",
+			"Read one symbol's body instead of the whole file",
 		parameters: Type.Object({
-			filePath: Type.String({
+			path: Type.String({
 				description: "Absolute or workspace-relative path to the source file.",
 			}),
 			symbol: Type.String({
@@ -98,12 +98,12 @@ export function createReadSymbolTool(
 		}),
 		async execute(
 			_toolCallId: string,
-			params: { filePath: string; symbol: string },
+			params: { path: string; symbol: string },
 			_signal: AbortSignal | undefined,
 			_onUpdate: unknown,
 			ctx: { cwd?: string },
 		) {
-			const absFile = resolveFile(params.filePath, ctx.cwd);
+			const absFile = resolveFile(params.path, ctx.cwd);
 			const cwd = getProjectRoot() || ctx.cwd || ".";
 			const result = await readSymbol(absFile, params.symbol, cwd);
 			if (!result.found) {

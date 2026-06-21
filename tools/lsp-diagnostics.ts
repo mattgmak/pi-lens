@@ -195,18 +195,18 @@ export function createLspDiagnosticsTool() {
 		promptSnippet:
 			"Get LSP diagnostics for a file or directory (use before builds)",
 		parameters: Type.Object({
-			filePath: Type.Optional(
+			path: Type.Optional(
 				Type.String({
 					description:
 						"File or directory path to check. For directories, all matching source files are scanned.",
 				}),
 			),
-			filePaths: Type.Optional(
+			paths: Type.Optional(
 				Type.Array(Type.String(), {
 					minItems: 1,
 					maxItems: MAX_BATCH_FILES,
 					description:
-						"Explicit files to check as a bounded-concurrency batch. When provided, filePath is ignored.",
+						"Explicit files to check as a bounded-concurrency batch. When provided, path is ignored.",
 				}),
 			),
 			severity: Type.Optional(
@@ -236,8 +236,8 @@ export function createLspDiagnosticsTool() {
 			ctx: { cwd?: string },
 		) {
 			const typedParams = params as {
-				filePath?: string;
-				filePaths?: string[];
+				path?: string;
+				paths?: string[];
 				severity?: string;
 				concurrency?: number;
 				waitMs?: number;
@@ -267,10 +267,10 @@ export function createLspDiagnosticsTool() {
 			}
 
 			if (
-				Array.isArray(typedParams.filePaths) &&
-				typedParams.filePaths.length > 0
+				Array.isArray(typedParams.paths) &&
+				typedParams.paths.length > 0
 			) {
-				const absPaths = typedParams.filePaths
+				const absPaths = typedParams.paths
 					.filter(
 						(entry): entry is string =>
 							typeof entry === "string" && entry.trim().length > 0,
@@ -285,13 +285,13 @@ export function createLspDiagnosticsTool() {
 				});
 			}
 
-			const rawPath = typedParams.filePath;
+			const rawPath = typedParams.path;
 			if (!rawPath || rawPath.trim().length === 0) {
 				return {
 					content: [
 						{
 							type: "text" as const,
-							text: "filePath or filePaths is required.",
+							text: "path or paths is required.",
 						},
 					],
 					isError: true,

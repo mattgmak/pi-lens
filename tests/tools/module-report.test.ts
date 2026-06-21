@@ -25,7 +25,7 @@ describe("module_report tool", () => {
 			const tool = createModuleReportTool(() => env.tmpDir);
 			const result = await tool.execute(
 				"1",
-				{ filePath: "sample.ts" },
+				{ path: "sample.ts" },
 				undefined,
 				null,
 				{ cwd: env.tmpDir },
@@ -56,7 +56,7 @@ describe("module_report tool", () => {
 			const tool = createModuleReportTool(() => env.tmpDir);
 			const result = await tool.execute(
 				"1",
-				{ filePath: "data.json" },
+				{ path: "data.json" },
 				undefined,
 				null,
 				{ cwd: env.tmpDir },
@@ -84,7 +84,7 @@ describe("read_symbol tool", () => {
 			);
 			const result = await tool.execute(
 				"1",
-				{ filePath: "sample.ts", symbol: "target" },
+				{ path: "sample.ts", symbol: "target" },
 				undefined,
 				null,
 				{ cwd: env.tmpDir },
@@ -114,7 +114,7 @@ describe("read_symbol tool", () => {
 			);
 			const result = await tool.execute(
 				"1",
-				{ filePath: "sample.ts", symbol: "ghost" },
+				{ path: "sample.ts", symbol: "ghost" },
 				undefined,
 				null,
 				{ cwd: env.tmpDir },
