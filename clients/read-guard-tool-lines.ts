@@ -1,4 +1,5 @@
 import * as nodeFs from "node:fs";
+import { normalizeForGuardMatch } from "./host-edit-normalize.js";
 import { logReadGuardEvent } from "./read-guard-logger.js";
 import { isToolCallEventType } from "./tool-event.js";
 
@@ -118,12 +119,11 @@ export function countFileLines(filePath: string): number {
 	}
 }
 
+// Match the host edit tool's fuzzy-match space (NFKC + smart quotes/dashes/
+// spaces + BOM + lone-CR), so the guard resolves oldText -> range exactly where
+// the host would apply it instead of false-blocking valid edits (#257).
 function normalizeContent(text: string): string {
-	return text
-		.replace(/\r\n/g, "\n")
-		.split("\n")
-		.map((line) => line.trimEnd())
-		.join("\n");
+	return normalizeForGuardMatch(text);
 }
 
 function lineNumberAt(content: string, index: number): number {

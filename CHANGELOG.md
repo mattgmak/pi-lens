@@ -14,6 +14,10 @@ All notable changes to pi-lens will be documented in this file.
 
 - **Built-in regex secrets scanner (`clients/secrets-scanner.ts`)** — the hand-rolled, always-on content scanner that regex-matched a handful of secret shapes (Stripe/OpenAI `sk-*`, GitHub tokens, AWS `AKIA*`, Slack `xox*`, private keys, generic api-key/password) on the edit/write path and blocked the pipeline. It's now redundant: the bundled CodeRabbit ast-grep ruleset ships dozens of language-specific `*-hardcoded-secret-*` rules and gitleaks covers repo-level entropy/history scanning, so three overlapping paths produced duplicate, noisy blocks. Removed the scanner, its dedicated pipeline stage + import, and its tests; the `"secrets"` defect class and taxonomy hints remain (now served by the ast-grep rules and gitleaks). Trivy is slated as the consolidated secret/vuln/IaC scanner in a later slice.
 
+### Fixed
+
+- **Read-guard no longer false-blocks edits the host would apply** (#257) — the guard gates the host's edit tool but resolved `oldText` → line range with a *weaker* normalizer than the host applies it with, so an edit whose `oldText` carried a smart quote, em-dash, NBSP, BOM, lone `\r`, or any NFKC-equivalent form matched on the host side but not in the guard, surfacing as a spurious `RETRYABLE — edit target not found` for a valid edit. Vendored the host's fuzzy-match normalization ladder (`normalizeForFuzzyMatch` + `normalizeToLF`/`stripBom`, from `@earendil-works/pi-coding-agent` `core/tools/edit-diff`) into a new `clients/host-edit-normalize.ts` and routed all three guard match-space normalizers through it, so the gate and the host now agree by construction. The partial-apply self-write path additionally adopts the host's first-occurrence-wins `detectLineEnding`/`restoreLineEndings` (was "any CRLF present"). A host-pin sync test re-reads the SDK source from devDeps and fails if the host's normalization set drifts. The SDK stays a type-only dependency — the ~50 lines are deliberately vendored, not imported.
+
 ## [3.8.60] - 2026-06-21
 
 ### Added
