@@ -6,6 +6,14 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Added
 
+### Changed
+
+### Fixed
+
+## [3.8.61] - 2026-06-25
+
+### Added
+
 - **Release notes now come from CHANGELOG.md (single source of truth) + per-language rule catalogs** — the GitHub release body is now the curated `## [VERSION]` CHANGELOG section instead of an auto-generated PR-title list, condensed to a scannable summary (bold titles grouped by Added/Changed/Fixed) by `scripts/changelog-extract.mjs --summary`; `release.yml` posts it via `gh release create --notes-file`. New helpers: `scripts/lib/changelog.mjs` (pure section parser), `changelog-release.mjs` (`npm run changelog:release` promotes `[Unreleased]` → a dated version section at bump time), and `backfill-github-releases.mjs` (retroactively set existing release bodies; all 35 v3.8.x releases were backfilled). Also added two generated docs — `docs/ast-grep_rules_catalog.md` and `docs/tree-sitter_rules_catalog.md` (rules listed per language via `npm run docs:rule-catalogs`, kept in sync by a `--check` test).
 - **Trivy security suite — four scan modes (#131)** — integrated [Trivy](https://github.com/aquasecurity/trivy) as the consolidated dependency/secret/IaC scanner that the removed built-in regex scanner and the scattered overlapping paths pointed toward. **Mode 1 — dependency CVEs** (#313): a session-scan client that resolves the project's lockfiles and surfaces known-vulnerable dependencies once per session (not per-edit). **Mode 3 — secret scan** (#314): edit/write-path secret detection with cross-source dedup so a secret already flagged by gitleaks or an ast-grep `*-hardcoded-secret-*` rule isn't reported twice. **Mode 2 — IaC misconfiguration** (#316): a per-edit runner for Terraform/Kubernetes/Dockerfile/etc. misconfigurations. **Mode 4 — dependency license risk** (#318): flags dependencies whose licenses fall outside an allow/deny policy. Trivy auto-installs on demand; each mode is independently gated.
 - **typos spell-checker as a cross-cutting auxiliary LSP (#283)** — [`typos-lsp`](https://github.com/tekumara/typos-lsp) (wrapping `crate-ci/typos`) attaches as a `role:"auxiliary"` diagnostic server alongside the file's primary language server, surfacing source-code and Markdown misspellings warm (the Opengrep/ast-grep auxiliary-LSP template). Allow-list based — it only flags *known* misspellings against a compiled-in dictionary, so the false-positive rate on code is low. Default-on when the binary is available (`--no-typos` to disable); a repo-local `typos.toml`/`_typos.toml`/`.typos.toml` opts in to blocking. Validated end-to-end via a tool-smoke fixture.

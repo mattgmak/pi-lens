@@ -160,8 +160,12 @@ describe("changelog lib — summarizeSection", () => {
 });
 
 describe("repo CHANGELOG.md contract", () => {
-  it("has an Unreleased section with pending entries", () => {
-    expect(unreleasedHasEntries(CHANGELOG)).toBe(true);
+  it("has an Unreleased section (may be empty right after a release bump)", () => {
+    // Existence, not entries: `changelog:release` promotes [Unreleased] to a
+    // dated section and opens a fresh EMPTY one, so requiring entries here would
+    // fail on every release commit. `npm run changelog:check` guards the
+    // has-entries precondition at the point it actually matters (pre-bump).
+    expect(extractSection(CHANGELOG, "Unreleased")).not.toBeNull();
   });
 
   // The CHANGELOG begins at the 3.x line; pre-3.x tags predate it (the backfill
