@@ -13,7 +13,7 @@ pi-lens gives AI coding agents fast, language-aware feedback while they write/ed
 ## What It Does
 
 - LSP diagnostics and navigation across supported languages
-- Impact cascade diagnostics that show which related files were affected
+- Impact cascade diagnostics that show which related files were affected and run LSP diagnostics on them
 - Language-specific linters, type-checkers, and scanners on every write/edit
 - Safe formatting/autofix where tools are configured or confidently detected
 - ast-grep and tree-sitter structural rules for correctness/security smells
