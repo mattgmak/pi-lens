@@ -56,6 +56,7 @@ migrate-*.js
 !LICENSE
 !SECURITY.md
 !docs/audit1.md
+!docs/agent-tools.md
 !docs/custom-rules.md
 !docs/dependencies.md
 !docs/env_variables.md

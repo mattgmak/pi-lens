@@ -37,6 +37,7 @@ pi install git:github.com/apmantza/pi-lens
 
 ## Documentation
 
+- [Agent tools](docs/agent-tools.md) — pi tool names, scopes, and arguments
 - [Usage guide](docs/usage.md) — lifecycle, tool behavior, MCP notes, and
   troubleshooting
 - [Features](docs/features.md) — detailed feature reference
