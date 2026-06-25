@@ -7,6 +7,10 @@ All notable changes to pi-lens will be documented in this file.
 ### Added
 
 - **Contributor guide + issue/PR templates** — added `CONTRIBUTING.md` with step-by-step wiring checklists for new dispatch runners, language servers (primary and auxiliary), formatters, ast-grep rules, and tree-sitter rules; added GitHub issue templates for bug reports, feature proposals, and enhancements; added a pull request template. Also added `docs/audit1.md` documenting the centralization gaps and stale docs found during the write-up.
+- **License, Code of Conduct, security policy, and all-contributors** — added an MIT `LICENSE` file, `CODE_OF_CONDUCT.md` adapted from the Contributor Covenant 2.1, `SECURITY.md` for private vulnerability reporting, and an `.all-contributorsrc` plus generated contributor table in `README.md` covering code contributors and resolved-issue reporters.
+- **Issue/PR automation** — added `stale.yml` workflow to mark and close stale issues/PRs, `greetings.yml` to welcome first-time contributors, `.github/labels.yml` plus a label-sync workflow, and `.github/release.yml` to categorize generated GitHub release notes.
+- **GitHub Actions hardening** — pinned workflow actions to full commit SHAs, disabled persisted checkout credentials where push credentials are unnecessary, replaced the release action with `gh release create`, and removed `pull_request_target` from the greetings workflow.
+- **README split begins** — shortened the front-page lifecycle overview and added `docs/usage.md` for detailed lifecycle, tool, rule, scanner, MCP, and troubleshooting notes.
 
 ### Changed
 

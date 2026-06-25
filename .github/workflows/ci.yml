@@ -14,9 +14,11 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: '22'
 
@@ -43,9 +45,11 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: '22'
 
@@ -70,9 +74,11 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: '22'
 
@@ -111,9 +117,11 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: '22'
 
@@ -132,21 +140,30 @@ jobs:
         run: |
           TARBALL=$(ls pi-lens-*.tgz)
           echo "Checking tarball: $TARBALL"
-          tar -tzf "$TARBALL" | grep -E "scripts/download-grammars\.js|dist/index\.js|package\.json" | sort
-          tar -tzf "$TARBALL" | grep "scripts/download-grammars.js" || \
-            (echo "ERROR: scripts/download-grammars.js missing from tarball" && exit 1)
-          # The published entry is compiled JS (prepare builds dist/); pi loads it
-          # directly instead of jiti-transpiling source on every startup (#182).
-          tar -tzf "$TARBALL" | grep "package/dist/index.js" || \
-            (echo "ERROR: dist/index.js missing from tarball (prepare build failed?)" && exit 1)
-          # Skills ship at the package root (skills/); pi.skills is "../../skills",
-          # resolved relative to the dist entry FILE (dist/index.js) back to root.
-          tar -tzf "$TARBALL" | grep "package/skills/" || \
-            (echo "ERROR: skills/ missing from tarball" && exit 1)
-          # Guard against accidentally shipping TS source again (reintroduces the
-          # jiti transpile-on-startup cost).
-          if tar -tzf "$TARBALL" | grep -E "package/(index\.ts|clients/.*\.ts)"; then
-            echo "ERROR: TypeScript source leaked into the tarball" && exit 1
+          REQUIRED_RE="scripts/download-grammars\.js"
+          REQUIRED_RE="${REQUIRED_RE}|dist/index\.js|package\.json"
+          tar -tzf "$TARBALL" | grep -E "$REQUIRED_RE" | sort
+          tar -tzf "$TARBALL" | grep "scripts/download-grammars.js" || {
+            echo "ERROR: scripts/download-grammars.js missing"
+            exit 1
+          }
+          # The published entry is compiled JS (prepare builds dist/); pi loads
+          # it directly instead of jiti-transpiling source on startup (#182).
+          tar -tzf "$TARBALL" | grep "package/dist/index.js" || {
+            echo "ERROR: dist/index.js missing from tarball"
+            exit 1
+          }
+          # Skills ship at package root (skills/); pi.skills is "../../skills",
+          # resolved relative to dist/index.js back to root.
+          tar -tzf "$TARBALL" | grep "package/skills/" || {
+            echo "ERROR: skills/ missing from tarball"
+            exit 1
+          }
+          # Guard against shipping TS source again (jiti startup cost).
+          SOURCE_RE="package/(index\.ts|clients/.*\.ts)"
+          if tar -tzf "$TARBALL" | grep -E "$SOURCE_RE"; then
+            echo "ERROR: TypeScript source leaked into the tarball"
+            exit 1
           fi
 
       - name: Verify package.json entry points exist in tarball
@@ -159,52 +176,68 @@ jobs:
           check_field() {
             local field="$1" value="$2"
             if [ ! -f "$TMPDIR/package/$value" ]; then
-              echo "ERROR: package.json '$field' points to '$value' which is missing from the tarball"
+              echo "ERROR: package.json '$field' points to missing '$value'"
               exit 1
             fi
             echo "OK: $field -> $value"
           }
 
-          # Pass PKG dir via env var so Node gets the right path on all platforms
+          # Pass package paths via env vars for cross-platform Node calls.
           export PI_LENS_PKG_DIR="$TMPDIR/package"
-          MAIN=$(node -p "require(process.env.PI_LENS_PKG_DIR + '/package.json').main || ''" 2>/dev/null)
+          export PI_LENS_PKG_JSON="$TMPDIR/package/package.json"
+          MAIN=$(node -p "require(process.env.PI_LENS_PKG_JSON).main || ''")
           [ -n "$MAIN" ] && check_field "main" "$MAIN"
 
           # Check pi.extensions entries — this is what pi actually loads.
-          node -e "
-            const path = require('path'); const fs = require('fs');
-            const pkgDir = process.env.PI_LENS_PKG_DIR;
-            const pkg = require(path.join(pkgDir, 'package.json'));
-            const exts = (pkg.pi && pkg.pi.extensions) || [];
-            if (exts.length === 0) { console.error('ERROR: no pi.extensions declared'); process.exit(1); }
-            for (const e of exts) {
-              if (!fs.existsSync(path.join(pkgDir, e))) {
-                console.error('ERROR: pi.extensions entry missing from tarball: ' + e); process.exit(1);
-              }
-              console.log('OK: pi.extensions -> ' + e);
+          node <<'NODE'
+          const path = require("path");
+          const fs = require("fs");
+          const pkgDir = process.env.PI_LENS_PKG_DIR;
+          const pkg = require(path.join(pkgDir, "package.json"));
+          const exts = (pkg.pi && pkg.pi.extensions) || [];
+          if (exts.length === 0) {
+            console.error("ERROR: no pi.extensions declared");
+            process.exit(1);
+          }
+          for (const e of exts) {
+            if (!fs.existsSync(path.join(pkgDir, e))) {
+              console.error("ERROR: pi.extensions entry missing: " + e);
+              process.exit(1);
             }
-          "
+            console.log("OK: pi.extensions -> " + e);
+          }
+          NODE
 
-          # Check exports map entries (string values only)
-          node -e "
-            const path = require('path');
-            const fs = require('fs');
-            const pkgDir = process.env.PI_LENS_PKG_DIR;
-            const pkg = require(path.join(pkgDir, 'package.json'));
-            const exp = pkg.exports;
-            if (!exp) process.exit(0);
-            const collect = (v) => typeof v === 'string' ? [v] : typeof v === 'object' ? Object.values(v).flatMap(collect) : [];
-            collect(exp).forEach(f => {
-              const full = path.join(pkgDir, f);
-              if (!fs.existsSync(full)) { console.error('ERROR: exports entry missing from tarball: ' + f); process.exit(1); }
-              else { console.log('OK: exports -> ' + f); }
-            });
-          "
+          # Check exports map entries (string values only).
+          node <<'NODE'
+          const path = require("path");
+          const fs = require("fs");
+          const pkgDir = process.env.PI_LENS_PKG_DIR;
+          const pkg = require(path.join(pkgDir, "package.json"));
+          const exp = pkg.exports;
+          if (!exp) process.exit(0);
+          const collect = (v) => {
+            if (typeof v === "string") return [v];
+            if (v && typeof v === "object") {
+              return Object.values(v).flatMap(collect);
+            }
+            return [];
+          };
+          collect(exp).forEach((f) => {
+            const full = path.join(pkgDir, f);
+            if (!fs.existsSync(full)) {
+              console.error("ERROR: exports entry missing: " + f);
+              process.exit(1);
+            }
+            console.log("OK: exports -> " + f);
+          });
+          NODE
           rm -rf "$TMPDIR"
 
+      # Intentional: this job verifies the package installs like pi installs it.
       - name: Install from tarball (simulates pi install npm:pi-lens)
         shell: bash
-        run: |
+        run: | # zizmor: ignore[adhoc-packages]
           TARBALL=$(ls pi-lens-*.tgz)
           npm install -g "$TARBALL"
 
@@ -230,14 +263,15 @@ jobs:
         run: |
           INSTALL_DIR=$(npm root -g)/pi-lens
           cd "$INSTALL_DIR"
-          # Simulate how pi loads the extension: the compiled entry, loaded by node.
-          # ERR_MODULE_NOT_FOUND = missing dep (e.g. 'minimatch') → fail
-          # Any other error = expected in CI (no pi API available) → pass
-          # pi-coding-agent is a host-provided peer dep; its absence is expected here
+          # Simulate how pi loads the extension: compiled entry, loaded by node.
+          # ERR_MODULE_NOT_FOUND = missing dep (e.g. 'minimatch') → fail.
+          # Any other error is expected in CI (no pi API available) → pass.
+          # pi-coding-agent is host-provided; absence is expected.
           ENTRY=$(node -p "require('./package.json').pi.extensions[0]")
           echo "Loading entry: $ENTRY"
           node "$ENTRY" 2>&1 | tee /tmp/load-output.txt || true
-          if grep -q "ERR_MODULE_NOT_FOUND\|Cannot find module" /tmp/load-output.txt \
+          if grep -q "ERR_MODULE_NOT_FOUND\|Cannot find module" \
+               /tmp/load-output.txt \
              && ! grep -q "pi-coding-agent" /tmp/load-output.txt; then
             echo "FAILED: missing module dependency detected"
             cat /tmp/load-output.txt
@@ -249,15 +283,21 @@ jobs:
         shell: bash
         run: |
           # Loading the entry above made pi-lens self-report its load source to
-          # ~/.pi-lens/sessionstart.log ("pi-lens loaded: <ms>ms ... (from dist)").
-          # A regression to source/jiti (or a missing dist) would weaken cold
-          # start; assert the fast precompiled path is the one in effect.
-          START_LINE=$(grep "pi-lens loaded:" "$HOME/.pi-lens/sessionstart.log" 2>/dev/null | tail -1 || true)
+          # ~/.pi-lens/sessionstart.log.
+          # A source/jiti regression (or missing dist) would weaken cold start.
+          START_LOG="$HOME/.pi-lens/sessionstart.log"
+          START_LINE=$(
+            grep "pi-lens loaded:" "$START_LOG" 2>/dev/null \
+              | tail -1 \
+              || true
+          )
           echo "Startup line: ${START_LINE:-<none>}"
           if [ -z "$START_LINE" ]; then
-            echo "ERROR: no startup line logged — extension_loaded timing missing"
+            echo "ERROR: no startup line logged"
             exit 1
           fi
-          echo "$START_LINE" | grep -q "from dist" || \
-            (echo "ERROR: extension loaded from source, not precompiled dist — startup regression (#182)" && exit 1)
+          echo "$START_LINE" | grep -q "from dist" || {
+            echo "ERROR: extension loaded from source, not dist"
+            exit 1
+          }
           echo "Startup loads from dist ✓"

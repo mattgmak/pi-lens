@@ -1,0 +1,27 @@
+name: Greetings
+
+on:
+  pull_request:
+    types: [opened]
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  greeting:
+    runs-on: ubuntu-latest
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: actions/first-interaction@fb2402657b4a28582200150d0a145671d0e50597 # v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          issue-message: >
+            Thanks for opening your first issue! Please check
+            [`CONTRIBUTING.md`](../../blob/master/CONTRIBUTING.md) for issue
+            templates and guidelines. A maintainer will triage this soon.
+          pr-message: >
+            Thanks for your first pull request! A maintainer will review it
+            soon. Please make sure CI passes and the PR template is filled out.

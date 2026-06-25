@@ -184,6 +184,7 @@ Ast-grep rules live in `rules/ast-grep-rules/rules/` (and vendored CodeRabbit ru
 ### Centralization note
 
 Rule discovery for ast-grep currently has two paths:
+
 - `clients/sgconfig.ts` resolves the shipped baseline for the ast-grep LSP.
 - `clients/dispatch/runners/ast-grep-napi.ts` hardcodes its own rule directories.
 
@@ -245,6 +246,14 @@ pi-lens hooks run on pi's event loop. Read the "Performance" section of `AGENTS.
 - **Project intelligence**: Graph, reverse-deps, snapshots, word index — see `clients/review-graph/`, `clients/reverse-deps.ts`, `clients/project-snapshot.ts`.
 - **MCP mirror**: New MCP tools must be added as one engine method in `clients/lens-engine.ts` plus one tool route in `mcp/server.ts`.
 - **Configuration**: Project config is loaded by `clients/project-lens-config.ts`; LSP config by `clients/lsp/config.ts`.
+
+## License and conduct
+
+pi-lens is released under the [MIT License](LICENSE). By contributing, you agree that your contributions will be licensed under the same terms.
+
+This project follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md). Please read it before participating.
+
+If you land a pull request or report an issue that gets resolved, we'll add you to the [contributors table](README.md#contributors-) via [all-contributors](https://allcontributors.org/). If the all-contributors bot is installed, maintainers can comment `@all-contributors please add @username for code,bug`; otherwise update `.all-contributorsrc` and regenerate the table with `npx all-contributors-cli generate`.
 
 ## Questions?
 

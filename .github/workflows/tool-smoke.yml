@@ -5,11 +5,11 @@ name: Tool smoke (nightly)
 # path against per-language fixtures — so it's slow and network-dependent, hence
 # nightly + manual only, never a per-PR gate.
 #
-# The harness exits nonzero only on genuine infra failures (timeout / exception /
-# server_error). A tool that's merely unavailable (couldn't install on the
+# The harness exits nonzero only on genuine infra failures (timeout / exception
+# / server_error). A tool that's merely unavailable (couldn't install on the
 # runner) reports ⚠ and does NOT fail the run, so transient install/network
-# flakiness doesn't produce false alarms — the printed report still shows the ⚠
-# counts for review.
+# flakiness doesn't produce false alarms — the printed report still shows the
+# ⚠ counts for review.
 
 on:
   schedule:
@@ -22,17 +22,18 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    # The installer's GitHub-release strategy hits the GitHub REST API to resolve
-    # release assets. Unauthenticated = 60 req/hr per IP, exhausted on shared-IP
-    # runners → every github-strategy tool (rust-analyzer/taplo/opengrep/…) fails
-    # to install. The auto-provided token raises this to 5000 req/hr; the installer
-    # sends it ONLY to api.github.com, never the asset CDN.
+    # The installer hits the GitHub REST API to resolve release assets.
+    # Unauthenticated = 60 req/hr per IP, exhausted on shared-IP runners.
+    # The auto-provided token raises this to 5000 req/hr; the installer sends it
+    # ONLY to api.github.com, never the asset CDN.
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: '22'
 
@@ -40,15 +41,17 @@ jobs:
       # sqlfluff, mypy). GitHub-release tools (shellcheck/shfmt/hadolint/taplo/
       # tflint/terraform-ls/rust-analyzer) are fetched by the harness's own
       # --install; ubuntu-latest ships rustup/cargo so rust-analyzer can load.
-      - uses: actions/setup-python@v6
+      # yamllint disable-line rule:line-length
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
 
-      # Toolchain-gated languages. go/rust(rustup)/pwsh/.NET ship on ubuntu-latest;
+      # Toolchain-gated languages. go/rust(rustup)/pwsh/.NET ship on Ubuntu;
       # these set up the rest. All best-effort: a setup failure must NOT red the
       # nightly (the harness already treats an unavailable tool as ⚠, not a
       # failure), so each is continue-on-error.
-      - uses: actions/setup-java@v5
+      # yamllint disable-line rule:line-length
+      - uses: actions/setup-java@ad2b38190b15e4d6bdf0c97fb4fca8412226d287 # v5
         continue-on-error: true
         with:
           distribution: temurin
@@ -59,7 +62,7 @@ jobs:
           ruby-version: '3.3'
       - uses: dart-lang/setup-dart@65eb853c7ba17dde3be364c3d2858773e7144260 # v1
         continue-on-error: true
-      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240
         continue-on-error: true
         with:
           php-version: '8.3'
@@ -93,5 +96,5 @@ jobs:
         continue-on-error: true
         run: node scripts/characterize-lsp.mjs --install
 
-      - name: Format layer (select + reformat through the real formatter pipeline)
+      - name: Format layer (select + reformat through formatter pipeline)
         run: node scripts/smoke-tools.mjs --format --install --verbose
