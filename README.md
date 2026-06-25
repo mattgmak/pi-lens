@@ -8,11 +8,12 @@
 [![All Contributors](https://img.shields.io/github/all-contributors/apmantza/pi-lens?color=ee8449&style=flat-square)](#contributors-)
 <!-- ALL-CONTRIBUTORS-BADGE:END -->
 
-pi-lens gives AI coding agents fast, language-aware feedback while they edit.
+pi-lens gives AI coding agents fast, language-aware feedback while they write/edit.
 
 ## What It Does
 
 - LSP diagnostics and navigation across supported languages
+- Language-specific linters, type-checkers, and scanners on every write/edit
 - Safe formatting/autofix where tools are configured or confidently detected
 - ast-grep and tree-sitter structural rules for correctness/security smells
 - Read-guard and edit-autopatch support to reduce bad edits
