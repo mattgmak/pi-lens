@@ -34,6 +34,7 @@
 		"changelog:extract": "node scripts/changelog-extract.mjs",
 		"release:backfill-notes": "node scripts/backfill-github-releases.mjs",
 		"docs:rule-catalogs": "node scripts/gen-rule-catalogs.mjs",
+		"banner": "npx -y sharp-cli --input banner.svg --output banner.png resize 2200 620",
 		"download-grammars": "node scripts/download-grammars.js",
 		"harness:poc": "node scripts/run-harness.mjs cases/ts/pipeline-dispatch-poc --pi-bin \"C:\\Users\\R3LiC\\AppData\\Roaming\\npm\\pi.cmd\"",
 		"harness:python-poc": "node scripts/run-harness.mjs cases/python/pipeline-dispatch-poc --pi-bin \"C:\\Users\\R3LiC\\AppData\\Roaming\\npm\\pi.cmd\"",
