@@ -55,38 +55,42 @@
 
   <!-- Column dividers -->
   <g fill="#2f81f722">
-    <rect x="294" y="170" width="1" height="94"/>
-    <rect x="550" y="170" width="1" height="94"/>
-    <rect x="806" y="170" width="1" height="94"/>
+    <rect x="294" y="170" width="1" height="108"/>
+    <rect x="550" y="170" width="1" height="108"/>
+    <rect x="806" y="170" width="1" height="108"/>
   </g>
 
   <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, sans-serif">
     <!-- ANALYZE -->
     <rect x="56" y="176" width="7" height="7" rx="1.5" fill="url(#accent)"/>
     <text x="72" y="183" font-size="13.5" font-weight="700" fill="#58a6ff" letter-spacing="2">ANALYZE</text>
-    <text x="56" y="210" font-size="14.5" font-weight="400" fill="#c9d1d9">LSP diagnostics</text>
-    <text x="56" y="234" font-size="14.5" font-weight="400" fill="#c9d1d9">Linters &amp; type-checks</text>
-    <text x="56" y="258" font-size="14.5" font-weight="400" fill="#c9d1d9">ast-grep &#183; tree-sitter</text>
+    <text x="56" y="200" font-size="11" font-weight="400" fill="#6e7681" letter-spacing="0.2">inline feedback, every edit</text>
+    <text x="56" y="225" font-size="14.5" font-weight="400" fill="#c9d1d9">LSP diagnostics</text>
+    <text x="56" y="248" font-size="14.5" font-weight="400" fill="#c9d1d9">Linters &amp; type-checks</text>
+    <text x="56" y="271" font-size="14.5" font-weight="400" fill="#c9d1d9">ast-grep &#183; tree-sitter</text>
 
     <!-- FIX & GUARD -->
     <rect x="312" y="176" width="7" height="7" rx="1.5" fill="url(#accent)"/>
     <text x="328" y="183" font-size="13.5" font-weight="700" fill="#58a6ff" letter-spacing="2">FIX &amp; GUARD</text>
-    <text x="312" y="210" font-size="14.5" font-weight="400" fill="#c9d1d9">Formatters &amp; auto-fix</text>
-    <text x="312" y="234" font-size="14.5" font-weight="400" fill="#c9d1d9">Read-guard</text>
-    <text x="312" y="258" font-size="14.5" font-weight="400" fill="#c9d1d9">Edit autopatch</text>
+    <text x="312" y="200" font-size="11" font-weight="400" fill="#6e7681" letter-spacing="0.2">automatic</text>
+    <text x="312" y="225" font-size="14.5" font-weight="400" fill="#c9d1d9">Formatters &amp; auto-fix</text>
+    <text x="312" y="248" font-size="14.5" font-weight="400" fill="#c9d1d9">Read-guard</text>
+    <text x="312" y="271" font-size="14.5" font-weight="400" fill="#c9d1d9">Edit autopatch</text>
 
     <!-- UNDERSTAND -->
     <rect x="568" y="176" width="7" height="7" rx="1.5" fill="url(#accent)"/>
     <text x="584" y="183" font-size="13.5" font-weight="700" fill="#58a6ff" letter-spacing="2">UNDERSTAND</text>
-    <text x="568" y="210" font-size="14.5" font-weight="400" fill="#c9d1d9">Review graph</text>
-    <text x="568" y="234" font-size="14.5" font-weight="400" fill="#c9d1d9">Impact cascade</text>
-    <text x="568" y="258" font-size="14.5" font-weight="400" fill="#c9d1d9">Centrality ranking</text>
+    <text x="568" y="200" font-size="11" font-weight="400" fill="#6e7681" letter-spacing="0.2">review-graph engine</text>
+    <text x="568" y="225" font-size="14.5" font-weight="400" fill="#c9d1d9">Review graph</text>
+    <text x="568" y="248" font-size="14.5" font-weight="400" fill="#c9d1d9">Impact cascade</text>
+    <text x="568" y="271" font-size="14.5" font-weight="400" fill="#c9d1d9">Centrality ranking</text>
 
     <!-- AGENT TOOLS -->
     <rect x="824" y="176" width="7" height="7" rx="1.5" fill="url(#accent)"/>
     <text x="840" y="183" font-size="13.5" font-weight="700" fill="#58a6ff" letter-spacing="2">AGENT TOOLS</text>
-    <text x="824" y="210" font-size="14.5" font-weight="400" fill="#c9d1d9">Symbol search</text>
-    <text x="824" y="234" font-size="14.5" font-weight="400" fill="#c9d1d9">Module reports</text>
-    <text x="824" y="258" font-size="14.5" font-weight="400" fill="#c9d1d9">AST search &amp; replace</text>
+    <text x="824" y="200" font-size="11" font-weight="400" fill="#6e7681" letter-spacing="0.2">on demand</text>
+    <text x="824" y="225" font-size="14.5" font-weight="400" fill="#c9d1d9">Symbol search</text>
+    <text x="824" y="248" font-size="14.5" font-weight="400" fill="#c9d1d9">Module reports</text>
+    <text x="824" y="271" font-size="14.5" font-weight="400" fill="#c9d1d9">AST search &amp; replace</text>
   </g>
 </svg>
