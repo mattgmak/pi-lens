@@ -16,7 +16,8 @@ share).
   `hover`, `documentSymbol`, `workspaceSymbol`, `signatureHelp`,
   `prepareCallHierarchy`, `incomingCalls`, `outgoingCalls`, `executeCommand`,
   and `capabilities`. Position-based operations accept a `path`/`line`/`character`
-  triple.
+  triple. `documentSymbol` accepts a `kinds` filter (e.g. `function`, `class`)
+  and a `maxResults` cap (default 20, max 100) to keep large files bounded.
 - **`ast_grep_search`** — AST-aware structural search across ~40 languages via
   the `sg` CLI. Supports metavariables (`$VAR`, `$$$ARGS`), `strictness`
   modes (`smart`, `relaxed`, `ast`, `cst`, `signature`, `template`), structural
@@ -77,6 +78,10 @@ share).
   diagnostics, or LSP locations) to the verbatim body of the smallest enclosing
   symbol or callback. Tree-sitter only — no LSP or graph build. Optional `kinds`
   filter and `maxLines` cap; records read-guard coverage for the returned range.
+  When the body exceeds `maxLines`, `onOversize` controls the fallback: `error`
+  (default) returns metadata only, `slice` returns a bounded partial read around
+  the line (size via `aroundLine`, default `maxLines` then 80), and `outline`
+  returns the nested symbols/callbacks with read handles.
 
 ## Session
 
