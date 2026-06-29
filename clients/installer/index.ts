@@ -3046,7 +3046,7 @@ export async function installTool(toolId: string): Promise<boolean> {
  */
 export async function ensureTool(
 	toolId: string,
-	opts?: { forceReinstall?: boolean },
+	opts?: { forceReinstall?: boolean; allowInstall?: boolean },
 ): Promise<string | undefined> {
 	// forceReinstall: nuke caches, download from managed source, skip PATH entirely.
 	// Used when a PATH-resolved tool proves broken at launch (e.g. broken symlink).
@@ -3128,6 +3128,17 @@ export async function ensureTool(
 				`auto-install ensure ${toolId}: already available at ${existingPath} (${Date.now() - ensureStartMs}ms)`,
 			);
 			return existingPath;
+		}
+
+		// Discovery and install are SEPARATE concerns. getToolPath() above already
+		// probed PATH / npm-global / managed bin — offline-safe, no download. When the
+		// caller forbids installs (allowInstall:false, e.g. PI_LENS_DISABLE_LSP_INSTALL=1)
+		// we must still return a discovered binary and only skip the actual install.
+		if (opts?.allowInstall === false) {
+			logSessionStart(
+				`auto-install ensure ${toolId}: install disabled — discovery only, not found (${Date.now() - ensureStartMs}ms)`,
+			);
+			return undefined;
 		}
 
 		const installed = await installTool(toolId);

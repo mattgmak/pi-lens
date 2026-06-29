@@ -24,7 +24,9 @@ import {
 	GoServer,
 	JavaServer,
 	RustServer,
+	TypeScriptServer,
 } from "../../../clients/lsp/server.ts";
+import { ensureTool } from "../../../clients/installer/index.js";
 
 const isWin = process.platform === "win32";
 const sep = (...parts: string[]) => path.join(...parts);
@@ -118,6 +120,36 @@ describe("runtime-install / discovery server wiring (#241)", () => {
 			),
 		).toBe(true);
 		expect(tried).toContain("fsautocomplete");
+	});
+
+	it("TypeScriptServer discovers a global tsserver-language-server when install is disabled (discovery decoupled from install)", async () => {
+		// Regression: with PI_LENS_DISABLE_LSP_INSTALL=1 (allowInstall:false) the old
+		// code skipped the ensureTool call entirely, so a globally-installed
+		// typescript-language-server (no per-project node_modules) was never found and
+		// the server stayed at ready=0/4. ensureTool must still run PATH/npm-global
+		// discovery; only the actual download is gated.
+		const GLOBAL_TLS = sep("/usr", "bin", "typescript-language-server");
+		vi.mocked(ensureTool).mockImplementation(async (id: string) =>
+			id === "typescript-language-server" ? GLOBAL_TLS : undefined,
+		);
+		launchLSP.mockReset();
+		launchLSP.mockResolvedValue({ kill: vi.fn() } as never);
+		try {
+			// A root with no node_modules/.bin so only ensureTool discovery can resolve.
+			const res = await TypeScriptServer.spawn(
+				sep("/tmp", "pi-lens-no-node-modules-xyz"),
+				{ allowInstall: false },
+			);
+			expect(vi.mocked(ensureTool)).toHaveBeenCalledWith(
+				"typescript-language-server",
+				{ allowInstall: false },
+			);
+			expect(triedCommands()).toContain(GLOBAL_TLS);
+			expect(res).toBeDefined();
+		} finally {
+			vi.mocked(ensureTool).mockReset();
+			vi.mocked(ensureTool).mockResolvedValue(undefined);
+		}
 	});
 
 	it("JavaServer passes Lombok javaagent through official jdtls --jvm-arg", async () => {
