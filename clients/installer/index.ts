@@ -47,11 +47,14 @@
  */
 
 import { spawn } from "node:child_process";
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import fs from "node:fs/promises";
 import https from "node:https";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+
+const _installerRequire = createRequire(import.meta.url);
 import { createGunzip } from "node:zlib";
 import { isTestMode } from "../env-utils.js";
 import { getGlobalPiLensDir } from "../file-utils.js";
@@ -184,6 +187,24 @@ export interface ToolDefinition {
 	github?: GitHubAssetSpec;
 	maven?: MavenJarSpec;
 	archive?: ArchiveSpec;
+	/**
+	 * For npm tools whose runnable binary ships in a per-platform
+	 * optional-dependency package (e.g. `@ast-grep/cli-<platform>`,
+	 * `@biomejs/cli-<platform>`). Under pnpm/bun the main package's JS launcher
+	 * frequently can't locate that binary (symlink store / skipped postinstall),
+	 * but the binary itself IS installed — so resolve it directly. The general
+	 * mechanism for any npm/pnpm/bun-distributed platform-CLI tool.
+	 */
+	platformPackage?: PlatformPackageSpec;
+}
+
+export interface PlatformPackageSpec {
+	/** Base name; the platform package is `${base}-${suffix}`. Defaults to `packageName`. */
+	base?: string;
+	/** node `${platform}-${arch}` → npm package-name suffix. */
+	suffixes: Record<string, string>;
+	/** Candidate binary filenames at the platform package root (first existing wins). */
+	binaries: string[];
 }
 
 /**
@@ -272,6 +293,18 @@ export const TOOLS: ToolDefinition[] = [
 		installStrategy: "npm",
 		packageName: "@biomejs/biome",
 		binaryName: "biome",
+		platformPackage: {
+			base: "@biomejs/cli",
+			suffixes: {
+				"linux-x64": "linux-x64",
+				"linux-arm64": "linux-arm64",
+				"darwin-x64": "darwin-x64",
+				"darwin-arm64": "darwin-arm64",
+				"win32-x64": "win32-x64",
+				"win32-arm64": "win32-arm64",
+			},
+			binaries: ["biome"],
+		},
 	},
 	// Analysis tools (run at session start / turn end)
 	{
@@ -301,6 +334,18 @@ export const TOOLS: ToolDefinition[] = [
 		installStrategy: "npm",
 		packageName: "@ast-grep/cli",
 		binaryName: "ast-grep",
+		platformPackage: {
+			suffixes: {
+				"linux-x64": "linux-x64-gnu",
+				"linux-arm64": "linux-arm64-gnu",
+				"darwin-x64": "darwin-x64",
+				"darwin-arm64": "darwin-arm64",
+				"win32-x64": "win32-x64-msvc",
+				"win32-arm64": "win32-arm64-msvc",
+				"win32-ia32": "win32-ia32-msvc",
+			},
+			binaries: ["ast-grep", "sg"],
+		},
 	},
 	{
 		id: "knip",
@@ -1246,6 +1291,8 @@ export async function updateProbeCache(
 export function resetProbeCacheStateForTesting(): void {
 	_probeCache = null;
 	_probeCacheDirty = false;
+	resolvedPathCache.clear();
+	ensureInFlight.clear();
 	if (_probeCacheFlushTimer !== null) {
 		clearTimeout(_probeCacheFlushTimer);
 		_probeCacheFlushTimer = null;
@@ -1566,6 +1613,51 @@ async function getArchiveTreeBundlePath(
 /**
  * Get the path to a tool (global or local)
  */
+/**
+ * Resolve a tool's native binary from its per-platform optional-dependency
+ * package (e.g. `@ast-grep/cli-linux-x64-gnu`), following pnpm/bun symlinks via
+ * the MAIN package's resolver. This is the reliable path for npm/pnpm/bun
+ * installs: the JS launcher in the main package frequently can't locate the
+ * binary under a symlink/isolated store (or after a skipped postinstall), but
+ * the binary is installed — find it directly. Returns undefined if the tool
+ * has no platformPackage spec, the platform is unsupported, or it isn't found.
+ */
+export function resolvePlatformPackageBinary(
+	tool: ToolDefinition,
+): string | undefined {
+	const spec = tool.platformPackage;
+	if (!spec || !tool.packageName) return undefined;
+	const suffix = spec.suffixes[`${process.platform}-${process.arch}`];
+	if (!suffix) return undefined;
+	const platformPkg = `${spec.base ?? tool.packageName}-${suffix}`;
+	try {
+		// Resolve the platform package FROM the main package, which owns it as an
+		// optional dependency (pnpm exposes it there, not to arbitrary roots).
+		const mainPkgJson = _installerRequire.resolve(
+			`${tool.packageName}/package.json`,
+		);
+		const fromMain = createRequire(mainPkgJson);
+		let pkgDir: string;
+		try {
+			pkgDir = path.dirname(fromMain.resolve(`${platformPkg}/package.json`));
+		} catch {
+			pkgDir = path.dirname(
+				_installerRequire.resolve(`${platformPkg}/package.json`),
+			);
+		}
+		const isWin = process.platform === "win32";
+		for (const bin of spec.binaries) {
+			for (const name of isWin ? [`${bin}.exe`, bin] : [bin]) {
+				const candidate = path.join(pkgDir, name);
+				if (existsSync(candidate)) return candidate;
+			}
+		}
+	} catch {
+		// not installed / not resolvable for this layout
+	}
+	return undefined;
+}
+
 export async function getToolPath(toolId: string): Promise<string | undefined> {
 	const tool = TOOLS.find((t) => t.id === toolId);
 	if (!tool) return undefined;
@@ -1626,6 +1718,23 @@ export async function getToolPath(toolId: string): Promise<string | undefined> {
 		);
 	} catch {
 		// fall through to global checks
+	}
+
+	// npm/pnpm/bun: prefer the native per-platform binary directly. The main
+	// package's launcher often can't find it under a symlink store / after a
+	// skipped postinstall, but the binary IS installed — resolve + verify it
+	// before falling back to PATH or a (re)install.
+	if (tool.platformPackage) {
+		const platformBin = resolvePlatformPackageBinary(tool);
+		if (platformBin && (await verifyToolBinary(platformBin))) {
+			logSessionStart(
+				`auto-install ${toolId}: resolved platform-package binary at ${platformBin}`,
+			);
+			return platformBin;
+		}
+		logSessionStart(
+			`auto-install ${toolId}: platform-package binary not resolved (${process.platform}-${process.arch}, base=${tool.platformPackage.base ?? tool.packageName}) — falling back to PATH/managed install`,
+		);
 	}
 
 	// For github/maven tools, prefer the managed install (~/.pi-lens/bin/) over
@@ -2939,10 +3048,20 @@ export async function installTool(toolId: string): Promise<boolean> {
  */
 export async function ensureTool(
 	toolId: string,
-	opts?: { forceReinstall?: boolean },
+	opts?: { forceReinstall?: boolean; allowInstall?: boolean },
 ): Promise<string | undefined> {
+	const cacheResolvedPath = (result: string | undefined): string | undefined => {
+		if (result) {
+			resolvedPathCache.set(toolId, result);
+			void updateProbeCache(toolId, result);
+		}
+		return result;
+	};
+
 	// forceReinstall: nuke caches, download from managed source, skip PATH entirely.
 	// Used when a PATH-resolved tool proves broken at launch (e.g. broken symlink).
+	// allowInstall:false wins over forceReinstall: caches are still cleared, but
+	// the function falls back to discovery-only and never downloads.
 	if (opts?.forceReinstall) {
 		const ensureStartMs = Date.now();
 		logSessionStart(
@@ -2962,6 +3081,13 @@ export async function ensureTool(
 			// best-effort
 		}
 
+		if (opts.allowInstall === false) {
+			logSessionStart(
+				`auto-install ensure ${toolId}: force reinstall blocked — install disabled, discovery only (${Date.now() - ensureStartMs}ms)`,
+			);
+			return cacheResolvedPath(await getToolPath(toolId));
+		}
+
 		// Force download
 		const installed = await installTool(toolId);
 		if (!installed) {
@@ -2972,10 +3098,8 @@ export async function ensureTool(
 		}
 
 		// Find the newly installed binary (github-local check now comes before PATH)
-		const result = await getToolPath(toolId);
+		const result = cacheResolvedPath(await getToolPath(toolId));
 		if (result) {
-			resolvedPathCache.set(toolId, result);
-			void updateProbeCache(toolId, result);
 			logSessionStart(
 				`auto-install ensure ${toolId}: force reinstall success at ${result} (${Date.now() - ensureStartMs}ms)`,
 			);
@@ -2999,11 +3123,15 @@ export async function ensureTool(
 
 	// Coalesce the whole ensure operation, not just installation. Most startup
 	// duplicates race while checking already-installed tools, before installTool()
-	// would ever run.
-	const inFlight = ensureInFlight.get(toolId);
+	// would ever run. The key includes the install policy so a discovery-only
+	// caller cannot accidentally inherit an install-allowed caller's download (or
+	// vice versa).
+	const inFlightKey =
+		opts?.allowInstall === false ? `${toolId}:discovery-only` : toolId;
+	const inFlight = ensureInFlight.get(inFlightKey);
 	if (inFlight) {
 		logSessionStart(
-			`auto-install ensure ${toolId}: waiting for in-flight ensure`,
+			`auto-install ensure ${toolId}: waiting for in-flight ensure (${inFlightKey})`,
 		);
 		return inFlight;
 	}
@@ -3021,6 +3149,17 @@ export async function ensureTool(
 				`auto-install ensure ${toolId}: already available at ${existingPath} (${Date.now() - ensureStartMs}ms)`,
 			);
 			return existingPath;
+		}
+
+		// Discovery and install are SEPARATE concerns. getToolPath() above already
+		// probed PATH / npm-global / managed bin — offline-safe, no download. When the
+		// caller forbids installs (allowInstall:false, e.g. PI_LENS_DISABLE_LSP_INSTALL=1)
+		// we must still return a discovered binary and only skip the actual install.
+		if (opts?.allowInstall === false) {
+			logSessionStart(
+				`auto-install ensure ${toolId}: install disabled — discovery only, not found (${Date.now() - ensureStartMs}ms)`,
+			);
+			return undefined;
 		}
 
 		const installed = await installTool(toolId);
@@ -3046,11 +3185,11 @@ export async function ensureTool(
 		return result;
 	})();
 
-	ensureInFlight.set(toolId, ensurePromise);
+	ensureInFlight.set(inFlightKey, ensurePromise);
 	try {
 		return await ensurePromise;
 	} finally {
-		ensureInFlight.delete(toolId);
+		ensureInFlight.delete(inFlightKey);
 	}
 }
 

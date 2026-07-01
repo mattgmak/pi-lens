@@ -253,11 +253,12 @@ function getMaxWorkspaceDiagnosticFiles(): number {
 async function collectWorkspaceDiagnosticFiles(
 	root: string,
 	maxFiles: number = getMaxWorkspaceDiagnosticFiles(),
+	signal?: AbortSignal,
 ): Promise<string[]> {
 	const files: string[] = [];
 	const ignoreMatcher = getProjectIgnoreMatcher(root);
 	async function walk(current: string): Promise<void> {
-		if (files.length >= maxFiles) return;
+		if (signal?.aborted || files.length >= maxFiles) return;
 		let entries: nodeFs.Dirent[];
 		try {
 			entries = await nodeFs.promises.readdir(current, {
@@ -267,7 +268,7 @@ async function collectWorkspaceDiagnosticFiles(
 			return;
 		}
 		for (const entry of entries) {
-			if (files.length >= maxFiles) return;
+			if (signal?.aborted || files.length >= maxFiles) return;
 			if (entry.isSymbolicLink()) continue;
 			const full = path.join(current, entry.name);
 			if (entry.isDirectory()) {
@@ -768,6 +769,20 @@ export class LSPService {
 					`lsp spawn ${server.id}: unavailable (${Date.now() - startedAt}ms)`,
 				);
 				recordLsp(server.id, root, "spawn_failed", Date.now() - startedAt);
+
+				// When installs are disabled, an unavailable binary is an expected
+				// policy outcome, not proof the server/root is broken. Cool down briefly
+				// to avoid hot-looping PATH probes, but do not count toward permanent
+				// disablement: a user may install or expose the binary on PATH during the
+				// same session and should not need a full LSP reset.
+				if (!allowInstall) {
+					logSessionStart(
+						`lsp spawn ${server.id}: unavailable with install disabled; temporary cooldown only`,
+					);
+					this.state.broken.set(key, Date.now() + BROKEN_BASE_COOLDOWN_MS);
+					return undefined;
+				}
+
 				const uCount = (this.failureCounts.get(key) ?? 0) + 1;
 				this.failureCounts.set(key, uCount);
 				const uCooldown = Math.min(
@@ -1814,16 +1829,32 @@ export class LSPService {
 	 */
 	async runWorkspaceDiagnostics(
 		cwd: string,
+		options: { maxFiles?: number; signal?: AbortSignal } = {},
 	): Promise<LSPWorkspaceDiagnosticResult[]> {
 		const startedAt = Date.now();
 		const root = path.resolve(cwd);
-		const files = await collectWorkspaceDiagnosticFiles(root);
+		const { signal } = options;
+		// Cap the per-file LSP sweep: a Next.js-scale project can route thousands
+		// of files through the language server at concurrency 8, and without a
+		// caller cap that grinds for tens of minutes (#341). `maxFiles` lets
+		// lens_diagnostics' `maxLspFiles` bound it; falls back to the env/default.
+		const maxFiles =
+			typeof options.maxFiles === "number" &&
+			Number.isFinite(options.maxFiles) &&
+			options.maxFiles > 0
+				? Math.floor(options.maxFiles)
+				: getMaxWorkspaceDiagnosticFiles();
+		const files = await collectWorkspaceDiagnosticFiles(root, maxFiles, signal);
 		const results: LSPWorkspaceDiagnosticResult[] = new Array(files.length);
 		let nextIndex = 0;
 		const workers = Math.min(WORKSPACE_DIAGNOSTICS_CONCURRENCY, files.length);
 		await Promise.all(
 			Array.from({ length: workers }, async () => {
 				while (true) {
+					// Honor cancellation: a long sweep must stop when the agent/user
+					// aborts the turn rather than chew through the remaining files
+					// (#341). Already-collected results are returned as a partial.
+					if (signal?.aborted) return;
 					const index = nextIndex;
 					nextIndex += 1;
 					if (index >= files.length) return;
@@ -1865,6 +1896,8 @@ export class LSPService {
 					0,
 				),
 				concurrency: WORKSPACE_DIAGNOSTICS_CONCURRENCY,
+				maxFiles,
+				aborted: signal?.aborted ?? false,
 			},
 		});
 
@@ -2039,8 +2072,9 @@ export function resetLSPService(options: LSPShutdownOptions = {}): void {
 export function __collectWorkspaceDiagnosticFilesForTest(
 	root: string,
 	maxFiles?: number,
+	signal?: AbortSignal,
 ): Promise<string[]> {
 	return maxFiles === undefined
-		? collectWorkspaceDiagnosticFiles(path.resolve(root))
-		: collectWorkspaceDiagnosticFiles(path.resolve(root), maxFiles);
+		? collectWorkspaceDiagnosticFiles(path.resolve(root), undefined, signal)
+		: collectWorkspaceDiagnosticFiles(path.resolve(root), maxFiles, signal);
 }

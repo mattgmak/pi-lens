@@ -1,6 +1,6 @@
 {
 	"name": "pi-lens",
-	"version": "3.8.61",
+	"version": "3.8.62",
 	"type": "module",
 	"description": "Real-time code feedback for pi — LSP, linters, formatters, type-checking, structural analysis & booboo",
 	"repository": {
@@ -23,6 +23,7 @@
 		"test:integration": "vitest run tests/index-integration.test.ts tests/clients/lsp/integration.test.ts",
 		"test:watch": "vitest",
 		"check": "node scripts/check-extensions.mjs",
+		"selftest:install": "node scripts/install-selftest.mjs",
 		"check:lockfile": "node scripts/check-lockfile-sync.mjs",
 		"audit:tree-sitter": "node scripts/audit-tree-sitter-rules.mjs",
 		"audit:rule-catalog": "node scripts/validate-rule-catalog.mjs",
@@ -33,6 +34,7 @@
 		"changelog:extract": "node scripts/changelog-extract.mjs",
 		"release:backfill-notes": "node scripts/backfill-github-releases.mjs",
 		"docs:rule-catalogs": "node scripts/gen-rule-catalogs.mjs",
+		"banner": "npx -y sharp-cli --input banner.svg --output banner.png resize 2200 620",
 		"download-grammars": "node scripts/download-grammars.js",
 		"harness:poc": "node scripts/run-harness.mjs cases/ts/pipeline-dispatch-poc --pi-bin \"C:\\Users\\R3LiC\\AppData\\Roaming\\npm\\pi.cmd\"",
 		"harness:python-poc": "node scripts/run-harness.mjs cases/python/pipeline-dispatch-poc --pi-bin \"C:\\Users\\R3LiC\\AppData\\Roaming\\npm\\pi.cmd\"",
@@ -65,6 +67,8 @@
 		"skills/",
 		"scripts/download-grammars.js",
 		"scripts/analyze-pi-lens-logs.mjs",
+		"scripts/install-selftest.mjs",
+		"scripts/rpc-load-check.mjs",
 		"README.md",
 		"CHANGELOG.md",
 		"banner.svg",
