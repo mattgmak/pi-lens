@@ -78,7 +78,11 @@ const AUTOFIX_CHANGED_FILE_SCAN_LIMIT = 5000;
 
 type FileSnapshot = Map<string, { mtimeMs: number; size: number }>;
 
-function snapshotProjectFiles(root: string): FileSnapshot {
+// Exported for the event-loop occupancy guard (#361): this is a synchronous
+// O(files) walk on the tool_result autofix path, bounded only by
+// AUTOFIX_CHANGED_FILE_SCAN_LIMIT. The perf guard asserts its sync block stays
+// bounded at scale (and that dir excludes keep the walk from exploding).
+export function snapshotProjectFiles(root: string): FileSnapshot {
 	const snapshot: FileSnapshot = new Map();
 	const projectRoot = path.resolve(root);
 	const ignoreMatcher = getProjectIgnoreMatcher(projectRoot);
