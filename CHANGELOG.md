@@ -8,6 +8,14 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Changed
 
+### Fixed
+
+## [3.8.63] - 2026-07-01
+
+### Added
+
+### Changed
+
 - **Consolidated the timeout-race helpers into one shared `clients/deadline-utils.ts` (#366)** — the "race a promise against a timer" pattern had drifted into three near-identical copies (`withTimeout` in the LSP client, `withBudget` in read-expansion, `withinRemaining` in module-report). They're now thin adapters over one `withDeadline` core, which also fixes two latent bugs the copies carried: `withBudget` didn't suppress the loser promise's late rejection (an unhandled rejection when the timer won first), and `withinRemaining` never cleared its timer. Behaviour at every call site is unchanged (covered by the consumer suites); the core's semantics are locked by dedicated tests including an explicit late-rejection-suppression probe.
 
 ### Fixed
