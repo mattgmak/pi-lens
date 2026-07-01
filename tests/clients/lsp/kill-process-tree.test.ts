@@ -25,37 +25,64 @@ vi.mock("node:child_process", async (importOriginal) => {
 
 const { killProcessTree } = await import("../../../clients/lsp/client.js");
 
-describe("killProcessTree — Windows process-exit teardown", () => {
+describe("killProcessTree", () => {
 	const realPlatform = process.platform;
-	beforeEach(() => {
-		spawnMock.mockClear();
-		Object.defineProperty(process, "platform", {
-			value: "win32",
-			configurable: true,
-		});
-	});
+	let processKillSpy: ReturnType<typeof vi.spyOn> | undefined;
+
 	afterEach(() => {
 		Object.defineProperty(process, "platform", {
 			value: realPlatform,
 			configurable: true,
 		});
+		processKillSpy?.mockRestore();
+		processKillSpy = undefined;
 	});
 
-	it("processExiting: kills via the existing handle and NEVER spawns taskkill", async () => {
-		const proc = { kill: vi.fn(() => true), unref: vi.fn() };
-		await killProcessTree(proc, 4242, { fast: true, processExiting: true });
-		// The whole point: no child spawn while the loop is closing.
-		expect(spawnMock).not.toHaveBeenCalled();
-		expect(proc.kill).toHaveBeenCalled();
-		expect(proc.unref).toHaveBeenCalled();
+	describe("Windows process-exit teardown", () => {
+		beforeEach(() => {
+			spawnMock.mockClear();
+			Object.defineProperty(process, "platform", {
+				value: "win32",
+				configurable: true,
+			});
+		});
+
+		it("processExiting: kills via the existing handle and NEVER spawns taskkill", async () => {
+			const proc = { kill: vi.fn(() => true), unref: vi.fn() };
+			await killProcessTree(proc, 4242, { fast: true, processExiting: true });
+			// The whole point: no child spawn while the loop is closing.
+			expect(spawnMock).not.toHaveBeenCalled();
+			expect(proc.kill).toHaveBeenCalled();
+			expect(proc.unref).toHaveBeenCalled();
+		});
+
+		it("non-exiting fast shutdown still spawns the taskkill /T tree-kill", async () => {
+			const proc = { kill: vi.fn(() => true), unref: vi.fn() };
+			await killProcessTree(proc, 4242, { fast: true });
+			expect(spawnMock).toHaveBeenCalledTimes(1);
+			const call = spawnMock.mock.calls[0];
+			expect(String(call[0]).toLowerCase()).toContain("taskkill");
+			expect(call[1]).toEqual(expect.arrayContaining(["/T", "/PID", "4242"]));
+		});
 	});
 
-	it("non-exiting fast shutdown still spawns the taskkill /T tree-kill", async () => {
-		const proc = { kill: vi.fn(() => true), unref: vi.fn() };
-		await killProcessTree(proc, 4242, { fast: true });
-		expect(spawnMock).toHaveBeenCalledTimes(1);
-		const call = spawnMock.mock.calls[0];
-		expect(String(call[0]).toLowerCase()).toContain("taskkill");
-		expect(call[1]).toEqual(expect.arrayContaining(["/T", "/PID", "4242"]));
+	describe("POSIX process-group teardown", () => {
+		beforeEach(() => {
+			spawnMock.mockClear();
+			Object.defineProperty(process, "platform", {
+				value: "linux",
+				configurable: true,
+			});
+			processKillSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+		});
+
+		it("fast shutdown signals the LSP process group before unref", async () => {
+			const proc = { kill: vi.fn(() => true), unref: vi.fn() };
+			await killProcessTree(proc, 4242, { fast: true });
+
+			expect(processKillSpy).toHaveBeenCalledWith(-4242, "SIGTERM");
+			expect(proc.kill).not.toHaveBeenCalledWith("SIGTERM");
+			expect(proc.unref).toHaveBeenCalled();
+		});
 	});
 });
