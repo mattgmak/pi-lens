@@ -14,6 +14,8 @@ import {
 	clientShutdown,
 	clientWaitForDiagnostics,
 	handleNotifyChange,
+	navRequest,
+	runServerCommand,
 	stripDiagnosticNoiseLines,
 	handleNotifyOpen,
 	type LSPClientState,
@@ -548,6 +550,106 @@ describe("clientWaitForDiagnostics — pull mode (#240)", () => {
 		expect(elapsed).toBeGreaterThanOrEqual(100);
 		// ...and did NOT hang on the never-resolving request.
 		expect(elapsed).toBeLessThan(2000);
+	});
+});
+
+describe("navRequest — per-request timeout ceiling (#365)", () => {
+	// workspaceSymbol and codeAction now route through navRequest, so its
+	// withTimeout ceiling is what stops a hung server (a request the server
+	// accepts but never replies to — safeSendRequest only settles on a reply or
+	// a destroyed stream) from hanging those tools forever.
+	const TEST_FILE = "/proj/file.ts";
+
+	it.each(["workspace/symbol", "textDocument/codeAction"])(
+		"bounds a hung %s request instead of hanging forever",
+		async (method) => {
+			const state = createMockState();
+			state.connection.sendRequest = vi.fn(() => new Promise<never>(() => {}));
+
+			const start = Date.now();
+			const result = await navRequest(state, method, {}, undefined, 120);
+			const elapsed = Date.now() - start;
+
+			expect(result).toBeUndefined();
+			// Went through the timeout, not an instant error return...
+			expect(elapsed).toBeGreaterThanOrEqual(100);
+			// ...and did not hang on the never-resolving request.
+			expect(elapsed).toBeLessThan(2000);
+		},
+	);
+
+	it("returns the server result unchanged on a normal reply", async () => {
+		const state = createMockState();
+		const payload = [{ name: "sym", kind: 12 }];
+		state.connection.sendRequest = vi.fn().mockResolvedValue(payload);
+
+		const result = await navRequest(state, "workspace/symbol", {}, undefined, 120);
+		expect(result).toEqual(payload);
+	});
+
+	it("drops a single-file result when the document version advances mid-request", async () => {
+		const state = createMockState();
+		const key = normalizeMapKey(TEST_FILE);
+		state.documentVersions.set(key, 1);
+		// An edit lands while the request is in flight → the reply is stale.
+		state.connection.sendRequest = vi.fn(async () => {
+			state.documentVersions.set(key, 2);
+			return [{ title: "stale action" }];
+		});
+
+		const result = await navRequest(
+			state,
+			"textDocument/codeAction",
+			{},
+			TEST_FILE,
+			120,
+		);
+		expect(result).toBeUndefined();
+	});
+});
+
+describe("runServerCommand — executeCommand timeout backstop (#365)", () => {
+	const advertised = (): LSPClientState => {
+		const state = createMockState();
+		state.advertisedCommands.add("test.command");
+		return state;
+	};
+
+	it("bounds a hung command with the generous backstop and surfaces it honestly", async () => {
+		const state = advertised();
+		state.connection.sendRequest = vi.fn(() => new Promise<never>(() => {}));
+
+		const start = Date.now();
+		const outcome = await runServerCommand(state, "test.command", [], 120);
+		const elapsed = Date.now() - start;
+
+		expect(outcome.executed).toBe(false);
+		expect(outcome.reason).toMatch(/timed out.*may still be applying/i);
+		expect(elapsed).toBeGreaterThanOrEqual(100);
+		expect(elapsed).toBeLessThan(2000);
+		// The serverEditsAllowed window must close even on timeout.
+		expect(state.serverEditsAllowed).toBe(0);
+	});
+
+	it("returns the command result on a normal reply", async () => {
+		const state = advertised();
+		state.connection.sendRequest = vi.fn().mockResolvedValue({ applied: true });
+
+		const outcome = await runServerCommand(state, "test.command", [], 120);
+		expect(outcome).toEqual({ executed: true, result: { applied: true } });
+		expect(state.serverEditsAllowed).toBe(0);
+	});
+
+	it("refuses a command the server never advertised (hardening preserved)", async () => {
+		const state = createMockState(); // advertisedCommands empty
+		state.connection.sendRequest = vi.fn().mockResolvedValue({ applied: true });
+
+		const outcome = await runServerCommand(state, "evil.command", [], 120);
+		expect(outcome.executed).toBe(false);
+		expect(outcome.reason).toMatch(/not advertised/i);
+		// Never sent, and the edit window never opened.
+		expect(state.connection.sendRequest).not.toHaveBeenCalled();
+		expect(state.serverEditsAllowed).toBe(0);
 	});
 });
 

@@ -402,6 +402,15 @@ const SHUTDOWN_REQUEST_TIMEOUT_MS = positiveIntFromEnv(
 	"PI_LENS_LSP_SHUTDOWN_TIMEOUT_MS",
 	1000,
 );
+// Anti-deadlock backstop for workspace/executeCommand. Deliberately generous
+// (30s): the command is mutating and legitimately long-running (a real server
+// refactor / organize-imports), so this must not truncate valid work — it only
+// stops a hung server from blocking the caller forever. On timeout the command
+// may still be applying server-side; we surface that rather than pretend it ran.
+const EXECUTE_COMMAND_TIMEOUT_MS = positiveIntFromEnv(
+	"PI_LENS_LSP_EXECUTE_COMMAND_TIMEOUT_MS",
+	30_000,
+);
 
 const LSP_CRASH_CODES = new Set([
 	"ERR_STREAM_DESTROYED",
@@ -1287,7 +1296,9 @@ function navStaleDropEnabled(): boolean {
 	return process.env.PI_LENS_LSP_NAV_STALE_DROP !== "0";
 }
 
-async function navRequest<T>(
+// Exported for the timeout regression tests (#365). `timeoutMs` overrides the
+// per-request ceiling so a test can bound a hung server quickly.
+export async function navRequest<T>(
 	state: LSPClientState,
 	method: string,
 	params: Record<string, unknown>,
@@ -1295,6 +1306,7 @@ async function navRequest<T>(
 	// (an edit landed) between send and response. Omit for non-single-file
 	// requests (workspaceSymbol, call-hierarchy follow-ups) that have no version.
 	staleCheckPath?: string,
+	timeoutMs: number = NAV_REQUEST_TIMEOUT_MS,
 ): Promise<T | null | undefined> {
 	if (!isClientAlive(state)) return null;
 	const normalizedPath =
@@ -1305,7 +1317,7 @@ async function navRequest<T>(
 			: undefined;
 	const result = (await withTimeout(
 		safeSendRequest<T>(state.connection, method, params),
-		NAV_REQUEST_TIMEOUT_MS,
+		timeoutMs,
 	).catch((err: unknown) => {
 		if (err instanceof Error && err.message.startsWith("Timeout after")) {
 			return undefined;
@@ -1325,6 +1337,57 @@ async function navRequest<T>(
 		}
 	}
 	return result;
+}
+
+// Run an advertised server command via workspace/executeCommand, with the
+// generous EXECUTE_COMMAND_TIMEOUT_MS anti-deadlock backstop. Preserves the
+// hardening invariants: allowlist-by-advertisement (only commands the server
+// declared) and the serverEditsAllowed window that gates server-driven
+// applyEdit to the duration of an explicit call. Exported with an overridable
+// `timeoutMs` for the #365 regression tests.
+export async function runServerCommand(
+	state: LSPClientState,
+	command: string,
+	args: unknown[] | undefined,
+	timeoutMs: number = EXECUTE_COMMAND_TIMEOUT_MS,
+): Promise<{ executed: boolean; result?: unknown; reason?: string }> {
+	if (!isClientAlive(state)) {
+		return { executed: false, reason: "lsp client not alive" };
+	}
+	if (!state.advertisedCommands.has(command)) {
+		return {
+			executed: false,
+			reason: `command "${command}" is not advertised by the ${state.serverId} server`,
+		};
+	}
+	state.serverEditsAllowed += 1;
+	try {
+		let result: unknown;
+		try {
+			result = await withTimeout(
+				safeSendRequest<unknown>(state.connection, "workspace/executeCommand", {
+					command,
+					arguments: args ?? [],
+				}),
+				timeoutMs,
+			);
+		} catch (err) {
+			// Generous backstop only: a timeout means the server is hung (or the
+			// command is running longer than the ceiling). Surface it honestly — the
+			// command may still be applying — instead of hanging the caller. Real
+			// (non-timeout) errors still propagate.
+			if (err instanceof Error && err.message.startsWith("Timeout after")) {
+				return {
+					executed: false,
+					reason: `workspace/executeCommand timed out after ${timeoutMs}ms — the command may still be applying server-side`,
+				};
+			}
+			throw err;
+		}
+		return { executed: true, result };
+	} finally {
+		state.serverEditsAllowed -= 1;
+	}
 }
 
 async function resolveCodeActionBestEffort(
@@ -1698,28 +1761,7 @@ export async function createLSPClient(options: {
 		},
 
 		async executeCommand(command, args) {
-			if (!isClientAlive(state)) {
-				return { executed: false, reason: "lsp client not alive" };
-			}
-			// Hardening: allowlist-by-advertisement. Only commands the server
-			// itself declared (static or dynamic) may run — no arbitrary strings.
-			if (!state.advertisedCommands.has(command)) {
-				return {
-					executed: false,
-					reason: `command "${command}" is not advertised by the ${state.serverId} server`,
-				};
-			}
-			state.serverEditsAllowed += 1;
-			try {
-				const result = await safeSendRequest<unknown>(
-					state.connection,
-					"workspace/executeCommand",
-					{ command, arguments: args ?? [] },
-				);
-				return { executed: true, result };
-			} finally {
-				state.serverEditsAllowed -= 1;
-			}
+			return runServerCommand(state, command, args);
 		},
 
 		get diagnosticsVersion() {
@@ -1828,19 +1870,23 @@ export async function createLSPClient(options: {
 
 		async workspaceSymbol(query) {
 			if (!isClientAlive(state)) return [];
-			const result = await safeSendRequest<LSPSymbol[]>(
-				connection,
-				"workspace/symbol",
-				{ query },
-			);
+			// Route through navRequest for the shared withTimeout ceiling — a hung
+			// server would otherwise await forever (safeSendRequest only settles on
+			// a reply or a destroyed stream). No staleCheckPath: not single-file.
+			const result = await navRequest<LSPSymbol[]>(state, "workspace/symbol", {
+				query,
+			});
 			return result ?? [];
 		},
 
 		async codeAction(filePath, line, character, endLine, endCharacter) {
 			if (!isClientAlive(state)) return [];
 			const uri = pathToFileURL(filePath).href;
-			const result = await safeSendRequest<unknown[]>(
-				connection,
+			// navRequest adds the shared withTimeout ceiling + single-file
+			// stale-drop (matches documentSymbol); a hung server no longer awaits
+			// forever, and code actions computed against superseded content drop.
+			const result = await navRequest<unknown[]>(
+				state,
 				"textDocument/codeAction",
 				{
 					textDocument: { uri },
@@ -1855,6 +1901,7 @@ export async function createLSPClient(options: {
 						),
 					},
 				},
+				filePath,
 			);
 			if (!result || !Array.isArray(result)) return [];
 			const actions = result.filter(
