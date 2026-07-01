@@ -402,6 +402,15 @@ const SHUTDOWN_REQUEST_TIMEOUT_MS = positiveIntFromEnv(
 	"PI_LENS_LSP_SHUTDOWN_TIMEOUT_MS",
 	1000,
 );
+// Anti-deadlock backstop for workspace/executeCommand. Deliberately generous
+// (30s): the command is mutating and legitimately long-running (a real server
+// refactor / organize-imports), so this must not truncate valid work — it only
+// stops a hung server from blocking the caller forever. On timeout the command
+// may still be applying server-side; we surface that rather than pretend it ran.
+const EXECUTE_COMMAND_TIMEOUT_MS = positiveIntFromEnv(
+	"PI_LENS_LSP_EXECUTE_COMMAND_TIMEOUT_MS",
+	30_000,
+);
 
 const LSP_CRASH_CODES = new Set([
 	"ERR_STREAM_DESTROYED",
@@ -1330,6 +1339,57 @@ export async function navRequest<T>(
 	return result;
 }
 
+// Run an advertised server command via workspace/executeCommand, with the
+// generous EXECUTE_COMMAND_TIMEOUT_MS anti-deadlock backstop. Preserves the
+// hardening invariants: allowlist-by-advertisement (only commands the server
+// declared) and the serverEditsAllowed window that gates server-driven
+// applyEdit to the duration of an explicit call. Exported with an overridable
+// `timeoutMs` for the #365 regression tests.
+export async function runServerCommand(
+	state: LSPClientState,
+	command: string,
+	args: unknown[] | undefined,
+	timeoutMs: number = EXECUTE_COMMAND_TIMEOUT_MS,
+): Promise<{ executed: boolean; result?: unknown; reason?: string }> {
+	if (!isClientAlive(state)) {
+		return { executed: false, reason: "lsp client not alive" };
+	}
+	if (!state.advertisedCommands.has(command)) {
+		return {
+			executed: false,
+			reason: `command "${command}" is not advertised by the ${state.serverId} server`,
+		};
+	}
+	state.serverEditsAllowed += 1;
+	try {
+		let result: unknown;
+		try {
+			result = await withTimeout(
+				safeSendRequest<unknown>(state.connection, "workspace/executeCommand", {
+					command,
+					arguments: args ?? [],
+				}),
+				timeoutMs,
+			);
+		} catch (err) {
+			// Generous backstop only: a timeout means the server is hung (or the
+			// command is running longer than the ceiling). Surface it honestly — the
+			// command may still be applying — instead of hanging the caller. Real
+			// (non-timeout) errors still propagate.
+			if (err instanceof Error && err.message.startsWith("Timeout after")) {
+				return {
+					executed: false,
+					reason: `workspace/executeCommand timed out after ${timeoutMs}ms — the command may still be applying server-side`,
+				};
+			}
+			throw err;
+		}
+		return { executed: true, result };
+	} finally {
+		state.serverEditsAllowed -= 1;
+	}
+}
+
 async function resolveCodeActionBestEffort(
 	state: LSPClientState,
 	action: LSPCodeAction,
@@ -1701,28 +1761,7 @@ export async function createLSPClient(options: {
 		},
 
 		async executeCommand(command, args) {
-			if (!isClientAlive(state)) {
-				return { executed: false, reason: "lsp client not alive" };
-			}
-			// Hardening: allowlist-by-advertisement. Only commands the server
-			// itself declared (static or dynamic) may run — no arbitrary strings.
-			if (!state.advertisedCommands.has(command)) {
-				return {
-					executed: false,
-					reason: `command "${command}" is not advertised by the ${state.serverId} server`,
-				};
-			}
-			state.serverEditsAllowed += 1;
-			try {
-				const result = await safeSendRequest<unknown>(
-					state.connection,
-					"workspace/executeCommand",
-					{ command, arguments: args ?? [] },
-				);
-				return { executed: true, result };
-			} finally {
-				state.serverEditsAllowed -= 1;
-			}
+			return runServerCommand(state, command, args);
 		},
 
 		get diagnosticsVersion() {

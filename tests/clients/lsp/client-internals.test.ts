@@ -15,6 +15,7 @@ import {
 	clientWaitForDiagnostics,
 	handleNotifyChange,
 	navRequest,
+	runServerCommand,
 	stripDiagnosticNoiseLines,
 	handleNotifyOpen,
 	type LSPClientState,
@@ -604,6 +605,51 @@ describe("navRequest — per-request timeout ceiling (#365)", () => {
 			120,
 		);
 		expect(result).toBeUndefined();
+	});
+});
+
+describe("runServerCommand — executeCommand timeout backstop (#365)", () => {
+	const advertised = (): LSPClientState => {
+		const state = createMockState();
+		state.advertisedCommands.add("test.command");
+		return state;
+	};
+
+	it("bounds a hung command with the generous backstop and surfaces it honestly", async () => {
+		const state = advertised();
+		state.connection.sendRequest = vi.fn(() => new Promise<never>(() => {}));
+
+		const start = Date.now();
+		const outcome = await runServerCommand(state, "test.command", [], 120);
+		const elapsed = Date.now() - start;
+
+		expect(outcome.executed).toBe(false);
+		expect(outcome.reason).toMatch(/timed out.*may still be applying/i);
+		expect(elapsed).toBeGreaterThanOrEqual(100);
+		expect(elapsed).toBeLessThan(2000);
+		// The serverEditsAllowed window must close even on timeout.
+		expect(state.serverEditsAllowed).toBe(0);
+	});
+
+	it("returns the command result on a normal reply", async () => {
+		const state = advertised();
+		state.connection.sendRequest = vi.fn().mockResolvedValue({ applied: true });
+
+		const outcome = await runServerCommand(state, "test.command", [], 120);
+		expect(outcome).toEqual({ executed: true, result: { applied: true } });
+		expect(state.serverEditsAllowed).toBe(0);
+	});
+
+	it("refuses a command the server never advertised (hardening preserved)", async () => {
+		const state = createMockState(); // advertisedCommands empty
+		state.connection.sendRequest = vi.fn().mockResolvedValue({ applied: true });
+
+		const outcome = await runServerCommand(state, "evil.command", [], 120);
+		expect(outcome.executed).toBe(false);
+		expect(outcome.reason).toMatch(/not advertised/i);
+		// Never sent, and the edit window never opened.
+		expect(state.connection.sendRequest).not.toHaveBeenCalled();
+		expect(state.serverEditsAllowed).toBe(0);
 	});
 });
 
