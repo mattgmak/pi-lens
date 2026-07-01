@@ -78,42 +78,58 @@ const AUTOFIX_CHANGED_FILE_SCAN_LIMIT = 5000;
 
 type FileSnapshot = Map<string, { mtimeMs: number; size: number }>;
 
-function snapshotProjectFiles(root: string): FileSnapshot {
+// Scan one directory's entries into `snapshot`, pushing walkable subdirs onto
+// `stack`. Extracted from the walk loop to keep each function's cognitive
+// complexity low. Excluded/ignored dirs are not descended; ignored/vanished
+// files are skipped.
+function snapshotDirInto(
+	dir: string,
+	ignoreMatcher: ReturnType<typeof getProjectIgnoreMatcher>,
+	stack: string[],
+	snapshot: FileSnapshot,
+): void {
+	let entries: nodeFs.Dirent[];
+	try {
+		entries = nodeFs.readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	for (const entry of entries) {
+		const fullPath = path.join(dir, entry.name);
+		if (entry.isDirectory()) {
+			if (
+				!isExcludedDirName(entry.name) &&
+				!ignoreMatcher.isIgnored(fullPath, true)
+			) {
+				stack.push(fullPath);
+			}
+			continue;
+		}
+		if (!entry.isFile()) continue;
+		if (ignoreMatcher.isIgnored(fullPath, false)) continue;
+		try {
+			const stat = nodeFs.statSync(fullPath);
+			snapshot.set(path.resolve(fullPath), {
+				mtimeMs: stat.mtimeMs,
+				size: stat.size,
+			});
+		} catch {
+			// ignore vanished files
+		}
+	}
+}
+
+// Exported for the event-loop occupancy guard (#361): this is a synchronous
+// O(files) walk on the tool_result autofix path, bounded only by
+// AUTOFIX_CHANGED_FILE_SCAN_LIMIT. The perf guard asserts its sync block stays
+// bounded at scale (and that dir excludes keep the walk from exploding).
+export function snapshotProjectFiles(root: string): FileSnapshot {
 	const snapshot: FileSnapshot = new Map();
 	const projectRoot = path.resolve(root);
 	const ignoreMatcher = getProjectIgnoreMatcher(projectRoot);
 	const stack = [projectRoot];
 	while (stack.length > 0 && snapshot.size < AUTOFIX_CHANGED_FILE_SCAN_LIMIT) {
-		const dir = stack.pop()!;
-		let entries: nodeFs.Dirent[];
-		try {
-			entries = nodeFs.readdirSync(dir, { withFileTypes: true });
-		} catch {
-			continue;
-		}
-		for (const entry of entries) {
-			const fullPath = path.join(dir, entry.name);
-			if (entry.isDirectory()) {
-				if (
-					!isExcludedDirName(entry.name) &&
-					!ignoreMatcher.isIgnored(fullPath, true)
-				) {
-					stack.push(fullPath);
-				}
-				continue;
-			}
-			if (!entry.isFile()) continue;
-			if (ignoreMatcher.isIgnored(fullPath, false)) continue;
-			try {
-				const stat = nodeFs.statSync(fullPath);
-				snapshot.set(path.resolve(fullPath), {
-					mtimeMs: stat.mtimeMs,
-					size: stat.size,
-				});
-			} catch {
-				// ignore vanished files
-			}
-		}
+		snapshotDirInto(stack.pop()!, ignoreMatcher, stack, snapshot);
 	}
 	return snapshot;
 }
