@@ -33,6 +33,7 @@
 		"changelog:release": "node scripts/changelog-release.mjs",
 		"changelog:extract": "node scripts/changelog-extract.mjs",
 		"release:backfill-notes": "node scripts/backfill-github-releases.mjs",
+		"release:backfill-thanks": "node scripts/backfill-release-thanks.mjs",
 		"docs:rule-catalogs": "node scripts/gen-rule-catalogs.mjs",
 		"banner": "npx -y sharp-cli --input banner.svg --output banner.png resize 2200 620",
 		"download-grammars": "node scripts/download-grammars.js",
