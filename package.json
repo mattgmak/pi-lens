@@ -94,7 +94,6 @@
 		}
 	},
 	"optionalDependencies": {
-		"tree-sitter-wasms": "npm:null@^0.11.0",
 		"web-tree-sitter": "0.25.10"
 	},
 	"devDependencies": {

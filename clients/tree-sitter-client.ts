@@ -169,7 +169,8 @@ export class TreeSitterClient {
 			return grammarsDir;
 		}
 
-		// Fallback: tree-sitter-wasms package (real installs, not npm:null)
+		// Fallback: a real `tree-sitter-wasms` package, if the user installed one
+		// (it is not a pi-lens dependency — grammars ship bundled / lazy-fetched).
 		try {
 			const wasmsOut = path.join(
 				path.dirname(_require.resolve("tree-sitter-wasms/package.json")),
@@ -244,7 +245,16 @@ export class TreeSitterClient {
 					`[pi-lens] fetched missing tree-sitter grammar ${grammarFile} at runtime (install scripts were skipped by the package manager)`,
 				);
 			} else {
-				this.dbg(`grammar fetch failed for ${grammarFile}`);
+				// Surface the degradation once per grammar (the promise cache dedupes)
+				// instead of failing silently — otherwise pnpm/bun users offline get
+				// no signal that a language's tree-sitter features are unavailable.
+				console.error(
+					`[pi-lens] tree-sitter grammar '${grammarFile}' is unavailable — ` +
+						`symbol search, module reports and structural rules for this language will be degraded. ` +
+						`The package manager skipped install scripts and the runtime download failed (offline or CDN unreachable). ` +
+						`Fix: reinstall with a manager that runs postinstall, allow its build scripts ` +
+						`(pnpm approve-builds / bun trustedDependencies), or restore network access.`,
+				);
 			}
 			return ok;
 		})();
