@@ -165,27 +165,39 @@ export class TreeSitterClient {
 	 * manager). Resolved from the package root; cached. Absent in a source
 	 * checkout where `prepare` hasn't populated it.
 	 */
-	private _bundledGrammarsDir?: string | null;
+	private _bundledGrammarsDir?: string;
 	private bundledGrammarsDir(): string | undefined {
-		if (this._bundledGrammarsDir !== undefined) {
-			return this._bundledGrammarsDir ?? undefined;
-		}
+		// Cache only a positive hit; keep re-checking until it exists (prepare may
+		// not have populated it yet at first probe).
+		if (this._bundledGrammarsDir) return this._bundledGrammarsDir;
 		try {
 			const dir = resolvePackagePath(import.meta.url, "grammars");
-			this._bundledGrammarsDir = fs.existsSync(dir) ? dir : null;
+			if (fs.existsSync(dir)) this._bundledGrammarsDir = dir;
+			return this._bundledGrammarsDir;
 		} catch {
-			this._bundledGrammarsDir = null;
+			return undefined;
 		}
-		return this._bundledGrammarsDir ?? undefined;
 	}
 
 	/**
-	 * Absolute path to `grammarFile` if it exists in the bundled core dir or the
-	 * postinstall/lazy dir (checked in that order), else undefined.
+	 * All directories that may hold grammar wasms, in precedence order: the
+	 * bundled core dir, the resolved `this.grammarsDir`, and the web-tree-sitter
+	 * grammars dir (the lazy-fetch write target). Deduped.
 	 */
+	private grammarSourceDirs(): string[] {
+		const dirs: string[] = [];
+		const push = (d: string | undefined): void => {
+			if (d && !dirs.includes(d)) dirs.push(d);
+		};
+		push(this.bundledGrammarsDir());
+		push(this.grammarsDir || undefined);
+		push(this.resolveWebTreeSitterAsset("grammars"));
+		return dirs;
+	}
+
+	/** Absolute path to `grammarFile` across all source dirs, else undefined. */
 	private resolveGrammarFile(grammarFile: string): string | undefined {
-		for (const dir of [this.bundledGrammarsDir(), this.grammarsDir]) {
-			if (!dir) continue;
+		for (const dir of this.grammarSourceDirs()) {
 			const candidate = path.join(dir, grammarFile);
 			if (fs.existsSync(candidate)) return candidate;
 		}
@@ -523,13 +535,16 @@ export class TreeSitterClient {
 		return injections;
 	}
 
-	/** Check if tree-sitter is available (grammars installed) */
+	/** Check if tree-sitter is available (a core grammar resolves somewhere). */
 	isAvailable(): boolean {
-		if (fs.existsSync(this.grammarsDir)) return true;
-		// Re-evaluate in case grammars were installed after process start
+		// Available if the core TS grammar resolves in ANY source dir — the bundled
+		// `grammars/` counts even when web-tree-sitter/grammars is empty (no
+		// postinstall on pnpm/bun, or a fresh CI checkout).
+		if (this.resolveGrammarFile("tree-sitter-typescript.wasm")) return true;
+		// Re-evaluate the legacy dir in case grammars were installed after start.
 		const dir = this.findGrammarsDir();
 		this.grammarsDir = dir;
-		return fs.existsSync(dir);
+		return !!dir && fs.existsSync(dir);
 	}
 
 	/** Check if specific language is supported */
