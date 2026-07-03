@@ -13,6 +13,11 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getProjectDataDir } from "../file-utils.js";
+import {
+	globalInstallArgs,
+	pmBinary,
+	resolveNodePackageManager,
+} from "../package-manager.js";
 import { safeSpawnAsync } from "../safe-spawn.js";
 
 function canUseInteractivePrompt(): boolean {
@@ -304,7 +309,7 @@ function isAutoInstallEnabled(): boolean {
 /**
  * Attempt to install a tool using the configured strategy.
  *
- * - "npm":    npm install -g <packageName>
+ * - "npm":    global install via the resolved manager (npm/pnpm/yarn/bun)
  * - "shell":  run the static installCommand as argv (gem, dotnet, brew, etc.)
  * - "manual": can't auto-install — print the command and return false
  */
@@ -327,10 +332,17 @@ async function installTool(config: LanguageConfig): Promise<boolean> {
 		return false;
 	}
 
-	const invocation: [string, string[]] | undefined =
-		installStrategy === "npm" && packageName
-			? ["npm", ["install", "-g", packageName]]
-			: _parseStaticInstallCommandForTest(installCommand);
+	let invocation: [string, string[]] | undefined;
+	if (installStrategy === "npm" && packageName) {
+		// Resolve the machine's package manager (npm/pnpm/yarn/bun) rather than
+		// hardcoding npm — this global install is what makes an LSP server
+		// available on hosts without npm. The result lands in that manager's
+		// global bin dir, which `allAvailableGlobalBinDirs` already discovers.
+		const pm = await resolveNodePackageManager();
+		invocation = [pmBinary(pm), globalInstallArgs(pm, packageName)];
+	} else {
+		invocation = _parseStaticInstallCommandForTest(installCommand);
+	}
 	if (!invocation) return false;
 
 	const [cmd, args] = invocation;
