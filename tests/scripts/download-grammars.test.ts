@@ -19,29 +19,18 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import {
+	CORE,
+	loadManifest,
+	sidecarPathFor,
+} from "../../scripts/download-grammars.js";
 
 const SCRIPT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
 	"../../scripts/download-grammars.js",
 );
 
-// Mirrors the CORE list in scripts/download-grammars.ts. Pre-creating these
-// forces every entry down the offline "skip (already exists)" branch, so the
-// test never touches the network.
-const CORE_FILES = [
-	"tree-sitter-typescript.wasm",
-	"tree-sitter-tsx.wasm",
-	"tree-sitter-javascript.wasm",
-	"tree-sitter-python.wasm",
-	"tree-sitter-go.wasm",
-	"tree-sitter-rust.wasm",
-	"tree-sitter-json.wasm",
-	"tree-sitter-yaml.wasm",
-	"tree-sitter-bash.wasm",
-	"tree-sitter-html.wasm",
-	"tree-sitter-css.wasm",
-	"tree-sitter-java.wasm",
-];
+const MANIFEST = loadManifest();
 
 const dirs: string[] = [];
 
@@ -57,8 +46,21 @@ describe("download-grammars stdout hygiene (#376)", () => {
 		dirs.push(base);
 		const dest = path.join(base, "grammars");
 		fs.mkdirSync(dest, { recursive: true });
-		// Pre-create every core grammar so the script skips (no network fetch).
-		for (const f of CORE_FILES) fs.writeFileSync(path.join(dest, f), "");
+		// Pre-create every core grammar AND a matching provenance sidecar
+		// (version + manifest hash), so needsDownload verifies them and skips —
+		// no network fetch. needsDownload trusts the sidecar's recorded hash, so
+		// the wasm bytes themselves don't need to match here.
+		for (const f of CORE) {
+			fs.writeFileSync(path.join(dest, f), "");
+			fs.writeFileSync(
+				sidecarPathFor(path.join(dest, f)),
+				JSON.stringify({
+					npmPackage: MANIFEST.package,
+					version: MANIFEST.version,
+					sha256: MANIFEST.grammars[f],
+				}),
+			);
+		}
 
 		// dest is resolved relative to cwd (join(process.cwd(), args.dest)), so
 		// run with cwd=base and --dest grammars.
