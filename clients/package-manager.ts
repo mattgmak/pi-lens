@@ -172,6 +172,25 @@ export function installArgs(
 }
 
 /**
+ * Args to install a single package **globally** (`-g`). npm/pnpm/bun spell this
+ * `install -g` / `add -g`; yarn uses `global add` (yarn classic — Berry removed
+ * global installs, but pi-lens's manager resolution prefers npm/pnpm first, so
+ * yarn is only chosen when it is the declared/only manager). The resulting
+ * binary is found again by `allAvailableGlobalBinDirs`, which covers every
+ * manager's global bin dir.
+ */
+export function globalInstallArgs(pm: NodePackageManager, pkg: string): string[] {
+	switch (pm) {
+		case "yarn":
+			return ["global", "add", pkg];
+		case "npm":
+			return ["install", "-g", pkg];
+		default: // pnpm, bun
+			return ["add", "-g", pkg];
+	}
+}
+
+/**
  * Command + args to run a package's binary without a global install — the
  * `npx --no <pkg>` equivalent for each manager (`bun x`, `pnpm dlx`, `yarn dlx`).
  */

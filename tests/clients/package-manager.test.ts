@@ -25,6 +25,7 @@ import {
 	detectNodePackageManager,
 	execArgs,
 	formatRunScript,
+	globalInstallArgs,
 	installArgs,
 	pmBinary,
 	resolveNodePackageManager,
@@ -182,7 +183,24 @@ describe("command builders", () => {
 		).toEqual(["add", "--ignore-scripts", "biome"]);
 	});
 
+	it("globalInstallArgs spells the global install per manager", () => {
+		expect(globalInstallArgs("npm", "typescript-language-server")).toEqual([
+			"install", "-g", "typescript-language-server",
+		]);
+		expect(globalInstallArgs("pnpm", "typescript-language-server")).toEqual([
+			"add", "-g", "typescript-language-server",
+		]);
+		expect(globalInstallArgs("bun", "typescript-language-server")).toEqual([
+			"add", "-g", "typescript-language-server",
+		]);
+		// yarn classic uses `global add`.
+		expect(globalInstallArgs("yarn", "typescript-language-server")).toEqual([
+			"global", "add", "typescript-language-server",
+		]);
+	});
+
 	it("execArgs maps to each manager's package runner", () => {
+		setPlatform("linux"); // pin platform — the Windows spelling is asserted below
 		expect(execArgs("npm", "pkg")).toEqual({
 			command: "npx",
 			args: ["--no", "pkg"],
@@ -226,8 +244,10 @@ describe("allAvailableGlobalBinDirs", () => {
 			stderr: "",
 			status: 0,
 		});
+		// allAvailableGlobalBinDirs path.resolve()s each dir (dedup); resolve the
+		// expected too so the assertion holds on Windows (drive-prefixed) as well.
 		expect(await allAvailableGlobalBinDirs()).toEqual([
-			path.join("/usr/local", "bin"),
+			path.resolve(path.join("/usr/local", "bin")),
 		]);
 	});
 
@@ -238,7 +258,7 @@ describe("allAvailableGlobalBinDirs", () => {
 		process.env.BUN_INSTALL = "/opt/bun";
 		try {
 			expect(await allAvailableGlobalBinDirs()).toEqual([
-				path.join("/opt/bun", "bin"),
+				path.resolve(path.join("/opt/bun", "bin")),
 			]);
 			expect(safeSpawnAsync).not.toHaveBeenCalled();
 		} finally {
