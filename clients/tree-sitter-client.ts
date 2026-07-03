@@ -159,6 +159,39 @@ export class TreeSitterClient {
 		return undefined;
 	}
 
+	/**
+	 * The `grammars/` dir bundled inside the pi-lens package (the core grammars
+	 * shipped in the tarball, so common languages parse offline on every package
+	 * manager). Resolved from the package root; cached. Absent in a source
+	 * checkout where `prepare` hasn't populated it.
+	 */
+	private _bundledGrammarsDir?: string | null;
+	private bundledGrammarsDir(): string | undefined {
+		if (this._bundledGrammarsDir !== undefined) {
+			return this._bundledGrammarsDir ?? undefined;
+		}
+		try {
+			const dir = resolvePackagePath(import.meta.url, "grammars");
+			this._bundledGrammarsDir = fs.existsSync(dir) ? dir : null;
+		} catch {
+			this._bundledGrammarsDir = null;
+		}
+		return this._bundledGrammarsDir ?? undefined;
+	}
+
+	/**
+	 * Absolute path to `grammarFile` if it exists in the bundled core dir or the
+	 * postinstall/lazy dir (checked in that order), else undefined.
+	 */
+	private resolveGrammarFile(grammarFile: string): string | undefined {
+		for (const dir of [this.bundledGrammarsDir(), this.grammarsDir]) {
+			if (!dir) continue;
+			const candidate = path.join(dir, grammarFile);
+			if (fs.existsSync(candidate)) return candidate;
+		}
+		return undefined;
+	}
+
 	/** Find tree-sitter grammar directory */
 	private findGrammarsDir(): string {
 		const grammarsDir = this.resolveWebTreeSitterAsset("grammars");
@@ -224,7 +257,7 @@ export class TreeSitterClient {
 	 * throws.
 	 */
 	private async ensureGrammar(grammarFile: string): Promise<boolean> {
-		if (this.grammarsDir && fs.existsSync(path.join(this.grammarsDir, grammarFile))) {
+		if (this.resolveGrammarFile(grammarFile)) {
 			return true;
 		}
 		const inflight = this.grammarEnsurePromises.get(grammarFile);
@@ -337,14 +370,14 @@ export class TreeSitterClient {
 			return null;
 		}
 
-		let grammarPath = this.grammarsDir
-			? path.join(this.grammarsDir, grammarFile)
-			: "";
-		// Lazily fetch the grammar if the postinstall download was skipped
-		// (pnpm/bun). Only the language actually being parsed is fetched.
-		if (!grammarPath || !fs.existsSync(grammarPath)) {
+		// Look across the bundled core `grammars/` dir and the postinstall/lazy
+		// dir. Lazily fetch only if the grammar is in neither (pnpm/bun skip
+		// postinstall; the long-tail grammars aren't bundled). Only the language
+		// actually being parsed is fetched.
+		let grammarPath = this.resolveGrammarFile(grammarFile);
+		if (!grammarPath) {
 			if (await this.ensureGrammar(grammarFile)) {
-				grammarPath = path.join(this.grammarsDir, grammarFile);
+				grammarPath = this.resolveGrammarFile(grammarFile);
 			}
 		}
 		this.dbg(
