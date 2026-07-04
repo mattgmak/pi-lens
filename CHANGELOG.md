@@ -8,6 +8,8 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Changed
 
+- **CLI tool resolution now finds binaries installed by any package manager, not just npm/PATH** (#375) — the shared `resolveLocalFirstAsync` helper (the runner fleet's "local `.bin` → global → `npx --no`" resolver) plus the per-tool resolvers for **biome** (`biome-client.ts`, `dispatch/runners/biome.ts`, `formatters.ts`), **prettier** (`formatters.ts`), **type-coverage**, **jscpd**, **madge** (`dependency-checker.ts`), **ast-grep** (`sg-runner.ts` + the shared `isSgAvailableAsync`), and the **test runners** (`test-runner-client.ts`) now check every installed manager's global bin dir (npm/pnpm/yarn/bun) by direct file lookup before falling back to `npx`. This finds tools installed via `pnpm add -g` / `bun add -g` (whose bin dirs are often off PATH) and survives PATH-cache staleness right after an `install -g`. Each site's existing `npx` fallback is unchanged — the lookup is purely additive, so no user ever gets a surprise `dlx` download. New `findGlobalBinary` / `findNodeToolBinary` helpers in `package-manager.ts`, which also de-duplicate the identical private lookup in `lsp/launch.ts`.
+
 ### Fixed
 
 ## [3.8.65] - 2026-07-04
