@@ -60,7 +60,8 @@ export function registerDefaultRunners(registry: RunnerRegistry): void {
 	registry.register(tsLspRunner); // TypeScript type-checking (priority 5) - fallback when --lens-lsp disabled
 	registry.register(pyrightRunner); // Python type-checking (priority 5) - fallback when --lens-lsp disabled
 	registry.register(biomeCheckJsonRunner); // Biome check with JSON output for diagnostic capture (priority 9)
-	// DISABLED in post-write dispatch - ast-grep-napi can crash. Enabled via /lens-booboo plan only.
+	// DISABLED in post-write dispatch - ast-grep-napi can crash. Runs in the
+	// project-wide pass via lens_diagnostics mode=full (refreshRunners) instead.
 	registry.register(astGrepNapiRunner); // TS/JS structural analysis via NAPI (priority 15, post-write disabled)
 	registry.register(biomeRunner); // Biome formatting/linting (priority 10)
 	registry.register(treeSitterRunner); // Tree-sitter structural analysis (priority 14)

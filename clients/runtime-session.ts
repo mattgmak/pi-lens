@@ -52,7 +52,6 @@ import {
 } from "./startup-scan.js";
 import type { TestRunnerClient } from "./test-runner-client.js";
 import type { TodoScanner } from "./todo-scanner.js";
-import type { TypeCoverageClient } from "./type-coverage-client.js";
 
 interface SessionStartDeps {
 	ctxCwd?: string;
@@ -73,7 +72,6 @@ interface SessionStartDeps {
 	govulncheckClient: GovulncheckClient;
 	gitleaksClient: GitleaksClient;
 	trivyClient: TrivyClient;
-	typeCoverageClient: TypeCoverageClient;
 	depChecker: DependencyChecker;
 	testRunnerClient: TestRunnerClient;
 	goClient: GoClient;
@@ -1040,7 +1038,6 @@ export async function handleSessionStart(
 		runtime,
 		metricsClient,
 		cacheManager,
-		typeCoverageClient: _typeCoverageClient,
 		testRunnerClient,
 		goClient,
 		rustClient,

@@ -841,7 +841,7 @@ export async function dispatchForFile(
 	const coverageNotice = buildCoverageNotice(ctx, runnerLatencies);
 
 	// Format output — only blocking issues shown inline
-	// Warnings tracked but not shown (noise) — surfaced via /lens-booboo
+	// Warnings tracked but not shown (noise) — surfaced via lens_diagnostics
 	const blockerOutput = formatDiagnostics(inlineBlockers, "blocking");
 	let output = blockerOutput;
 	output += formatDiagnostics(inlineFixed, "fixed");

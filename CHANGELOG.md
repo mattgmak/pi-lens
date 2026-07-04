@@ -4,6 +4,10 @@ All notable changes to pi-lens will be documented in this file.
 
 ## [Unreleased]
 
+### Removed
+
+- **The `/lens-booboo` command is gone** — its full-codebase review (design smells, complexity, dead code, duplicates, circular deps, secrets, vulns) is now available through the normal diagnostic surface: **`lens_diagnostics mode=full refreshRunners=all`**, which folds in the same heavyweight analyzers via the extractor registry. Also removed the dormant `TypeCoverageClient` (its only caller was `/lens-booboo`; it was never run on the normal path and is TS-only, redundant with LSP strict-mode + biome). The `--lens-guard` commit-block message and `/lens-tdi` now point to `lens_diagnostics` instead. (`FULL_LINT_PLANS`/`fullOnlyGroups` in `dispatch/plan.ts` are now dormant — orphaned by the removal, slated for a follow-up cleanup.)
+
 ### Added
 
 - **`lens_diagnostics mode=full` now surfaces the heavyweight project analyzers via an extractor registry** — previously only knip crossed from the heavyweight analyzers into the diagnostic surface; the rest reached the agent only via next-turn context injection. New `project-diagnostics/extractors.ts` registry maps each analyzer's **cached** result to per-file `ProjectDiagnostic`s through pure `runner-adapters/*` functions (mirroring `knip.ts`): **jscpd** copy-paste (a clone → a diagnostic on **both** ends, each naming the other span), **madge** circular deps (a cycle → one on **each** participating file), **gitleaks** secrets (→ **blocking**), **govulncheck** reachable Go CVEs (anchored at the first traced source frame), **trivy** dependency CVEs (anchored at the manifest), and **dead-code** (vulture/Python — unused symbols; unlisted deps → **blocking**). **Cache-only, never re-launched:** `mode=full` reads each analyzer's session-start cache and folds the results in — it never spawns a scan, so it can't relaunch or contend with the background runs (which share a global abort signal). Adding a new analyzer is now one adapter + one registry row. Included when `refreshRunners` is `cached`/`cheap`/`all`.
