@@ -10,6 +10,8 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Fixed
 
+- **Full-scan progress bar now actually renders** — the progress bar added in 3.8.64 was computed and streamed to the tool's `onUpdate`, but never displayed: `lens_diagnostics`/`lsp_diagnostics` define a custom `renderResult` (`compactRenderResult`), and the pi host renders a partial update through that renderer, which drove its summary off structured `details` and ignored the progress text in `content`. The summarizers now detect a streaming progress partial (`details.phase === "scanning"`, via the new `scanningSummaryLine` helper) and show the bar (`Scanning… [████░░░░░░] 62/123 (50%)`) during the scan, falling back to the normal diagnostic summary on completion. Also ran `npm pkg fix` to drop the `./` prefix from the `bin` paths, silencing an npm publish auto-correct warning (the published bins were already correct).
+
 ## [3.8.64] - 2026-07-04
 
 ### Added

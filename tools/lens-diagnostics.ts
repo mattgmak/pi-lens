@@ -36,7 +36,7 @@ import {
 	reconcileStaleWidgetFiles,
 	type WidgetDiagnostic,
 } from "../clients/widget-state.js";
-import { makeProgressReporter } from "./scan-progress.js";
+import { makeProgressReporter, scanningSummaryLine } from "./scan-progress.js";
 
 // The widget state exposes the full per-file diagnostic set; this is the tool's
 // own generous display budget per file (independent of the TUI's 12 cap), to
@@ -108,6 +108,9 @@ export function createLensDiagnosticsTool(
 			"Use lens_diagnostics mode=all to verify no blocking errors remain; use mode=full for expensive project-wide checks",
 		renderResult: compactRenderResult<{
 			mode?: string;
+			phase?: string;
+			completed?: number;
+			total?: number;
 			actionableWarnings?: number;
 			qualityIssues?: number;
 			projectDiagnostics?: number;
@@ -117,6 +120,11 @@ export function createLensDiagnosticsTool(
 			totalErrors?: number;
 			totalWarnings?: number;
 		}>(({ details, args, isError, text }) => {
+			// Streaming progress partials render the live bar (see scanningSummaryLine)
+			// instead of the details-driven summary, which would show "0 diagnostics"
+			// mid-scan.
+			const scanning = scanningSummaryLine(details, text);
+			if (scanning) return scanning;
 			const mode =
 				details?.mode ?? (typeof args.mode === "string" ? args.mode : "delta");
 			if (isError) {
