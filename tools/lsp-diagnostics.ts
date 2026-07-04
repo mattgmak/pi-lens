@@ -13,6 +13,7 @@ import {
 	isExcludedDirName,
 } from "../clients/file-utils.js";
 import { getLSPService } from "../clients/lsp/index.js";
+import { combineAbortSignals } from "../clients/deadline-utils.js";
 import type { LSPDiagnostic } from "../clients/lsp/client.js";
 import { baseName, compactRenderResult } from "./render-compact.js";
 
@@ -75,6 +76,7 @@ type LspHealthLike = {
 type BatchOptions = {
 	concurrency: number;
 	waitMs?: number;
+	signal?: AbortSignal;
 };
 
 type FileDiag = {
@@ -130,6 +132,7 @@ async function mapWithConcurrency<T, R>(
 	items: T[],
 	concurrency: number,
 	mapper: (item: T, index: number) => Promise<R>,
+	signal?: AbortSignal,
 ): Promise<R[]> {
 	const results: R[] = [];
 	let nextIndex = 0;
@@ -137,6 +140,9 @@ async function mapWithConcurrency<T, R>(
 	await Promise.all(
 		Array.from({ length: workers }, async () => {
 			while (true) {
+				// Honor cancellation (Escape / turn abort): stop pulling new items
+				// rather than grind the whole batch. Completed entries are returned.
+				if (signal?.aborted) return;
 				const index = nextIndex;
 				nextIndex += 1;
 				if (index >= items.length) return;
@@ -268,10 +274,13 @@ export function createLspDiagnosticsTool() {
 		async execute(
 			_toolCallId: string,
 			params: Record<string, unknown>,
-			_signal: AbortSignal,
+			_signal: AbortSignal | undefined,
 			_onUpdate: unknown,
-			ctx: { cwd?: string },
+			ctx: { cwd?: string; signal?: AbortSignal },
 		) {
+			// Escape aborts the turn via ctx.signal; honor both it and the tool-call
+			// signal so a batch/directory scan cancels rather than grinding on.
+			const signal = combineAbortSignals(_signal, ctx.signal);
 			const typedParams = params as {
 				path?: string;
 				paths?: string[];
@@ -319,6 +328,7 @@ export function createLspDiagnosticsTool() {
 				return runBatchFileDiagnostics(absPaths, severity, lspService, {
 					concurrency,
 					waitMs,
+					signal,
 				});
 			}
 
@@ -356,6 +366,7 @@ export function createLspDiagnosticsTool() {
 				return runDirectoryDiagnostics(absPath, severity, lspService, {
 					concurrency,
 					waitMs,
+					signal,
 				});
 			}
 			return runFileDiagnostics(absPath, severity, lspService, waitMs);
@@ -526,6 +537,7 @@ async function runBatchFileDiagnostics(
 		options.concurrency,
 		(file) =>
 			collectFileDiagnosticResult(file, severity, lspService, options.waitMs),
+		options.signal,
 	);
 	const fileErrors = results.flatMap((result) =>
 		result.error ? [result.error] : [],
@@ -631,6 +643,7 @@ async function runDirectoryDiagnostics(
 		options.concurrency,
 		(file) =>
 			collectFileDiagnosticResult(file, severity, lspService, options.waitMs),
+		options.signal,
 	);
 	const fileErrors = results.flatMap((result) =>
 		result.error ? [result.error] : [],

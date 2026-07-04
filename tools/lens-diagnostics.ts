@@ -12,6 +12,7 @@
 import * as path from "node:path";
 import { Type } from "../clients/deps/typebox.js";
 import { compactRenderResult } from "./render-compact.js";
+import { combineAbortSignals } from "../clients/deadline-utils.js";
 import { getProjectIgnoreMatcher } from "../clients/file-utils.js";
 import { getLSPService } from "../clients/lsp/index.js";
 import type { LSPDiagnostic } from "../clients/lsp/client.js";
@@ -53,6 +54,16 @@ type WorkspaceLspDiagnosticResult = {
 	diagnostics: LSPDiagnostic[];
 	count?: number;
 };
+
+// Wall-clock ceiling for the whole mode=full scan. Even with per-file budgets
+// and abort-signal honoring, a pathological state (a language server hanging on
+// spawn/initialize across many files) could otherwise stall the tool
+// indefinitely — an unattended session was observed hung for ~8h. This hard cap
+// aborts the scan so it always returns (partial) rather than never. Env-tunable.
+const FULL_SCAN_WALL_CLOCK_MS = (() => {
+	const raw = Number(process.env.PI_LENS_LENS_DIAGNOSTICS_FULL_TIMEOUT_MS);
+	return Number.isFinite(raw) && raw > 0 ? raw : 180_000; // 3 min default
+})();
 
 export function createLensDiagnosticsTool(
 	cacheManager: CacheManager,
@@ -165,9 +176,9 @@ export function createLensDiagnosticsTool(
 		async execute(
 			_toolCallId: string,
 			params: Record<string, unknown>,
-			signal: AbortSignal,
+			signal: AbortSignal | undefined,
 			_onUpdate: unknown,
-			ctx: { cwd?: string },
+			ctx: { cwd?: string; signal?: AbortSignal },
 		) {
 			const mode = (params.mode as string | undefined) ?? "delta";
 			const severity = (params.severity as string | undefined) ?? "all";
@@ -180,6 +191,12 @@ export function createLensDiagnosticsTool(
 			const maxLspFiles = parsePositiveInt(params.maxLspFiles);
 			const cwd = ctx.cwd ?? getCwd();
 
+			// Escape aborts the agent *turn*, which fires ctx.signal (the turn-wired
+			// abort); the positional signal is the tool-call signal. A registered
+			// extension tool only reliably sees the turn abort via ctx.signal, so honor
+			// BOTH — else a long mode=full scan ignores Escape (the reported bug).
+			const abortSignal = combineAbortSignals(signal, ctx.signal);
+
 			// Reflect the agent's just-made fixes before reporting: flush pending
 			// per-edit dispatches (re-records fixed files), then drop entries whose
 			// file changed on disk afterwards / was deleted (stale, e.g. external
@@ -191,11 +208,17 @@ export function createLensDiagnosticsTool(
 				return formatAllMode(cwd, severity, undefined, undefined, staleDropped);
 			}
 			if (mode === "full") {
+				// Fold a hard wall-clock ceiling into the abort signal so the scan
+				// always terminates (partial) even if a hung server would otherwise
+				// stall it forever. AbortSignal.timeout aborts with a TimeoutError.
+				const ceiling = AbortSignal.timeout(FULL_SCAN_WALL_CLOCK_MS);
+				const fullSignal = combineAbortSignals(abortSignal, ceiling);
 				return formatFullMode(cwd, severity, getLspService(), {
 					refreshRunners,
 					maxProjectFiles,
 					maxLspFiles,
-					signal,
+					signal: fullSignal,
+					wallClockMs: FULL_SCAN_WALL_CLOCK_MS,
 				});
 			}
 			return formatDeltaMode(cacheManager, cwd, severity);
@@ -592,6 +615,7 @@ async function formatFullMode(
 		maxProjectFiles?: number;
 		maxLspFiles?: number;
 		signal?: AbortSignal;
+		wallClockMs?: number;
 	} = {},
 ): Promise<{ content: [{ type: "text"; text: string }]; details: object }> {
 	const runWorkspaceDiagnostics = lspService.runWorkspaceDiagnostics;
@@ -657,17 +681,23 @@ async function formatFullMode(
 						turnIndex: projectDelta.turnIndex,
 					},
 	});
-	// Cancelled mid-scan: the results above are whatever completed before the
-	// abort. Tell the agent so it doesn't read a partial sweep as "clean" (#341).
+	// Stopped mid-scan: the results above are whatever completed before the abort.
+	// Tell the agent so it doesn't read a partial sweep as "clean" (#341). The
+	// abort is either a user/turn cancel (Escape) or the wall-clock ceiling firing
+	// (AbortSignal.timeout → TimeoutError), which guarantees the scan can't hang
+	// indefinitely — distinguish them so the agent knows whether to just re-run.
 	if (aborted) {
-		const note =
-			"\n\n⚠ Scan cancelled before completion — results are partial. " +
-			"Re-run with a smaller maxLspFiles to finish within budget.";
+		const timedOut =
+			(signal as (AbortSignal & { reason?: { name?: string } }) | undefined)
+				?.reason?.name === "TimeoutError";
+		const note = timedOut
+			? `\n\n⚠ Scan exceeded its ${Math.round((options.wallClockMs ?? 0) / 1000)}s time budget and was stopped — results are partial. ` +
+				"Narrow it with maxLspFiles, or raise PI_LENS_LENS_DIAGNOSTICS_FULL_TIMEOUT_MS."
+			: "\n\n⚠ Scan cancelled before completion — results are partial. " +
+				"Re-run with a smaller maxLspFiles to finish within budget.";
 		return {
-			content: [
-				{ type: "text" as const, text: result.content[0].text + note },
-			],
-			details: result.details,
+			content: [{ type: "text" as const, text: result.content[0].text + note }],
+			details: { ...result.details, timedOut },
 		};
 	}
 	return result;

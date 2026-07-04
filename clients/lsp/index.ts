@@ -20,6 +20,7 @@ import {
 } from "../file-utils.js";
 import { recordLsp } from "../widget-state.js";
 import { logLatency } from "../latency-logger.js";
+import { withDeadline } from "../deadline-utils.js";
 import { normalizeMapKey, uriToPath } from "../path-utils.js";
 import type {
 	LSPClientInfo,
@@ -1845,8 +1846,30 @@ export class LSPService {
 				? Math.floor(options.maxFiles)
 				: getMaxWorkspaceDiagnosticFiles();
 		const files = await collectWorkspaceDiagnosticFiles(root, maxFiles, signal);
+		// Per-file wall-clock: a language server that hangs during spawn/initialize
+		// would otherwise park a worker on `touchFile` FOREVER (the per-edit
+		// diagnostic wait is bounded, but client acquisition here is not) — the root
+		// of an observed multi-hour hang. Budget each file so the worker always
+		// returns to the loop (and its abort check). Env-tunable.
+		const perFileMs = (() => {
+			const raw = Number(process.env.PI_LENS_LSP_WORKSPACE_PER_FILE_MS);
+			return Number.isFinite(raw) && raw > 0 ? raw : 15_000;
+		})();
 		const results: LSPWorkspaceDiagnosticResult[] = new Array(files.length);
 		let nextIndex = 0;
+		let completed = 0;
+		let timedOutFiles = 0;
+		let lastHeartbeat = Date.now();
+		// Start marker: without this a hang leaves no trace that the sweep even
+		// began (the completion log below never fires). Per-file `lsp_touch_file`
+		// phases + these heartbeats let a hang be bracketed to a file/time.
+		logLatency({
+			type: "phase",
+			phase: "lsp_workspace_diagnostics_start",
+			filePath: root,
+			durationMs: 0,
+			metadata: { fileCount: files.length, maxFiles, perFileMs },
+		});
 		const workers = Math.min(WORKSPACE_DIAGNOSTICS_CONCURRENCY, files.length);
 		await Promise.all(
 			Array.from({ length: workers }, async () => {
@@ -1861,12 +1884,19 @@ export class LSPService {
 					const filePath = files[index];
 					try {
 						const content = await nodeFs.promises.readFile(filePath, "utf-8");
-						const diagnostics = await this.touchFile(filePath, content, {
-							diagnostics: "document",
-							collectDiagnostics: true,
-							clientScope: "all",
-							source: "lens_diagnostics_full",
-						});
+						// onTimeout:"undefined" so a hung file yields no diagnostics and the
+						// worker moves on; a real touchFile rejection still propagates to the
+						// catch below and is recorded as an error.
+						const diagnostics = await withDeadline(
+							this.touchFile(filePath, content, {
+								diagnostics: "document",
+								collectDiagnostics: true,
+								clientScope: "all",
+								source: "lens_diagnostics_full",
+							}),
+							{ ms: perFileMs, onTimeout: "undefined" },
+						);
+						if (diagnostics === undefined) timedOutFiles += 1;
 						results[index] = {
 							filePath,
 							diagnostics: diagnostics ?? [],
@@ -1879,6 +1909,24 @@ export class LSPService {
 							count: 0,
 							error: err instanceof Error ? err.message : String(err),
 						};
+					}
+					completed += 1;
+					// Time-based heartbeat (every ~10s): a hang shows the last heartbeat
+					// then silence, so latency.log pinpoints how far it got.
+					if (Date.now() - lastHeartbeat >= 10_000) {
+						lastHeartbeat = Date.now();
+						logLatency({
+							type: "phase",
+							phase: "lsp_workspace_diagnostics_progress",
+							filePath: root,
+							durationMs: Date.now() - startedAt,
+							metadata: {
+								completed,
+								total: files.length,
+								timedOutFiles,
+								aborted: signal?.aborted ?? false,
+							},
+						});
 					}
 				}
 			}),
@@ -1897,6 +1945,7 @@ export class LSPService {
 				),
 				concurrency: WORKSPACE_DIAGNOSTICS_CONCURRENCY,
 				maxFiles,
+				timedOutFiles,
 				aborted: signal?.aborted ?? false,
 			},
 		});
