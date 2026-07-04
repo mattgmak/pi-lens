@@ -91,10 +91,17 @@ describe("runWorkspaceDiagnostics — per-server serialization (#387)", () => {
 			return clients.get(serverId);
 		});
 
+		const progress: Array<[number, number]> = [];
 		const { LSPService } = await import("../../../clients/lsp/index.js");
-		const results = await new LSPService().runWorkspaceDiagnostics(tmp);
+		const results = await new LSPService().runWorkspaceDiagnostics(tmp, {
+			onProgress: (completed, total) => progress.push([completed, total]),
+		});
 
 		expect(results.length).toBe(6);
+		// Progress streamed once per file, monotonically increasing, ending at 6/6.
+		expect(progress.length).toBe(6);
+		expect(progress.map(([c]) => c)).toEqual([1, 2, 3, 4, 5, 6]);
+		expect(progress.at(-1)).toEqual([6, 6]);
 		// Serial within each server: at most one in-flight touch at a time.
 		expect(maxPerServer.get("python")).toBe(1);
 		expect(maxPerServer.get("typescript")).toBe(1);

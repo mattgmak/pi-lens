@@ -1860,7 +1860,11 @@ export class LSPService {
 	 */
 	async runWorkspaceDiagnostics(
 		cwd: string,
-		options: { maxFiles?: number; signal?: AbortSignal } = {},
+		options: {
+			maxFiles?: number;
+			signal?: AbortSignal;
+			onProgress?: (completed: number, total: number) => void;
+		} = {},
 	): Promise<LSPWorkspaceDiagnosticResult[]> {
 		const startedAt = Date.now();
 		const root = path.resolve(cwd);
@@ -1954,6 +1958,9 @@ export class LSPService {
 				});
 			}
 			completed += 1;
+			// User-facing progress (streamed to the tool's onUpdate). Per-file so the
+			// bar moves; the tool throttles the actual UI writes.
+			options.onProgress?.(completed, files.length);
 			// Time-based heartbeat (every ~10s): a hang shows the last heartbeat
 			// then silence, so latency.log pinpoints how far it got.
 			if (Date.now() - lastHeartbeat >= 10_000) {
