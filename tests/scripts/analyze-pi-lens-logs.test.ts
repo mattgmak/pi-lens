@@ -181,6 +181,18 @@ describe("analyze-pi-lens-logs.mjs", () => {
 			.join("\n");
 		fs.writeFileSync(path.join(root, "ast-grep-tools.log"), `${astGrep}\n`);
 
+		// sessionstart.log — background-task timings in the current "runMs=" format
+		// (one over the 3000ms threshold, one under) so the slow-background-tasks
+		// smell is exercised against the real shape, not the stale "(<n>ms)" one.
+		const sessionstart = [
+			"session_start cwd: /proj/a",
+			"session_start task call-graph: success runMs=28469 queuedMs=245",
+			"session_start task codebase-model: success runMs=8 queuedMs=235",
+		]
+			.map((m) => `[${NOW}] ${m}`)
+			.join("\n");
+		fs.writeFileSync(path.join(root, "sessionstart.log"), `${sessionstart}\n`);
+
 		report = runReport(root);
 	});
 
@@ -226,6 +238,16 @@ describe("analyze-pi-lens-logs.mjs", () => {
 		expect(report.actionable.autoFixEligible).toBe(1);
 		expect(report.actionable.lspSource).toEqual({ fresh: 1 });
 		expect(report.actionable.fileSkipReasons).toEqual({ no_lsp_support: 1 });
+	});
+
+	it("flags slow background tasks in the current runMs= log format", () => {
+		const smell = report.smells.find(
+			(s: any) => s.id === "slow-background-tasks",
+		);
+		// call-graph ran 28469ms (>= 3000 threshold); codebase-model 8ms excluded.
+		expect(smell?.count).toBe(1);
+		expect(smell.examples[0].task).toBe("call-graph");
+		expect(smell.examples[0].durationMs).toBe(28469);
 	});
 
 	it("surfaces incomplete + timed-out full LSP workspace sweeps", () => {

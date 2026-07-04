@@ -577,9 +577,12 @@ async function analyzeSessionStart(files, state) {
 				);
 			}
 
-			const task = /session_start task ([^:]+): success \((\d+)ms\)/.exec(
-				message,
-			);
+			// Runtime logs "success runMs=<n> queuedMs=<n>"; older logs used
+			// "success (<n>ms)". Match both so a format drift can't silently zero
+			// this smell again (it did: the `(<n>ms)` regex matched 0 of ~2k rows).
+			const task =
+				/session_start task ([^:]+): success runMs=(\d+)/.exec(message) ??
+				/session_start task ([^:]+): success \((\d+)ms\)/.exec(message);
 			if (task && Number(task[2]) >= thresholds.backgroundSlowMs) {
 				state.smellTotals.inc("slow-background-tasks");
 				pushTop(
