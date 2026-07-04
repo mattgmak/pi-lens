@@ -91,14 +91,102 @@ describe("runWorkspaceDiagnostics — per-server serialization (#387)", () => {
 			return clients.get(serverId);
 		});
 
+		const progress: Array<[number, number]> = [];
 		const { LSPService } = await import("../../../clients/lsp/index.js");
-		const results = await new LSPService().runWorkspaceDiagnostics(tmp);
+		const results = await new LSPService().runWorkspaceDiagnostics(tmp, {
+			onProgress: (completed, total) => progress.push([completed, total]),
+		});
 
 		expect(results.length).toBe(6);
+		// Progress streamed once per file, monotonically increasing, ending at 6/6.
+		expect(progress.length).toBe(6);
+		expect(progress.map(([c]) => c)).toEqual([1, 2, 3, 4, 5, 6]);
+		expect(progress.at(-1)).toEqual([6, 6]);
 		// Serial within each server: at most one in-flight touch at a time.
 		expect(maxPerServer.get("python")).toBe(1);
 		expect(maxPerServer.get("typescript")).toBe(1);
 		// But the two distinct servers ran concurrently.
 		expect(crossServerOverlap).toBe(true);
+	});
+
+	it("uses one workspace/diagnostic pull per server when enabled — no per-file opens (#387 Item 2)", async () => {
+		process.env.PI_LENS_LSP_WORKSPACE_PULL = "1";
+		try {
+			for (const n of ["a.py", "b.py", "c.py"])
+				fs.writeFileSync(path.join(tmp, n), "x\n");
+			const pyServer = makeServer("python", ".py");
+			getServersForFileWithConfig.mockImplementation((fp: string) =>
+				fp.endsWith(".py") ? [pyServer] : [],
+			);
+			const notifyOpen = vi.fn(async () => {});
+			const requestWorkspaceDiagnostics = vi.fn(async () => [
+				// a.py has a diagnostic; b.py/c.py are absent → reported clean.
+				{ filePath: path.join(tmp, "a.py"), diagnostics: [{ message: "boom" }] },
+			]);
+			createLSPClient.mockResolvedValue({
+				isAlive: () => true,
+				shutdown: async () => {},
+				serverId: "python",
+				getWorkspaceDiagnosticsSupport: () => ({
+					advertised: true,
+					mode: "pull" as const,
+					workspaceDiagnostics: true,
+					diagnosticProviderKind: "object",
+				}),
+				getOperationSupport: () => ({}),
+				notify: { open: notifyOpen },
+				requestWorkspaceDiagnostics,
+				waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
+				getDiagnostics: vi.fn(() => []),
+			});
+
+			const { LSPService } = await import("../../../clients/lsp/index.js");
+			const results = await new LSPService().runWorkspaceDiagnostics(tmp);
+
+			// One pull for the whole group; the per-file open path was skipped.
+			expect(requestWorkspaceDiagnostics).toHaveBeenCalledTimes(1);
+			expect(notifyOpen).not.toHaveBeenCalled();
+			expect(results.length).toBe(3);
+			const byName = (name: string) =>
+				results.find((r) => r.filePath.endsWith(name));
+			expect(byName("a.py")?.count).toBe(1);
+			expect(byName("b.py")?.count).toBe(0); // absent from report = clean
+			expect(byName("c.py")?.count).toBe(0);
+		} finally {
+			delete process.env.PI_LENS_LSP_WORKSPACE_PULL;
+		}
+	});
+
+	it("falls back to per-file opens when the pull is unsupported (default, flag off)", async () => {
+		delete process.env.PI_LENS_LSP_WORKSPACE_PULL;
+		fs.writeFileSync(path.join(tmp, "a.py"), "x\n");
+		const pyServer = makeServer("python", ".py");
+		getServersForFileWithConfig.mockImplementation((fp: string) =>
+			fp.endsWith(".py") ? [pyServer] : [],
+		);
+		const notifyOpen = vi.fn(async () => {});
+		const requestWorkspaceDiagnostics = vi.fn();
+		createLSPClient.mockResolvedValue({
+			isAlive: () => true,
+			shutdown: async () => {},
+			serverId: "python",
+			getWorkspaceDiagnosticsSupport: () => ({
+				advertised: true,
+				mode: "pull" as const,
+				workspaceDiagnostics: true,
+				diagnosticProviderKind: "object",
+			}),
+			getOperationSupport: () => ({}),
+			notify: { open: notifyOpen },
+			requestWorkspaceDiagnostics,
+			waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
+			getDiagnostics: vi.fn(() => []),
+		});
+
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		await new LSPService().runWorkspaceDiagnostics(tmp);
+
+		expect(requestWorkspaceDiagnostics).not.toHaveBeenCalled();
+		expect(notifyOpen).toHaveBeenCalled();
 	});
 });

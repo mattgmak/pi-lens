@@ -36,6 +36,7 @@ import {
 	reconcileStaleWidgetFiles,
 	type WidgetDiagnostic,
 } from "../clients/widget-state.js";
+import { makeProgressReporter } from "./scan-progress.js";
 
 // The widget state exposes the full per-file diagnostic set; this is the tool's
 // own generous display budget per file (independent of the TUI's 12 cap), to
@@ -45,9 +46,14 @@ const MAX_DIAGNOSTICS_PER_FILE = 50;
 type LSPServiceLike = ReturnType<typeof getLSPService> & {
 	runWorkspaceDiagnostics?: (
 		cwd: string,
-		options?: { maxFiles?: number; signal?: AbortSignal },
+		options?: {
+			maxFiles?: number;
+			signal?: AbortSignal;
+			onProgress?: (completed: number, total: number) => void;
+		},
 	) => Promise<WorkspaceLspDiagnosticResult[]>;
 };
+
 
 type WorkspaceLspDiagnosticResult = {
 	filePath: string;
@@ -177,7 +183,7 @@ export function createLensDiagnosticsTool(
 			_toolCallId: string,
 			params: Record<string, unknown>,
 			signal: AbortSignal | undefined,
-			_onUpdate: unknown,
+			onUpdate: unknown,
 			ctx: { cwd?: string; signal?: AbortSignal },
 		) {
 			const mode = (params.mode as string | undefined) ?? "delta";
@@ -213,12 +219,16 @@ export function createLensDiagnosticsTool(
 				// stall it forever. AbortSignal.timeout aborts with a TimeoutError.
 				const ceiling = AbortSignal.timeout(FULL_SCAN_WALL_CLOCK_MS);
 				const fullSignal = combineAbortSignals(abortSignal, ceiling);
+				// Stream a throttled progress bar: the full scan is opaque for minutes
+				// otherwise.
+				const onProgress = makeProgressReporter(onUpdate);
 				return formatFullMode(cwd, severity, getLspService(), {
 					refreshRunners,
 					maxProjectFiles,
 					maxLspFiles,
 					signal: fullSignal,
 					wallClockMs: FULL_SCAN_WALL_CLOCK_MS,
+					onProgress,
 				});
 			}
 			return formatDeltaMode(cacheManager, cwd, severity);
@@ -616,6 +626,7 @@ async function formatFullMode(
 		maxLspFiles?: number;
 		signal?: AbortSignal;
 		wallClockMs?: number;
+		onProgress?: (completed: number, total: number) => void;
 	} = {},
 ): Promise<{ content: [{ type: "text"; text: string }]; details: object }> {
 	const runWorkspaceDiagnostics = lspService.runWorkspaceDiagnostics;
@@ -636,6 +647,7 @@ async function formatFullMode(
 		runWorkspaceDiagnostics.call(lspService, cwd, {
 			maxFiles: options.maxLspFiles,
 			signal,
+			onProgress: options.onProgress,
 		}),
 		getProjectDiagnosticsSnapshotForFullMode(cwd, options),
 	]);
