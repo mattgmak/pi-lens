@@ -772,10 +772,10 @@ async function ensureTsFacts(
 				import("../dispatch/facts/import-facts.js"),
 				import("../dispatch/facts/function-facts.js"),
 			]);
-		// importFactProvider.run is async (tree-sitter parse) — must be awaited so
-		// file.imports/file.reexports are populated before the graph reads them.
+		// Both providers are async (tree-sitter parse) — await so file.imports /
+		// file.reexports / file.functionSummaries are populated before the graph reads them.
 		await importFactProvider.run(ctx, facts);
-		functionFactProvider.run(ctx, facts);
+		await functionFactProvider.run(ctx, facts);
 	} catch (err) {
 		console.error(
 			`[pi-lens] review-graph TypeScript facts disabled (degraded mode): ${

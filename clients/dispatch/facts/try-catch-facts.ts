@@ -1,5 +1,5 @@
-import { ts } from "../../deps/typescript.js";
 import type { FactProvider } from "../fact-provider-types.js";
+import { firstChildOfType, parseFactTree, walk } from "./tree-sitter-facts.js";
 
 export interface TryCatchSummary {
   line: number;
@@ -78,100 +78,87 @@ export const tryCatchFactProvider: FactProvider = {
   appliesTo(ctx) {
     return /\.tsx?$/.test(ctx.filePath);
   },
-  run(ctx, store) {
+  async run(ctx, store) {
     const content = store.getFileFact<string>(ctx.filePath, "file.content");
     if (!content) {
       store.setFileFact(ctx.filePath, "file.tryCatchSummaries", []);
       return;
     }
 
-    const sourceFile = ts.createSourceFile(
-      ctx.filePath,
-      content,
-      ts.ScriptTarget.Latest,
-      true,
-      ts.ScriptKind.TSX,
-    );
+    const root = await parseFactTree(ctx.filePath, content);
+    if (!root) {
+      store.setFileFact(ctx.filePath, "file.tryCatchSummaries", []);
+      return;
+    }
 
     const summaries: TryCatchSummary[] = [];
 
-    function visit(node: ts.Node): void {
-      if (ts.isTryStatement(node)) {
-        const tryText = node.tryBlock.getText(sourceFile);
-        const tryResolvesLocalValues = detectTryResolvesLocalValues(tryText);
-        const boundaryCategory = detectBoundaryCategory(tryText);
+    walk(root, (node) => {
+      if (node.type !== "try_statement") return;
+      // The direct `statement_block` child is the try body; the catch/finally
+      // blocks are nested inside their own clauses (not direct children).
+      const tryBlock = firstChildOfType(node, "statement_block");
+      const catchClause = firstChildOfType(node, "catch_clause");
+      if (!tryBlock || !catchClause) return;
 
-        if (node.catchClause) {
-          const clause = node.catchClause;
-          const pos = sourceFile.getLineAndCharacterOfPosition(
-            clause.getStart(sourceFile),
-          );
+      const tryText = tryBlock.text;
+      const tryResolvesLocalValues = detectTryResolvesLocalValues(tryText);
+      const boundaryCategory = detectBoundaryCategory(tryText);
 
-          let catchParam: string | null = null;
-          if (clause.variableDeclaration) {
-            const name = clause.variableDeclaration.name;
-            if (ts.isIdentifier(name)) {
-              catchParam = name.text;
-            }
-          }
+      // Catch binding: `catch (e)` → identifier param; `catch {}` or a destructuring
+      // pattern → null (matching the old `ts.isIdentifier` gate).
+      const paramNode = firstChildOfType(catchClause, "identifier");
+      const catchParam = paramNode ? paramNode.text : null;
 
-          const bodyText = clause.block
-            .getText(sourceFile)
-            .replace(/^\{/, "")
-            .replace(/\}$/, "")
-            .trim();
+      const catchBody = firstChildOfType(catchClause, "statement_block");
+      const bodyText = catchBody
+        ? catchBody.text.replace(/^\{/, "").replace(/\}$/, "").trim()
+        : "";
 
-          const isEmpty = isOnlyWhitespaceOrComments(bodyText);
-          const hasRethrow = /\bthrow\b/.test(bodyText);
-          const hasLogging =
-            /\bconsole\.(log|warn|error)\b/.test(bodyText) ||
-            /\blogger\./.test(bodyText);
+      const isEmpty = isOnlyWhitespaceOrComments(bodyText);
+      const hasRethrow = /\bthrow\b/.test(bodyText);
+      const hasLogging =
+        /\bconsole\.(log|warn|error)\b/.test(bodyText) ||
+        /\blogger\./.test(bodyText);
 
-          // Derived enrichment fields
-          const catchReturnsDefault = DEFAULT_VALUE_PATTERN.test(bodyText);
-          const catchReturnsStructuredError =
-            STRUCTURED_ERROR_PATTERN.test(bodyText);
-          const isDocumentedLocalFallback =
-            EXPLAINING_COMMENT_PATTERN.test(bodyText);
+      // Derived enrichment fields
+      const catchReturnsDefault = DEFAULT_VALUE_PATTERN.test(bodyText);
+      const catchReturnsStructuredError =
+        STRUCTURED_ERROR_PATTERN.test(bodyText);
+      const isDocumentedLocalFallback =
+        EXPLAINING_COMMENT_PATTERN.test(bodyText);
 
-          const catchLogsOnly =
-            hasLogging &&
-            !hasRethrow &&
-            !catchReturnsDefault &&
-            !catchReturnsStructuredError &&
-            !/\b(?:set|update|notify|emit|dispatch|resolve|reject)\b/.test(
-              bodyText,
-            );
+      const catchLogsOnly =
+        hasLogging &&
+        !hasRethrow &&
+        !catchReturnsDefault &&
+        !catchReturnsStructuredError &&
+        !/\b(?:set|update|notify|emit|dispatch|resolve|reject)\b/.test(bodyText);
 
-          // Filesystem existence probe: try reads a file/path, catch returns a default
-          const isFilesystemExistenceProbe =
-            boundaryCategory === "fs" &&
-            FS_PROBE_PATTERN.test(tryText) &&
-            catchReturnsDefault;
+      // Filesystem existence probe: try reads a file/path, catch returns a default
+      const isFilesystemExistenceProbe =
+        boundaryCategory === "fs" &&
+        FS_PROBE_PATTERN.test(tryText) &&
+        catchReturnsDefault;
 
-          summaries.push({
-            line: pos.line + 1,
-            column: pos.character + 1,
-            catchParam,
-            bodyText,
-            isEmpty,
-            hasRethrow,
-            hasLogging,
-            catchLogsOnly,
-            catchReturnsDefault,
-            catchReturnsStructuredError,
-            isDocumentedLocalFallback,
-            tryResolvesLocalValues,
-            isFilesystemExistenceProbe,
-            boundaryCategory,
-          });
-        }
-      }
+      summaries.push({
+        line: catchClause.startPosition.row + 1,
+        column: catchClause.startPosition.column + 1,
+        catchParam,
+        bodyText,
+        isEmpty,
+        hasRethrow,
+        hasLogging,
+        catchLogsOnly,
+        catchReturnsDefault,
+        catchReturnsStructuredError,
+        isDocumentedLocalFallback,
+        tryResolvesLocalValues,
+        isFilesystemExistenceProbe,
+        boundaryCategory,
+      });
+    });
 
-      ts.forEachChild(node, visit);
-    }
-
-    visit(sourceFile);
     store.setFileFact(ctx.filePath, "file.tryCatchSummaries", summaries);
   },
 };

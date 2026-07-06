@@ -1,9 +1,12 @@
 import { logLatency } from "../../latency-logger.js";
-import {
-	getSharedTreeSitterClient,
-	resolveTreeSitterLanguage,
-} from "../../tree-sitter-shared.js";
 import type { FactProvider } from "../fact-provider-types.js";
+import {
+	childrenOfType,
+	firstChildOfType,
+	parseFactTree,
+	type TsNode,
+	walk,
+} from "./tree-sitter-facts.js";
 
 export interface ImportEntry {
 	/** Module specifier, e.g. "node:fs", "./utils.js", "react" */
@@ -42,28 +45,8 @@ const JSTS_EXTS = new Set([
 	".cjs",
 ]);
 
-// biome-ignore lint/suspicious/noExplicitAny: web-tree-sitter node (see tree-sitter-client.ts)
-type TsNode = any;
-
 function stripQuotes(raw: string): string {
 	return raw.replace(/^["'`]+|["'`]+$/g, "");
-}
-
-function childrenOfType(node: TsNode, type: string): TsNode[] {
-	return (node.children ?? []).filter((c: TsNode) => c && c.type === type);
-}
-
-function firstChildOfType(node: TsNode, type: string): TsNode | undefined {
-	return (node.children ?? []).find((c: TsNode) => c && c.type === type);
-}
-
-/** Walk the whole tree, calling `visit` on every node (dynamic import()/require() and
- *  module.exports can be nested arbitrarily). */
-function walk(node: TsNode, visit: (n: TsNode) => void): void {
-	visit(node);
-	for (const child of node.children ?? []) {
-		if (child) walk(child, visit);
-	}
 }
 
 /** Parse a top-level `import_statement` node into an ImportEntry. */
@@ -145,22 +128,13 @@ export const importFactProvider: FactProvider = {
 			return;
 		}
 
-		const languageId = resolveTreeSitterLanguage(ctx.filePath);
-		const client = getSharedTreeSitterClient();
-		// init() lazily loads the grammar/wasm (memoized) and must run before
-		// parseFile — matches the runner/scanner/module-report/review-graph pattern.
-		const tree =
-			languageId && client && (await client.init())
-				? await client.parseFile(ctx.filePath, languageId, content)
-				: null;
-		if (!tree) {
-			// Grammar unavailable / parse failed / wasm aborted — degrade to empty
-			// (there is no typescript-compiler fallback by design, #402).
+		// Grammar unavailable / parse failed / wasm aborted — degrade to empty
+		// (there is no typescript-compiler fallback by design, #402).
+		const root = await parseFactTree(ctx.filePath, content);
+		if (!root) {
 			setEmpty();
 			return;
 		}
-
-		const root = tree.rootNode;
 
 		// --- module-type detection + static import/re-export node collection ---
 		let hasEsm = false;
