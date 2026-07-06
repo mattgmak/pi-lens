@@ -26,6 +26,7 @@
 		"selftest:install": "node scripts/install-selftest.mjs",
 		"check:lockfile": "node scripts/check-lockfile-sync.mjs",
 		"check:grammars": "node scripts/check-grammar-provenance.mjs",
+		"check:grammar-load": "node scripts/check-grammar-load.mjs",
 		"audit:tree-sitter": "node scripts/audit-tree-sitter-rules.mjs",
 		"audit:rule-catalog": "node scripts/validate-rule-catalog.mjs",
 		"audit:playground": "node scripts/playground-verify-rule.mjs",
