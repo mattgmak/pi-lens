@@ -1,5 +1,12 @@
-import { describe, expect, it, vi } from "vitest";
+import * as fs from "node:fs";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { TreeCache } from "../../clients/tree-sitter-cache.js";
+import { createTempFile, setupTestEnvironment } from "./test-utils.js";
+
+const cleanups: Array<() => void> = [];
+afterEach(() => {
+	while (cleanups.length) cleanups.pop()?.();
+});
 
 // web-tree-sitter Trees hold WASM-heap memory that JS GC does NOT reclaim — the
 // cache must call tree.delete() on every removal or it leaks (#417). These use
@@ -79,6 +86,38 @@ describe("TreeCache frees WASM trees on removal (#417)", () => {
 
 		expect(a.delete).toHaveBeenCalledTimes(1);
 		expect(b.delete).toHaveBeenCalledTimes(1);
+	});
+
+	it("frees the tree when the file changed on disk (mtime bump)", () => {
+		const env = setupTestEnvironment("pi-lens-tccache-mtime-");
+		cleanups.push(env.cleanup);
+		const src = "export const x = 1;\n";
+		const file = createTempFile(env.tmpDir, "m.ts", src);
+		const cache = new TreeCache(10);
+		const a = fakeTree();
+		cache.set(file, src, "typescript", a);
+
+		// Same content (hash matches) but a newer mtime ⇒ get() must invalidate+free.
+		const future = new Date(Date.now() + 5000);
+		fs.utimesSync(file, future, future);
+
+		expect(cache.get(file, src, "typescript")).toBeNull();
+		expect(a.delete).toHaveBeenCalledTimes(1);
+	});
+
+	it("frees the tree when the file was deleted on disk", () => {
+		const env = setupTestEnvironment("pi-lens-tccache-del-");
+		cleanups.push(env.cleanup);
+		const src = "export const y = 2;\n";
+		const file = createTempFile(env.tmpDir, "d.ts", src);
+		const cache = new TreeCache(10);
+		const a = fakeTree();
+		cache.set(file, src, "typescript", a);
+
+		fs.rmSync(file);
+
+		expect(cache.get(file, src, "typescript")).toBeNull();
+		expect(a.delete).toHaveBeenCalledTimes(1);
 	});
 
 	it("survives a tree whose delete() throws (dead/aborted runtime)", () => {

@@ -117,3 +117,42 @@ describe("shared tree cache is reused across consumers (one parse per write)", (
 		expect(servedToModuleReport).toBe(parsedByRunner);
 	});
 });
+
+describe("eviction frees WASM trees without corrupting live parsing (#417 regression)", () => {
+	it("parses past the cache limit (real tree.delete() on eviction) and re-parses cleanly", async () => {
+		const env = setupTestEnvironment("pi-lens-tsevict-");
+		cleanups.push(env.cleanup);
+		const client = getSharedTreeSitterClient();
+		expect(client).not.toBeNull();
+
+		// The shared TreeCache holds 50 entries. Parse 60 distinct files so the
+		// earliest trees are evicted AND their WASM heap is freed via tree.delete()
+		// mid-run. Fake-tree unit tests can't exercise a real double-free/UAF; this
+		// drives real web-tree-sitter trees through eviction.
+		const files: string[] = [];
+		for (let i = 0; i < 60; i++) {
+			files.push(
+				createTempFile(env.tmpDir, `f${i}.ts`, `export const v${i} = ${i};\n`),
+			);
+		}
+
+		const first = await client!.parseFile(files[0], "typescript");
+		if (!first) return; // grammars unavailable in this environment
+		expect(first.rootNode.type).toBe("program");
+
+		// Each just-parsed (newest) tree must stay valid — freeing evicted older
+		// neighbours must not corrupt it. (We never touch `first` after this point;
+		// it is the tree that gets evicted+freed — the documented transient-use rule.)
+		for (const f of files) {
+			const tree = await client!.parseFile(f, "typescript");
+			expect(tree).not.toBeNull();
+			expect(tree!.rootNode.type).toBe("program");
+		}
+
+		// Re-parsing the evicted-and-freed first file yields a fresh, usable tree —
+		// no use-after-free, no crash.
+		const reparsed = await client!.parseFile(files[0], "typescript");
+		expect(reparsed).not.toBeNull();
+		expect(reparsed!.rootNode.type).toBe("program");
+	});
+});
