@@ -85,10 +85,10 @@ describe("shared tree cache is reused across consumers (one parse per write)", (
 
 		const client = getSharedTreeSitterClient();
 		expect(client).not.toBeNull();
+		expect(await client!.init()).toBe(true); // load grammar/wasm before parseFile
 
 		const tree1 = await client!.parseFile(file, "typescript");
-		// If grammars aren't available in this environment, the reuse claim is moot.
-		if (!tree1) return;
+		expect(tree1).not.toBeNull();
 		const tree2 = await client!.parseFile(file, "typescript");
 
 		// A cache hit returns the SAME tree object — the file is parsed once and the
@@ -105,9 +105,10 @@ describe("shared tree cache is reused across consumers (one parse per write)", (
 		const runnerClient = getSharedTreeSitterClient();
 		const moduleReportClient = getSharedTreeSitterClient();
 		expect(runnerClient).toBe(moduleReportClient);
+		expect(await runnerClient!.init()).toBe(true);
 
 		const parsedByRunner = await runnerClient!.parseFile(file, "typescript");
-		if (!parsedByRunner) return;
+		expect(parsedByRunner).not.toBeNull();
 		const servedToModuleReport = await moduleReportClient!.parseFile(
 			file,
 			"typescript",
@@ -124,6 +125,7 @@ describe("eviction frees WASM trees without corrupting live parsing (#417 regres
 		cleanups.push(env.cleanup);
 		const client = getSharedTreeSitterClient();
 		expect(client).not.toBeNull();
+		expect(await client!.init()).toBe(true);
 
 		// The shared TreeCache holds 50 entries. Parse 60 distinct files so the
 		// earliest trees are evicted AND their WASM heap is freed via tree.delete()
@@ -137,8 +139,8 @@ describe("eviction frees WASM trees without corrupting live parsing (#417 regres
 		}
 
 		const first = await client!.parseFile(files[0], "typescript");
-		if (!first) return; // grammars unavailable in this environment
-		expect(first.rootNode.type).toBe("program");
+		expect(first).not.toBeNull();
+		expect(first!.rootNode.type).toBe("program");
 
 		// Each just-parsed (newest) tree must stay valid — freeing evicted older
 		// neighbours must not corrupt it. (We never touch `first` after this point;

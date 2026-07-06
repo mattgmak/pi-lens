@@ -772,7 +772,9 @@ async function ensureTsFacts(
 				import("../dispatch/facts/import-facts.js"),
 				import("../dispatch/facts/function-facts.js"),
 			]);
-		importFactProvider.run(ctx, facts);
+		// importFactProvider.run is async (tree-sitter parse) — must be awaited so
+		// file.imports/file.reexports are populated before the graph reads them.
+		await importFactProvider.run(ctx, facts);
 		functionFactProvider.run(ctx, facts);
 	} catch (err) {
 		console.error(
