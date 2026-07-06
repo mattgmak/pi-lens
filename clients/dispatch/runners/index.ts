@@ -47,7 +47,6 @@ import trivyConfigRunner from "./trivy-config.js";
 import valeRunner from "./vale.js";
 // Import tree-sitter runner
 import treeSitterRunner from "./tree-sitter.js";
-import tsLspRunner from "./ts-lsp.js";
 import yamllintRunner from "./yamllint.js";
 import zigCheckRunner from "./zig-check.js";
 
@@ -55,7 +54,6 @@ export function registerDefaultRunners(registry: RunnerRegistry): void {
 	// Register all runners (ordered by priority)
 	// Unified LSP runner for all languages (TypeScript, Python, Go, Rust, etc.) - priority 4
 	registry.register(lspRunner); // Unified LSP type-checking for all languages (priority 4)
-	registry.register(tsLspRunner); // TypeScript type-checking (priority 5) - fallback when --lens-lsp disabled
 	registry.register(pyrightRunner); // Python type-checking (priority 5) - fallback when --lens-lsp disabled
 	registry.register(biomeCheckJsonRunner); // Biome check with JSON output for diagnostic capture (priority 9)
 	// DISABLED in post-write dispatch - ast-grep-napi can crash. Runs in the

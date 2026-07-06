@@ -329,7 +329,7 @@ function withPrimaryPolicyGroup(
 		: groups
 				.map((group) => {
 					const runnerIds = group.runnerIds.filter(
-						(id) => id !== "lsp" && id !== "ts-lsp",
+						(id) => id !== "lsp",
 					);
 					if (runnerIds.length === 0) return null;
 					return {

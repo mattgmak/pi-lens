@@ -34,7 +34,6 @@ const EXEMPT = new Map<string, string>([
 	["golangci-lint", "Go; go-vet covered in lint, golangci-lint in --autofix"],
 	// Covered via the --lsp handshake layer rather than a dispatch fixture.
 	["lsp", "covered as the target across LSP fixtures"],
-	["ts-lsp", "TS LSP; covered via --lsp typescript"],
 	["pyright", "covered via --lsp python"],
 	["prisma-validate", "covered via --lsp prisma"],
 	// Config-gated checkers with no fixture yet.
