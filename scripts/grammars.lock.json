@@ -26,7 +26,7 @@
     "tree-sitter-tsx.wasm": "sha256:6aa3b2c70e76f5d48eafef1093e9c4de383e13f2fdde2f4e9b98a378f6a8f1b6",
     "tree-sitter-typescript.wasm": "sha256:8515404dceed38e1ed86aa34b09fcf3379fff1b4ff9dd3967bcd6d1eb5ac3d8f",
     "tree-sitter-vue.wasm": "sha256:6244521bb3fb60f34ce5f677f2af81facb2c38691193985ca5fa85e1b6f29250",
-    "tree-sitter-yaml.wasm": "sha256:5dea7cfff83d41d8f87fb8e434e1a5b292c0d670bfcdc42cb2af420ef490dde5",
+    "tree-sitter-yaml.wasm": "sha256:e752dc21c3591df9b45692fe417d101f45d1828c28c44d79005f4066dc7e4e91",
     "tree-sitter-zig.wasm": "sha256:59cc4531aa661e2de4c5bc04e4045b6bdd5d2bfa75045cbda5f673102d140eef"
   },
   "overrides": {
@@ -34,6 +34,11 @@
       "package": "@tree-sitter-grammars/tree-sitter-lua",
       "version": "0.4.1",
       "url": "https://unpkg.com/@tree-sitter-grammars/tree-sitter-lua@0.4.1/tree-sitter-lua.wasm"
+    },
+    "tree-sitter-yaml.wasm": {
+      "package": "@tree-sitter-grammars/tree-sitter-yaml",
+      "version": "0.7.1",
+      "url": "https://unpkg.com/@tree-sitter-grammars/tree-sitter-yaml@0.7.1/tree-sitter-yaml.wasm"
     }
   }
 }

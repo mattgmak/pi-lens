@@ -27,8 +27,10 @@ export const GRAMMAR_CDN_BASE = `https://unpkg.com/tree-sitter-wasms@${TREE_SITT
  *
  * tree-sitter-lua: the aggregator's lua wasm corrupts to ERROR trees once a second
  * grammar loads into web-tree-sitter's shared WASM Module (#255) — the maintained
- * 0.4.1 build parses cleanly in a multi-grammar process. (yaml #427 is a future
- * override candidate.) Mirrored by `SOURCE_OVERRIDES` in scripts/download-grammars.
+ * 0.4.1 build parses cleanly in a multi-grammar process. tree-sitter-yaml: the
+ * aggregator's yaml wasm is ABI-incompatible with web-tree-sitter 0.25 and fails to
+ * load at all (#427); the maintained 0.7.1 build loads + parses. Mirrored by
+ * `SOURCE_OVERRIDES` in scripts/download-grammars.
  */
 export interface GrammarSourceOverride {
 	/** npm package the wasm actually comes from (for the provenance sidecar). */
@@ -43,6 +45,11 @@ export const GRAMMAR_SOURCE_OVERRIDES: Record<string, GrammarSourceOverride> = {
 		package: "@tree-sitter-grammars/tree-sitter-lua",
 		version: "0.4.1",
 		url: "https://unpkg.com/@tree-sitter-grammars/tree-sitter-lua@0.4.1/tree-sitter-lua.wasm",
+	},
+	"tree-sitter-yaml.wasm": {
+		package: "@tree-sitter-grammars/tree-sitter-yaml",
+		version: "0.7.1",
+		url: "https://unpkg.com/@tree-sitter-grammars/tree-sitter-yaml@0.7.1/tree-sitter-yaml.wasm",
 	},
 };
 

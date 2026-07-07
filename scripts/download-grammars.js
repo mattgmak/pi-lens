@@ -33,6 +33,11 @@ export const SOURCE_OVERRIDES = {
         version: "0.4.1",
         url: "https://unpkg.com/@tree-sitter-grammars/tree-sitter-lua@0.4.1/tree-sitter-lua.wasm",
     },
+    "tree-sitter-yaml.wasm": {
+        package: "@tree-sitter-grammars/tree-sitter-yaml",
+        version: "0.7.1",
+        url: "https://unpkg.com/@tree-sitter-grammars/tree-sitter-yaml@0.7.1/tree-sitter-yaml.wasm",
+    },
 };
 /** The package a grammar's sidecar records (override or the global aggregator). */
 export function expectedPackage(filename, manifest) {

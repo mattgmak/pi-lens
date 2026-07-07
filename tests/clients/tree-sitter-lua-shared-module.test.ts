@@ -69,3 +69,25 @@ describe("lua survives the shared WASM Module (#255)", () => {
 		}
 	});
 });
+
+describe("overridden yaml grammar loads (#427)", () => {
+	it("parses yaml cleanly (aggregator wasm was ABI-unloadable)", async () => {
+		const env = setupTestEnvironment("pi-lens-yaml427-");
+		try {
+			const client = new TreeSitterClient();
+			await client.init();
+			// Load a second grammar first, mirroring a real multi-language session.
+			const py = createTempFile(env.tmpDir, "a.py", "import os\n");
+			await client.parseFile(py, "python", "import os\n");
+
+			const yamlSrc = "foo: 1\nbar:\n  - a\n  - b\n";
+			const fp = createTempFile(env.tmpDir, "c.yaml", yamlSrc);
+			const tree = await client.parseFile(fp, "yaml", yamlSrc);
+			// Regression: the aggregator yaml wasm failed Language.load → null tree.
+			expect(tree).toBeTruthy();
+			expect(countErrorNodes(tree!.rootNode)).toBe(0);
+		} finally {
+			env.cleanup();
+		}
+	});
+});
