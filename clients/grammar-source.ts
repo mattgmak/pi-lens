@@ -19,6 +19,38 @@ export const TREE_SITTER_WASMS_VERSION = "0.1.13";
 /** unpkg mirror of the tree-sitter-wasms artifacts. */
 export const GRAMMAR_CDN_BASE = `https://unpkg.com/tree-sitter-wasms@${TREE_SITTER_WASMS_VERSION}/out`;
 
+/**
+ * Per-grammar source overrides — grammars we pull from a DIFFERENT package than the
+ * `tree-sitter-wasms` aggregator, because the aggregator's frozen 0.1.13 build is
+ * broken for them. Each override points at the maintained `@tree-sitter-grammars/*`
+ * package's prebuilt wasm on unpkg.
+ *
+ * tree-sitter-lua: the aggregator's lua wasm corrupts to ERROR trees once a second
+ * grammar loads into web-tree-sitter's shared WASM Module (#255) — the maintained
+ * 0.4.1 build parses cleanly in a multi-grammar process. (yaml #427 is a future
+ * override candidate.) Mirrored by `SOURCE_OVERRIDES` in scripts/download-grammars.
+ */
+export interface GrammarSourceOverride {
+	/** npm package the wasm actually comes from (for the provenance sidecar). */
+	package: string;
+	version: string;
+	/** Full unpkg URL of the wasm. */
+	url: string;
+}
+
+export const GRAMMAR_SOURCE_OVERRIDES: Record<string, GrammarSourceOverride> = {
+	"tree-sitter-lua.wasm": {
+		package: "@tree-sitter-grammars/tree-sitter-lua",
+		version: "0.4.1",
+		url: "https://unpkg.com/@tree-sitter-grammars/tree-sitter-lua@0.4.1/tree-sitter-lua.wasm",
+	},
+};
+
+/** The URL a grammar wasm is fetched from (override if any, else the aggregator). */
+export function grammarSourceUrl(filename: string): string {
+	return GRAMMAR_SOURCE_OVERRIDES[filename]?.url ?? `${GRAMMAR_CDN_BASE}/${filename}`;
+}
+
 /** Language id → grammar wasm filename. */
 export const LANGUAGE_TO_GRAMMAR: Record<string, string> = {
 	typescript: "tree-sitter-typescript.wasm",
@@ -134,7 +166,7 @@ export async function downloadGrammar(
 ): Promise<boolean> {
 	try {
 		fs.mkdirSync(destDir, { recursive: true });
-		const res = await fetch(`${GRAMMAR_CDN_BASE}/${filename}`);
+		const res = await fetch(grammarSourceUrl(filename));
 		if (!res.ok) throw new Error(`HTTP ${res.status}`);
 		const data = Buffer.from(await res.arrayBuffer());
 		const tmp = path.join(destDir, `.${filename}.${process.pid}.tmp`);

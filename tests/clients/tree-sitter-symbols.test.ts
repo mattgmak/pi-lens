@@ -47,7 +47,13 @@ const CASES: Record<string, SymbolCase> = {
 	dart: { file: "a.dart", src: "int foo() => 1;\n", expect: ["foo"] },
 	php: { file: "a.php", src: "<?php\nfunction foo() {}\n", expect: ["foo"] },
 	ocaml: { file: "a.ml", src: "let foo x = x\n", expect: ["foo"] },
-	lua: { file: "a.lua", src: "function foo() end\n", expect: ["foo"] },
+	lua: {
+		// @tree-sitter-grammars build (#255): function_declaration with a plain
+		// identifier (global / `local function`) or a dot_index_expression name.
+		file: "a.lua",
+		src: "function foo() end\nfunction M.run() end\nlocal function util() end\n",
+		expect: ["foo", "util"],
+	},
 	zig: { file: "a.zig", src: "fn foo() void {}\n", expect: ["foo"] },
 	bash: { file: "a.sh", src: "foo() { :; }\n", expect: ["foo"] },
 	elixir: { file: "a.ex", src: "defmodule M do\nend\n", expect: ["M"] },

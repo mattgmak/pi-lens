@@ -31,17 +31,50 @@ const PACKAGE = "tree-sitter-wasms";
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const MANIFEST_PATH = join(SCRIPT_DIR, "grammars.lock.json");
 
+/**
+ * Per-grammar source override — a grammar pulled from a different package than the
+ * `tree-sitter-wasms` aggregator because the aggregator's frozen build is broken for
+ * it. Mirrors `GRAMMAR_SOURCE_OVERRIDES` in clients/grammar-source.ts. tree-sitter-lua
+ * corrupts once a 2nd grammar loads the shared WASM Module (#255); pull the maintained
+ * @tree-sitter-grammars build instead.
+ */
+export interface SourceOverride {
+	package: string;
+	version: string;
+	url: string;
+}
+
+export const SOURCE_OVERRIDES: Record<string, SourceOverride> = {
+	"tree-sitter-lua.wasm": {
+		package: "@tree-sitter-grammars/tree-sitter-lua",
+		version: "0.4.1",
+		url: "https://unpkg.com/@tree-sitter-grammars/tree-sitter-lua@0.4.1/tree-sitter-lua.wasm",
+	},
+};
+
 export interface GrammarManifest {
 	package: string;
 	version: string;
 	/** filename → "sha256:<hex>" */
 	grammars: Record<string, string>;
+	/** filename → override provenance, for grammars not from the aggregator. */
+	overrides?: Record<string, SourceOverride>;
 }
 
 export interface GrammarSidecar {
 	npmPackage: string;
 	version: string;
 	sha256: string;
+}
+
+/** The package a grammar's sidecar records (override or the global aggregator). */
+export function expectedPackage(filename: string, manifest: GrammarManifest): string {
+	return manifest.overrides?.[filename]?.package ?? SOURCE_OVERRIDES[filename]?.package ?? manifest.package;
+}
+
+/** The version a grammar's sidecar records (override or the global aggregator). */
+export function expectedVersion(filename: string, manifest: GrammarManifest): string {
+	return manifest.overrides?.[filename]?.version ?? SOURCE_OVERRIDES[filename]?.version ?? manifest.version;
 }
 
 export const GRAMMARS: string[] = [
@@ -129,7 +162,7 @@ export function needsDownload(
 	} catch {
 		return true;
 	}
-	if (meta.version !== manifest.version) return true;
+	if (meta.version !== expectedVersion(filename, manifest)) return true;
 	const expected = manifest.grammars[filename];
 	if (expected && meta.sha256 !== expected) return true;
 	return false;
@@ -145,8 +178,13 @@ function baseUrl(version: string): string {
 	return `https://unpkg.com/${PACKAGE}@${version}/out`;
 }
 
+/** Fetch URL for a grammar: its source override if any, else the aggregator. */
+function grammarUrl(version: string, filename: string): string {
+	return SOURCE_OVERRIDES[filename]?.url ?? `${baseUrl(version)}/${filename}`;
+}
+
 async function fetchGrammar(version: string, filename: string): Promise<Buffer> {
-	const res = await fetch(`${baseUrl(version)}/${filename}`);
+	const res = await fetch(grammarUrl(version, filename));
 	if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${filename}`);
 	return Buffer.from(await res.arrayBuffer());
 }
@@ -177,8 +215,8 @@ async function downloadGrammar(
 	const wasm = join(destDir, filename);
 	writeFileSync(wasm, buf);
 	const sidecar: GrammarSidecar = {
-		npmPackage: manifest.package,
-		version: manifest.version,
+		npmPackage: expectedPackage(filename, manifest),
+		version: expectedVersion(filename, manifest),
 		sha256: actual,
 	};
 	writeFileSync(sidecarPathFor(wasm), `${JSON.stringify(sidecar, null, 2)}\n`);
@@ -220,6 +258,7 @@ async function regenerateManifest(): Promise<void> {
 		package: PACKAGE,
 		version: TREE_SITTER_WASMS_VERSION,
 		grammars: sorted,
+		...(Object.keys(SOURCE_OVERRIDES).length ? { overrides: SOURCE_OVERRIDES } : {}),
 	};
 	writeFileSync(MANIFEST_PATH, `${JSON.stringify(manifest, null, 2)}\n`);
 	console.error(`Wrote ${MANIFEST_PATH} (${GRAMMARS.length} grammars).`);

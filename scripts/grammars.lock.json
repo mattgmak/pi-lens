@@ -15,7 +15,7 @@
     "tree-sitter-javascript.wasm": "sha256:63812b9e275d26851264734868d27a1656bd44a2ef6eb3e85e6b03728c595ab5",
     "tree-sitter-json.wasm": "sha256:fdb5219abe058369e16897aaa11eecf47ef4f546752c3ddbac339cdd89e1e667",
     "tree-sitter-kotlin.wasm": "sha256:b5cb00c8d06ed0f10f1dbe497205b437809d7e87db1f638721a8cfb30e044449",
-    "tree-sitter-lua.wasm": "sha256:75ef809136d610068c5b2135741d89f5df62690a3d55169203351cb7cc85727d",
+    "tree-sitter-lua.wasm": "sha256:6d95607fc7d78964cfdf065ccb1ba76be5ed217c5ec0d0a3cace13c59fa1ae43",
     "tree-sitter-ocaml.wasm": "sha256:60849b6320ee956233d77b017c65c45660e507d03ae70aa1bd5783458e2e9e18",
     "tree-sitter-php.wasm": "sha256:55bb617b6f01e14bab997861f0b20a2420cf6ba3199ffeb295b9ec398966d8a3",
     "tree-sitter-python.wasm": "sha256:9056d0fb0c337810d019fae350e8167786119da98f0f282aceae7ab89ee8253b",
@@ -28,5 +28,12 @@
     "tree-sitter-vue.wasm": "sha256:6244521bb3fb60f34ce5f677f2af81facb2c38691193985ca5fa85e1b6f29250",
     "tree-sitter-yaml.wasm": "sha256:5dea7cfff83d41d8f87fb8e434e1a5b292c0d670bfcdc42cb2af420ef490dde5",
     "tree-sitter-zig.wasm": "sha256:59cc4531aa661e2de4c5bc04e4045b6bdd5d2bfa75045cbda5f673102d140eef"
+  },
+  "overrides": {
+    "tree-sitter-lua.wasm": {
+      "package": "@tree-sitter-grammars/tree-sitter-lua",
+      "version": "0.4.1",
+      "url": "https://unpkg.com/@tree-sitter-grammars/tree-sitter-lua@0.4.1/tree-sitter-lua.wasm"
+    }
   }
 }

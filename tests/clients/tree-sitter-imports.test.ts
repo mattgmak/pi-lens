@@ -89,9 +89,13 @@ const CASES: Record<string, ImportCase> = {
 	ocaml: { file: "a.ml", src: "open Core\n", expect: ["Core"] },
 	dart: { file: "a.dart", src: 'import "dart:io";\n', expect: ["dart:io"] },
 	// Call/builtin-based imports (#249 coverage expansion) — predicate-filtered.
-	// lua is omitted on purpose: its tree parses to ERROR once a 2nd grammar
-	// loads into the shared WASM Module (#255), so it can't be exercised through
-	// the shared client here. Its validated import query is recorded on #255.
+	// lua now parses cleanly in a multi-grammar process (#255 fixed by swapping to
+	// the @tree-sitter-grammars build), so its require() import query is exercised.
+	lua: {
+		file: "a.lua",
+		src: 'local a = require("mod.a")\nlocal b = require("mod.b")\nprint("hi")\n',
+		expect: ["mod.a", "mod.b"],
+	},
 	ruby: {
 		file: "a.rb",
 		src: 'require "json"\nrequire_relative "./foo"\nputs "hi"\n',

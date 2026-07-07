@@ -5,8 +5,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	BLOCKED_GRAMMARS,
 	GRAMMAR_FILES,
+	GRAMMAR_SOURCE_OVERRIDES,
 	grammarBlockReason,
 	type GrammarRuntime,
+	grammarSourceUrl,
 	LANGUAGE_TO_GRAMMAR,
 	TREE_SITTER_WASMS_VERSION,
 } from "../../clients/grammar-source.js";
@@ -44,6 +46,30 @@ describe("grammar-source ↔ download-grammars stay in sync", () => {
 		expect([...GRAMMAR_FILES].sort()).toEqual(
 			[...new Set(Object.values(LANGUAGE_TO_GRAMMAR))].sort(),
 		);
+	});
+
+	it("mirrors the same source overrides in download-grammars.js", () => {
+		for (const o of Object.values(GRAMMAR_SOURCE_OVERRIDES)) {
+			// The mirror lists each override's url (which embeds package + version).
+			expect(scriptSrc).toContain(o.url);
+			expect(o.url).toContain(o.version);
+		}
+	});
+});
+
+describe("GRAMMAR_SOURCE_OVERRIDES (#255)", () => {
+	it("routes lua to the @tree-sitter-grammars build, not the aggregator", () => {
+		const o = GRAMMAR_SOURCE_OVERRIDES["tree-sitter-lua.wasm"];
+		expect(o?.package).toBe("@tree-sitter-grammars/tree-sitter-lua");
+		const url = grammarSourceUrl("tree-sitter-lua.wasm");
+		expect(url).toBe(o?.url);
+		expect(url).not.toContain("tree-sitter-wasms");
+	});
+
+	it("leaves non-overridden grammars on the aggregator CDN", () => {
+		const url = grammarSourceUrl("tree-sitter-python.wasm");
+		expect(url).toContain(`tree-sitter-wasms@${TREE_SITTER_WASMS_VERSION}`);
+		expect(url).toContain("tree-sitter-python.wasm");
 	});
 });
 
