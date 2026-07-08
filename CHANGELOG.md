@@ -10,6 +10,10 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Fixed
 
+- **`no-init-return` no longer flags factory functions** (#439) — the ast-grep rule matched `return` inside any `function_definition` whose *body text* regex-contained `def __init__`, so a factory that returns a class with an `__init__` (and its sibling methods' returns) tripped it. It now matches a `function_definition` whose **name field** is `__init__` (`has: field: name`), so only real `__init__` returns are flagged. Regression fixtures added (factory + sibling-method cases).
+- **`python-assert-production` no longer fires in test files** (#440) — `assert` is the idiomatic test assertion, so flagging every `assert` in `tests/**` was pure noise that trained users to ignore the rule. Tree-sitter rules gain an opt-in `skip_test_files` field (the runner otherwise runs on test files, since structural issues matter there); `python-assert-production` sets it, so production `assert` (the `-O` strip risk) is still flagged while test asserts are skipped. Exercised through the real runner (prod fires, `tests/` skips).
+- **The opengrep/Semgrep runner now honors `# nosemgrep` suppression** (#441) — the canonical Semgrep inline suppression (`# nosemgrep` and `# nosemgrep: <rule-id>[,<rule-id>]`, also `//`) was ignored, leaving only `.pi-lens.json` path globs or code restructuring as escapes. The auxiliary-LSP runner now drops opengrep findings suppressed by a `nosemgrep` comment on the finding's own line (inline) or a standalone comment on the line above — matching Semgrep's placement semantics (an inline comment doesn't leak to the next line).
+
 ## [3.8.66] - 2026-07-07
 
 ### Added
