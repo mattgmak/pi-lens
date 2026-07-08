@@ -9,6 +9,7 @@ All notable changes to pi-lens will be documented in this file.
 ### Changed
 
 - perf: cascade diagnostics now run concurrently after each edit instead of blocking the write pipeline (~26% median per-edit latency reduction); settled at turn_end with a bounded wait (#450)
+- perf: write-path micro batch — ESLint autofix runs a single `--fix` spawn (was dry-run + fix, double cold-start), LSP quick-fix lookups for blocking diagnostics run in parallel, and the lsp runner reuses its already-read file content for nosemgrep suppression (#453)
 
 ### Fixed
 

@@ -229,25 +229,27 @@ const lspRunner: RunnerDefinition = {
 			.filter(({ d }) => d.severity === 1)
 			.slice(0, MAX_CODE_ACTION_LOOKUPS);
 
-		for (const { d, idx } of blockingDiagIndexes) {
-			try {
-				const start = d.range.start;
-				const end = d.range.end ?? d.range.start;
-				const actions = await lspService.codeAction(
-					ctx.filePath,
-					start.line,
-					start.character,
-					end.line,
-					end.character,
-				);
-				const suggestion = buildCodeActionSuggestion(actions);
-				if (suggestion) {
-					fixSuggestionByIndex.set(idx, suggestion);
+		await Promise.all(
+			blockingDiagIndexes.map(async ({ d, idx }) => {
+				try {
+					const start = d.range.start;
+					const end = d.range.end ?? d.range.start;
+					const actions = await lspService.codeAction(
+						ctx.filePath,
+						start.line,
+						start.character,
+						end.line,
+						end.character,
+					);
+					const suggestion = buildCodeActionSuggestion(actions);
+					if (suggestion) {
+						fixSuggestionByIndex.set(idx, suggestion);
+					}
+				} catch {
+					// Best-effort enrichment only; base diagnostics remain authoritative.
 				}
-			} catch {
-				// Best-effort enrichment only; base diagnostics remain authoritative.
-			}
-		}
+			}),
+		);
 
 		const diagnostics: Diagnostic[] = convertLspDiagnostics(
 			validLspDiags,
@@ -261,24 +263,13 @@ const lspRunner: RunnerDefinition = {
 		// blockingAllowed is per-workspace (e.g. curated repo rules), computed once.
 		const blockingAllowedByProfile = new Map<unknown, boolean>();
 		// Diagnostics dropped by the tool's NATIVE inline suppression (e.g. opengrep
-		// `# nosemgrep`, #441). Read the file content lazily — only once, and only if
-		// some auxiliary profile can suppress.
+		// `# nosemgrep`, #441). Reuses `content` from the sync read above.
 		const suppressedIndices = new Set<number>();
-		let auxFileContent: string | undefined;
-		let auxFileContentRead = false;
-		const getAuxFileContent = (): string | undefined => {
-			if (!auxFileContentRead) {
-				auxFileContent = readFileContent(diagnosticPath);
-				auxFileContentRead = true;
-			}
-			return auxFileContent;
-		};
 		for (let i = 0; i < diagnostics.length; i++) {
 			const profile = findAuxiliaryProfileForSource(validLspDiags[i]?.source);
 			if (!profile) continue;
 			if (profile.isSuppressed) {
-				const content = getAuxFileContent();
-				if (content && profile.isSuppressed(validLspDiags[i], content)) {
+				if (profile.isSuppressed(validLspDiags[i], content)) {
 					suppressedIndices.add(i);
 					continue;
 				}
