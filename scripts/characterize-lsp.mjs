@@ -15,6 +15,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { mergeRows, mergeSrc, parseTable, replaceTable } from "./lib/md-matrix.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const argv = process.argv.slice(2);
@@ -87,5 +88,69 @@ const push = rows.filter((r) => r.mode === "push-only").length;
 console.log(`\n  pull-capable (clean confirmable via pull): ${pull}`);
 console.log(`  push-only (needs re-publish-empty, else silent → budget-bound): ${push}`);
 
+// Merge the measured `mode` (and derived tier for pull servers) into
+// docs/lsp-capability-matrix.md — MERGE, don't overwrite: a row we couldn't
+// measure here (server unavailable on this host) is preserved, so an
+// ubuntu-poor nightly can't regress a dev-box row (#390). This script owns the
+// `mode`/`tier` columns; probe-clean-signal owns `clean-behavior`; both bump
+// `src`. Rows whose mode came back "unknown"/"no-lsp"/error are NOT written
+// (don't blank a prior good value).
+try {
+	updateMatrix(rows);
+} catch (e) {
+	console.error(`matrix update skipped: ${e?.message ?? e}`);
+}
+
 try { await resetLSPService?.({ fast: true }); } catch {}
 process.exit(0);
+
+function updateMatrix(measuredRows) {
+	const src = process.env.CI ? "ci" : "dev";
+	const docPath = path.join(repoRoot, "docs", "lsp-capability-matrix.md");
+	if (!fs.existsSync(docPath)) {
+		console.error(`matrix update skipped: ${docPath} not found (gitignored — nothing to merge)`);
+		return;
+	}
+	const text = fs.readFileSync(docPath, "utf8");
+	const marker = "| lang | server |";
+	const tbl = parseTable(text, marker);
+	if (!tbl) {
+		console.error("matrix update skipped: capability table not found in doc");
+		return;
+	}
+	// Only rows we actually measured a mode for (pull/push-only) are authoritative.
+	const measurable = measuredRows.filter(
+		(r) => r.mode === "pull" || r.mode === "push-only",
+	);
+	// pull ⇒ Tier 1 by protocol; push-only tier is decided by the clean-behavior
+	// probe, so leave `tier` untouched for push rows (don't clobber a probed value).
+	// Key on `lang` (the matrix's first column + the fixture's stable id) — the
+	// hand-written `server` column doesn't always equal a fixture's serverHint.
+	const keyIdx = tbl.header.indexOf("lang");
+	const srcIdx = tbl.header.indexOf("src");
+	const existingByLang = new Map(tbl.rows.map((c) => [c[keyIdx], c]));
+	const measured = measurable.map((r) => {
+		const cell = { lang: r.lang, mode: r.mode };
+		if (r.mode === "pull") cell.tier = "1";
+		const prior = existingByLang.get(r.lang);
+		cell.src = mergeSrc(prior ? prior[srcIdx] : "", src);
+		return cell;
+	});
+	const merged = mergeRows(
+		tbl.rows,
+		tbl.header,
+		measured,
+		"lang",
+		["mode", "tier", "src"],
+		{ updateOnly: true },
+	);
+	const out = replaceTable(text, marker, tbl.header, tbl.sep, merged);
+	if (out && out !== text) {
+		fs.writeFileSync(docPath, out);
+		console.error(
+			`Updated docs/lsp-capability-matrix.md mode column (${measured.length} servers measured, ${tbl.rows.length} rows preserved).`,
+		);
+	} else {
+		console.error("matrix mode column: no changes.");
+	}
+}

@@ -21,7 +21,8 @@ jobs:
     name: Live tool + LSP smoke
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write # commit-back branch for the LSP-docs refresh PR (#390)
+      pull-requests: write # open/update the auto-refresh PR (#390)
     # The installer hits the GitHub REST API to resolve release assets.
     # Unauthenticated = 60 req/hr per IP, exhausted on shared-IP runners.
     # The auto-provided token raises this to 5000 req/hr; the installer sends it
@@ -91,10 +92,58 @@ jobs:
       # advertised mode (pull vs push) — the first cut of the affirmative-clean
       # -signal classification (docs/lsp-capability-matrix.md). Best-effort: the
       # script always exits 0 and a server whose toolchain is absent reports
-      # "unavailable", so this never reds the nightly.
+      # "unavailable", so this never reds the nightly. MERGES into the doc — a
+      # server this ubuntu host couldn't spawn keeps its prior (dev-box) row (#390).
       - name: LSP capability matrix (characterize diagnostic mode per server)
         continue-on-error: true
         run: node scripts/characterize-lsp.mjs --install
+
+      # Clean-signal probe (#460): among PUSH-mode servers, split Tier 2
+      # (publishes a versioned set on a clean scan — free affirmative signal) from
+      # Tier 3 (version-less/silent — the budget-wait case, #458). Merges into the
+      # same matrix's clean-behavior column (same dev/ci src + merge-guard as
+      # characterize). Best-effort: always exits 0, per-server hard timeouts.
+      - name: LSP clean-signal probe (Tier 2 vs 3 among push servers)
+        continue-on-error: true
+        run: node scripts/probe-clean-signal.mjs --install
+
+      # Server capability inventory (#390 item 1): regenerate
+      # docs/servercapabilities.md (mode + ws-pull + nav/edit ops + raw caps) —
+      # previously never run anywhere, so its ws-pull column (#389) stayed stale.
+      # Merges over the prior doc (keeps servers absent on this host).
+      - name: LSP server capability inventory (regenerate docs/servercapabilities.md)
+        continue-on-error: true
+        run: node scripts/server-capabilities.mjs --install
+
+      # Commit-back (#390 item 2): the three steps above regenerate the LSP docs
+      # in-place. master has required checks the schedule's GITHUB_TOKEN can't
+      # bypass, so we open/UPDATE a single auto-PR (fixed branch, force-pushed each
+      # run) instead of pushing to master. Docs change rarely (only when a server's
+      # caps/tier change), so this is low-noise. No-ops when nothing changed.
+      - name: Open/update LSP-docs refresh PR
+        continue-on-error: true
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: bot/lsp-docs-refresh
+          base: master
+          add-paths: |
+            docs/lsp-capability-matrix.md
+            docs/servercapabilities.md
+          commit-message: 'docs(nightly): refresh LSP capability docs'
+          title: 'docs(nightly): refresh LSP capability docs'
+          body: |
+            Automated refresh of the LSP capability docs from the nightly tool-smoke run.
+
+            - `docs/lsp-capability-matrix.md` — `mode` (characterize-lsp) + `clean-behavior` (probe-clean-signal, Tier 2 vs 3) columns (#460)
+            - `docs/servercapabilities.md` — advertised capability inventory incl. ws-pull (#389)
+
+            Rows are **merged**, never blind-overwritten: a server this ubuntu host
+            couldn't spawn keeps its prior (dev-box) classification, so the nightly
+            can't regress a richer run (#390).
+
+            Refs #460, #390.
+          delete-branch: false
 
       - name: Format layer (select + reformat through formatter pipeline)
         run: node scripts/smoke-tools.mjs --format --install --verbose

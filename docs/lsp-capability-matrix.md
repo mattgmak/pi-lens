@@ -8,27 +8,41 @@ classify each server and pick a per-server strategy. (Background: #240; mechanis
 confirmed against Neovim's LSP client, which sidesteps this entirely by being async.)
 
 Generate/refresh this matrix with `node scripts/characterize-lsp.mjs [--install]`
-(mode) and `scripts/probe-clean-signal.mjs` + `PILENS_PUB_DEBUG=1` (clean-behavior).
+(the `mode` column) and `node scripts/probe-clean-signal.mjs [--install]` (the
+`clean-behavior` column — 4-way: 2 / 2* / 3 / unknown). Both **merge** in place: a server the
+running host couldn't spawn keeps its prior row, so an ubuntu-poor run can't
+regress a richer one (#390). The nightly **tool-smoke** workflow runs both (plus
+`server-capabilities.mjs`) and opens/updates a single auto-PR
+(`bot/lsp-docs-refresh`, "docs(nightly): refresh LSP capability docs") with the
+regenerated docs — so this file self-populates from CI without manual copy-paste.
 
-## The three strategies
+## The strategies
 
 | Tier | Signal | Affirmative clean? | Example |
 |---|---|---|---|
 | **1 — pull** | `textDocument/diagnostic` returns an authoritative report (empty = clean) | YES, deterministic | rust-analyzer |
-| **2 — push, re-publishes empty** | `publishDiagnostics([])` **with version** on every scan, incl. clean→clean | YES, via version bump | ast-grep |
-| **3 — push, silent on clean** | server publishes nothing when nothing changed | **NO** — budget-wait floor (safe; a timeout is *not* a false clean) | typescript-language-server |
+| **2 — push, publishes-versioned** | `publishDiagnostics([])` **with version** on every scan, incl. clean→clean | YES, currency-proven via version | ast-grep |
+| **2\* — push, publishes-unversioned** | re-publishes on a clean scan but **version-less** — the wait still early-returns (the client accepts a version-less publish as fresh: it can't be proven stale), but currency is only *temporally correlated*, not proven | YES at runtime, with a staleness-risk caveat (not a latency cost) | opengrep |
+| **3 — push, silent on clean** | server publishes nothing when nothing changed | **NO** — budget-wait floor (safe; a timeout is *not* a false clean). **This tier is #458's learned-deadline target set.** | typescript-language-server |
 
 Detection is **cached** at `initialize` (`detectWorkspaceDiagnosticsSupport` →
 `state.workspaceDiagnosticsSupport.mode`, upgraded on `client/registerCapability`),
 so the tier is free at collection time — no per-edit probe.
 
-## Matrix (dev box + CI nightly, last refreshed 2026-06-17 from run 27713958681)
+## Matrix (dev box + CI nightly; mode last refreshed 2026-06-17 from run 27713958681, clean-behavior probed on the dev box 2026-07-08 — #460)
 
-`mode` from cached capabilities; `clean-behavior` from the publish-trace probe
-(only servers actually probed are marked — TBD otherwise). `src` = where the mode
-was measured: **ci** = the nightly `characterize-lsp.mjs` step, **dev** = the dev
-box. A few `dev` rows returned `unknown` in CI this run (the server spawned but
-didn't surface a mode within the characterize budget) — the `dev` value stands.
+`mode` from cached capabilities; `clean-behavior` from the phase-aware publish-trace
+probe. The probe attributes publishes to two phases — the **dirty touch** (proves the
+server is live) and the **clean transitions** (the discriminator) — and classifies
+4-way: `publishes-versioned` (tier 2: publish WITH version on a clean transition —
+affirmative + currency-proven), `publishes-unversioned` (tier 2\*: version-less
+publish on a clean transition — the wait still early-returns at runtime, currency
+only temporally correlated), `silent` (tier 3: alive on dirty, silent on clean —
+budget-wait, the #458 target), `unknown` (no publish at all — slow/absent,
+conservatively not classified). `src` = where a row was measured: **ci** = the
+nightly steps, **dev** = the dev box (a row measured on both reads `dev+ci`).
+Merges never blank a prior good value, so a CI non-result leaves the dev
+classification standing.
 
 | lang | server | mode | clean-behavior | tier | src |
 |---|---|---|---|---|---|
@@ -40,10 +54,10 @@ didn't surface a mode within the characterize budget) — the `dev` value stands
 | deno | deno (alt of typescript) | pull | — | 1 | dev+ci |
 | ruby | ruby-lsp | pull | — | 1 | ci |
 | csharp | csharp-ls | pull | — | 1 | ci |
-| typescript | typescript-language-server | push-only | **silent** (probed) | 3 | dev |
+| typescript | typescript-language-server | push-only | silent | 3 | dev |
 | python | pyright | push-only | TBD | 2/3? | dev |
 | jedi | jedi-language-server (alt of python) | push-only | TBD | 2/3? | ci |
-| yaml | yaml-language-server | push-only | TBD | 2/3? | dev |
+| yaml | yaml-language-server | push-only | publishes-unversioned | 2* | dev |
 | shell | bash-language-server | push-only | TBD | 2/3? | dev |
 | dockerfile | docker-langserver | push-only | TBD | 2/3? | dev |
 | toml | taplo | push-only | TBD | 2/3? | dev |
@@ -55,8 +69,8 @@ didn't surface a mode within the characterize budget) — the `dev` value stands
 | dart | dart language-server | push-only | TBD | 2/3? | ci |
 | gleam | gleam lsp | push-only | TBD | 2/3? | ci |
 | clojure | clojure-lsp | push-only | TBD | 2/3? | ci |
-| opengrep | opengrep (aux) | push-only | re-publishes (early-returns ~1.2s) | 2 | dev+ci |
-| ast-grep | ast-grep (aux) | push-only | **re-publishes empty+version** (probed) | 2 | dev+ci |
+| opengrep | opengrep (aux) | push-only | publishes-unversioned | 2* | dev+ci |
+| ast-grep | ast-grep (aux) | push-only | publishes-versioned | 2 | dev+ci |
 
 **Unknown — fixture exists, mode not yet captured.** The toolchain-gated family
 (no auto-install today; tracked in #241) — `go` (gopls), `java` (jdtls),
@@ -67,9 +81,29 @@ the same way clojure-lsp/gleam now do (both auto-install via the github strategy
 and were characterized `push-only` in the run above).
 
 ## Key findings
-- **Mode ≠ tier.** Push-only further splits into Tier 2 (re-publishes empty — ast-grep,
-  opengrep) vs Tier 3 (silent — typescript). That split needs the clean→clean behavior
-  probe per server; only ast-grep, opengrep, and typescript are probed so far.
+- **Mode ≠ tier, and the split needs BOTH axes.** Push-only further splits along
+  latency (does anything publish on a clean transition? — silence is the only
+  budget-wait case, because pi-lens's publish handler emits and early-returns the
+  wait on EVERY publish, versioned or not) and currency-proof (is the publish
+  versioned, i.e. provably about the live edit?). The 4-way
+  `probe-clean-signal.mjs` measurement drives this: ast-grep → 2, yaml/opengrep →
+  2\*, typescript (clean file) → 3.
+- **opengrep is 2\*, not 3 and not plain 2.** It *does* re-publish on a clean scan
+  (the wait early-returns at runtime — fast), but every push carries
+  `pubVersion=undefined`, so currency is only temporally correlated, not proven —
+  a staleness-risk note, not a latency cost. An earlier hand-note called it Tier 2
+  on the "re-publishes" observation alone; the phase-aware probe refines it to 2\*.
+- **typescript's clean behavior is diagnostic-set-dependent (major probe finding).**
+  On a DIRTY file it re-publishes (version-lessly) after every change — the dirty
+  fixture measures 2\*. On a genuinely CLEAN file (the `typescript-clean` fixture)
+  it publishes nothing on a clean→clean edit — silent, Tier 3. The clean-file
+  behavior is the production case (the observed budget-wait timeouts), so the
+  matrix row records the clean fixture's verdict; the probe prefers `clean: true`
+  fixtures for exactly this reason. Corollary: a 2\* measured only on a dirty
+  fixture may overstate a server whose publishes stop when its set goes empty —
+  langs without a clean fixture carry that caveat.
+- **#458's learned-deadline target set = the tier-3 rows only.** 2\* rows resolve
+  the wait at runtime and must NOT be given learned deadlines.
 - **Tier 3 is budget-bound by necessity**, not laziness: a silent server's silence is
   ambiguous (clean-unchanged vs still-analyzing), so shortening the wait or reusing
   `lastKnownDiagnostics` would risk a false clean. The wait *is* the safety mechanism.
@@ -85,15 +119,19 @@ tool-layer fixture we point `characterize-lsp.mjs` at the existing (deliberately
 dirty) `bad.*` source rather than a colliding clean duplicate; new languages get a
 minimal clean source. Either way the mode reported is the same.
 
-The nightly **tool-smoke** workflow runs `characterize-lsp.mjs --install` (after the
-LSP handshake layer) on `ubuntu-latest`, so the matrix's `mode` column self-populates
-in CI. It fills for servers that either auto-install (npm/pip/github — including
-clojure-lsp and gleam, both github-strategy as of f263cf3) or whose toolchain the
-workflow provisions (Ruby/Dart/Zig + .NET→csharp). The remaining `unknown` rows are
-the toolchain-gated family (#241): until `runtimeInstall` + canonical-bin discovery
-land, their servers don't install in CI and stay ⚠.
+The nightly **tool-smoke** workflow runs `characterize-lsp.mjs --install` **and**
+`probe-clean-signal.mjs --install` (after the LSP handshake layer) on `ubuntu-latest`,
+then opens/updates an auto-PR with the regenerated docs (#390) — so both the `mode`
+and `clean-behavior` columns self-populate in CI without manual copy-paste. They fill
+for servers that either auto-install (npm/pip/github — including clojure-lsp and gleam,
+both github-strategy as of f263cf3) or whose toolchain the workflow provisions
+(Ruby/Dart/Zig + .NET→csharp). The remaining `unknown` rows are the toolchain-gated
+family (#241): until `runtimeInstall` + canonical-bin discovery land, their servers
+don't install in CI and stay ⚠. The **merge guard** means a CI run that can't reach a
+server never blanks its dev-measured row.
 
-Each row still needs (2) the clean→clean publish-behavior probe (`probe-clean-signal.mjs`
-+ `PILENS_PUB_DEBUG=1`) to split push-only into Tier 2 (re-publishes empty) vs Tier 3
-(silent). Only typescript (Tier 3) and ast-grep/opengrep (Tier 2) are probed so far —
-that second cut is still per-server and manual.
+The `clean-behavior` split (4-way: 2 publishes-versioned / 2\* publishes-unversioned /
+3 silent / unknown) is now measured per-server by `probe-clean-signal.mjs`, no longer a
+manual one-off. Locally confirmed: ast-grep + ast-grep-baseline → 2, yaml + opengrep →
+2\*, typescript → 3 on its clean fixture (2\* on the dirty fixture — see Key findings);
+the rest fill in as the nightly reaches them.
