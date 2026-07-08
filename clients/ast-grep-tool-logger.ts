@@ -10,10 +10,10 @@
  * Mirrors `actionable-warnings-logger.ts` for shape + rotation behaviour.
  */
 
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
+import { createNdjsonLogger } from "./ndjson-logger.js";
 
 const AG_LOG_DIR = getGlobalPiLensDir();
 const AG_LOG_FILE = path.join(AG_LOG_DIR, "ast-grep-tools.log");
@@ -25,14 +25,11 @@ const MAX_LOG_BYTES = Math.max(
 		10,
 	) || 1048576,
 );
-
-try {
-	if (!fs.existsSync(AG_LOG_DIR)) {
-		fs.mkdirSync(AG_LOG_DIR, { recursive: true });
-	}
-} catch (err) {
-	void err;
-}
+const writer = createNdjsonLogger({
+	filePath: AG_LOG_FILE,
+	maxBytes: MAX_LOG_BYTES,
+	backupPath: AG_LOG_BACKUP_FILE,
+});
 
 export type AstGrepToolName = "ast_grep_search" | "ast_grep_replace";
 
@@ -151,22 +148,6 @@ export function astGrepRemediationHint(kind: AstGrepErrorKind): string | null {
 	}
 }
 
-function rotateIfNeeded(): void {
-	try {
-		if (!fs.existsSync(AG_LOG_FILE)) return;
-		const size = fs.statSync(AG_LOG_FILE).size;
-		if (size < MAX_LOG_BYTES) return;
-		try {
-			fs.rmSync(AG_LOG_BACKUP_FILE, { force: true });
-		} catch (err) {
-			void err;
-		}
-		fs.renameSync(AG_LOG_FILE, AG_LOG_BACKUP_FILE);
-	} catch (err) {
-		void err;
-	}
-}
-
 export function logAstGrepToolEvent(
 	event: Omit<
 		AstGrepToolEvent,
@@ -186,17 +167,16 @@ export function logAstGrepToolEvent(
 		rewriteLineCount: event.rewriteLineCount,
 		errorRaw: truncate(event.errorRaw, ERROR_TRUNCATE_AT),
 	};
-	const line = `${JSON.stringify({ ts: new Date().toISOString(), ...payload })}\n`;
-	try {
-		rotateIfNeeded();
-		fs.appendFileSync(AG_LOG_FILE, line);
-	} catch (err) {
-		void err;
-	}
+	writer.log({ ts: new Date().toISOString(), ...payload });
 }
 
 export function getAstGrepToolLogPath(): string {
 	return AG_LOG_FILE;
+}
+
+/** Resolve once all enqueued ast-grep-tool writes are on disk. */
+export function flushAstGrepToolLog(): Promise<void> {
+	return writer.flush();
 }
 
 export { countLines as _countLinesForTest };

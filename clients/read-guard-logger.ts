@@ -1,7 +1,7 @@
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
+import { createNdjsonLogger } from "./ndjson-logger.js";
 
 const READ_GUARD_LOG_DIR = getGlobalPiLensDir();
 const READ_GUARD_LOG_FILE = path.join(READ_GUARD_LOG_DIR, "read-guard.log");
@@ -14,6 +14,11 @@ const MAX_LOG_BYTES = Math.max(
 	Number.parseInt(process.env.PI_LENS_READ_GUARD_MAX_BYTES ?? "1048576", 10) ||
 		1048576,
 );
+const writer = createNdjsonLogger({
+	filePath: READ_GUARD_LOG_FILE,
+	maxBytes: MAX_LOG_BYTES,
+	backupPath: READ_GUARD_LOG_BACKUP_FILE,
+});
 const VERBOSE_READ_GUARD_LOG =
 	process.env.PI_LENS_READ_GUARD_VERBOSE === "1" ||
 	process.env.PI_LENS_READ_GUARD_LOG === "verbose";
@@ -24,14 +29,6 @@ const SNAPSHOT_LOG_SETTING = (
 const LOG_SNAPSHOT_VALIDATION = !["0", "false", "off"].includes(
 	SNAPSHOT_LOG_SETTING,
 );
-
-try {
-	if (!fs.existsSync(READ_GUARD_LOG_DIR)) {
-		fs.mkdirSync(READ_GUARD_LOG_DIR, { recursive: true });
-	}
-} catch (err) {
-	void err;
-}
 
 export interface ReadGuardLogEntry {
 	event: string;
@@ -68,35 +65,18 @@ function shouldLogEvent(event: string): boolean {
 	);
 }
 
-function rotateIfNeeded(): void {
-	try {
-		if (!fs.existsSync(READ_GUARD_LOG_FILE)) return;
-		const size = fs.statSync(READ_GUARD_LOG_FILE).size;
-		if (size < MAX_LOG_BYTES) return;
-		try {
-			fs.rmSync(READ_GUARD_LOG_BACKUP_FILE, { force: true });
-		} catch (err) {
-			void err;
-		}
-		fs.renameSync(READ_GUARD_LOG_FILE, READ_GUARD_LOG_BACKUP_FILE);
-	} catch (err) {
-		void err;
-	}
-}
-
 export function logReadGuardEvent(entry: ReadGuardLogEntry): void {
 	if (isTestMode() || !shouldLogEvent(entry.event)) {
 		return;
 	}
-	const line = `${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`;
-	try {
-		rotateIfNeeded();
-		fs.appendFileSync(READ_GUARD_LOG_FILE, line);
-	} catch (err) {
-		void err;
-	}
+	writer.log({ ts: new Date().toISOString(), ...entry });
 }
 
 export function getReadGuardLogPath(): string {
 	return READ_GUARD_LOG_FILE;
+}
+
+/** Resolve once all enqueued read-guard writes are on disk (tests/shutdown). */
+export function flushReadGuardLog(): Promise<void> {
+	return writer.flush();
 }

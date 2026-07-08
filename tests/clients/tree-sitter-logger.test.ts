@@ -11,12 +11,14 @@ describe("tree-sitter-logger", () => {
 	});
 
 	it("writes JSON line entries to tree-sitter.log", async () => {
-		const appendFileSync = vi.fn();
+		const appendFile = vi.fn(async (_file: string, _data: string) => {});
 
 		vi.doMock("node:fs", () => ({
-			existsSync: () => true,
 			mkdirSync: vi.fn(),
-			appendFileSync,
+			statSync: () => {
+				throw new Error("ENOENT");
+			},
+			promises: { appendFile },
 		}));
 		vi.doMock("node:os", () => ({
 			homedir: () => "/mock-home",
@@ -31,11 +33,11 @@ describe("tree-sitter-logger", () => {
 			blocking: 1,
 		});
 
-		expect(appendFileSync).toHaveBeenCalledTimes(1);
-		const [filePath, payload] = appendFileSync.mock.calls[0] as [
-			string,
-			string,
-		];
+		// Buffered async write — await the exported flush before asserting.
+		await mod.flushTreeSitterLog();
+
+		expect(appendFile).toHaveBeenCalledTimes(1);
+		const [filePath, payload] = appendFile.mock.calls[0];
 		expect(filePath).toContain("tree-sitter.log");
 		expect(payload).toContain('"phase":"runner_complete"');
 		expect(payload).toContain('"filePath":"src/main.go"');
@@ -44,22 +46,24 @@ describe("tree-sitter-logger", () => {
 	});
 
 	it("swallows append errors", async () => {
-		const appendFileSync = vi.fn(() => {
+		const appendFile = vi.fn(async () => {
 			throw new Error("disk full");
 		});
 
 		vi.doMock("node:fs", () => ({
-			existsSync: () => true,
 			mkdirSync: vi.fn(),
-			appendFileSync,
+			statSync: () => {
+				throw new Error("ENOENT");
+			},
+			promises: { appendFile },
 		}));
 		vi.doMock("node:os", () => ({
 			homedir: () => "/mock-home",
 		}));
 
 		const mod = await import("../../clients/tree-sitter-logger.js");
-		expect(() =>
-			mod.logTreeSitter({ phase: "runner_start", filePath: "src/a.go" }),
-		).not.toThrow();
+		mod.logTreeSitter({ phase: "runner_start", filePath: "src/a.go" });
+		// The swallowed rejection must not surface through flush().
+		await expect(mod.flushTreeSitterLog()).resolves.toBeUndefined();
 	});
 });

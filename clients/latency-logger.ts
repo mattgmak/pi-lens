@@ -2,15 +2,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
+import { createNdjsonLogger } from "./ndjson-logger.js";
 
 const LATENCY_LOG_DIR = getGlobalPiLensDir();
 const LATENCY_LOG_FILE = path.join(LATENCY_LOG_DIR, "latency.log");
 
-try {
-	if (!fs.existsSync(LATENCY_LOG_DIR)) {
-		fs.mkdirSync(LATENCY_LOG_DIR, { recursive: true });
-	}
-} catch {}
+const writer = createNdjsonLogger({ filePath: LATENCY_LOG_FILE });
 
 export interface LatencyEntry {
 	type: "runner" | "tool_result" | "phase";
@@ -44,14 +41,16 @@ export function logLatency(entry: LatencyEntry): void {
 	if (isTestMode()) {
 		return;
 	}
-	const line = `${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`;
-	try {
-		fs.appendFileSync(LATENCY_LOG_FILE, line);
-	} catch {}
+	writer.log({ ts: new Date().toISOString(), ...entry });
 }
 
 export function getLatencyLogPath(): string {
 	return LATENCY_LOG_FILE;
+}
+
+/** Resolve once all enqueued latency writes are on disk (tests/shutdown). */
+export function flushLatencyLog(): Promise<void> {
+	return writer.flush();
 }
 
 export function readLatencyLog(limit = 100): LatencyEntry[] {
@@ -68,7 +67,7 @@ export function readLatencyLog(limit = 100): LatencyEntry[] {
 }
 
 export function clearLatencyLog(): void {
-	try {
-		fs.writeFileSync(LATENCY_LOG_FILE, "");
-	} catch {}
+	// Enqueue the truncate in the same serialized queue so a clear cannot race a
+	// pending drain. Await flushLatencyLog() if you need the file empty on disk.
+	writer.truncate();
 }

@@ -6,10 +6,10 @@
  * for shape + size-based rotation.
  */
 
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
+import { createNdjsonLogger } from "./ndjson-logger.js";
 
 const LOG_DIR = getGlobalPiLensDir();
 const LOG_FILE = path.join(LOG_DIR, "dead-code.log");
@@ -19,6 +19,11 @@ const MAX_LOG_BYTES = Math.max(
 	Number.parseInt(process.env.PI_LENS_DEAD_CODE_LOG_MAX_BYTES ?? "1048576", 10) ||
 		1048576,
 );
+const writer = createNdjsonLogger({
+	filePath: LOG_FILE,
+	maxBytes: MAX_LOG_BYTES,
+	backupPath: LOG_BACKUP_FILE,
+});
 
 export interface DeadCodeScanEvent {
 	language: string;
@@ -33,17 +38,6 @@ export interface DeadCodeScanEvent {
 	reason?: string;
 }
 
-function rotateIfNeeded(): void {
-	try {
-		const stat = fs.statSync(LOG_FILE);
-		if (stat.size >= MAX_LOG_BYTES) {
-			fs.renameSync(LOG_FILE, LOG_BACKUP_FILE);
-		}
-	} catch {
-		// no file yet, or rename raced — nothing to rotate
-	}
-}
-
 /**
  * Append one scan event. Fire-and-forget: telemetry must never break a scan, so
  * every fs error is swallowed. Skipped under test mode to keep the suite from
@@ -51,12 +45,10 @@ function rotateIfNeeded(): void {
  */
 export function logDeadCodeScan(event: DeadCodeScanEvent): void {
 	if (isTestMode()) return;
-	try {
-		if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
-		rotateIfNeeded();
-		const row = JSON.stringify({ ts: new Date().toISOString(), ...event });
-		fs.appendFileSync(LOG_FILE, row + "\n");
-	} catch {
-		// telemetry is best-effort
-	}
+	writer.log({ ts: new Date().toISOString(), ...event });
+}
+
+/** Resolve once all enqueued dead-code writes are on disk (tests/shutdown). */
+export function flushDeadCodeLog(): Promise<void> {
+	return writer.flush();
 }
