@@ -10,6 +10,8 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Fixed
 
+- **`lens_diagnostics mode=full` now honors inline `# pi-lens-ignore` comments** (#442) — inline suppression (`// pi-lens-ignore: rule` / `# pi-lens-ignore: rule`) was applied only in the per-edit dispatch path (`mode=all`), so a site cleanly suppressed there reappeared as **blocking** in the project-wide `mode=full` sweep — making `mode=full` unusable as a "clean" gate for any project with a legitimate suppression. The suppression filter is now shared (`clients/dispatch/inline-suppressions.ts`) and applied to the merged `mode=full` summaries too: each flagged file is read and its inline ignores honored (fail-safe — a read error never hides a finding), and counts are re-summarized so a fully-suppressed file reports clean. Rule matching also normalizes `ast-grep:<id>` / `<id>-js` forms, so a bare `pi-lens-ignore: <id>` suppresses the finding in both modes. (The reporter's secondary ask — per-rule enable/disable in `.pi-lens.json` — is tracked separately as a follow-up.)
+
 ## [3.8.66] - 2026-07-07
 
 ### Added
