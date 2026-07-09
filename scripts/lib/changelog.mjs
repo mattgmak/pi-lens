@@ -47,13 +47,16 @@ function finalize(current) {
 
 /**
  * Condense a section body into scannable release notes: keep the `### Added/
- * Changed/Fixed` subheadings and each entry's bold title, but trim the entry to
- * a single short gist (first sentence, length-capped). The full prose stays in
- * CHANGELOG.md; this is what the GitHub release body shows so a release reads as
- * a summary, not a wall of implementation detail.
+ * Changed/Fixed` subheadings and every top-level entry, trimmed to a short
+ * one-liner. Bold-titled entries (`- **Title** …`) keep the title (plus a
+ * short gist when one exists); plain entries (`- perf: …`) keep their first
+ * clause — dropping them entirely (the pre-3.8.67 behavior) made a
+ * perf-heavy release body show none of its perf work. The full prose stays
+ * in CHANGELOG.md; this is what the GitHub release body shows so a release
+ * reads as a summary, not a wall of implementation detail.
  *
  * @param {string} body a section body from extractSection()
- * @param {{ maxGist?: number }} [opts]
+ * @param {{ maxGist?: number, gist?: boolean }} [opts]
  * @returns {string}
  */
 export function summarizeSection(body, opts = {}) {
@@ -74,11 +77,17 @@ export function summarizeSection(body, opts = {}) {
       }
       continue;
     }
-    // Only top-level entries (`- **Title** …`); skip nested/continuation lines.
-    const m = line.match(/^- (\*\*.+?\*\*)\s*(.*)$/);
-    if (!m || heading === null) continue;
-    const gist = opts.gist ? cleanGist(m[2], maxGist) : "";
-    buckets.get(heading).push(gist ? `- ${m[1]} — ${gist}` : `- ${m[1]}`);
+    // Only top-level entries; nested/continuation lines are skipped.
+    if (heading === null) continue;
+    const bold = line.match(/^- (\*\*.+?\*\*)\s*(.*)$/);
+    if (bold) {
+      const gist = opts.gist ? cleanGist(bold[2], maxGist) : "";
+      buckets.get(heading).push(gist ? `- ${bold[1]} — ${gist}` : `- ${bold[1]}`);
+      continue;
+    }
+    const plain = line.match(/^- (\S.*)$/);
+    if (!plain) continue;
+    buckets.get(heading).push(`- ${plainGist(plain[1], maxGist)}`);
   }
   const out = [];
   for (const h of order) {
@@ -87,6 +96,32 @@ export function summarizeSection(body, opts = {}) {
     out.push(`### ${h}`, "", ...items, "");
   }
   return out.join("\n").replace(/^\n+/, "").replace(/\s+$/, "");
+}
+
+// Condense a plain (non-bold-titled) entry to its first clause: cut at the
+// earliest sentence/clause boundary past a minimum (so `perf: X — details`
+// keeps the self-describing `perf: X`), hard-truncating at a word boundary
+// only as a last resort. Trailing `(#NNN)` refs from the original are
+// re-appended so the release still links its issues.
+function plainGist(text, maxGist) {
+  const refs = [...text.matchAll(/\((?:refs?|closes?|fixes?)?\s*#\d+\)/gi)].map(
+    (m) => m[0],
+  );
+  const MIN_CLAUSE = 30;
+  let cut = text.length;
+  for (const boundary of [/\.\s/g, /;\s/g, /\s—\s/g]) {
+    for (const m of text.matchAll(boundary)) {
+      if (m.index >= MIN_CLAUSE && m.index < cut) cut = m.index;
+      break; // only the first occurrence of each boundary matters
+    }
+  }
+  let gist = text.slice(0, cut).trim();
+  if (gist.length > maxGist) {
+    const sliced = gist.slice(0, maxGist);
+    gist = sliced.slice(0, sliced.lastIndexOf(" ")).trim() + " …";
+  }
+  const missing = refs.filter((r) => !gist.includes(r));
+  return missing.length ? `${gist} ${missing.join(" ")}` : gist;
 }
 
 // Return a short, clean one-clause gist, or "" if no clean short form exists

@@ -157,6 +157,43 @@ describe("changelog lib — summarizeSection", () => {
     const s = summarizeSection(VERBOSE, { gist: true });
     expect(s).toContain("- **A fix (#20)** — short");
   });
+
+  // Plain (non-bold-titled) bullets were silently dropped before 3.8.67 —
+  // a release whose headline was `- perf: …` entries showed none of them.
+  const PLAIN = [
+    "### Changed",
+    "",
+    "- perf: cascade diagnostics now run concurrently after each edit instead of blocking the write pipeline (~26% median per-edit latency reduction); settled at turn_end with a bounded wait (#450)",
+    "- perf: short one (#453)",
+    "  - nested continuation stays dropped",
+    "",
+  ].join("\n");
+
+  it("keeps plain bullets, condensed to their first clause", () => {
+    const s = summarizeSection(PLAIN);
+    expect(s).toContain("### Changed");
+    // First clause survives; the post-boundary tail does not.
+    expect(s).toContain("- perf: cascade diagnostics now run concurrently");
+    expect(s).not.toContain("settled at turn_end");
+    expect(s).toContain("- perf: short one (#453)");
+    expect(s).not.toContain("nested continuation");
+  });
+
+  it("re-appends trailing issue refs cut off by the clause boundary", () => {
+    const s = summarizeSection(PLAIN);
+    const line = s.split("\n").find((l) => l.includes("cascade diagnostics"));
+    expect(line).toContain("(#450)");
+  });
+
+  it("hard-truncates an unbroken over-long plain bullet at a word boundary", () => {
+    const long = `### Fixed\n\n- ${"word ".repeat(60).trim()} (#99)\n`;
+    const s = summarizeSection(long);
+    const line = s.split("\n").find((l) => l.startsWith("- word"));
+    expect(line).toBeDefined();
+    expect(line!.length).toBeLessThan(180);
+    expect(line).toContain("…");
+    expect(line).toContain("(#99)");
+  });
 });
 
 describe("repo CHANGELOG.md contract", () => {
