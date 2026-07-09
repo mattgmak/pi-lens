@@ -10,6 +10,8 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Fixed
 
+- **`servercapabilities.md` merge guard survives schema changes and merges bullet sections (#469)** — the #390 nightly merge guard for `scripts/server-capabilities.mjs` required the prior and freshly-generated table headers to be byte-identical before merging, so adding the `ws-pull` column silently disabled the guard and last night's ubuntu-only run dropped the rust and php rows (and their capability-key / executeCommand bullets) entirely. Fixed by reshaping prior rows onto the new header **by column name** (`reshapeRowsByName` in `scripts/lib/md-matrix.mjs` — columns the prior doc lacked are filled with the `·` placeholder, columns dropped from the new schema are simply not carried) and by merging the two bulleted sections ("Raw advertised capability keys", "Advertised executeCommand allowlists") for preserved servers, which the original guard never touched at all (`parseBulletSection`/`mergeBulletSection`). The whole merge is now a pure, unit-tested function (`mergeServerCapabilitiesDoc`) that never spawns an LSP server and fails open (writes the fresh doc, logs to stderr) if either doc's table is unparseable.
+
 ## [3.8.67] - 2026-07-09
 
 ### Added
