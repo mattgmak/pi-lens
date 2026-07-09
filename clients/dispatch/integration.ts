@@ -64,6 +64,7 @@ import {
 	buildReverseDependencyIndexFromGraph,
 	getAffectedFilesFromIndex,
 	writeReverseDependencyIndexToSnapshot,
+	type ReverseDependencyIndex,
 } from "../reverse-deps.js";
 import {
 	buildOrUpdateGraph,
@@ -397,6 +398,7 @@ export function resetDispatchBaselines(cwd?: string): void {
 	resetSessionSlopScore();
 	clearCoverageNoticeState();
 	clearReviewGraphWorkspaceCache();
+	clearReverseDepsIndexCache();
 	clearModuleGraphCache();
 	neighborTouchCache.clear();
 	recentlyCleanNeighborCache.clear();
@@ -466,6 +468,31 @@ function ensureCascadeTurnScope(turnSeq: number): void {
 const CASCADE_TTL_MS = 240_000;
 const MAX_PER_FILE = RUNTIME_CONFIG.pipeline.cascadeMaxDiagnosticsPerFile;
 const MAX_FILES = RUNTIME_CONFIG.pipeline.cascadeMaxFiles;
+
+// #459: the reverse-dependency index is a pure function of the review graph.
+// Rebuilding it (O(graph edges)) and re-writing it to the project snapshot
+// (disk write) on every cascade run is wasted work whenever the graph build
+// was a cache hit. Keyed per-workspace (normalized cwd — same key shape as
+// builder.ts's _workspaceGraphCache) so unrelated workspaces never share or
+// clobber each other's cached index. Freshness is keyed on the generation
+// stamp the entry's index was built from (ReviewGraph.buildGeneration).
+type ReverseDepsCacheEntry = {
+	index: ReverseDependencyIndex;
+	savedToSnapshot: boolean;
+	/** buildGeneration of the graph this index was derived from. */
+	generation: number | undefined;
+};
+const reverseDepsIndexCache = new Map<string, ReverseDepsCacheEntry>();
+
+function reverseDepsReuseEnabled(): boolean {
+	const raw = process.env.PI_LENS_REVERSE_DEPS_REUSE;
+	return raw !== "0" && raw !== "false";
+}
+
+/** Test-reset hook — mirrors clearReviewGraphWorkspaceCache's scope. */
+export function clearReverseDepsIndexCache(): void {
+	reverseDepsIndexCache.clear();
+}
 
 // Bounded transitive cascade (#162): expand neighbour derivation beyond the
 // one-hop importers/callers to depth-2 dependents, so an edit's blast radius
@@ -599,30 +626,71 @@ export async function computeCascadeForFile(
 			seqState,
 		);
 		const graphMs = Date.now() - graphStart;
-		const reverseDepsIndex = buildReverseDependencyIndexFromGraph({
-			cwd,
-			graph,
-		});
-		const reverseDepsSaved = writeReverseDependencyIndexToSnapshot({
-			cwd,
-			index: reverseDepsIndex,
-			dbg,
-		});
-		logCascade({
-			phase: "reverse_deps_cache",
-			filePath,
-			durationMs: Date.now() - graphStart,
-			metadata: {
-				action: "refresh_from_review_graph",
+		// #459: the reuse decision keys on graph.buildGeneration — a stamp that
+		// travels WITH the graph instance this cascade holds. Deliberately NOT the
+		// global last-build-info slot: post-#450 cascades overlap, and another
+		// cascade's cache-hit build can overwrite that slot (graphChanged:false)
+		// between this build mutating the graph and this read — which would turn a
+		// changed graph into a spurious reuse of a stale index that steady-state
+		// cache hits then never heal. Generation equality can't be clobbered into
+		// a false positive: a graph-mutating build always mints a new generation.
+		// An unstamped graph (mode "skipped") always rebuilds.
+		const graphBuildInfo = getLastGraphBuildInfo();
+		const workspaceKey = normalizeMapKey(cwd);
+		const cachedReverseDeps = reverseDepsIndexCache.get(workspaceKey);
+		const canReuse =
+			reverseDepsReuseEnabled() &&
+			cachedReverseDeps !== undefined &&
+			graph.buildGeneration !== undefined &&
+			cachedReverseDeps.generation === graph.buildGeneration;
+
+		let reverseDepsIndex: ReverseDependencyIndex;
+		let reverseDepsSaved: boolean;
+		if (canReuse && cachedReverseDeps) {
+			reverseDepsIndex = cachedReverseDeps.index;
+			reverseDepsSaved = cachedReverseDeps.savedToSnapshot;
+			logCascade({
+				phase: "reverse_deps_cache",
+				filePath,
+				durationMs: Date.now() - graphStart,
+				metadata: {
+					action: "reused_unchanged",
+					savedToSnapshot: reverseDepsSaved,
+					importsFileCount: Object.keys(reverseDepsIndex.imports).length,
+					importedByFileCount: Object.keys(reverseDepsIndex.importedBy).length,
+				},
+			});
+		} else {
+			reverseDepsIndex = buildReverseDependencyIndexFromGraph({
+				cwd,
+				graph,
+			});
+			reverseDepsSaved = writeReverseDependencyIndexToSnapshot({
+				cwd,
+				index: reverseDepsIndex,
+				dbg,
+			});
+			reverseDepsIndexCache.set(workspaceKey, {
+				index: reverseDepsIndex,
 				savedToSnapshot: reverseDepsSaved,
-				importsFileCount: Object.keys(reverseDepsIndex.imports).length,
-				importedByFileCount: Object.keys(reverseDepsIndex.importedBy).length,
-				importEdgeCount: Object.values(reverseDepsIndex.imports).reduce(
-					(total, imports) => total + imports.length,
-					0,
-				),
-			},
-		});
+				generation: graph.buildGeneration,
+			});
+			logCascade({
+				phase: "reverse_deps_cache",
+				filePath,
+				durationMs: Date.now() - graphStart,
+				metadata: {
+					action: "refresh_from_review_graph",
+					savedToSnapshot: reverseDepsSaved,
+					importsFileCount: Object.keys(reverseDepsIndex.imports).length,
+					importedByFileCount: Object.keys(reverseDepsIndex.importedBy).length,
+					importEdgeCount: Object.values(reverseDepsIndex.imports).reduce(
+						(total, imports) => total + imports.length,
+						0,
+					),
+				},
+			});
+		}
 
 		// Count files represented in the graph (nodes with a filePath).
 		const graphFileCount = new Set(
@@ -631,7 +699,6 @@ export async function computeCascadeForFile(
 			),
 		).size;
 
-		const graphBuildInfo = getLastGraphBuildInfo();
 		logCascade({
 			phase: "graph_build",
 			filePath,

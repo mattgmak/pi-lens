@@ -81,8 +81,16 @@ const _workspaceGraphCache = new Map<
 		lastFullVerifyMs?: number;
 		/** Count of consecutive seq fast-path builds since the last full verify (#451). */
 		fastPathSinceVerify?: number;
+		/** #459: generation of this entry's graph content — see ReviewGraph.buildGeneration. */
+		buildGeneration?: number;
 	}
 >();
+
+// #459: process-wide monotonic source for ReviewGraph.buildGeneration stamps.
+// Never reset (uniqueness is the invariant — a workspace-cache clear must not
+// let a new build collide with a generation a derived-data cache recorded
+// earlier in the same process).
+let _graphGenerationCounter = 0;
 
 /**
  * RuntimeCoordinator sequence hint (#451). Threaded from the deferred cascade so
@@ -110,7 +118,7 @@ type SeqFastpathFallback =
 	| "removed-file"
 	| "stat-error";
 
-type GraphBuildInfo = {
+export type GraphBuildInfo = {
 	reused: boolean;
 	mode: "full" | "cached" | "incremental" | "skipped" | "seq-fastpath";
 	skipReason?: string;
@@ -118,6 +126,17 @@ type GraphBuildInfo = {
 	maxFileCount?: number;
 	/** When the seq fast path was attempted but fell back to the sweep (#451). */
 	seqFastpathFallback?: SeqFastpathFallback;
+	/**
+	 * #459: whether this build changed the graph content. `mode` alone is NOT
+	 * enough to tell — both "cached" and "seq-fastpath" cover a real no-op AND
+	 * (for seq-fastpath) a genuine incremental re-extract, depending on whether
+	 * any files actually needed re-parsing. INFORMATIONAL (logs) ONLY: this
+	 * lives in a single global slot that overlapping deferred cascades can
+	 * clobber between a build and its caller's read, so derived-data caches
+	 * must key invalidation off `ReviewGraph.buildGeneration` (which travels
+	 * with the returned instance), never off this flag.
+	 */
+	graphChanged: boolean;
 };
 
 function seqFastpathEnabled(): boolean {
@@ -128,6 +147,7 @@ function seqFastpathEnabled(): boolean {
 let _lastGraphBuildInfo: GraphBuildInfo = {
 	reused: false,
 	mode: "full",
+	graphChanged: true,
 };
 
 export function clearGraphCache(): void {
@@ -137,7 +157,7 @@ export function clearGraphCache(): void {
 export function clearReviewGraphWorkspaceCache(): void {
 	_buildCache.clear();
 	_workspaceGraphCache.clear();
-	_lastGraphBuildInfo = { reused: false, mode: "full" };
+	_lastGraphBuildInfo = { reused: false, mode: "full", graphChanged: true };
 }
 
 export function getLastGraphBuildInfo(): GraphBuildInfo {
@@ -1303,6 +1323,8 @@ interface CachedGraphEntry {
 	fileSignatures: Map<string, string>;
 	fileHashes?: Map<string, string>;
 	graph: ReviewGraph;
+	/** #459: generation of this entry's graph content — see ReviewGraph.buildGeneration. */
+	buildGeneration?: number;
 }
 
 interface IncrementalCtx {
@@ -1377,6 +1399,10 @@ async function tryIncrementalFromCache(
 
 	if (filesToUpdate.length === 0) {
 		// Pure drift on existing files only — reuse the cached graph as-is.
+		// #459: content unchanged ⇒ carry the entry's generation forward (a legacy
+		// or disk-hydrated entry without one gets a fresh stamp — conservative:
+		// derived caches see it as new and rebuild once).
+		const generation = cached.buildGeneration ?? ++_graphGenerationCounter;
 		const graph = cloneGraph(cached.graph);
 		rebuildIndexes(graph);
 		graph.changedSymbolsByFile.clear();
@@ -1388,10 +1414,12 @@ async function tryIncrementalFromCache(
 			fileSignatures: new Map(ctx.fileSignatures),
 			fileHashes: hashes,
 			graph: cloneGraph(cached.graph),
+			buildGeneration: generation,
 			...verifiedCacheFields(ctx.seqAtBuildStart),
 		});
 		// #260: pure drift leaves the graph unchanged — don't rewrite the disk blob.
-		_lastGraphBuildInfo = { reused: true, mode: "cached" };
+		_lastGraphBuildInfo = { reused: true, mode: "cached", graphChanged: false };
+		graph.buildGeneration = generation;
 		ctx.facts.setSessionFact("session.reviewGraph", graph);
 		return graph;
 	}
@@ -1405,12 +1433,15 @@ async function tryIncrementalFromCache(
 
 	const graph = cloneGraph(cached.graph);
 	await updateGraphFiles(graph, ctx.cwd, filesToUpdate, ctx.facts);
+	// #459: real re-extract ⇒ new generation.
+	const generation = ++_graphGenerationCounter;
 	const graphSnapshot = cloneGraph(graph);
 	_workspaceGraphCache.set(ctx.normalizedCwd, {
 		signature: ctx.signature,
 		fileSignatures: new Map(ctx.fileSignatures),
 		fileHashes: hashes,
 		graph: graphSnapshot,
+		buildGeneration: generation,
 		...verifiedCacheFields(ctx.seqAtBuildStart),
 	});
 	persistGraph(
@@ -1420,7 +1451,8 @@ async function tryIncrementalFromCache(
 		hashes,
 		graphSnapshot,
 	);
-	_lastGraphBuildInfo = { reused: true, mode: "incremental" };
+	_lastGraphBuildInfo = { reused: true, mode: "incremental", graphChanged: true };
+	graph.buildGeneration = generation;
 	ctx.facts.setSessionFact("session.reviewGraph", graph);
 	return graph;
 }
@@ -1520,7 +1552,10 @@ async function trySeqFastpath(
 		// build has seq > stamp and is re-diffed next build, never missed.
 		cached.builtAtProjectSeq = seqAtBuildStart;
 		cached.fastPathSinceVerify = sinceVerify + 1;
-		_lastGraphBuildInfo = { reused: true, mode: "seq-fastpath" };
+		// #459: nothing graph-relevant changed — this is a genuine no-op reuse.
+		const generation = (cached.buildGeneration ??= ++_graphGenerationCounter);
+		_lastGraphBuildInfo = { reused: true, mode: "seq-fastpath", graphChanged: false };
+		graph.buildGeneration = generation;
 		facts.setSessionFact("session.reviewGraph", graph);
 		return { graph };
 	}
@@ -1546,12 +1581,15 @@ async function trySeqFastpath(
 	}
 	const nextSignature = sourceSignatureFromMap(nextSignatures);
 
+	// #459: real re-extract ⇒ new generation.
+	const generation = ++_graphGenerationCounter;
 	const graphSnapshot = cloneGraph(graph);
 	_workspaceGraphCache.set(normalizedCwd, {
 		signature: nextSignature,
 		fileSignatures: nextSignatures,
 		fileHashes: nextHashes,
 		graph: graphSnapshot,
+		buildGeneration: generation,
 		// Build-start seq, not stamp-time: see verifiedCacheFields — a bump that
 		// interleaved during updateGraphFiles' awaits must be re-diffed next build.
 		builtAtProjectSeq: seqAtBuildStart,
@@ -1559,7 +1597,10 @@ async function trySeqFastpath(
 		fastPathSinceVerify: sinceVerify + 1,
 	});
 	persistGraph(cwd, nextSignature, nextSignatures, nextHashes, graphSnapshot);
-	_lastGraphBuildInfo = { reused: true, mode: "seq-fastpath" };
+	// #459: filesToUpdate was non-empty — this fastpath re-extracted real files,
+	// so (unlike the no-op branch above) the graph object did change.
+	_lastGraphBuildInfo = { reused: true, mode: "seq-fastpath", graphChanged: true };
+	graph.buildGeneration = generation;
 	facts.setSessionFact("session.reviewGraph", graph);
 	return { graph };
 }
@@ -1613,6 +1654,11 @@ async function _doBuildGraph(
 			sourceFileCount: filesToBuild.length,
 			maxFileCount: maxGraphFiles,
 			seqFastpathFallback,
+			// #459: a fresh empty graph is returned every call on this path (never
+			// persisted/reused) — treat it as changed so dependents never trust stale
+			// derived state across skip/unskip transitions. Deliberately NOT stamped
+			// with a buildGeneration: absent ⇒ derived caches rebuild every time.
+			graphChanged: true,
 		};
 		facts.setSessionFact("session.reviewGraph", graph);
 		return graph;
@@ -1633,7 +1679,15 @@ async function _doBuildGraph(
 		// changed — a legitimate full verify. Refresh the clock/counter and seq so a
 		// later fast path diffs from here and the periodic re-verify resets.
 		Object.assign(memCached, verifiedCacheFields(seqAtBuildStart));
-		_lastGraphBuildInfo = { reused: true, mode: "cached", seqFastpathFallback };
+		// #459: content unchanged ⇒ carry the entry's generation forward.
+		const generation = (memCached.buildGeneration ??= ++_graphGenerationCounter);
+		_lastGraphBuildInfo = {
+			reused: true,
+			mode: "cached",
+			seqFastpathFallback,
+			graphChanged: false,
+		};
+		graph.buildGeneration = generation;
 		facts.setSessionFact("session.reviewGraph", graph);
 		return graph;
 	}
@@ -1662,14 +1716,25 @@ async function _doBuildGraph(
 		for (const file of normalizedChanged) {
 			upsertChangedSymbols(graph, facts, file);
 		}
+		// #459: disk-hydrated content is new to THIS process — fresh stamp (a prior
+		// process's derived caches don't exist here; in-process derived caches from
+		// before a workspace-cache clear must not match it).
+		const generation = ++_graphGenerationCounter;
 		_workspaceGraphCache.set(normalizedCwd, {
 			signature,
 			fileSignatures: new Map(fileSignatures),
 			fileHashes: diskCached.fileHashes,
 			graph: cloneGraph(diskCached.graph),
+			buildGeneration: generation,
 			...verifiedCacheFields(seqAtBuildStart),
 		});
-		_lastGraphBuildInfo = { reused: true, mode: "cached", seqFastpathFallback };
+		_lastGraphBuildInfo = {
+			reused: true,
+			mode: "cached",
+			seqFastpathFallback,
+			graphChanged: false,
+		};
+		graph.buildGeneration = generation;
 		facts.setSessionFact("session.reviewGraph", graph);
 		return graph;
 	}
@@ -1717,16 +1782,25 @@ async function _doBuildGraph(
 	// content change apart from pure mtime/size drift. Only runs on the (rare)
 	// full-build path; the OS file cache is warm from the parse above.
 	const fileHashes = await sourceHashMapAsync(filesToBuild);
+	// #459: full rebuild ⇒ new generation.
+	const generation = ++_graphGenerationCounter;
 	const graphSnapshot = cloneGraph(graph);
 	_workspaceGraphCache.set(normalizedCwd, {
 		signature,
 		fileSignatures: new Map(fileSignatures),
 		fileHashes,
 		graph: graphSnapshot,
+		buildGeneration: generation,
 		...verifiedCacheFields(seqAtBuildStart),
 	});
 	persistGraph(cwd, signature, fileSignatures, fileHashes, graphSnapshot); // fire-and-forget
-	_lastGraphBuildInfo = { reused: false, mode: "full", seqFastpathFallback };
+	_lastGraphBuildInfo = {
+		reused: false,
+		mode: "full",
+		seqFastpathFallback,
+		graphChanged: true,
+	};
+	graph.buildGeneration = generation;
 	facts.setSessionFact("session.reviewGraph", graph);
 	return graph;
 }

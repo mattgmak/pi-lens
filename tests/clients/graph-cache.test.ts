@@ -103,7 +103,12 @@ describe("buildOrUpdateGraph — Promise dedup cache", () => {
 		expect(getLastGraphBuildInfo().reused).toBe(false);
 		clearGraphCache();
 		await buildOrUpdateGraph(cwd, [path.join(cwd, "b.ts")], facts);
-		expect(getLastGraphBuildInfo()).toEqual({ reused: true, mode: "cached" });
+		expect(getLastGraphBuildInfo()).toEqual({
+			reused: true,
+			mode: "cached",
+			graphChanged: false,
+			seqFastpathFallback: undefined,
+		});
 	});
 
 	it("reuses the cached graph when mtime drifts but content is unchanged (#202)", async () => {
@@ -128,6 +133,34 @@ describe("buildOrUpdateGraph — Promise dedup cache", () => {
 		const info = getLastGraphBuildInfo();
 		expect(info.reused).toBe(true);
 		expect(info.mode).toBe("cached");
+	});
+
+	it("stamps buildGeneration — no-op builds carry it forward, content changes mint a new one (#459)", async () => {
+		const facts = new FactStore();
+		const cwd = tmpDir();
+		const file = path.join(cwd, "gen.ts");
+		fs.writeFileSync(file, "export function genA() {\n\treturn 1;\n}\n");
+
+		const g1 = await buildOrUpdateGraph(cwd, [file], facts);
+		expect(g1.buildGeneration).toBeDefined();
+
+		// Unchanged content → cache-hit build returns a fresh clone with the SAME
+		// stamp, so derived-data caches (reverse-deps index) can prove reusability.
+		clearGraphCache();
+		const g2 = await buildOrUpdateGraph(cwd, [file], facts);
+		expect(getLastGraphBuildInfo().mode).toBe("cached");
+		expect(g2.buildGeneration).toBe(g1.buildGeneration);
+
+		// A graph-mutating build (here: full rebuild after a workspace-cache clear)
+		// mints a NEW stamp. (The incremental/content-change paths are covered with
+		// real files in review-graph-seq-fastpath.test.ts — this harness mocks the
+		// source walk, so content edits are invisible to the signature here.)
+		clearReviewGraphWorkspaceCache();
+		clearGraphCache();
+		const g3 = await buildOrUpdateGraph(cwd, [file], facts);
+		expect(getLastGraphBuildInfo().mode).toBe("full");
+		expect(g3.buildGeneration).toBeDefined();
+		expect(g3.buildGeneration).not.toBe(g1.buildGeneration);
 	});
 
 	it("resolves to a ReviewGraph with version and builtAt fields", async () => {

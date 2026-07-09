@@ -258,4 +258,45 @@ describe("review-graph seq fast path (#451)", () => {
 			env.cleanup();
 		}
 	});
+
+	it("buildGeneration: no-op fastpath carries the stamp forward, a real re-extract mints a new one (#459)", async () => {
+		const env = setupTestEnvironment("pi-lens-seqfp-gen-");
+		try {
+			const aPath = createTempFile(
+				env.tmpDir,
+				"src/a.ts",
+				["export function alpha() { return 1; }", ""].join("\n"),
+			);
+			const facts = new FactStore();
+			const hint = makeSeqHint();
+
+			clearGraphCache();
+			const g1 = await buildOrUpdateGraph(env.tmpDir, [aPath], facts, hint);
+			expect(getLastGraphBuildInfo().mode).toBe("full");
+			expect(g1.buildGeneration).toBeDefined();
+
+			// Nothing changed (no bumps, empty changedFiles): no-op fastpath returns
+			// a fresh clone carrying the SAME stamp — derived caches may reuse.
+			clearGraphCache();
+			const g2 = await buildOrUpdateGraph(env.tmpDir, [], facts, hint);
+			expect(getLastGraphBuildInfo().mode).toBe("seq-fastpath");
+			expect(getLastGraphBuildInfo().graphChanged).toBe(false);
+			expect(g2.buildGeneration).toBe(g1.buildGeneration);
+
+			// Real edit + coordinator bump: fastpath re-extracts → NEW stamp.
+			fs.writeFileSync(
+				aPath,
+				["export function alphaRenamed() { return 2; }", ""].join("\n"),
+			);
+			hint.bump(aPath);
+			clearGraphCache();
+			const g3 = await buildOrUpdateGraph(env.tmpDir, [aPath], facts, hint);
+			expect(getLastGraphBuildInfo().mode).toBe("seq-fastpath");
+			expect(getLastGraphBuildInfo().graphChanged).toBe(true);
+			expect(g3.buildGeneration).toBeDefined();
+			expect(g3.buildGeneration).not.toBe(g1.buildGeneration);
+		} finally {
+			env.cleanup();
+		}
+	});
 });
