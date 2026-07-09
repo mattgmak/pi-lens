@@ -24,6 +24,7 @@ import {
 	detectProjectLanguageProfile,
 	getDefaultStartupTools,
 } from "./language-profile.js";
+import { logLatency } from "./latency-logger.js";
 import { runLogCleanup } from "./log-cleanup.js";
 import { setSessionLanguages } from "./widget-state.js";
 import { initLSPConfig, loadLSPConfig } from "./lsp/config.js";
@@ -45,6 +46,11 @@ import type { RuntimeCoordinator } from "./runtime-coordinator.js";
 import type { RustClient } from "./rust-client.js";
 
 import { isAtOrAboveHomeDir } from "./path-utils.js";
+import {
+	getSlowFsVerdict,
+	isSlowFs,
+	slowFsDegradationNotice,
+} from "./slow-fs.js";
 import {
 	findNearestProjectRoot,
 	resolveStartupScanContext,
@@ -480,6 +486,26 @@ function scheduleStartupScans(
 	if (!canRunJsTsHeavyScans) {
 		dbg(
 			"session_start: skipping JS/TS startup scans (requires JS/TS language + project config)",
+		);
+		return;
+	}
+
+	// #462: knip/jscpd/madge/dead-code/govulncheck/gitleaks/trivy each spawn an
+	// external CLI that walks the whole project tree on its own — a walk we
+	// don't control or get to route to an async collector. On a measured-slow
+	// filesystem that walk reproduces the exact multi-second freeze this
+	// feature exists to prevent, so skip them outright with a visible reason
+	// instead of leaving the agent to read an empty/stale cache as "clean".
+	// TODO/call-graph/codebase-model/ast-grep-exports/word-index above and
+	// below this point already route through `collectSourceFilesAsync` and stay
+	// on regardless.
+	if (isSlowFs(analysisRoot)) {
+		dbg(
+			"session_start: skipping knip/jscpd/madge/dead-code/govulncheck/gitleaks/trivy (slow-fs)",
+		);
+		deps.notify(
+			`⏭️ Skipped background code-quality scans (knip/jscpd/madge/dead-code/govulncheck/gitleaks/trivy): ${slowFsDegradationNotice()}`,
+			"info",
 		);
 		return;
 	}
@@ -1193,6 +1219,34 @@ export async function handleSessionStart(
 	dbg(`session_start workspace cwd available: ${hasWorkspaceCwd}`);
 	if (useScanRootForSignals && analysisRoot !== cwd) {
 		dbg(`session_start: monorepo analysis root override -> ${analysisRoot}`);
+	}
+
+	// Slow-FS probe (#462): classify the workspace filesystem by measurement
+	// (median fs.statSync cost) before any tree walk runs. WSL 9p mounts cost
+	// ~1.3ms/stat vs ~17µs native — a 75x slowdown that turns a 5,000-file sync
+	// walk into a multi-second TUI freeze. Logged to the latency log so
+	// dogfooding can see the verdict; a visible notice fires when engaged so a
+	// degraded scan is never mistaken for a silently-empty one.
+	const slowFsVerdict = getSlowFsVerdict(analysisRoot);
+	logLatency({
+		type: "phase",
+		phase: "slow_fs_probe",
+		filePath: analysisRoot,
+		durationMs: 0,
+		metadata: {
+			slow: slowFsVerdict.slow,
+			medianStatMicros: slowFsVerdict.medianStatMicros,
+			samples: slowFsVerdict.samples,
+		},
+	});
+	dbg(
+		`session_start slow-fs probe: slow=${slowFsVerdict.slow} medianStatMicros=${slowFsVerdict.medianStatMicros.toFixed(1)} samples=${slowFsVerdict.samples}`,
+	);
+	if (slowFsVerdict.slow) {
+		notify(
+			`🐢 Slow filesystem detected (median ${slowFsVerdict.medianStatMicros.toFixed(0)}µs/stat) — reduced-scan mode engaged (set PI_LENS_ALLOW_SLOW_FS_SCAN=1 to override).`,
+			"warning",
+		);
 	}
 
 	const lensLspEnabled = !getFlag("no-lsp");
