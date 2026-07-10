@@ -56,18 +56,6 @@
       ]
     },
     {
-      "login": "wastedC",
-      "name": "wastedC",
-      "avatar_url": "https://avatars.githubusercontent.com/u/917574?v=4",
-      "profile": "https://github.com/wastedC",
-      "contributions": [
-        "code",
-        "ideas",
-        "maintenance",
-        "review"
-      ]
-    },
-    {
       "login": "anh-chu",
       "name": "Anh Chu",
       "avatar_url": "https://avatars.githubusercontent.com/u/34973633?v=4",
@@ -132,6 +120,24 @@
       ]
     },
     {
+      "login": "rfxlamia",
+      "name": "V",
+      "avatar_url": "https://avatars.githubusercontent.com/u/222023708?v=4",
+      "profile": "https://github.com/rfxlamia",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "fabio-dee",
+      "name": "Fabio Dee",
+      "avatar_url": "https://avatars.githubusercontent.com/u/10808443?v=4",
+      "profile": "https://github.com/fabio-dee",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
       "login": "moj02090",
       "name": "moj02090",
       "avatar_url": "https://avatars.githubusercontent.com/u/57255166?v=4",
@@ -145,6 +151,15 @@
       "name": "Micah Halter",
       "avatar_url": "https://avatars.githubusercontent.com/u/1591837?v=4",
       "profile": "https://github.com/mehalter",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "JulienEllie",
+      "name": "Julien Ellie",
+      "avatar_url": "https://avatars.githubusercontent.com/u/670518?v=4",
+      "profile": "https://github.com/JulienEllie",
       "contributions": [
         "code"
       ]
@@ -229,6 +244,15 @@
       "name": "Max L.",
       "avatar_url": "https://avatars.githubusercontent.com/u/91132641?v=4",
       "profile": "https://github.com/shaDmx",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "radge",
+      "name": "David Ryan",
+      "avatar_url": "https://avatars.githubusercontent.com/u/129205?v=4",
+      "profile": "https://github.com/radge",
       "contributions": [
         "code"
       ]
