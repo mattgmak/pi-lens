@@ -88,6 +88,11 @@ import {
 import { RuntimeCoordinator } from "./clients/runtime-coordinator.js";
 import { handleSessionStart } from "./clients/runtime-session.js";
 import {
+	decideSessionStart,
+	decrementSecondarySessionCount,
+	noteSessionShutdown,
+} from "./clients/session-lifecycle.js";
+import {
 	clearLastAnalyzedStateCache,
 	flushDebouncedToolResults,
 	handleToolResult,
@@ -1087,15 +1092,6 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (event, ctx) => {
 		try {
 			dbg("session_start fired");
-			// #449 slice 1 / #472: register this process in the cross-process
-			// instance registry and fire-and-forget an orphan-LSP sweep. Neither
-			// call is awaited — registry I/O and the reaper sweep must never delay
-			// session start; both are internally best-effort (never throw).
-			void registerInstance(ctx.cwd ?? process.cwd()).catch(() => {
-				// best-effort observability — never fail session_start over this
-			});
-			void sweepOrphans();
-			updateRuntimeIdentityFromEvent(event);
 			// #190: pi's session lifecycle. `reason` distinguishes new/resume/fork/
 			// reload/startup; the STABLE session id comes from the session manager
 			// (the event carries none), and is what lets a resumed session rehydrate.
@@ -1109,6 +1105,45 @@ export default function (pi: ExtensionAPI) {
 					return undefined;
 				}
 			})();
+
+			// #473: distinguish a concurrently-live in-process subagent bind
+			// (tintinweb/pi-subagents-style) from a real sequential session
+			// replacement BEFORE touching any process-shared singleton. A
+			// concurrent secondary must not run handleSessionStart (which resets
+			// the shared LSP fleet + runtime generation out from under the still
+			// -live parent) or updateRuntimeIdentityFromEvent (which would
+			// overwrite the parent's telemetry identity).
+			const sessionStartDecision = decideSessionStart(ctx, stableSessionId);
+			if (!sessionStartDecision.runFullSessionStart) {
+				dbg(
+					`session_start: concurrent secondary detected (count=${sessionStartDecision.secondaryCount}) — skipping handleSessionStart`,
+				);
+				logLatency({
+					type: "phase",
+					filePath: "<pi-lens>",
+					phase: "concurrent_session_bind",
+					durationMs: 0,
+					metadata: {
+						secondaryCount: sessionStartDecision.secondaryCount,
+						sessionReason,
+						sameCwd: (ctx as { cwd?: string })?.cwd === process.cwd(),
+					},
+				});
+				return;
+			}
+
+			// #449 slice 1 / #472: register this process in the cross-process
+			// instance registry and fire-and-forget an orphan-LSP sweep. Below the
+			// #473 guard deliberately: a concurrent secondary neither re-registers
+			// (the pid's entry already exists) nor re-sweeps (a fan-out would run
+			// up to maxConcurrent redundant sweeps). Neither call is awaited —
+			// registry I/O and the reaper must never delay session start; both are
+			// internally best-effort (never throw).
+			void registerInstance(ctx.cwd ?? process.cwd()).catch(() => {
+				// best-effort observability — never fail session_start over this
+			});
+			void sweepOrphans();
+			updateRuntimeIdentityFromEvent(event);
 			try {
 				await ensureLSPConfigInitialized(ctx.cwd ?? process.cwd());
 			} catch (cfgErr) {
@@ -2217,7 +2252,30 @@ export default function (pi: ExtensionAPI) {
 	// --- Session shutdown: release all handles so subagent processes exit cleanly ---
 	// The LSP idle-reset timer (240s) is unref'd but we cancel it explicitly here
 	// so it does not fire after shutdown. resetLSPService shuts down any live clients.
-	(pi as any).on("session_shutdown", () => {
+	(pi as any).on("session_shutdown", (_event: unknown, ctx: unknown) => {
+		// #473: a concurrently-live in-process subagent session shutting down
+		// (its sibling primary — the real parent — still active) must NOT run
+		// the shared-infra teardown below: no LSP fleet shutdown, no idle-timer
+		// cancel that the parent still relies on. Only cheap/idempotent work
+		// (none here) would be safe to keep; everything in this handler today
+		// is destructive shared-infra teardown, so a secondary skips the whole
+		// body.
+		const stableSessionId = (() => {
+			try {
+				return (
+					ctx as { sessionManager?: { getSessionId?: () => string } }
+				)?.sessionManager?.getSessionId?.();
+			} catch {
+				return undefined;
+			}
+		})();
+		const shutdownClassification = noteSessionShutdown(ctx, stableSessionId);
+		if (shutdownClassification === "secondary") {
+			decrementSecondarySessionCount();
+			dbg("session_shutdown: concurrent secondary — skipping shared-infra teardown");
+			return;
+		}
+
 		cancelLSPIdleReset();
 		// #449 slice 1: SYNC-only deregistration (no child spawns — see the
 		// processExiting note below); safe to call unconditionally here.
