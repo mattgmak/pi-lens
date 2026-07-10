@@ -19,7 +19,9 @@ export interface CascadeLogEntry {
 		| "neighbor_snapshot" // neighbor read from passive snapshot (autoPropagate jsts)
 		| "neighbor_fallback" // neighbor fell back to getAllDiagnostics (error or degraded)
 		| "cascade_result" // final per-file cascade result
-		| "cascade_turn_end"; // merged result emitted at turn_end
+		| "cascade_turn_end" // merged result emitted at turn_end
+		| "cascade_tier3_skip" // #458: in-lane wait skipped for a tier-3 neighbor touch
+		| "cascade_tier3_reconcile"; // #458: quiet-window reconcile of outstanding tier-3 touches
 	filePath: string;
 	neighborFile?: string;
 	reason?: string;

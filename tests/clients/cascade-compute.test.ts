@@ -411,6 +411,141 @@ describe("computeCascadeForFile", () => {
 		}
 	});
 
+	it("#458: skips the in-lane wait for a tier-3 (push-only, silent-on-clean) neighbor touch and records it outstanding", async () => {
+		const env = setupTestEnvironment("cascade-tier3-skip-");
+		try {
+			const primary = path.join(env.tmpDir, "src", "primary.ts");
+			const neighbor = path.join(env.tmpDir, "src", "neighbor.ts");
+			fs.mkdirSync(path.dirname(primary), { recursive: true });
+			fs.writeFileSync(primary, "export const x = 1;\n");
+			fs.writeFileSync(neighbor, "import { x } from './primary';\n");
+			mocks.computeImpactCascade.mockReturnValue(impact(primary, [neighbor]));
+
+			const touchFile = vi.fn();
+			const getClientForFile = vi.fn().mockResolvedValue({
+				client: { serverId: "typescript", diagnosticsVersion: 3 },
+			});
+			const getCapabilitySnapshots = vi.fn().mockResolvedValue([
+				{
+					serverId: "typescript",
+					root: env.tmpDir,
+					operationSupport: {},
+					workspaceDiagnosticsSupport: { mode: "push-only" },
+					advertisedCommands: [],
+					rawCapabilityKeys: [],
+				},
+			]);
+			mocks.getLSPService.mockReturnValue({
+				// Empty allDiags — no snapshot for neighbor (cold session), forces
+				// the active-touch branch rather than the passive-snapshot read.
+				getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+				getCapabilitySnapshots,
+				getClientForFile,
+				touchFile,
+				getDiagnostics: vi.fn(),
+			});
+
+			const { computeCascadeForFile } = await import(
+				"../../clients/dispatch/integration.js"
+			);
+			const { _getOutstandingCascadeTouchesForTests } = await import(
+				"../../clients/lsp/cascade-tier.js"
+			);
+
+			const result = await computeCascadeForFile(primary, env.tmpDir, {
+				turnSeq: 1,
+				writeSeq: 1,
+			});
+
+			// The wait-skipping touch still fires the notify (didOpen/didChange),
+			// just with the wait disabled — never a wholesale no-touch.
+			expect(touchFile).toHaveBeenCalledWith(
+				neighbor,
+				expect.any(String),
+				expect.objectContaining({
+					diagnostics: "none",
+					collectDiagnostics: false,
+					clientScope: "primary",
+				}),
+			);
+			// Recorded outstanding for the quiet-window reconcile — not silently
+			// dropped, not silently treated as clean.
+			const outstanding = _getOutstandingCascadeTouchesForTests();
+			expect(outstanding).toHaveLength(1);
+			expect(outstanding[0]).toMatchObject({
+				serverId: "typescript",
+				baselineVersion: 3,
+			});
+			// No trustworthy diagnostics were produced by this touch, so the
+			// degraded-fallback path (empty diagnostics, not "clean") applies —
+			// never a false "no errors" for a skipped wait.
+			expect(result?.result?.neighbors[0]?.diagnostics ?? []).toEqual([]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("#458: PI_LENS_TIER_AWARE_CASCADE=0 disables the skip — tier-3 neighbor still waits in-lane", async () => {
+		const original = process.env.PI_LENS_TIER_AWARE_CASCADE;
+		process.env.PI_LENS_TIER_AWARE_CASCADE = "0";
+		const env = setupTestEnvironment("cascade-tier3-killswitch-");
+		try {
+			const primary = path.join(env.tmpDir, "src", "primary.ts");
+			const neighbor = path.join(env.tmpDir, "src", "neighbor.ts");
+			fs.mkdirSync(path.dirname(primary), { recursive: true });
+			fs.writeFileSync(primary, "export const x = 1;\n");
+			fs.writeFileSync(neighbor, "import { x } from './primary';\n");
+			mocks.computeImpactCascade.mockReturnValue(impact(primary, [neighbor]));
+
+			const touchFile = vi
+				.fn()
+				.mockResolvedValue([lspError("type error in neighbor")]);
+			const getCapabilitySnapshots = vi.fn();
+			const getClientForFile = vi.fn();
+			mocks.getLSPService.mockReturnValue({
+				getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+				getCapabilitySnapshots,
+				getClientForFile,
+				touchFile,
+				getDiagnostics: vi.fn(),
+			});
+
+			const {
+				computeCascadeForFile,
+				resetDispatchBaselines: _reset,
+			} = await import("../../clients/dispatch/integration.js");
+			const { _resetTierAwareCascadeEnabledForTests } = await import(
+				"../../clients/lsp/cascade-tier.js"
+			);
+			_resetTierAwareCascadeEnabledForTests();
+
+			await computeCascadeForFile(primary, env.tmpDir, {
+				turnSeq: 1,
+				writeSeq: 1,
+			});
+
+			// Kill switch off: classification is never even attempted, and the
+			// full in-lane wait (collectDiagnostics: true) is used, same as before #458.
+			expect(getCapabilitySnapshots).not.toHaveBeenCalled();
+			expect(touchFile).toHaveBeenCalledWith(
+				neighbor,
+				expect.any(String),
+				expect.objectContaining({ collectDiagnostics: true }),
+			);
+		} finally {
+			env.cleanup();
+			if (original === undefined) {
+				delete process.env.PI_LENS_TIER_AWARE_CASCADE;
+			} else {
+				process.env.PI_LENS_TIER_AWARE_CASCADE = original;
+			}
+			const { _resetTierAwareCascadeEnabledForTests } = await import(
+				"../../clients/lsp/cascade-tier.js"
+			);
+			_resetTierAwareCascadeEnabledForTests();
+		}
+	});
+
 	it("does not touch jsts neighbor when snapshot is valid (warm session)", async () => {
 		const env = setupTestEnvironment("cascade-warm-snapshot-");
 		try {

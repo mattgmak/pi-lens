@@ -90,6 +90,21 @@ export interface DiagnosticStrategy {
 	 *  that only re-scan on a fresh open — e.g. opengrep ignores didChange, so an
 	 *  incremental sync silently yields zero findings on every edit-after-first. */
 	reopenOnResync?: boolean;
+	/**
+	 * Tier-3 marker (#458): true only for a `mode: "push-only"` server that is
+	 * known to publish NOTHING on a clean→clean transition (silent on clean —
+	 * see docs/lsp-capability-matrix.md's `clean-behavior` column, measured by
+	 * `scripts/probe-clean-signal.mjs`). Combined with the live capability
+	 * snapshot's `mode === "push-only"`, this is what the cascade lane's tier
+	 * gate (`clients/lsp/cascade-tier.ts`) uses to decide whether an in-lane
+	 * diagnostic wait can be skipped and reconciled later at the quiet window
+	 * instead. Undefined/false is the fail-safe default — a server not marked
+	 * here always gets the full in-lane wait, same as before #458. Do NOT set
+	 * this for `2*`/publishes-unversioned servers (opengrep, yaml, taplo, …):
+	 * they DO resolve the wait early at runtime, just without a proven version,
+	 * so shortening their in-lane wait would be a behavior change, not a no-op.
+	 */
+	silentOnClean?: boolean;
 }
 
 export const SERVER_DIAGNOSTIC_STRATEGIES: Record<string, DiagnosticStrategy> =
@@ -100,6 +115,11 @@ export const SERVER_DIAGNOSTIC_STRATEGIES: Record<string, DiagnosticStrategy> =
 			debounceMs: 50,
 			aggregateWaitMs: 1000,
 			expectSemanticSecondPush: false,
+			// Tier 3 (#458): typescript-language-server publishes nothing on a
+			// clean→clean edit (docs/lsp-capability-matrix.md, probed 2026-07-08).
+			// It's the lone core-set tier-3 server, which is exactly why the
+			// cascade lane's in-lane wait is worth skipping for it specifically.
+			silentOnClean: true,
 		},
 		"rust-analyzer": {
 			seedFirstPush: false,
