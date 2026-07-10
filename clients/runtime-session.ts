@@ -1288,10 +1288,11 @@ export async function handleSessionStart(
 			metadata: {
 				runId: identity?.runId,
 				agentName: identity?.agentName,
+				marker: identity?.marker,
 			},
 		});
 		dbg(
-			`session_start subagent light mode: engaged (runId=${identity?.runId ?? "unknown"} agentName=${identity?.agentName ?? "unknown"})`,
+			`session_start subagent light mode: engaged (marker=${identity?.marker ?? "unknown"} runId=${identity?.runId ?? "unknown"} agentName=${identity?.agentName ?? "unknown"})`,
 		);
 	}
 

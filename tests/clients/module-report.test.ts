@@ -580,6 +580,56 @@ describe("moduleReport — review-graph who-uses-this", () => {
 		expect(report.recommendedReads.some((r) => r.symbol === "foo")).toBe(true);
 	});
 
+	it("#511: warm graph missing a node for THIS file is reported as an actionable stale gap, not silent none", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"a.ts",
+			"export function foo(x: number): number {\n  return x + 1;\n}\n",
+		);
+		// Warm the graph BEFORE the target file exists — mirrors #511: a review
+		// graph was built/persisted, then a new file (e.g. clients/agent-nudge.ts)
+		// was added afterward without a rebuild. The graph is genuinely warm (it has
+		// nodes, e.g. for a.ts) but has no node for the new file.
+		await warmGraph(env.tmpDir);
+		const newFile = createTempFile(
+			env.tmpDir,
+			"new-file.ts",
+			[
+				"export function wireSubscriber(): void {}",
+				"export function consume(): void {}",
+			].join("\n"),
+		);
+
+		const report = await moduleReport(newFile, env.tmpDir);
+
+		expect(report.available).toBe(true);
+		// usedBy/semantic still degrade to none — there's genuinely no graph data
+		// for this file — but the report must say WHY and that a rebuild would fix
+		// it, rather than looking identical to a fully-cold cache.
+		expect(report.provenance?.usedBy).toBe("none");
+		expect(report.semantic.source).toBe("none");
+		expect(report.warnings?.some((w) => /pilens_rebuild/.test(w))).toBe(true);
+		expect(
+			report.warnings?.some((w) => /cached review graph exists/.test(w)),
+		).toBe(true);
+	});
+
+	it("true cold cache (no graph built at all) carries no stale-gap warning", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"a.ts",
+			"export function foo(x: number): number {\n  return x + 1;\n}\n",
+		);
+		// No warmGraph() at all — genuinely cold, not "warm but missing this file".
+		const report = await moduleReport(file, env.tmpDir);
+		expect(report.provenance?.usedBy).toBe("none");
+		expect(
+			report.warnings?.some((w) => /cached review graph exists/.test(w)),
+		).toBeFalsy();
+	});
+
 	it("drops a function-local declaration from the outline entirely (#259, supersedes #256 routing)", async () => {
 		const env = makeEnv();
 		const file = createTempFile(

@@ -1,9 +1,11 @@
 /**
- * Subagent light mode (#449 slice 0).
+ * Subagent light mode (#449 slice 0; broadened #507).
  *
- * Covers: env detection of `PI_SUBAGENT_CHILD=1`, the `PI_LENS_SUBAGENT_FULL=1`
- * override hatch, identity parsing from `PI_SUBAGENT_RUN_ID` /
- * `PI_SUBAGENT_CHILD_AGENT`, and `_resetSubagentModeForTests`.
+ * Covers: env detection of `PI_SUBAGENT_CHILD=1` (nicobailon/pi-subagents)
+ * and the `PI_SUBAGENT_CHILD_AGENT` + `PI_SUBAGENT_PARENT_PID` pair
+ * (avtc-pi-subagent, #507), the `PI_LENS_SUBAGENT_FULL=1` override hatch for
+ * both vocabularies, identity parsing (including the `marker` field), and
+ * `_resetSubagentModeForTests`.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -19,6 +21,7 @@ const envKeys = [
 	"PI_LENS_SUBAGENT_FULL",
 	"PI_SUBAGENT_RUN_ID",
 	"PI_SUBAGENT_CHILD_AGENT",
+	"PI_SUBAGENT_PARENT_PID",
 ] as const;
 let savedEnv: Record<string, string | undefined>;
 
@@ -72,6 +75,29 @@ describe("isSubagentSession", () => {
 		process.env.PI_LENS_SUBAGENT_FULL = "0";
 		expect(isSubagentSession()).toBe(true);
 	});
+
+	it("is true when both PI_SUBAGENT_CHILD_AGENT and PI_SUBAGENT_PARENT_PID are set (avtc-pi-subagent pair)", () => {
+		process.env.PI_SUBAGENT_CHILD_AGENT = "reviewer-1";
+		process.env.PI_SUBAGENT_PARENT_PID = "12345";
+		expect(isSubagentSession()).toBe(true);
+	});
+
+	it("is false when only PI_SUBAGENT_CHILD_AGENT is set (no parent pid) — false-positive guard", () => {
+		process.env.PI_SUBAGENT_CHILD_AGENT = "reviewer-1";
+		expect(isSubagentSession()).toBe(false);
+	});
+
+	it("is false when only PI_SUBAGENT_PARENT_PID is set (no child agent) — false-positive guard", () => {
+		process.env.PI_SUBAGENT_PARENT_PID = "12345";
+		expect(isSubagentSession()).toBe(false);
+	});
+
+	it("PI_LENS_SUBAGENT_FULL=1 overrides the avtc pair back to full behavior", () => {
+		process.env.PI_SUBAGENT_CHILD_AGENT = "reviewer-1";
+		process.env.PI_SUBAGENT_PARENT_PID = "12345";
+		process.env.PI_LENS_SUBAGENT_FULL = "1";
+		expect(isSubagentSession()).toBe(false);
+	});
 });
 
 describe("getSubagentIdentity", () => {
@@ -79,12 +105,13 @@ describe("getSubagentIdentity", () => {
 		expect(getSubagentIdentity()).toBeUndefined();
 	});
 
-	it("parses runId and agentName when both are set", () => {
+	it("parses runId and agentName when both are set (nicobailon, no avtc pair)", () => {
 		process.env.PI_SUBAGENT_RUN_ID = "run-123";
 		process.env.PI_SUBAGENT_CHILD_AGENT = "code-reviewer";
 		expect(getSubagentIdentity()).toEqual({
 			runId: "run-123",
 			agentName: "code-reviewer",
+			marker: undefined,
 		});
 	});
 
@@ -93,6 +120,7 @@ describe("getSubagentIdentity", () => {
 		expect(getSubagentIdentity()).toEqual({
 			runId: "run-456",
 			agentName: undefined,
+			marker: undefined,
 		});
 	});
 
@@ -101,6 +129,7 @@ describe("getSubagentIdentity", () => {
 		expect(getSubagentIdentity()).toEqual({
 			runId: undefined,
 			agentName: "explore",
+			marker: undefined,
 		});
 	});
 
@@ -108,6 +137,28 @@ describe("getSubagentIdentity", () => {
 		process.env.PI_SUBAGENT_RUN_ID = "";
 		process.env.PI_SUBAGENT_CHILD_AGENT = "";
 		expect(getSubagentIdentity()).toBeUndefined();
+	});
+
+	it("carries marker 'pi-subagents' and agentName when PI_SUBAGENT_CHILD=1", () => {
+		process.env.PI_SUBAGENT_CHILD = "1";
+		process.env.PI_SUBAGENT_CHILD_AGENT = "code-reviewer";
+		expect(isSubagentSession()).toBe(true);
+		expect(getSubagentIdentity()).toEqual({
+			runId: undefined,
+			agentName: "code-reviewer",
+			marker: "pi-subagents",
+		});
+	});
+
+	it("carries marker 'avtc-pi-subagent' and agentName when the avtc pair is set", () => {
+		process.env.PI_SUBAGENT_CHILD_AGENT = "reviewer-1";
+		process.env.PI_SUBAGENT_PARENT_PID = "12345";
+		expect(isSubagentSession()).toBe(true);
+		expect(getSubagentIdentity()).toEqual({
+			runId: undefined,
+			agentName: "reviewer-1",
+			marker: "avtc-pi-subagent",
+		});
 	});
 });
 
