@@ -14,6 +14,11 @@ vi.mock("../../clients/read-guard-logger.js", () => ({
 	getReadGuardLogPath: vi.fn(() => "/dev/null"),
 }));
 
+const logLatency = vi.fn();
+vi.mock("../../clients/latency-logger.js", () => ({
+	logLatency: (...args: unknown[]) => logLatency(...args),
+}));
+
 vi.mock("../../clients/file-time.js", () => ({
 	createFileTime: (_sessionId: string) => ({
 		read: vi.fn(),
@@ -144,6 +149,43 @@ describe("agent-nudge — inline context nudge for out-of-view mutations (#485)"
 		bus.emit(touchedPayload({ paths: ["/repo/src/unseen.ts"] }));
 
 		expect(consumeAgentNudge()).toBeUndefined();
+	});
+
+	it("agent_nudge phase reports filesFiltered = relevance drops, not display overflow", () => {
+		logLatency.mockClear();
+		const guard = createReadGuard("s1");
+		guard.recordRead(createReadRecord("/repo/src/seen.ts"));
+
+		const bus = makeBus();
+		wireAgentNudgeSubscriber({ events: bus, getReadGuard: () => guard });
+
+		// One relevant file + two never-seen files in the same payload.
+		bus.emit(
+			touchedPayload({
+				paths: ["/repo/src/seen.ts", "/repo/src/x.ts", "/repo/src/y.ts"],
+			}),
+		);
+
+		expect(consumeAgentNudge()).toBeDefined();
+		const phase = logLatency.mock.calls
+			.map((c) => c[0] as { phase?: string; metadata?: Record<string, unknown> })
+			.find((e) => e.phase === "agent_nudge");
+		expect(phase?.metadata).toMatchObject({
+			filesTotal: 1,
+			filesShown: 1,
+			filesFiltered: 2,
+		});
+
+		// The filter counter drains with the consume — a second consume must
+		// not re-report the same drops.
+		logLatency.mockClear();
+		guard.recordRead(createReadRecord("/repo/src/z.ts"));
+		bus.emit(touchedPayload({ paths: ["/repo/src/z.ts"] }));
+		expect(consumeAgentNudge()).toBeDefined();
+		const phase2 = logLatency.mock.calls
+			.map((c) => c[0] as { phase?: string; metadata?: Record<string, unknown> })
+			.find((e) => e.phase === "agent_nudge");
+		expect(phase2?.metadata).toMatchObject({ filesFiltered: 0 });
 	});
 
 	it("relevance filter honors cross-form paths: read recorded with backslashes, bus event uses forward slashes", () => {

@@ -59,16 +59,24 @@ interface AccumulatedFile {
 // Module-level accumulator: one process/session, so a plain map keyed via
 // normalizeMapKey (house style — every map/set key in this module MUST go
 // through it; a hand-rolled replace() is the exact trap that cost two red CI
-// rounds this week on the sibling #439-441 batch) is sufficient. Cleared ONLY
+// rounds on #458's reconcile tests, PR #491) is sufficient. Cleared ONLY
 // inside consumeAgentNudge() (i.e. only at actual injection into a `context`
 // call) — deliberately NOT tied to turn_start/agent_end/agent_settled, so
 // entries accumulated during run A's turn_end survive until run B's first
 // `context` call in the same session (the cross-run `git status` case).
 const _touched = new Map<string, AccumulatedFile>();
 
+// Count of bus-reported paths dropped by the relevance filter (file never
+// read/edited this session) since the last consume — drained alongside the
+// accumulator so the `agent_nudge` phase can report how much the filter
+// actually suppresses, which is the metric that validates (or indicts) the
+// "only nudge for files the session saw" rule.
+let _relevanceFilteredCount = 0;
+
 /** Test-only: clear accumulator state between test files/cases. */
 export function _resetAgentNudgeForTests(): void {
 	_touched.clear();
+	_relevanceFilteredCount = 0;
 	_enabledCache = undefined;
 }
 
@@ -114,7 +122,10 @@ function recordTouchedEvent(
 		const isRelevant =
 			readGuard.getReadHistory(rawPath).length > 0 ||
 			readGuard.getEditHistory(rawPath).length > 0;
-		if (!isRelevant) continue;
+		if (!isRelevant) {
+			_relevanceFilteredCount++;
+			continue;
+		}
 
 		const mapKey = normalizeMapKey(rawPath);
 		const existing = _touched.get(mapKey);
@@ -189,6 +200,8 @@ export function consumeAgentNudge(
 ): { messages: Array<{ role: "user"; content: string }> } | undefined {
 	const entries = Array.from(_touched.values());
 	_touched.clear();
+	const filesFiltered = _relevanceFilteredCount;
+	_relevanceFilteredCount = 0;
 
 	if (!isAgentNudgeEnabled()) return undefined;
 	if (entries.length === 0) return undefined;
@@ -229,7 +242,10 @@ export function consumeAgentNudge(
 			metadata: {
 				filesTotal,
 				filesShown: shown.length,
-				filesFiltered: filesTotal - shown.length,
+				// Relevance-filter drops since the last consume (files the session
+				// never read/edited) — NOT the display overflow, which is
+				// filesTotal - filesShown.
+				filesFiltered,
 				reasonMix: Array.from(allReasons),
 			},
 		});
