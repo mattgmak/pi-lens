@@ -1641,6 +1641,21 @@ export async function moduleReport(
 
 	const hasGraphNode = graph?.fileNodes.has(normalizedPath) ?? false;
 
+	// #511: distinguish two very different reasons `usedBy`/`semantic` degrade to
+	// "none". A graph that doesn't exist at all (`!graph`) is an honest, expected
+	// cold start — the edit pipeline hasn't warmed this workspace yet. But a graph
+	// that DOES exist and just doesn't have a node for THIS file (e.g. the file was
+	// added/renamed after the graph was last persisted) is silently
+	// indistinguishable from "no who-uses-this data exists" unless we say so. Make
+	// the second case actionable: a rebuild (pilens_rebuild) would populate it.
+	if (graph && !hasGraphNode) {
+		warnings.push(
+			"who-uses-this is unavailable for this file: the cached review graph " +
+				"exists but has no node for it (likely added/changed after the graph " +
+				"was last built). Run pilens_rebuild to refresh it.",
+		);
+	}
+
 	// Cross-file blast radius (#304): opt-in, read-only over the CACHED graph. Only
 	// computed when requested AND the file is in a warm graph — a cold cache omits
 	// the section entirely (never builds, same #256 contract as the rest of this
