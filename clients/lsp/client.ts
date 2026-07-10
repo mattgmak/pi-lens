@@ -11,6 +11,7 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { access, readFile } from "node:fs/promises";
+import * as os from "node:os";
 import { pathToFileURL } from "node:url";
 import { withTimeout } from "../deadline-utils.js";
 import type { MessageConnection } from "../deps/vscode-jsonrpc.js";
@@ -26,6 +27,7 @@ import {
 import { getAmbientAbortSignal } from "../safe-spawn.js";
 
 import { applyWorkspaceEdit } from "./edits.js";
+import { recordLspChild, removeLspChild } from "../instance-registry.js";
 import type { LSPProcess } from "./launch.js";
 import { normalizeMapKey, uriToPath } from "./path-utils.js";
 import {
@@ -43,6 +45,32 @@ import { WatchedFilesQueue } from "./watch-queue.js";
 // diagnose the clean-file affirmative-signal question (#240): which servers
 // publish an empty-with-version set on a clean scan vs go silent.
 const PUB_DEBUG = Boolean(process.env.PILENS_PUB_DEBUG);
+
+/**
+ * #472/#449: extract a per-spawn-unique "marker" from an LSP server's resolved
+ * args, for the instance registry's command-line re-identification fallback
+ * (used when a recorded child's pid is dead/recycled but its process tree
+ * grandchild — e.g. ast-grep's native exe behind a dead node wrapper — is
+ * still alive under a different pid).
+ *
+ * Generalized, NOT ast-grep-specific (uniformity requirement — no per-server
+ * special casing): the value immediately following a `--config`/`-c` flag, if
+ * that value looks like a path under a temp directory (`os.tmpdir()`). This
+ * covers ast-grep's `lsp --config <tmp sgconfig path>` (clients/sgconfig.ts)
+ * today, and any other server later launched with a temp-file `--config`/`-c`
+ * argument, without new server-specific code.
+ */
+function extractSpawnMarker(args: readonly string[]): string | undefined {
+	const tmpDir = os.tmpdir();
+	for (let i = 0; i < args.length - 1; i++) {
+		const flag = args[i];
+		if (flag === "--config" || flag === "-c") {
+			const value = args[i + 1];
+			if (value?.startsWith(tmpDir)) return value;
+		}
+	}
+	return undefined;
+}
 
 // --- Types ---
 
@@ -575,8 +603,24 @@ export async function killProcessTree(
 		// Host process is exiting (loop already closing): never spawn a child here —
 		// the spawn's uv_async_send on the closing loop-wakeup handle hard-aborts
 		// (src\win\async.c). Kill the direct child via the handle we already hold
-		// (TerminateProcess; synchronous, no async handle). Orphaned grandchildren
-		// are reaped by the OS as the host exits.
+		// (TerminateProcess; synchronous, no async handle).
+		//
+		// #472 CORRECTION of a prior false claim here ("orphaned grandchildren are
+		// reaped by the OS as the host exits"): Windows does NOT kill children when
+		// a parent dies. For shell/.cmd-wrapped servers the direct child is
+		// cmd.exe, so this path only ever kills the wrapper — the actual server
+		// (its grandchild) survives by design whenever it doesn't independently
+		// exit. It relies entirely on best-effort backstops instead: (1) the
+		// server observing stdin EOF once the wrapper's pipes close, (2) LSP
+		// `initialize.processId: process.pid` (some servers self-watchdog on that
+		// pid dying — typescript-language-server does, ast-grep's native binary
+		// does not, an upstream spec violation), and (3) the #449/#472
+		// cross-process instance registry's orphan reaper, which is the only
+		// mechanism that works regardless of why a pipe write-end stayed open
+		// (e.g. Windows handle-inheritance capture by a long-lived process). This
+		// is why registering every LSP child at spawn matters uniformly — do NOT
+		// weaken this direct-child-only kill to try to chase grandchildren here;
+		// spawning taskkill in this branch is exactly the libuv hazard above.
 		if (options.processExiting) {
 			try {
 				proc.kill();
@@ -1312,6 +1356,14 @@ export async function clientShutdown(
 	}
 	disposeClientConnection(state);
 	const pid = state.lspProcess.pid;
+	// #449/#472: deregister this LSP child from the instance registry. Fire-
+	// and-forget (async fs, no spawn) — must not add latency/risk to shutdown,
+	// including the `processExiting` path where the event loop is closing
+	// (#234 forbids spawning here, but a plain fs write/rename is fine; even
+	// so, we don't await it to keep this teardown path as fast as before).
+	void removeLspChild(pid).catch(() => {
+		// best-effort — a stale entry is caught dead-pid by the reaper later
+	});
 	// On Windows, killing the direct child first can orphan grandchildren before
 	// taskkill can traverse the tree. Kill the full tree first and wait briefly.
 	await killProcessTree(state.lspProcess.process, pid, options);
@@ -1496,6 +1548,22 @@ export async function createLSPClient(options: {
 		initializeTimeoutMs = INITIALIZE_TIMEOUT_MS,
 	} = options;
 
+	// #449/#472: register this LSP child in the cross-process instance registry
+	// as soon as we have a live pid — BEFORE `initialize` completes, not after.
+	// Registering early means a child that dies/hangs during initialize (the
+	// catch block below kills it) is still deregistered by that same path via
+	// removeLspChild, and a process that crashes mid-initialize is still
+	// visible to the orphan reaper rather than silently untracked. Fire-and-
+	// forget: registry I/O must never block or fail LSP startup.
+	void recordLspChild({
+		pid: lspProcess.pid,
+		serverId,
+		command: lspProcess.command,
+		marker: extractSpawnMarker(lspProcess.args),
+	}).catch(() => {
+		// best-effort observability — never fail LSP startup over this
+	});
+
 	const startupState: {
 		exitCode: number | null;
 		exitSignal: NodeJS.Signals | null;
@@ -1668,6 +1736,13 @@ export async function createLSPClient(options: {
 		// SIGTERM alone is unreliable on Windows for cmd.exe/PowerShell trees.
 		const pid = lspProcess.pid;
 		void killProcessTree(lspProcess.process, pid);
+		// A child registered above (recordLspChild) but never reaching a healthy
+		// createLSPClient return must still be deregistered here — otherwise the
+		// registry keeps a stale entry for a process we just killed.
+		void removeLspChild(pid).catch(() => {
+			// best-effort — a stale registry entry is harmless (the reaper's
+			// liveness check will find it dead on the next sweep regardless)
+		});
 		setTimeout(() => {
 			if (!lspProcess.process.killed && process.platform !== "win32") {
 				lspProcess.process.kill("SIGKILL");

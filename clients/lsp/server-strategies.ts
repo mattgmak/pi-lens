@@ -7,6 +7,68 @@
  * Env var overrides (PI_LENS_LSP_*) always take precedence over strategy values.
  */
 
+import { createRequire } from "node:module";
+
+const _require = createRequire(import.meta.url);
+
+/**
+ * Platform/arch → `@ast-grep/cli-<platform>-<arch>[-msvc|-gnu]` native
+ * package name, mirroring @ast-grep/cli's own `optionalDependencies` matrix
+ * (checked directly against node_modules/@ast-grep/cli/package.json). Each
+ * package ships the native `ast-grep`/`ast-grep.exe` binary at its package
+ * root (no `bin/` subdir) — see node_modules/@ast-grep/cli-win32-x64-msvc/.
+ */
+function astGrepNativePackageName(
+	platform: NodeJS.Platform,
+	arch: string,
+): string | undefined {
+	switch (platform) {
+		case "win32":
+			if (arch === "x64") return "@ast-grep/cli-win32-x64-msvc";
+			if (arch === "arm64") return "@ast-grep/cli-win32-arm64-msvc";
+			if (arch === "ia32") return "@ast-grep/cli-win32-ia32-msvc";
+			return undefined;
+		case "darwin":
+			if (arch === "arm64") return "@ast-grep/cli-darwin-arm64";
+			if (arch === "x64") return "@ast-grep/cli-darwin-x64";
+			return undefined;
+		case "linux":
+			if (arch === "x64") return "@ast-grep/cli-linux-x64-gnu";
+			if (arch === "arm64") return "@ast-grep/cli-linux-arm64-gnu";
+			return undefined;
+		default:
+			return undefined;
+	}
+}
+
+/**
+ * Resolve ast-grep's platform-native exe DIRECTLY, skipping the node-bin
+ * wrapper (`ast-grep.cmd`/shim → node → cli.js → spawn native exe). One less
+ * orphanable process layer (#472): a wrapper's direct child is the node/cmd
+ * process, so on abnormal exit the actual ast-grep binary is a grandchild the
+ * #234 teardown path never reaches — resolving straight to the native exe
+ * means the LSP's direct child IS the real server.
+ *
+ * `require.resolve` is wrapped in try/catch (ESM-safe via createRequire, same
+ * pattern as clients/deps/ast-grep-napi.ts) — returns undefined so the caller
+ * falls back to the existing wrapper-based resolution when the platform
+ * package isn't installed (it's an optionalDependency; native builds can be
+ * absent on unsupported platforms/arches or a partial install).
+ */
+export function resolveAstGrepNativeExe(
+	platform: NodeJS.Platform = process.platform,
+	arch: string = process.arch,
+): string | undefined {
+	const pkgName = astGrepNativePackageName(platform, arch);
+	if (!pkgName) return undefined;
+	const binaryName = platform === "win32" ? "ast-grep.exe" : "ast-grep";
+	try {
+		return _require.resolve(`${pkgName}/${binaryName}`);
+	} catch {
+		return undefined;
+	}
+}
+
 export interface DiagnosticStrategy {
 	/** Seed the push cache on the very first publishDiagnostics notification.
 	 *  True for servers whose first push is known to be complete. */

@@ -54,6 +54,11 @@ import {
 import { initLensEvents } from "./clients/lens-events.js";
 import { initLSPConfig } from "./clients/lsp/config.js";
 import { getLSPService, resetLSPService } from "./clients/lsp/index.js";
+import { sweepOrphans } from "./clients/instance-reaper.js";
+import {
+	deregisterInstance,
+	registerInstance,
+} from "./clients/instance-registry.js";
 import {
 	EXPANSION_BUDGET_MS,
 	EXPANSION_LIMIT_LINES,
@@ -1082,6 +1087,14 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (event, ctx) => {
 		try {
 			dbg("session_start fired");
+			// #449 slice 1 / #472: register this process in the cross-process
+			// instance registry and fire-and-forget an orphan-LSP sweep. Neither
+			// call is awaited — registry I/O and the reaper sweep must never delay
+			// session start; both are internally best-effort (never throw).
+			void registerInstance(ctx.cwd ?? process.cwd()).catch(() => {
+				// best-effort observability — never fail session_start over this
+			});
+			void sweepOrphans();
 			updateRuntimeIdentityFromEvent(event);
 			// #190: pi's session lifecycle. `reason` distinguishes new/resume/fork/
 			// reload/startup; the STABLE session id comes from the session manager
@@ -2206,10 +2219,17 @@ export default function (pi: ExtensionAPI) {
 	// so it does not fire after shutdown. resetLSPService shuts down any live clients.
 	(pi as any).on("session_shutdown", () => {
 		cancelLSPIdleReset();
+		// #449 slice 1: SYNC-only deregistration (no child spawns — see the
+		// processExiting note below); safe to call unconditionally here.
+		deregisterInstance();
 		// processExiting: the loop is closing here — killing LSP servers must NOT
 		// spawn taskkill, or libuv aborts on uv_async_send to the closing loop
 		// (Assertion !(handle->flags & UV_HANDLE_CLOSING), src\win\async.c) — seen
-		// on `pi update`. Direct handle-kill only; the OS reaps any orphans.
+		// on `pi update`. Direct handle-kill only. Grandchildren behind a
+		// shell/.cmd wrapper are NOT reaped by the OS (Windows does not kill
+		// children when a parent dies) — they rely on stdin EOF, LSP
+		// `initialize.processId` self-watchdog compliance, and the #449/#472
+		// cross-process instance registry's orphan reaper as the backstop (#472).
 		resetLSPService({ fast: true, processExiting: true });
 	});
 
