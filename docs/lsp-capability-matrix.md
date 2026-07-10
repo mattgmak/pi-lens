@@ -46,29 +46,29 @@ classification standing.
 
 | lang | server | mode | clean-behavior | tier | src |
 |---|---|---|---|---|---|
-| json | vscode-json-language-server | pull | — | 1 | dev |
-| css | vscode-css-language-server | pull | — | 1 | dev |
-| html | vscode-html-language-server | pull | — | 1 | dev |
+| json | vscode-json-language-server | pull | — | 1 | dev+ci |
+| css | vscode-css-language-server | pull | — | 1 | dev+ci |
+| html | vscode-html-language-server | pull | — | 1 | dev+ci |
 | rust | rust-analyzer | pull | — | 1 | dev |
 | svelte | svelte-language-server | pull | — | 1 | dev+ci |
 | deno | deno (alt of typescript) | pull | — | 1 | dev+ci |
 | ruby | ruby-lsp | pull | — | 1 | ci |
 | csharp | csharp-ls | pull | — | 1 | ci |
-| typescript | typescript-language-server | push-only | silent | 3 | dev |
-| python | pyright | push-only | TBD | 2/3? | dev |
-| jedi | jedi-language-server (alt of python) | push-only | TBD | 2/3? | ci |
-| yaml | yaml-language-server | push-only | publishes-unversioned | 2* | dev |
-| shell | bash-language-server | push-only | TBD | 2/3? | dev |
-| dockerfile | docker-langserver | push-only | TBD | 2/3? | dev |
-| toml | taplo | push-only | TBD | 2/3? | dev |
-| terraform | terraform-ls | push-only | TBD | 2/3? | dev |
-| prisma | @prisma/language-server | push-only | TBD | 2/3? | dev+ci |
+| typescript | typescript-language-server | push-only | silent | 3 | dev+ci |
+| python | pyright | push-only | publishes-versioned | 2 | dev+ci |
+| jedi | jedi-language-server (alt of python) | push-only | publishes-versioned | 2 | ci |
+| yaml | yaml-language-server | push-only | publishes-unversioned | 2* | dev+ci |
+| shell | bash-language-server | push-only | publishes-versioned | 2 | dev+ci |
+| dockerfile | docker-langserver | push-only | publishes-unversioned | 2* | dev+ci |
+| toml | taplo | push-only | publishes-unversioned | 2* | dev+ci |
+| terraform | terraform-ls | push-only | TBD | 2/3? | dev+ci |
+| prisma | @prisma/language-server | push-only | publishes-unversioned | 2* | dev+ci |
 | php | intelephense | push-only | TBD | 2/3? | dev |
-| zig | zls | push-only | TBD | 2/3? | dev+ci |
+| zig | zls | push-only | publishes-unversioned | 2* | dev+ci |
 | vue | @vue/language-server | push-only | TBD | 2/3? | dev+ci |
-| dart | dart language-server | push-only | TBD | 2/3? | ci |
-| gleam | gleam lsp | push-only | TBD | 2/3? | ci |
-| clojure | clojure-lsp | push-only | TBD | 2/3? | ci |
+| dart | dart language-server | push-only | publishes-unversioned | 2* | ci |
+| gleam | gleam lsp | push-only | publishes-unversioned | 2* | ci |
+| clojure | clojure-lsp | push-only | publishes-unversioned | 2* | ci |
 | opengrep | opengrep (aux) | push-only | publishes-unversioned | 2* | dev+ci |
 | ast-grep | ast-grep (aux) | push-only | publishes-versioned | 2 | dev+ci |
 
