@@ -21,6 +21,17 @@ import { defineConfig } from "vitest/config";
 //    nesting no longer exists and is silently ignored).
 export default defineConfig({
 	test: {
+		// Background coding agents get worktrees under .claude/worktrees/ —
+		// vitest's default exclude covers node_modules/.git/dist but NOT those,
+		// so a "full suite" run in the main tree silently swept every agent's
+		// IN-PROGRESS worktree tests too (seen 2026-07-11: 40+ phantom failures,
+		// all from half-finished branches in sibling worktrees).
+		exclude: [
+			"**/node_modules/**",
+			"**/dist/**",
+			"**/.{git,cache,output,temp}/**",
+			"**/.claude/**",
+		],
 		globalSetup: ["./tests/support/check-build-freshness.ts"],
 		setupFiles: ["./tests/support/vitest-setup.ts"],
 		execArgv: [
