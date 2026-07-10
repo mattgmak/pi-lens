@@ -78,6 +78,21 @@ export function decideOrphanReaping(
 	const childrenToKill: ChildToKill[] = [];
 	const markerSearches: MarkerSearch[] = [];
 
+	// Markers claimed by any LIVE instance's children. A marker search kills by
+	// command-line match, so a marker that a live session also uses must never
+	// be searched — killing it would take down the live session's server.
+	// Markers are per-process-unique by construction (sgconfig.ts embeds the
+	// pid), so this is defense in depth against non-unique markers ever
+	// reappearing (#472: the original shared baseline.sgconfig.yml would have
+	// made the fallback kill every live ast-grep on the machine).
+	const liveMarkers = new Set<string>();
+	for (const instance of registry) {
+		if (!isPidAlive(instance.pid)) continue;
+		for (const child of instance.lspChildren) {
+			if (child.marker) liveMarkers.add(child.marker);
+		}
+	}
+
 	for (const instance of registry) {
 		if (isPidAlive(instance.pid)) {
 			continue; // parent still alive — leave its children alone entirely
@@ -105,7 +120,8 @@ export function decideOrphanReaping(
 			// Child pid is dead, or alive-but-identity-mismatched (recycled pid) —
 			// if we have a marker, surface it so the caller can find a live
 			// process (e.g. the native exe grandchild) by command-line match.
-			if (child.marker) {
+			// Never surface a marker a live instance also claims (see above).
+			if (child.marker && !liveMarkers.has(child.marker)) {
 				markerSearches.push({ marker: child.marker, serverId: child.serverId });
 			}
 		}
@@ -148,8 +164,11 @@ function escapeWqlLikeValue(value: string): string {
 async function findPidsByMarkerWindows(marker: string): Promise<number[]> {
 	if (!isWindows || !marker) return [];
 	const escaped = escapeWqlLikeValue(marker);
+	// $PID exclusion: the query's own powershell.exe command line embeds the
+	// marker string, so it would match itself.
 	const psScript =
 		`Get-CimInstance Win32_Process -Filter "CommandLine LIKE '%${escaped}%'" ` +
+		`| Where-Object { $_.ProcessId -ne $PID } ` +
 		`| Select-Object -ExpandProperty ProcessId`;
 	return new Promise((resolve) => {
 		try {
@@ -177,6 +196,99 @@ async function findPidsByMarkerWindows(marker: string): Promise<number[]> {
 			resolve([]);
 		}
 	});
+}
+
+/** Fetch command lines for a set of pids in one query (Windows: CIM; POSIX:
+ *  `ps`). Returns a pid → command-line map; pids that can't be resolved are
+ *  simply absent (the caller treats absent as "identity unverifiable — do not
+ *  kill by pid"). Best-effort: any failure ⇒ empty map. */
+async function queryCommandLines(pids: number[]): Promise<Map<number, string>> {
+	const valid = [...new Set(pids.filter((p) => Number.isFinite(p) && p > 0))];
+	const map = new Map<number, string>();
+	if (valid.length === 0) return map;
+	if (isWindows) {
+		const filter = valid.map((p) => `ProcessId=${p}`).join(" OR ");
+		const psScript =
+			`Get-CimInstance Win32_Process -Filter "${filter}" ` +
+			`| ForEach-Object { "$($_.ProcessId)\t$($_.CommandLine)" }`;
+		return new Promise((resolve) => {
+			try {
+				const powershell = windowsExe(
+					"WindowsPowerShell\\v1.0\\powershell.exe",
+				);
+				const child = nodeSpawn(
+					powershell,
+					["-NoProfile", "-NonInteractive", "-Command", psScript],
+					{ shell: false, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] },
+				);
+				let out = "";
+				child.stdout?.on("data", (chunk) => {
+					out += chunk.toString();
+				});
+				child.once("error", () => resolve(map));
+				child.once("close", () => {
+					for (const line of out.split(/\r?\n/)) {
+						const tab = line.indexOf("\t");
+						if (tab <= 0) continue;
+						const pid = Number(line.slice(0, tab).trim());
+						if (Number.isFinite(pid) && pid > 0) map.set(pid, line.slice(tab + 1));
+					}
+					resolve(map);
+				});
+			} catch {
+				resolve(map);
+			}
+		});
+	}
+	return new Promise((resolve) => {
+		try {
+			const child = nodeSpawn(
+				"ps",
+				["-p", valid.join(","), "-o", "pid=,args="],
+				{ shell: false, stdio: ["ignore", "pipe", "ignore"] },
+			);
+			let out = "";
+			child.stdout?.on("data", (chunk) => {
+				out += chunk.toString();
+			});
+			child.once("error", () => resolve(map));
+			child.once("close", () => {
+				for (const line of out.split(/\r?\n/)) {
+					const m = line.match(/^\s*(\d+)\s+(.*)$/);
+					if (m) map.set(Number(m[1]), m[2]);
+				}
+				resolve(map);
+			});
+		} catch {
+			resolve(map);
+		}
+	});
+}
+
+/**
+ * Build a `matchProcess` identity predicate from a pid → command-line map
+ * (as produced by `queryCommandLines`). PURE — exported for unit testing.
+ *
+ * Semantics (guarding pid kills against pid recycling):
+ * - pid absent from the map ⇒ false: identity is UNVERIFIABLE, so never kill
+ *   by pid (the marker-search fallback may still catch a real orphan).
+ * - marker recorded and present in the command line ⇒ match (strongest
+ *   signal — markers are per-spawn-unique).
+ * - else: the recorded command's basename appears (case-insensitive) in the
+ *   command line ⇒ match. Empty basename never matches (guard against a
+ *   recorded empty/odd command matching everything via `includes("")`).
+ */
+export function buildIdentityMatcher(
+	cmdlines: Map<number, string>,
+): (pid: number, expected: { command: string; marker?: string }) => boolean {
+	return (pid, expected) => {
+		const cmdline = cmdlines.get(pid);
+		if (cmdline === undefined) return false; // unverifiable ⇒ never kill by pid
+		if (expected.marker && cmdline.includes(expected.marker)) return true;
+		const basename = path.basename(expected.command ?? "").toLowerCase();
+		if (!basename) return false;
+		return cmdline.toLowerCase().includes(basename);
+	};
 }
 
 /** Force-kill a pid's full process tree. Windows: `taskkill /F /T`. POSIX:
@@ -226,7 +338,19 @@ export async function sweepOrphans(): Promise<void> {
 		const registry = await readInstanceRegistry();
 		if (registry.length === 0) return;
 
-		const decision = decideOrphanReaping(registry, realIsPidAlive);
+		// Identity verification before any pid kill (recycled-pid guard): fetch
+		// the command lines of every recorded child pid in ONE batched query,
+		// then let the pure decision function verify each live child's identity
+		// against what was recorded at spawn. A pid whose command line can't be
+		// fetched is treated as unverifiable and never killed by pid — the
+		// marker-search fallback may still catch it.
+		const candidatePids = registry.flatMap((instance) =>
+			instance.lspChildren.map((child) => child.pid),
+		);
+		const cmdlines = await queryCommandLines(candidatePids);
+		const matchProcess = buildIdentityMatcher(cmdlines);
+
+		const decision = decideOrphanReaping(registry, realIsPidAlive, matchProcess);
 
 		let killedCount = 0;
 		const killedServerIds: string[] = [];

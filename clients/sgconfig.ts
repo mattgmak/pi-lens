@@ -63,13 +63,39 @@ export function resolveBaselineSgconfig(): string | undefined {
 	if (ruleDirs.length === 0) return undefined;
 	const dir = path.join(os.tmpdir(), "pi-lens-ast-grep");
 	fs.mkdirSync(dir, { recursive: true });
-	const file = path.join(dir, "baseline.sgconfig.yml");
+	// Per-PROCESS filename (#472): the config path doubles as the orphan
+	// reaper's command-line marker, so it must be unique per instance — a
+	// shared filename would make the reaper's marker-fallback match every
+	// live session's ast-grep on the machine.
+	const file = path.join(dir, `baseline-${process.pid}.sgconfig.yml`);
+	cleanupStaleBaselines(dir, file);
 	const ruleDirsForYaml = ruleDirs
 		.map((ruleDir) => `  - "${ruleDir.split(path.sep).join("/")}"`)
 		.join("\n");
 	fs.writeFileSync(file, `ruleDirs:\n${ruleDirsForYaml}\n`);
 	cachedBaselinePath = file;
 	return file;
+}
+
+/** Best-effort removal of baseline configs left by dead processes (per-pid
+ * filenames accumulate). Age-based (>7 days) so a live long-running session's
+ * file is never touched; fs-only, never throws. */
+function cleanupStaleBaselines(dir: string, keep: string): void {
+	try {
+		const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+		for (const name of fs.readdirSync(dir)) {
+			if (!/^baseline(-\d+)?\.sgconfig\.yml$/.test(name)) continue;
+			const full = path.join(dir, name);
+			if (full === keep) continue;
+			try {
+				if (fs.statSync(full).mtimeMs < cutoff) fs.rmSync(full, { force: true });
+			} catch {
+				// racing another session — skip
+			}
+		}
+	} catch {
+		// missing dir / permission — nothing to clean
+	}
 }
 
 /** Test-only: reset the memoized baseline sgconfig path. */

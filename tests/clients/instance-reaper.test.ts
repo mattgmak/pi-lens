@@ -6,6 +6,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+	buildIdentityMatcher,
 	decideOrphanReaping,
 	type ChildToKill,
 } from "../../clients/instance-reaper.js";
@@ -183,5 +184,97 @@ describe("decideOrphanReaping", () => {
 		expect(decision.markerSearches).toEqual([
 			{ marker: "C:/temp/pi-lens-ast-grep/m.yml", serverId: "c" },
 		]);
+	});
+
+	it("never surfaces a marker search for a marker a LIVE instance also claims (machine-wide live-kill guard)", () => {
+		// The critical #472 review case: with a shared (non-unique) marker, the
+		// marker fallback would command-line-match — and tree-kill — the LIVE
+		// session's server. The decision must exclude live-claimed markers.
+		const shared = "C:/temp/pi-lens-ast-grep/baseline.sgconfig.yml";
+		const reg = [
+			instance({
+				pid: 1, // dead
+				lspChildren: [child({ pid: 100, marker: shared })], // child also dead
+			}),
+			instance({
+				pid: 2, // ALIVE
+				lspChildren: [child({ pid: 200, marker: shared })],
+			}),
+		];
+		const decision = decideOrphanReaping(reg, alivePids(2, 200));
+
+		expect(decision.deadInstances.map((i) => i.pid)).toEqual([1]);
+		expect(decision.childrenToKill).toHaveLength(0);
+		expect(decision.markerSearches).toHaveLength(0); // shared marker suppressed
+	});
+
+	it("a marker unique to the dead instance IS surfaced even when live instances exist", () => {
+		const reg = [
+			instance({
+				pid: 1, // dead
+				lspChildren: [
+					child({ pid: 100, marker: "C:/temp/pi-lens-ast-grep/baseline-1.sgconfig.yml" }),
+				],
+			}),
+			instance({
+				pid: 2, // ALIVE, different marker
+				lspChildren: [
+					child({ pid: 200, marker: "C:/temp/pi-lens-ast-grep/baseline-2.sgconfig.yml" }),
+				],
+			}),
+		];
+		const decision = decideOrphanReaping(reg, alivePids(2, 200));
+
+		expect(decision.markerSearches).toEqual([
+			{
+				marker: "C:/temp/pi-lens-ast-grep/baseline-1.sgconfig.yml",
+				serverId: "ast-grep",
+			},
+		]);
+	});
+});
+
+describe("buildIdentityMatcher", () => {
+	const expected = {
+		command: "C:\\tools\\ast-grep.exe",
+		marker: "C:/temp/pi-lens-ast-grep/baseline-42.sgconfig.yml",
+	};
+
+	it("pid absent from the command-line map ⇒ false (unverifiable — never kill by pid)", () => {
+		const match = buildIdentityMatcher(new Map());
+		expect(match(100, expected)).toBe(false);
+	});
+
+	it("marker present in the command line ⇒ match", () => {
+		const match = buildIdentityMatcher(
+			new Map([
+				[
+					100,
+					"node wrapper.js lsp --config C:/temp/pi-lens-ast-grep/baseline-42.sgconfig.yml",
+				],
+			]),
+		);
+		expect(match(100, expected)).toBe(true);
+	});
+
+	it("command basename matches case-insensitively when no marker matches", () => {
+		// Separator-free command so path.basename behaves identically on every
+		// CI platform (win32 backslash paths don't split under POSIX basename).
+		const match = buildIdentityMatcher(
+			new Map([[100, '"C:\\Other\\Path\\AST-GREP.EXE" lsp']]),
+		);
+		expect(match(100, { command: "ast-grep.exe" })).toBe(true);
+	});
+
+	it("neither marker nor basename in the command line ⇒ false (recycled pid)", () => {
+		const match = buildIdentityMatcher(
+			new Map([[100, "C:\\Windows\\System32\\notepad.exe unrelated.txt"]]),
+		);
+		expect(match(100, expected)).toBe(false);
+	});
+
+	it("empty command basename never matches (guard against includes(''))", () => {
+		const match = buildIdentityMatcher(new Map([[100, "anything at all"]]));
+		expect(match(100, { command: "" })).toBe(false);
 	});
 });
