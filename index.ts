@@ -126,6 +126,12 @@ import {
 	markPiLensLoaded,
 	PI_LENS_LOADED_FROM,
 } from "./clients/startup-timing.js";
+import { toRunnerDisplayPath } from "./clients/dispatch/runner-context.js";
+import {
+	formatTurnSummaryLine,
+	TURN_SUMMARY_CUSTOM_TYPE,
+} from "./clients/turn-summary.js";
+import { renderTurnSummaryMessage } from "./clients/turn-summary-render.js";
 import {
 	getEventLoopStats,
 	shouldLogWorstBlock,
@@ -582,6 +588,13 @@ export default function (pi: ExtensionAPI) {
 		default: false,
 	});
 
+	pi.registerFlag("lens-turn-summary", {
+		description:
+			"Opt-in: persist a per-turn transcript entry summarizing diagnostics found, autofixes applied, and autoformats applied this turn (#484). Collapsed one-line, expandable in place. Default off. Also via turnSummary.enabled=true in ~/.pi-lens/config.json.",
+		type: "boolean",
+		default: false,
+	});
+
 	const globalConfig = loadPiLensGlobalConfig();
 	const globalConfigOnlyFlags = new Set([
 		"lens-actionable-warnings",
@@ -649,6 +662,18 @@ export default function (pi: ExtensionAPI) {
 		const setWidget = ui.setWidget as LensWidgetSetWidget;
 		setWidget("pi-lens", undefined);
 		return true;
+	}
+
+	// #484: turn-summary custom message renderer. Feature-detected — older pi
+	// hosts without registerMessageRenderer simply never get a renderer
+	// registered (the raw `content` fallback text still shows since sendMessage
+	// itself is guarded the same way at the emit site below).
+	if (typeof (pi as { registerMessageRenderer?: unknown }).registerMessageRenderer === "function") {
+		try {
+			pi.registerMessageRenderer(TURN_SUMMARY_CUSTOM_TYPE, renderTurnSummaryMessage);
+		} catch (registerRendererErr) {
+			dbg(`turn-summary renderer registration failed: ${registerRendererErr}`);
+		}
 	}
 
 	// --- Commands ---
@@ -2255,6 +2280,52 @@ export default function (pi: ExtensionAPI) {
 					runtime.telemetrySessionId,
 					exportWidgetState(),
 				);
+			}
+
+			// #484: opt-in per-turn summary entry. Emitted here (after
+			// handleTurnEnd, which also folds in the actionable-warnings autofix
+			// pass from agent_end) so the collector reflects the WHOLE turn —
+			// immediate-mode pipeline runs, deferred format completion, and the
+			// experimental LSP quickfix autofix pass all feed the same collector.
+			if (getLensFlag("lens-turn-summary") && !runtime.turnSummary.isEmpty()) {
+				const summaryStart = Date.now();
+				const cwd = ctx.cwd ?? process.cwd();
+				const details = runtime.turnSummary.consume(runtime.turnIndex, (fp) =>
+					toRunnerDisplayPath(cwd, fp),
+				);
+				const line = formatTurnSummaryLine(details);
+				if (typeof (pi as { sendMessage?: unknown }).sendMessage === "function") {
+					try {
+						pi.sendMessage({
+							customType: TURN_SUMMARY_CUSTOM_TYPE,
+							content: line,
+							display: true,
+							details,
+						});
+					} catch (sendErr) {
+						dbg(`turn-summary sendMessage failed: ${sendErr}`);
+					}
+				} else {
+					dbg("turn-summary: pi.sendMessage unavailable on this host, skipping emit");
+				}
+				logLatency({
+					type: "phase",
+					toolName: "turn_end",
+					filePath: cwd,
+					phase: "turn_summary",
+					durationMs: Date.now() - summaryStart,
+					metadata: {
+						files: details.files.length,
+						diagnostics: details.counts.diagnostics,
+						autofixes: details.counts.autofixes,
+						formats: details.counts.formats,
+					},
+				});
+			} else if (getLensFlag("lens-turn-summary")) {
+				// Empty turn — clear defensively even though isEmpty() already
+				// guarded the emit (consume() would also clear, but we never called
+				// it on this branch).
+				runtime.turnSummary.clear();
 			}
 		} catch (turnEndErr) {
 			dbg(`turn_end crashed: ${turnEndErr}`);

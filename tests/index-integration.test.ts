@@ -30,6 +30,11 @@ function createMockPi(overrides: Record<string, boolean> = {}) {
 	});
 	return {
 		pi: mock.asExtensionAPI(),
+		// #484: raw mock recordings not on the ExtensionAPI type surface
+		// (sentMessages, messageRenderers) — exposed directly for tests that
+		// assert on pi.sendMessage/registerMessageRenderer calls.
+		sentMessages: mock.sentMessages,
+		messageRenderers: mock.messageRenderers,
 		handlers: new Proxy({} as Record<string, IntegrationHook[]>, {
 			get: (_target, prop) =>
 				typeof prop === "string" ? mock.handlers.get(prop) : undefined,
@@ -154,7 +159,10 @@ describe("index.ts integration", () => {
 				todoScanner: {},
 				biomeClient: { isAvailable: () => false },
 				ruffClient: { isAvailable: () => false },
-				knipClient: { isAvailable: () => false },
+				knipClient: {
+					isAvailable: () => false,
+					analyze: async () => ({ success: false, summary: "unavailable", issues: [] }),
+				},
 				jscpdClient: { isAvailable: () => false },
 				depChecker: { isAvailable: () => false },
 				testRunnerClient: { detectRunner: () => null },
@@ -235,7 +243,10 @@ describe("index.ts integration", () => {
 		}));
 		vi.doMock("../clients/bootstrap.js", () => ({
 			loadBootstrapClients: async () => ({
-				knipClient: { isAvailable: () => false },
+				knipClient: {
+					isAvailable: () => false,
+					analyze: async () => ({ success: false, summary: "unavailable", issues: [] }),
+				},
 				depChecker: { isAvailable: () => false },
 				testRunnerClient: { detectRunner: () => null },
 			}),
@@ -359,7 +370,10 @@ describe("index.ts integration", () => {
 				todoScanner: {},
 				biomeClient: { isAvailable: () => false },
 				ruffClient: { isAvailable: () => false },
-				knipClient: { isAvailable: () => false },
+				knipClient: {
+					isAvailable: () => false,
+					analyze: async () => ({ success: false, summary: "unavailable", issues: [] }),
+				},
 				jscpdClient: { isAvailable: () => false },
 				depChecker: { isAvailable: () => false },
 				testRunnerClient: { detectRunner: () => null },
@@ -449,7 +463,10 @@ describe("index.ts integration", () => {
 				todoScanner: {},
 				biomeClient: { isAvailable: () => false },
 				ruffClient: { isAvailable: () => false },
-				knipClient: { isAvailable: () => false },
+				knipClient: {
+					isAvailable: () => false,
+					analyze: async () => ({ success: false, summary: "unavailable", issues: [] }),
+				},
 				jscpdClient: { isAvailable: () => false },
 				depChecker: { isAvailable: () => false },
 				testRunnerClient: { detectRunner: () => null },
@@ -544,7 +561,10 @@ describe("index.ts integration", () => {
 				todoScanner: {},
 				biomeClient: { isAvailable: () => false },
 				ruffClient: { isAvailable: () => false },
-				knipClient: { isAvailable: () => false },
+				knipClient: {
+					isAvailable: () => false,
+					analyze: async () => ({ success: false, summary: "unavailable", issues: [] }),
+				},
 				jscpdClient: { isAvailable: () => false },
 				depChecker: { isAvailable: () => false },
 				testRunnerClient: { detectRunner: () => null },
@@ -652,7 +672,10 @@ describe("index.ts integration", () => {
 				todoScanner: {},
 				biomeClient: { isAvailable: () => false },
 				ruffClient: { isAvailable: () => false },
-				knipClient: { isAvailable: () => false },
+				knipClient: {
+					isAvailable: () => false,
+					analyze: async () => ({ success: false, summary: "unavailable", issues: [] }),
+				},
 				jscpdClient: { isAvailable: () => false },
 				depChecker: { isAvailable: () => false },
 				testRunnerClient: { detectRunner: () => null },
@@ -742,7 +765,10 @@ describe("index.ts integration", () => {
 				todoScanner: {},
 				biomeClient: { isAvailable: () => false },
 				ruffClient: { isAvailable: () => false },
-				knipClient: { isAvailable: () => false },
+				knipClient: {
+					isAvailable: () => false,
+					analyze: async () => ({ success: false, summary: "unavailable", issues: [] }),
+				},
 				jscpdClient: { isAvailable: () => false },
 				depChecker: { isAvailable: () => false },
 				testRunnerClient: { detectRunner: () => null },
@@ -827,7 +853,10 @@ describe("index.ts integration", () => {
 				todoScanner: {},
 				biomeClient: { isAvailable: () => false },
 				ruffClient: { isAvailable: () => false },
-				knipClient: { isAvailable: () => false },
+				knipClient: {
+					isAvailable: () => false,
+					analyze: async () => ({ success: false, summary: "unavailable", issues: [] }),
+				},
 				jscpdClient: { isAvailable: () => false },
 				depChecker: { isAvailable: () => false },
 				testRunnerClient: { detectRunner: () => null },
@@ -957,7 +986,10 @@ describe("index.ts integration", () => {
 				todoScanner: {},
 				biomeClient: { isAvailable: () => false },
 				ruffClient: { isAvailable: () => false },
-				knipClient: { isAvailable: () => false },
+				knipClient: {
+					isAvailable: () => false,
+					analyze: async () => ({ success: false, summary: "unavailable", issues: [] }),
+				},
 				jscpdClient: { isAvailable: () => false },
 				depChecker: { isAvailable: () => false },
 				testRunnerClient: { detectRunner: () => null },
@@ -1008,5 +1040,287 @@ describe("index.ts integration", () => {
 		expect(message).toContain("Cascade runs: 5");
 		expect(message).toContain("Cascade diagnostics surfaced: 3");
 		expect(message).toContain("Cold-snapshot touches: 2");
+	}, INTEGRATION_TIMEOUT_MS);
+});
+
+describe("#484 turn-summary emit at turn_end", () => {
+	let tmpDir: string;
+	let originalStartupMode: string | undefined;
+
+	beforeEach(() => {
+		vi.resetModules();
+		vi.clearAllMocks();
+		// This suite needs the REAL RuntimeCoordinator (setTelemetryIdentity,
+		// turnSummary, etc.) — an earlier describe block in this file
+		// (`vi.doMock("../clients/runtime-coordinator.js", ...)`) persists past
+		// its own test via vitest's module registry, surviving vi.resetModules().
+		// Explicitly unmock (doUnmock, NOT the hoisted vi.unmock) so this
+		// suite's behavior does not depend on file run order.
+		vi.doUnmock("../clients/runtime-coordinator.js");
+		vi.doUnmock("../clients/installer/index.js");
+		vi.doUnmock("../clients/runtime-session.js");
+		vi.doUnmock("../clients/lsp/index.js");
+		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-turn-summary-"));
+		originalStartupMode = process.env.PI_LENS_STARTUP_MODE;
+		process.env.PI_LENS_STARTUP_MODE = "quick";
+	});
+
+	afterEach(() => {
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+		if (originalStartupMode === undefined)
+			delete process.env.PI_LENS_STARTUP_MODE;
+		else process.env.PI_LENS_STARTUP_MODE = originalStartupMode;
+		vi.restoreAllMocks();
+	});
+
+	function mockBootstrapAndTurnEndDeps() {
+		vi.doMock("../clients/bootstrap.js", () => ({
+			loadBootstrapClients: async () => ({
+				metricsClient: { reset: () => {} },
+				todoScanner: {},
+				biomeClient: { isAvailable: () => false },
+				ruffClient: { isAvailable: () => false },
+				knipClient: { isAvailable: () => false },
+				jscpdClient: { isAvailable: () => false },
+				depChecker: { isAvailable: () => false },
+				testRunnerClient: { detectRunner: () => null },
+				goClient: { isGoAvailableAsync: async () => false },
+				rustClient: { isAvailableAsync: async () => false },
+				agentBehaviorClient: {
+					recordToolCall: () => [],
+					formatWarnings: () => "",
+				},
+				complexityClient: {
+					isSupportedFile: () => false,
+					analyzeFile: () => null,
+				},
+			}),
+		}));
+		// The emit-at-turn_end logic under test lives AFTER handleTurnEnd
+		// returns in index.ts's turn_end handler. handleTurnEnd itself is a
+		// heavyweight, separately-tested pass (knip/madge/tests/actionable
+		// warnings — clients/runtime-turn.ts, exercised by its own suite).
+		// Stub it to a no-op here so this suite exercises only the #484 seam
+        // (collector → sendMessage) without depending on that machinery or its
+		// real-filesystem/timer side effects.
+		vi.doMock("../clients/runtime-turn.js", () => ({
+			handleTurnEnd: vi.fn(async () => undefined),
+			cancelLSPIdleReset: vi.fn(),
+		}));
+	}
+
+	async function driveEditThenTurnEnd(
+		handlers: ReturnType<typeof createMockPi>["handlers"],
+		filePath: string,
+	) {
+		// runtime.projectRoot is only set at session_start (handleSessionStart);
+		// without firing it first, the tool_result handler's workspaceRoot falls
+		// back to process.cwd() and treats tmpDir as an external/vendor path.
+		const sessionStart = handlers.session_start?.[0];
+		expect(sessionStart).toBeTypeOf("function");
+		await sessionStart?.({}, { cwd: tmpDir, ui: { notify: vi.fn() } });
+
+		const toolResult = handlers.tool_result?.[0];
+		expect(toolResult).toBeTypeOf("function");
+		await toolResult?.(
+			{
+				toolName: "edit",
+				input: { path: filePath },
+				details: { diff: "+  1 export const x = 1;" },
+				content: [{ type: "text", text: "base" }],
+			},
+			{ cwd: tmpDir, ui: { notify: vi.fn() }, signal: undefined },
+		);
+
+		const turnEnd = handlers.turn_end?.[0];
+		expect(turnEnd).toBeTypeOf("function");
+		await turnEnd?.(
+			{},
+			{
+				cwd: tmpDir,
+				ui: {
+					notify: vi.fn(),
+					setStatus: () => {},
+					theme: { fg: (_c: string, s: string) => s },
+				},
+			},
+		);
+	}
+
+	it("emits exactly one pilens:turn-summary entry with correct details shape when opted in and the turn is non-empty", async () => {
+		vi.doMock("../clients/pipeline.js", () => ({
+			runPipeline: vi.fn(async () => ({
+				output: "✓ no blockers",
+				hasBlockers: false,
+				isError: false,
+				fileModified: true,
+				diagnostics: [
+					{
+						id: "d1",
+						message: "unused var",
+						filePath: path.join(tmpDir, "src", "app.ts"),
+						line: 4,
+						severity: "warning",
+						semantic: "warning",
+						tool: "eslint",
+						rule: "no-unused-vars",
+					},
+				],
+				formattersUsed: ["prettier"],
+				fixedCount: 1,
+				autofixTools: ["ruff:1"],
+			})),
+		}));
+		mockBootstrapAndTurnEndDeps();
+
+		const filePath = path.join(tmpDir, "src", "app.ts");
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+		fs.writeFileSync(filePath, "export const x = 1;\n");
+
+		const { default: registerExtension } = await import("../index.ts");
+		const { pi, handlers, sentMessages } = createMockPi({
+			"lens-turn-summary": true,
+		});
+		registerExtension(pi as any);
+
+		await driveEditThenTurnEnd(handlers, filePath);
+
+		expect(sentMessages).toHaveLength(1);
+		const sent = sentMessages[0];
+		expect(sent.customType).toBe("pilens:turn-summary");
+		expect(sent.display).toBe(true);
+		expect(typeof sent.content).toBe("string");
+		expect(sent.content).toContain("pi-lens:");
+		expect(sent.details).toMatchObject({
+			version: 1,
+			counts: {
+				diagnostics: 1,
+				autofixes: 1,
+				formats: 1,
+				byTool: {
+					diagnostic: { eslint: 1 },
+					autofix: { ruff: 1 },
+					format: { prettier: 1 },
+				},
+			},
+		});
+	}, INTEGRATION_TIMEOUT_MS);
+
+	it("emits nothing when the turn's collection is empty, even when opted in", async () => {
+		vi.doMock("../clients/pipeline.js", () => ({
+			runPipeline: vi.fn(async () => ({
+				output: "✓ no blockers",
+				hasBlockers: false,
+				isError: false,
+				fileModified: false,
+			})),
+		}));
+		mockBootstrapAndTurnEndDeps();
+
+		const filePath = path.join(tmpDir, "src", "app.ts");
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+		fs.writeFileSync(filePath, "export const x = 1;\n");
+
+		const { default: registerExtension } = await import("../index.ts");
+		const { pi, handlers, sentMessages } = createMockPi({
+			"lens-turn-summary": true,
+		});
+		registerExtension(pi as any);
+
+		await driveEditThenTurnEnd(handlers, filePath);
+
+		expect(sentMessages).toHaveLength(0);
+	}, INTEGRATION_TIMEOUT_MS);
+
+	it("does not emit or collect when lens-turn-summary is off (default off-by-default)", async () => {
+		vi.doMock("../clients/pipeline.js", () => ({
+			runPipeline: vi.fn(async () => ({
+				output: "✓ no blockers",
+				hasBlockers: false,
+				isError: false,
+				fileModified: true,
+				diagnostics: [
+					{
+						id: "d1",
+						message: "unused var",
+						filePath: path.join(tmpDir, "src", "app.ts"),
+						line: 4,
+						severity: "warning",
+						semantic: "warning",
+						tool: "eslint",
+						rule: "no-unused-vars",
+					},
+				],
+				formattersUsed: ["prettier"],
+				fixedCount: 1,
+				autofixTools: ["ruff:1"],
+			})),
+		}));
+		mockBootstrapAndTurnEndDeps();
+
+		const filePath = path.join(tmpDir, "src", "app.ts");
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+		fs.writeFileSync(filePath, "export const x = 1;\n");
+
+		const { default: registerExtension } = await import("../index.ts");
+		// lens-turn-summary NOT set → getFlag resolves to its registered
+		// default (false) via createPiMock's registerFlag seeding.
+		const { pi, handlers, sentMessages } = createMockPi();
+		registerExtension(pi as any);
+
+		await driveEditThenTurnEnd(handlers, filePath);
+
+		expect(sentMessages).toHaveLength(0);
+	}, INTEGRATION_TIMEOUT_MS);
+
+	it("registers the pilens:turn-summary message renderer (feature-detected)", async () => {
+		mockBootstrapAndTurnEndDeps();
+		const { default: registerExtension } = await import("../index.ts");
+		const { pi, messageRenderers } = createMockPi();
+		registerExtension(pi as any);
+
+		expect(messageRenderers.has("pilens:turn-summary")).toBe(true);
+	}, INTEGRATION_TIMEOUT_MS);
+
+	it("never throws when the host lacks sendMessage/registerMessageRenderer (feature-detect no-op)", async () => {
+		vi.doMock("../clients/pipeline.js", () => ({
+			runPipeline: vi.fn(async () => ({
+				output: "✓ no blockers",
+				hasBlockers: false,
+				isError: false,
+				fileModified: true,
+				diagnostics: [
+					{
+						id: "d1",
+						message: "unused var",
+						filePath: path.join(tmpDir, "src", "app.ts"),
+						line: 4,
+						severity: "warning",
+						semantic: "warning",
+						tool: "eslint",
+						rule: "no-unused-vars",
+					},
+				],
+				formattersUsed: ["prettier"],
+			})),
+		}));
+		mockBootstrapAndTurnEndDeps();
+
+		const filePath = path.join(tmpDir, "src", "app.ts");
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+		fs.writeFileSync(filePath, "export const x = 1;\n");
+
+		const { default: registerExtension } = await import("../index.ts");
+		const { pi, handlers } = createMockPi({ "lens-turn-summary": true });
+		// Simulate an older host lacking both APIs entirely — registerExtension
+		// itself feature-detects registerMessageRenderer at setup time, and the
+		// turn_end handler feature-detects sendMessage at emit time.
+		delete (pi as unknown as Record<string, unknown>).sendMessage;
+		delete (pi as unknown as Record<string, unknown>).registerMessageRenderer;
+		registerExtension(pi as any);
+
+		await expect(
+			driveEditThenTurnEnd(handlers, filePath),
+		).resolves.not.toThrow();
 	}, INTEGRATION_TIMEOUT_MS);
 });

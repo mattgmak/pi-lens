@@ -10,6 +10,7 @@ import { normalizeMapKey } from "./path-utils.js";
 import { ReadGuard } from "./read-guard.js";
 import type { RuleScanResult } from "./rules-scanner.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
+import { TurnSummaryCollector } from "./turn-summary.js";
 
 export interface ErrorDebtBaseline {
 	testsPassed: boolean;
@@ -102,6 +103,11 @@ export class RuntimeCoordinator {
 		string,
 		CodeQualityWarningRecord
 	>();
+	// #484: opt-in per-turn summary of diagnostics/autofixes/formats. The
+	// collector itself is always constructed (cheap, empty Map) but callers
+	// gate recording behind the `lens-turn-summary` flag so it's a true no-op
+	// when the feature is off.
+	private readonly _turnSummary = new TurnSummaryCollector();
 
 	resetForSession(): void {
 		this._sessionGeneration += 1;
@@ -137,6 +143,7 @@ export class RuntimeCoordinator {
 		this._pendingInlineBlockers.clear();
 		this._actionableWarningsThisTurn.clear();
 		this._codeQualityWarningsThisTurn.clear();
+		this._turnSummary.clear();
 	}
 
 	get sessionStartedAt(): number {
@@ -190,6 +197,7 @@ export class RuntimeCoordinator {
 		this._pendingInlineBlockers.clear();
 		this._actionableWarningsThisTurn.clear();
 		this._codeQualityWarningsThisTurn.clear();
+		this._turnSummary.clear();
 		this._turnStartProjectSeq = this._projectSeq;
 		this._turnIndex += 1;
 		this._writeIndex = 0;
@@ -499,6 +507,12 @@ export class RuntimeCoordinator {
 
 	clearCodeQualityWarnings(): void {
 		this._codeQualityWarningsThisTurn.clear();
+	}
+
+	/** #484: the per-turn diagnostics/autofix/format collector. Always present;
+	 * callers gate recording behind the `lens-turn-summary` opt-in flag. */
+	get turnSummary(): TurnSummaryCollector {
+		return this._turnSummary;
 	}
 
 	get complexityBaselines(): Map<string, FileComplexity> {
