@@ -4,6 +4,10 @@ All notable changes to pi-lens will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Subagent light mode now also detects avtc-pi-subagent children** (#507) — `isSubagentSession()` (`clients/subagent-mode.ts`) only recognized `PI_SUBAGENT_CHILD=1`, the marker nicobailon/pi-subagents sets; avtc-pi-subagent (the spawn engine under avtc-pi-feature-flow) is the same real child-process execution model but never sets that var — it sets `PI_SUBAGENT_CHILD_AGENT` + `PI_SUBAGENT_PARENT_PID` instead (grep-verified against avtc-pi-subagent@1.0.3). Consequence: light mode silently never engaged for its children, which run the full heavyweight session-start scan suite, multiplied by feature-flow's parallel-reviewer fan-out (up to ~9 subagents per review round). Detection now also treats the PAIR `PI_SUBAGENT_CHILD_AGENT` + `PI_SUBAGENT_PARENT_PID` (both non-empty) as a subagent signal — requiring the pair rather than either var alone is a deliberate false-positive guard, since a lone var set by some unrelated tool must not trigger light mode. `PI_LENS_SUBAGENT_FULL=1` remains the universal opt-out for both vocabularies. `getSubagentIdentity()` now also reports which vocabulary matched (`marker: "pi-subagents" | "avtc-pi-subagent"`), surfaced in the `subagent_light_mode` latency phase so dogfooding can tell the ecosystems apart. The issue's Layer A pinned-contract + Layer B behavioral compat-smoke additions for avtc-pi-subagent are a deferred M-effort follow-up, not part of this fix.
+
 ### Added
 
 - **Expert LSP for Elixir** (#498) — Expert is now an auto-installed alternate to ElixirLS for `.ex` and `.exs` files. ElixirLS remains the default; add `"elixir"` to `disabledServers` in `.pi-lens/lsp.json` to select Expert. pi-lens launches Expert with its required `--stdio` flag and downloads the official bare GitHub release binary for macOS, Linux, or Windows (Windows arm64 uses the x64 build through emulation).

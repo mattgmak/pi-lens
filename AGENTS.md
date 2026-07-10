@@ -287,23 +287,31 @@ Holds: `filePath`, language-root `cwd`, `kind` (`FileKind` — `jsts`, `python`,
 
 ## Subagent-extension compatibility (#476)
 
-pi-lens degrades gracefully — by construction — when it runs alongside the
-two popular subagent extensions (nicobailon/pi-subagents,
-`@tintinweb/pi-subagents`): subagent light mode (#475) skips heavyweight
+pi-lens degrades gracefully — by construction — when it runs alongside
+subagent-spawning extensions: subagent light mode (#475) skips heavyweight
 scans in a spawned child, the instance registry + orphan reaper (#474)
 cleans up LSP processes left behind by a dead parent, and the
 concurrent-session guard (#473, `clients/session-lifecycle.ts`) stops an
-in-process subagent bind from tearing down the parent's live LSP fleet. All
-three were built on reverse-engineered facts about those extensions and the
-pi SDK — nobody has promised us these stay true across releases. `docs/
-subagent-compat.md` records the exact pinned contracts (file + version last
-verified) and is checked nightly by `.github/workflows/compat-smoke.yml`
+in-process subagent bind from tearing down the parent's live LSP fleet.
+`isSubagentSession()` (`clients/subagent-mode.ts`) detects TWO env
+vocabularies: nicobailon/pi-subagents' `PI_SUBAGENT_CHILD=1`, and
+avtc-pi-subagent's `PI_SUBAGENT_CHILD_AGENT` + `PI_SUBAGENT_PARENT_PID` pair
+(both non-empty — requiring the pair, not either var alone, guards against a
+false positive from an unrelated tool; #507). `getSubagentIdentity()` reports
+which vocabulary matched (`marker: "pi-subagents" | "avtc-pi-subagent"`),
+surfaced in the `subagent_light_mode` latency phase. All of this was built on
+reverse-engineered facts about those extensions and the pi SDK — nobody has
+promised us these stay true across releases. `docs/subagent-compat.md`
+records the exact pinned contracts (file + version last verified) and is
+checked nightly by `.github/workflows/compat-smoke.yml`
 (`scripts/compat-contracts.mjs` — pattern-match the installed third-party
 source; `scripts/compat-smoke-behavioral.mjs` — drive a real `pi --mode rpc`
-and assert through the latency log, no LLM turn needed). A nightly failure
+and assert through the latency log, no LLM turn needed; avtc-pi-subagent
+Layer A/B coverage is a deferred follow-up, not yet wired). A nightly failure
 opens/refreshes a single tracking issue — never reds the workflow itself.
 Three env levers govern the behavior: `PI_LENS_SUBAGENT_FULL=1` (force full,
-non-light behavior in a detected subagent child), `PI_LENS_CONCURRENT_SESSION_GUARD=0`
+non-light behavior in a detected subagent child, either vocabulary),
+`PI_LENS_CONCURRENT_SESSION_GUARD=0`
 (disable the #473 guard — every session_start classifies sequential), and
 `PI_LENS_INSTANCE_REGISTRY=0` (disable the #474 registry/reaper).
 

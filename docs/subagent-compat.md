@@ -18,6 +18,7 @@ every run.
 | # | Contract | Depended on by | Third-party file (as of the versions below) | Verified against |
 |---|----------|-----------------|-------------------------------------------------|-------------------|
 | 1 | `PI_SUBAGENT_CHILD` is set to the literal string `"1"` in every spawned child's env; `PI_SUBAGENT_RUN_ID` / `PI_SUBAGENT_CHILD_AGENT` are set alongside it for best-effort identity. | `clients/subagent-mode.ts` (`isSubagentSession()`, `getSubagentIdentity()`) | `pi-subagents@0.34.0` — `src/runs/shared/pi-args.ts` (`SUBAGENT_CHILD_ENV`/`SUBAGENT_RUN_ID_ENV`/`SUBAGENT_CHILD_AGENT_ENV` consts + the `env[SUBAGENT_CHILD_ENV] = "1"` assignment) | `checkNicobailonChildEnv` |
+| 1b | avtc-pi-subagent sets `PI_SUBAGENT_CHILD_AGENT` + `PI_SUBAGENT_PARENT_PID` (never `PI_SUBAGENT_CHILD`); `isSubagentSession()` treats the PAIR (both non-empty) as an additional subagent signal (#507). Not yet Layer-A pinned — see the avtc-pi-feature-flow row below. | `clients/subagent-mode.ts` (`isSubagentSession()`, `getSubagentIdentity()`) | `avtc-pi-subagent@1.0.3` (package not yet installed by `compat-contracts.mjs`) | not yet smoke-covered (deferred follow-up) |
 | 2a | The pi SDK's extension loader keeps a **process-global** cache (`extensionCache = new Map()`). This is what makes an in-process `bindExtensions()` reuse pi-lens's own module-scope singletons instead of a fresh isolated instance. | `clients/session-lifecycle.ts` (the whole premise of the concurrent-session guard) | `@earendil-works/pi-coding-agent@0.80.6` — `dist/core/extensions/loader.js` | `checkSdkExtensionCache` |
 | 2b | `AgentSession.bindExtensions()` **unconditionally** emits a `session_start`-typed event (`this._extensionRunner.emit(this._sessionStartEvent)`). | Same as 2a — this is why an in-process subagent bind re-triggers pi-lens's `session_start` handler at all. | `@earendil-works/pi-coding-agent@0.80.6` — `dist/core/agent-session.js` (`bindExtensions()`, ~line 1717) | `checkSdkBindExtensionsEmitsSessionStart` |
 | 2c | `_extensionRunner.invalidate(...)` is called from the sequential session-replacement path (`newSession`/`fork`/`switchSession`/`reload`'s dispose route), never from a concurrent sibling bind. | `clients/session-lifecycle.ts` (`probeCtxActive()` — the asymmetry this whole guard relies on) | `@earendil-works/pi-coding-agent@0.80.6` — `dist/core/agent-session.js` (~line 551) | `checkSdkInvalidateCalled` |
@@ -34,7 +35,7 @@ directory, reads the specific files above, and runs every check.
 
 | Env var | Default | Effect |
 |---------|---------|--------|
-| `PI_LENS_SUBAGENT_FULL` | unset (light mode auto-detects) | Set to `1` to force full (non-light) behavior even inside a detected nicobailon/pi-subagents child session — disables the light-mode heavyweight-scan skip. |
+| `PI_LENS_SUBAGENT_FULL` | unset (light mode auto-detects) | Set to `1` to force full (non-light) behavior even inside a detected subagent child session — nicobailon/pi-subagents (`PI_SUBAGENT_CHILD=1`) or avtc-pi-subagent (`PI_SUBAGENT_CHILD_AGENT` + `PI_SUBAGENT_PARENT_PID` pair, #507) — disables the light-mode heavyweight-scan skip for either vocabulary. |
 | `PI_LENS_CONCURRENT_SESSION_GUARD` | unset (guard enabled) | Set to `0` to disable the #473 concurrent-session guard entirely — every `session_start` classifies as sequential replacement (pre-#473 behavior: a concurrent in-process bind would run the full reset, tearing down the parent's live LSP fleet). |
 | `PI_LENS_INSTANCE_REGISTRY` | unset (registry enabled) | Set to `0` to disable the #474 cross-process instance registry — no orphan-LSP reaping happens at `session_start`, but also no new risk (registry writes are best-effort and already fail open). |
 
@@ -222,10 +223,21 @@ child agents via its bundled `avtc-pi-subagent` engine: **real child-process
 spawns of `pi --mode rpc` / `--mode json -p` — the nicobailon shape — but
 with its OWN env vocabulary**: sets `PI_SUBAGENT_CHILD_AGENT` +
 `PI_SUBAGENT_PARENT_PID`, **never `PI_SUBAGENT_CHILD=1`** (grep-verified).
-Consequence: `subagent-mode.ts` light-mode detection silently never engages
-for its children, which DO run full pi-lens session_start — a real waste gap
-multiplied by feature-flow's parallel-reviewer fan-out. Tracked as #507
-(broaden detection vs document-and-scope); once decided, this package gets a
-Layer A env-vocabulary contract + a Layer B both-directions regression case.
-Its per-feature worktree isolation is the same bystander situation as
-pi-dynamic-workflows' isolated worktrees — no separate row needed for that.
+`subagent-mode.ts` `isSubagentSession()` now detects this vocabulary too
+(#507, fixed 2026-07-10): the pair `PI_SUBAGENT_CHILD_AGENT` +
+`PI_SUBAGENT_PARENT_PID` (both non-empty) is treated as an additional
+subagent signal, alongside nicobailon's `PI_SUBAGENT_CHILD=1`. The pair is
+required rather than either var alone — a lone var set by some unrelated
+tool must not trigger light mode by itself. `PI_LENS_SUBAGENT_FULL=1` remains
+the universal opt-out for both vocabularies. `getSubagentIdentity()` now also
+reports which vocabulary matched (`marker: "pi-subagents" | "avtc-pi-subagent"`),
+surfaced in the `subagent_light_mode` latency phase so dogfooding can tell the
+ecosystems apart. Its per-feature worktree isolation is the same bystander
+situation as pi-dynamic-workflows' isolated worktrees — no separate row
+needed for that.
+
+Still open (deferred, tracked as the remainder of #507): a Layer A pinned
+env-vocabulary contract for avtc-pi-subagent in
+`scripts/lib/compat-contracts.mjs`, and a Layer B behavioral regression case
+asserting light mode engages for an avtc-only-marker child. Both are an
+M-effort follow-up, not part of the detection fix itself.
