@@ -168,3 +168,33 @@ read-guard, or dispatch — pi-lens is a bystander until the parent session
 touches the files. Worktree-isolated agents (`.pi/worktrees/<slug>`) are
 additionally out of the parent's project scope. If a user reports "pi-lens
 didn't catch X in my workflow run", this is why.
+
+### pi-subagents-worktrees (`@gotgenes/pi-subagents` + `@gotgenes/pi-subagents-worktrees`, assessed 2026-07-10 at ~v0.x)
+
+Friendly fork of `@tintinweb/pi-subagents` with worktree isolation extracted
+into a pluggable `WorkspaceProvider`: each opted-in subagent runs in a
+detached `git worktree` (`git worktree add --detach <tmpdir> HEAD`; unchanged
+worktrees are removed, changed ones are committed to a `pi-agent-<id>` branch).
+**A fourth execution model, mechanically the tintinweb one with a relabeled
+cwd**: in-process `AgentSession` + `bindExtensions({})` per child — the same
+SDK mechanics the tintinweb contracts (2a/2b/2c/2d) already pin, so **no new
+Layer A contract and no Layer B addition is warranted**.
+
+Findings that matter to pi-lens:
+
+- **No `PI_SUBAGENT_CHILD` env marker is ever set** — this fork identifies its
+  own children via a session-id-keyed `globalThis` registry
+  (`Symbol.for("@gotgenes/pi-permission-system:subagent-registry")`), not env
+  vars. `subagent-mode.ts`'s `isSubagentSession()` therefore never fires for
+  it — **correctly**: the #473 concurrent-session guard classifies the child's
+  `bindExtensions` `session_start` as `concurrent-secondary` and suppresses
+  `handleSessionStart` entirely, so light mode has nothing to throttle. Do not
+  "fix" light-mode detection to catch this case.
+- The #473 classifier is cwd-agnostic by construction (ctx-liveness +
+  session-id only), so the different-cwd child binds safely; the
+  `concurrent_session_bind` phase already logs `sameCwd` for observability.
+- **Known-acceptable gap, same class as pi-dynamic-workflows**: worktree
+  children get zero pi-lens coverage (no diagnostics, read-guard, or LSP — the
+  worktree is never a pi-lens project root because pi-lens never runs there).
+  Edits surface to pi-lens only if/when the parent session touches the
+  resulting branch/files.
