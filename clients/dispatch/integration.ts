@@ -1096,11 +1096,15 @@ export async function computeCascadeForFile(
 							snapshots,
 						);
 						if (tier === "tier3-silent") {
-							const spawnedForBaseline =
+							const spawnedForTouch =
 								await lspService.getClientForFile(neighborPath);
-							if (spawnedForBaseline) {
-								const baselineVersion =
-									spawnedForBaseline.client.diagnosticsVersion;
+							if (spawnedForTouch) {
+								// Sampled BEFORE the touchFile notify: a publish landing
+								// in the notify→record gap must read as post-touch at
+								// reconcile time, never be misclassified as pre-touch
+								// (the reconcile compares this against the client's
+								// PER-FILE publish timestamp — see cascade-tier.ts).
+								const touchedAt = Date.now();
 								await lspService.touchFile(neighborPath, content, {
 									diagnostics: "none",
 									collectDiagnostics: false,
@@ -1110,9 +1114,8 @@ export async function computeCascadeForFile(
 								});
 								recordOutstandingCascadeTouch({
 									filePath: neighborPath,
-									serverId: spawnedForBaseline.client.serverId,
-									baselineVersion,
-									touchedAt: Date.now(),
+									serverId: spawnedForTouch.client.serverId,
+									touchedAt,
 								});
 								const durationMs = Date.now() - neighborStart;
 								logCascade({
@@ -1122,7 +1125,7 @@ export async function computeCascadeForFile(
 									durationMs,
 									lspServerCount: configuredServerCount,
 									coldSnapshot: isColdSnapshot,
-									metadata: { serverId: spawnedForBaseline.client.serverId },
+									metadata: { serverId: spawnedForTouch.client.serverId },
 								});
 								// Deliberately NOT cached as clean/diagnosed — the wait was
 								// skipped, not resolved, so neither neighborTouchCache nor

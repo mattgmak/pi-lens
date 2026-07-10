@@ -97,13 +97,20 @@ export function classifyCascadeWaitTier(
 interface OutstandingTouch {
 	filePath: string;
 	serverId: string;
-	/** The client's diagnosticsVersion counter at touch time (baseline). */
-	baselineVersion: number;
+	/**
+	 * Sampled BEFORE the touch's didOpen/didChange notify is sent, so any
+	 * publish that lands after the notify — including one landing in the
+	 * notify→record gap — reads as post-touch at reconcile time. Compared
+	 * against the client's PER-FILE publish timestamp (`getAllDiagnostics()`'s
+	 * `ts`), never against a client-wide signal: a cascade touches multiple
+	 * neighbors on the SAME client, so a client-wide counter advanced by
+	 * neighbor A's publish must not "prove" neighbor B clean (#240).
+	 */
 	touchedAt: number;
 }
 
 // Keyed by normalized file path. A later touch for the same file simply
-// replaces the earlier entry (only the most recent baseline matters — an
+// replaces the earlier entry (only the most recent touch matters — an
 // older touch's diagnostics, if they ever arrive, are still a strict superset
 // concern the newer touch already re-supersedes via didOpen/didChange).
 const _outstandingTouches = new Map<string, OutstandingTouch>();
@@ -111,9 +118,9 @@ const _outstandingTouches = new Map<string, OutstandingTouch>();
 /**
  * Record a Tier-3 cascade touch that skipped its in-lane wait. Called right
  * after the (still-performed) didOpen/didChange notify, before returning
- * without waiting. `baselineVersion` is the client's `diagnosticsVersion`
- * counter sampled immediately before the notify, so the reconcile task can
- * tell whether anything published since.
+ * without waiting. `touchedAt` must be sampled BEFORE the notify (see the
+ * field doc) so the reconcile comparison can never misread a publish that
+ * raced the record as pre-touch.
  */
 export function recordOutstandingCascadeTouch(entry: OutstandingTouch): void {
 	_outstandingTouches.set(normalizeMapKey(entry.filePath), entry);
@@ -140,19 +147,28 @@ export interface ReconcileOutcome {
 /**
  * Reconcile every outstanding Tier-3 touch against the LSP client's current
  * diagnostics cache. For each:
- *   - If the client's `diagnosticsVersion` advanced past the touch's baseline,
- *     something published since — pull `getDiagnostics(filePath)` and record
- *     `resolved-found` (diagnostics present) or `resolved-clean` (empty, but
- *     PROVEN empty by an actual publish after the touch).
- *   - If nothing published by settle time, record `unresolved` — per the
- *     #240 doctrine this is NEVER treated as clean.
+ *   - If the client holds a PER-FILE diagnostics entry for the touched file
+ *     whose publish timestamp (`getAllDiagnostics()`'s `ts` — the max of the
+ *     push/pull timestamps for that file, client.ts) is newer than the
+ *     touch's pre-notify `touchedAt`, something published for THAT FILE since
+ *     the touch — record `resolved-found` (diagnostics present) or
+ *     `resolved-clean` (empty, but PROVEN empty by an actual publish for that
+ *     file after the touch). A client-WIDE signal is deliberately not used:
+ *     it advances on any file's publish, so it could falsely "prove" a silent
+ *     neighbor clean when a sibling neighbor published (#240).
+ *   - If nothing published for the file by settle time, record `unresolved` —
+ *     per the #240 doctrine this is NEVER treated as clean.
+ *
+ * Client lookup is WARM-ONLY (`getWarmClientForFile`): the quiet window must
+ * never resurrect an idle-reaped server (a full tsserver spawn + cold index)
+ * just to write a log line. A warm-miss ⇒ `unresolved`.
  *
  * Always drains the whole registry (each entry is independently resolved;
  * one entry's client lookup failing doesn't block the rest) and never
  * throws — callers (the quiet-window task) must be fail-safe.
  */
 export async function reconcileOutstandingCascadeTouches(
-	lspService: Pick<LSPService, "getClientForFile">,
+	lspService: Pick<LSPService, "getWarmClientForFile">,
 ): Promise<ReconcileOutcome[]> {
 	const outcomes: ReconcileOutcome[] = [];
 	const entries = [..._outstandingTouches.entries()];
@@ -161,7 +177,7 @@ export async function reconcileOutstandingCascadeTouches(
 	for (const [key, touch] of entries) {
 		const ageMs = Date.now() - touch.touchedAt;
 		try {
-			const spawned = await lspService.getClientForFile(touch.filePath);
+			const spawned = await lspService.getWarmClientForFile(touch.filePath);
 			if (!spawned || spawned.client.serverId !== touch.serverId) {
 				outcomes.push({
 					filePath: touch.filePath,
@@ -171,8 +187,12 @@ export async function reconcileOutstandingCascadeTouches(
 				});
 				continue;
 			}
-			const advanced = spawned.client.diagnosticsVersion > touch.baselineVersion;
-			if (!advanced) {
+			const entry = spawned.client
+				.getAllDiagnostics()
+				.get(normalizeMapKey(touch.filePath));
+			if (!entry || entry.ts <= touch.touchedAt) {
+				// No per-file publish since the touch (or ever) — a missing answer
+				// is not a clean answer.
 				outcomes.push({
 					filePath: touch.filePath,
 					serverId: touch.serverId,
@@ -181,13 +201,12 @@ export async function reconcileOutstandingCascadeTouches(
 				});
 				continue;
 			}
-			const diags = spawned.client.getDiagnostics(touch.filePath);
 			outcomes.push({
 				filePath: touch.filePath,
 				serverId: touch.serverId,
-				outcome: diags.length > 0 ? "resolved-found" : "resolved-clean",
+				outcome: entry.diags.length > 0 ? "resolved-found" : "resolved-clean",
 				ageMs,
-				diagnosticCount: diags.length,
+				diagnosticCount: entry.diags.length,
 			});
 		} catch (err) {
 			outcomes.push({
@@ -216,7 +235,7 @@ let _reconcileTaskRegistered = false;
  * (e.g. multiple extension activations in tests).
  */
 export function registerCascadeTierReconcileTask(
-	getLspService: () => Pick<LSPService, "getClientForFile">,
+	getLspService: () => Pick<LSPService, "getWarmClientForFile">,
 ): void {
 	if (_reconcileTaskRegistered) return;
 	_reconcileTaskRegistered = true;

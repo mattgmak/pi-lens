@@ -421,9 +421,10 @@ describe("computeCascadeForFile", () => {
 			fs.writeFileSync(neighbor, "import { x } from './primary';\n");
 			mocks.computeImpactCascade.mockReturnValue(impact(primary, [neighbor]));
 
+			const beforeTouch = Date.now();
 			const touchFile = vi.fn();
 			const getClientForFile = vi.fn().mockResolvedValue({
-				client: { serverId: "typescript", diagnosticsVersion: 3 },
+				client: { serverId: "typescript" },
 			});
 			const getCapabilitySnapshots = vi.fn().mockResolvedValue([
 				{
@@ -472,10 +473,11 @@ describe("computeCascadeForFile", () => {
 			// dropped, not silently treated as clean.
 			const outstanding = _getOutstandingCascadeTouchesForTests();
 			expect(outstanding).toHaveLength(1);
-			expect(outstanding[0]).toMatchObject({
-				serverId: "typescript",
-				baselineVersion: 3,
-			});
+			expect(outstanding[0]).toMatchObject({ serverId: "typescript" });
+			// touchedAt is sampled BEFORE the notify (pre-touchFile), so a publish
+			// racing the record can never be misread as pre-touch at reconcile.
+			expect(outstanding[0].touchedAt).toBeGreaterThanOrEqual(beforeTouch);
+			expect(outstanding[0].touchedAt).toBeLessThanOrEqual(Date.now());
 			// No trustworthy diagnostics were produced by this touch, so the
 			// degraded-fallback path (empty diagnostics, not "clean") applies —
 			// never a false "no errors" for a skipped wait.

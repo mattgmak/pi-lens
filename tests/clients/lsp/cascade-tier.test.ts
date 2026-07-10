@@ -148,22 +148,42 @@ describe("outstanding touch registry + reconcile", () => {
 		mod._resetOutstandingCascadeTouchesForTests();
 	});
 
-	it("resolves an outstanding touch as resolved-found when diagnostics arrived since the baseline", async () => {
+	/** Warm client whose per-file diagnostics map is given as [path, diags, ts] rows. */
+	function warmClient(
+		serverId: string,
+		rows: Array<[string, unknown[], number]>,
+	) {
+		const map = new Map(
+			rows.map(([p, diags, ts]) => [
+				// getAllDiagnostics keys by normalizeMapKey — forward slashes.
+				p.replace(/\\/g, "/"),
+				{ diags, ts },
+			]),
+		);
+		return {
+			client: {
+				serverId,
+				getAllDiagnostics: vi.fn().mockReturnValue(map),
+			},
+		};
+	}
+
+	it("resolves an outstanding touch as resolved-found when THAT FILE's diagnostics published after the touch", async () => {
+		const touchedAt = Date.now() - 1000;
 		mod.recordOutstandingCascadeTouch({
 			filePath: FILE,
 			serverId: "typescript",
-			baselineVersion: 5,
-			touchedAt: Date.now() - 1000,
+			touchedAt,
 		});
 
 		const lspService = {
-			getClientForFile: vi.fn().mockResolvedValue({
-				client: {
-					serverId: "typescript",
-					diagnosticsVersion: 6,
-					getDiagnostics: vi.fn().mockReturnValue([{ message: "err" }]),
-				},
-			}),
+			getWarmClientForFile: vi
+				.fn()
+				.mockResolvedValue(
+					warmClient("typescript", [
+						[FILE, [{ message: "err" }], touchedAt + 500],
+					]),
+				),
 		};
 
 		const outcomes = await mod.reconcileOutstandingCascadeTouches(
@@ -178,22 +198,20 @@ describe("outstanding touch registry + reconcile", () => {
 		expect(mod._getOutstandingCascadeTouchesForTests()).toHaveLength(0);
 	});
 
-	it("resolves an outstanding touch as resolved-clean when the version advanced but diagnostics are empty", async () => {
+	it("resolves an outstanding touch as resolved-clean only when an empty publish for THAT FILE arrived after the touch", async () => {
+		const touchedAt = Date.now() - 1000;
 		mod.recordOutstandingCascadeTouch({
 			filePath: FILE,
 			serverId: "typescript",
-			baselineVersion: 5,
-			touchedAt: Date.now() - 1000,
+			touchedAt,
 		});
 
 		const lspService = {
-			getClientForFile: vi.fn().mockResolvedValue({
-				client: {
-					serverId: "typescript",
-					diagnosticsVersion: 7,
-					getDiagnostics: vi.fn().mockReturnValue([]),
-				},
-			}),
+			getWarmClientForFile: vi
+				.fn()
+				.mockResolvedValue(
+					warmClient("typescript", [[FILE, [], touchedAt + 500]]),
+				),
 		};
 
 		const outcomes = await mod.reconcileOutstandingCascadeTouches(
@@ -205,22 +223,19 @@ describe("outstanding touch registry + reconcile", () => {
 		});
 	});
 
-	it("records unresolved — NEVER clean — when nothing published by settle time (#240 doctrine)", async () => {
+	it("records unresolved — NEVER clean — when nothing published for the file by settle time (#240 doctrine)", async () => {
+		const touchedAt = Date.now() - 1000;
 		mod.recordOutstandingCascadeTouch({
 			filePath: FILE,
 			serverId: "typescript",
-			baselineVersion: 5,
-			touchedAt: Date.now() - 1000,
+			touchedAt,
 		});
 
 		const lspService = {
-			getClientForFile: vi.fn().mockResolvedValue({
-				client: {
-					serverId: "typescript",
-					diagnosticsVersion: 5, // unchanged — nothing published
-					getDiagnostics: vi.fn().mockReturnValue([]),
-				},
-			}),
+			getWarmClientForFile: vi
+				.fn()
+				// Client is warm but holds NO entry for this file at all.
+				.mockResolvedValue(warmClient("typescript", [])),
 		};
 
 		const outcomes = await mod.reconcileOutstandingCascadeTouches(
@@ -229,15 +244,93 @@ describe("outstanding touch registry + reconcile", () => {
 		expect(outcomes[0].outcome).toBe("unresolved");
 	});
 
-	it("records unresolved when the client is gone or a different server now owns the file", async () => {
+	it("records unresolved when the only per-file entry PREDATES the touch (stale publish is not an answer)", async () => {
+		const touchedAt = Date.now() - 1000;
 		mod.recordOutstandingCascadeTouch({
 			filePath: FILE,
 			serverId: "typescript",
-			baselineVersion: 5,
+			touchedAt,
+		});
+
+		const lspService = {
+			getWarmClientForFile: vi
+				.fn()
+				.mockResolvedValue(
+					warmClient("typescript", [[FILE, [], touchedAt - 5000]]),
+				),
+		};
+
+		const outcomes = await mod.reconcileOutstandingCascadeTouches(
+			lspService as any,
+		);
+		expect(outcomes[0].outcome).toBe("unresolved");
+	});
+
+	it("a sibling file's publish on the SAME client must not prove a silent neighbor clean (cross-file poisoning)", async () => {
+		// Two neighbors touched on one tsserver client: A publishes findings,
+		// B stays silent. Any client-wide freshness signal (e.g. the client's
+		// diagnosticsVersion counter) would have advanced because of A — B must
+		// still reconcile as unresolved, never resolved-clean (#240).
+		const touchedAt = Date.now() - 1000;
+		mod.recordOutstandingCascadeTouch({
+			filePath: "C:/repo/a.ts",
+			serverId: "typescript",
+			touchedAt,
+		});
+		mod.recordOutstandingCascadeTouch({
+			filePath: "C:/repo/b.ts",
+			serverId: "typescript",
+			touchedAt,
+		});
+
+		// ONE shared client: only a.ts has a post-touch publish entry.
+		const shared = warmClient("typescript", [
+			["C:/repo/a.ts", [{ message: "err in a" }], touchedAt + 300],
+		]);
+		const lspService = {
+			getWarmClientForFile: vi.fn().mockResolvedValue(shared),
+		};
+
+		const outcomes = await mod.reconcileOutstandingCascadeTouches(
+			lspService as any,
+		);
+		expect(outcomes).toHaveLength(2);
+		const byFile = Object.fromEntries(
+			outcomes.map((o) => [o.filePath, o.outcome]),
+		);
+		expect(byFile["C:/repo/a.ts"]).toBe("resolved-found");
+		expect(byFile["C:/repo/b.ts"]).toBe("unresolved");
+	});
+
+	it("records unresolved on a warm-miss (client idle-reaped) — reconcile must NEVER spawn a server", async () => {
+		mod.recordOutstandingCascadeTouch({
+			filePath: FILE,
+			serverId: "typescript",
 			touchedAt: Date.now(),
 		});
 
-		const lspService = { getClientForFile: vi.fn().mockResolvedValue(undefined) };
+		const getWarmClientForFile = vi.fn().mockResolvedValue(undefined);
+		const lspService = { getWarmClientForFile };
+		const outcomes = await mod.reconcileOutstandingCascadeTouches(
+			lspService as any,
+		);
+		expect(outcomes[0].outcome).toBe("unresolved");
+		// The warm-only accessor is the ONLY lookup used — no get-or-create.
+		expect(getWarmClientForFile).toHaveBeenCalledTimes(1);
+	});
+
+	it("records unresolved when a different server now owns the file", async () => {
+		mod.recordOutstandingCascadeTouch({
+			filePath: FILE,
+			serverId: "typescript",
+			touchedAt: Date.now() - 1000,
+		});
+
+		const lspService = {
+			getWarmClientForFile: vi
+				.fn()
+				.mockResolvedValue(warmClient("deno", [[FILE, [], Date.now()]])),
+		};
 		const outcomes = await mod.reconcileOutstandingCascadeTouches(
 			lspService as any,
 		);
@@ -248,12 +341,11 @@ describe("outstanding touch registry + reconcile", () => {
 		mod.recordOutstandingCascadeTouch({
 			filePath: FILE,
 			serverId: "typescript",
-			baselineVersion: 5,
 			touchedAt: Date.now(),
 		});
 
 		const lspService = {
-			getClientForFile: vi.fn().mockRejectedValue(new Error("boom")),
+			getWarmClientForFile: vi.fn().mockRejectedValue(new Error("boom")),
 		};
 		const outcomes = await mod.reconcileOutstandingCascadeTouches(
 			lspService as any,
@@ -262,32 +354,29 @@ describe("outstanding touch registry + reconcile", () => {
 	});
 
 	it("drains and resolves multiple outstanding touches independently", async () => {
+		const touchedAt = Date.now() - 1000;
 		mod.recordOutstandingCascadeTouch({
 			filePath: "C:/repo/a.ts",
 			serverId: "typescript",
-			baselineVersion: 1,
-			touchedAt: Date.now(),
+			touchedAt,
 		});
 		mod.recordOutstandingCascadeTouch({
 			filePath: "C:/repo/b.ts",
 			serverId: "typescript",
-			baselineVersion: 1,
-			touchedAt: Date.now(),
+			touchedAt,
 		});
 
 		const lspService = {
-			getClientForFile: vi.fn().mockImplementation(async (filePath: string) => {
-				if (filePath.endsWith("a.ts")) {
-					return {
-						client: {
-							serverId: "typescript",
-							diagnosticsVersion: 2,
-							getDiagnostics: vi.fn().mockReturnValue([]),
-						},
-					};
-				}
-				return undefined; // b.ts's client vanished
-			}),
+			getWarmClientForFile: vi
+				.fn()
+				.mockImplementation(async (filePath: string) => {
+					if (filePath.endsWith("a.ts")) {
+						return warmClient("typescript", [
+							["C:/repo/a.ts", [], touchedAt + 200],
+						]);
+					}
+					return undefined; // b.ts's client vanished
+				}),
 		};
 
 		const outcomes = await mod.reconcileOutstandingCascadeTouches(
@@ -326,7 +415,7 @@ describe("registerCascadeTierReconcileTask", () => {
 
 	it("the registered task is a no-op when the registry is empty", async () => {
 		mod.registerCascadeTierReconcileTask(() => ({
-			getClientForFile: vi.fn(),
+			getWarmClientForFile: vi.fn(),
 		}) as any);
 		const task = registerQuietWindowTask.mock.calls[0][1] as () => Promise<void>;
 		await expect(task()).resolves.toBeUndefined();
