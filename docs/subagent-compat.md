@@ -236,8 +236,8 @@ ecosystems apart. Its per-feature worktree isolation is the same bystander
 situation as pi-dynamic-workflows' isolated worktrees — no separate row
 needed for that.
 
-Still open (deferred, tracked as the remainder of #507): a Layer A pinned
-env-vocabulary contract for avtc-pi-subagent in
+Still open (deferred, tracked as #518 — #507 itself is CLOSED, fixed by PR
+#508): a Layer A pinned env-vocabulary contract for avtc-pi-subagent in
 `scripts/lib/compat-contracts.mjs`, and a Layer B behavioral regression case
 asserting light mode engages for an avtc-only-marker child. Both are an
 M-effort follow-up, not part of the detection fix itself.
