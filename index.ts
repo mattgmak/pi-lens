@@ -53,7 +53,15 @@ import {
 } from "./clients/lens-config.js";
 import { initLensEvents } from "./clients/lens-events.js";
 import { wireBusEmitter } from "./clients/bus-publish.js";
-import { consumeAgentNudge, wireAgentNudgeSubscriber } from "./clients/agent-nudge.js";
+import {
+	consumeAgentNudge,
+	recordCrossProcessTouches,
+	wireAgentNudgeSubscriber,
+} from "./clients/agent-nudge.js";
+import {
+	readCrossProcessTouchesForSessionStart,
+	readCrossProcessTouchesForTurnStart,
+} from "./clients/recent-touches.js";
 import { registerCascadeTierReconcileTask } from "./clients/lsp/cascade-tier.js";
 import { initLSPConfig } from "./clients/lsp/config.js";
 import { getLSPService, resetLSPService } from "./clients/lsp/index.js";
@@ -1198,6 +1206,32 @@ export default function (pi: ExtensionAPI) {
 				// best-effort observability — never fail session_start over this
 			});
 			void sweepOrphans();
+			// #492: child-at-session_start cross-process nudge consumer. Reads
+			// `recent-touches.json` (clients/recent-touches.ts) for entries from
+			// OTHER pi-lens instances (pid-excluded) within the 15-minute
+			// freshness window whose file still exists, and feeds them into the
+			// same #485 accumulator a bus event would use — the first `context`
+			// call this session makes (clients/agent-nudge.ts, wired below) then
+			// injects one batched provenance message. This is the "child blind to
+			// parent" direction from #492: a subagent asked to `git status` right
+			// after spawn otherwise sees unexplained `M` files with no
+			// explanation. Never awaited-to-block session_start; internally
+			// best-effort (recent-touches.ts never throws).
+			void readCrossProcessTouchesForSessionStart({
+				cwd: ctx.cwd ?? process.cwd(),
+			})
+				.then((entries) => {
+					if (entries.length === 0) return;
+					recordCrossProcessTouches(
+						entries.map((e) => ({ path: e.path, reason: e.reason })),
+					);
+					dbg(
+						`session_start: cross-process nudge — ${entries.length} file(s) from other instance(s)`,
+					);
+				})
+				.catch((err) => {
+					dbg(`session_start: cross-process nudge read failed: ${err}`);
+				});
 			updateRuntimeIdentityFromEvent(event);
 			try {
 				await ensureLSPConfigInitialized(ctx.cwd ?? process.cwd());
@@ -2197,9 +2231,46 @@ export default function (pi: ExtensionAPI) {
 
 	// --- Turn end: batch jscpd/madge on collected files, then clear state ---
 	// Clear cascade snapshot at start of each new turn so stale data never leaks
-	pi.on("turn_start", (_event: any) => {
+	pi.on("turn_start", (_event: any, ctx) => {
 		runtime.beginTurn();
 		clearLastAnalyzedStateCache();
+
+		// #492: parent-at-turn_start cross-process nudge consumer — the "parent
+		// blind to child" direction, arguably the more important one (the
+		// child is ephemeral; the parent keeps editing the same tree after a
+		// subagent returns and its pi-lens has autoformatted on top of the
+		// child's edits). Hot path: `readCrossProcessTouchesForTurnStart`
+		// mtime-gates itself (ONE `fs.stat`, no read/parse when the record
+		// hasn't changed since the last turn_start), so this call is
+		// effectively free on every turn that has no cross-process activity —
+		// fire-and-forget, never awaited (must not delay turn_start), and
+		// internally never throws.
+		const cwd = (ctx as { cwd?: string } | undefined)?.cwd ?? process.cwd();
+		void readCrossProcessTouchesForTurnStart({ cwd })
+			.then((entries) => {
+				if (entries.length === 0) return;
+				// Relevance filter (#492 point 6): readCrossProcessTouchesForTurnStart
+				// already applied the shared baseline filter (foreign pid, 15-minute
+				// freshness window, file still exists) plus the consumed-cursor
+				// dedup — same baseline as the session_start reader. A parent's own
+				// read-guard history is the FIRST signal for most entries (files it
+				// read/edited this session, same as the #485 local filter) — but
+				// unlike the local filter, an entry the parent has NEVER seen still
+				// passes through here: a parent about to `git commit` needs
+				// attribution for cross-process drift even in files it hasn't
+				// opened yet this session, so there is deliberately no read-guard
+				// drop path — every entry that reaches this point is relevant by
+				// construction.
+				recordCrossProcessTouches(
+					entries.map((e) => ({ path: e.path, reason: e.reason })),
+				);
+				dbg(
+					`turn_start: cross-process nudge — ${entries.length} file(s) from other instance(s)`,
+				);
+			})
+			.catch((err) => {
+				dbg(`turn_start: cross-process nudge read failed: ${err}`);
+			});
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {

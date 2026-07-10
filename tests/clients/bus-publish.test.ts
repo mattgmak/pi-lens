@@ -1,4 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const appendRecentTouches = vi.fn().mockResolvedValue(undefined);
+vi.mock("../../clients/recent-touches.js", () => ({
+	appendRecentTouches: (...args: unknown[]) => appendRecentTouches(...args),
+}));
+
 import {
 	_resetForTests,
 	BUS_FILES_TOUCHED_EVENT,
@@ -13,6 +19,8 @@ describe("bus-publish — pilens:files:touched (#482)", () => {
 
 	beforeEach(() => {
 		_resetForTests();
+		appendRecentTouches.mockClear();
+		appendRecentTouches.mockResolvedValue(undefined);
 	});
 
 	afterEach(() => {
@@ -158,5 +166,87 @@ describe("bus-publish — pilens:files:touched (#482)", () => {
 			}),
 		).not.toThrow();
 		expect(dbg).toHaveBeenCalledTimes(1);
+	});
+
+	describe("#492: recent-touches producer seam", () => {
+		it("appends to the cross-process record at the same call, even with no busEmit wired", () => {
+			// No wireBusEmitter call — mirrors a bare/MCP host with no pi.events.
+			publishFilesTouched({
+				reason: "autofix",
+				paths: ["/repo/a.ts"],
+				cwd: "/repo",
+			});
+
+			expect(appendRecentTouches).toHaveBeenCalledTimes(1);
+			expect(appendRecentTouches).toHaveBeenCalledWith(
+				expect.objectContaining({
+					cwd: "/repo",
+					reason: "autofix",
+					paths: ["/repo/a.ts"],
+				}),
+			);
+		});
+
+		it("passes sessionId through to the record when provided", () => {
+			publishFilesTouched({
+				reason: "format",
+				paths: ["/repo/b.ts"],
+				cwd: "/repo",
+				sessionId: "session-123",
+			});
+
+			expect(appendRecentTouches).toHaveBeenCalledWith(
+				expect.objectContaining({ sessionId: "session-123" }),
+			);
+		});
+
+		it("does not append for an empty paths batch (same guard as the bus emit)", () => {
+			publishFilesTouched({ reason: "autofix", paths: [], cwd: "/repo" });
+			expect(appendRecentTouches).not.toHaveBeenCalled();
+		});
+
+		it("does not append when origin is 'bus' (loop guard applies to both deliveries)", () => {
+			publishFilesTouched({
+				reason: "autofix",
+				paths: ["/repo/a.ts"],
+				cwd: "/repo",
+				origin: "bus",
+			});
+			expect(appendRecentTouches).not.toHaveBeenCalled();
+		});
+
+		it("does not append when PI_LENS_BUS_PUBLISH=0 (same kill switch as the bus emit)", () => {
+			process.env.PI_LENS_BUS_PUBLISH = "0";
+			_resetForTests();
+			appendRecentTouches.mockClear();
+
+			publishFilesTouched({
+				reason: "autofix",
+				paths: ["/repo/a.ts"],
+				cwd: "/repo",
+			});
+			expect(appendRecentTouches).not.toHaveBeenCalled();
+		});
+
+		it("a record-append rejection is swallowed and dbg-logged, never thrown into the publish path", async () => {
+			appendRecentTouches.mockRejectedValueOnce(new Error("disk full"));
+			const dbg = vi.fn();
+
+			expect(() =>
+				publishFilesTouched({
+					reason: "autofix",
+					paths: ["/repo/a.ts"],
+					cwd: "/repo",
+					dbg,
+				}),
+			).not.toThrow();
+
+			// The append is fire-and-forget (not awaited by publishFilesTouched) —
+			// flush the microtask queue so the rejection handler has run.
+			await new Promise((r) => setImmediate(r));
+			expect(dbg).toHaveBeenCalledWith(
+				expect.stringContaining("recent-touches append failed"),
+			);
+		});
 	});
 });

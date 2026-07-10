@@ -50,10 +50,32 @@ import type { ReadGuard } from "./read-guard.js";
 const BUS_FILES_TOUCHED_EVENT = "pilens:files:touched";
 const MAX_NAMES_SHOWN = 5;
 
+/**
+ * Provenance of an accumulated file (#492).
+ *
+ * "local" — this process's own in-process bus reported the touch (the
+ * original #485 path). "cross-process" — the file was first learned about
+ * from the shared `recent-touches.json` record (clients/recent-touches.ts),
+ * written by ANOTHER pi-lens instance (a parent or a subagent child).
+ *
+ * Merge rule when the SAME file is seen via both channels (e.g. a bus event
+ * arrives for a file that was already recorded via the cross-process feed,
+ * or vice versa): the entry reads as "local", never "cross-process" or a
+ * split/dual state. Rationale — once this session's own bus has reported a
+ * touch, the session already knows about it firsthand and the local wording
+ * ("after your last turn") is the more precise, more actionable framing;
+ * "cross-process" framing exists specifically to explain otherwise-
+ * unexplained working-tree drift, which no longer applies once the local
+ * feed has also seen it. In code: "local" is sticky — once set, a later
+ * cross-process report for the same file never downgrades it back.
+ */
+export type AccumulatedFileOrigin = "local" | "cross-process";
+
 interface AccumulatedFile {
 	/** Original (non-normalized) path, for display. First-seen form wins. */
 	displayPath: string;
 	reasons: Set<FilesTouchedPayload["reason"]>;
+	origin: AccumulatedFileOrigin;
 }
 
 // Module-level accumulator: one process/session, so a plain map keyed via
@@ -131,10 +153,60 @@ function recordTouchedEvent(
 		const existing = _touched.get(mapKey);
 		if (existing) {
 			existing.reasons.add(payload.reason);
+			// "local" is sticky — see AccumulatedFileOrigin doc. A file already
+			// recorded via the cross-process feed, now also reported by this
+			// session's own bus, upgrades to "local".
+			existing.origin = "local";
 		} else {
 			_touched.set(mapKey, {
 				displayPath: rawPath,
 				reasons: new Set([payload.reason]),
+				origin: "local",
+			});
+		}
+	}
+}
+
+/**
+ * Feed entries read from the cross-process `recent-touches.json` record
+ * (#492, clients/recent-touches.ts) into the SAME accumulator #485 uses for
+ * in-process bus events — one accumulator, one `consumeAgentNudge` call, one
+ * batched context message regardless of how many files came from which
+ * channel.
+ *
+ * Relevance filtering differs by call site (#492 point 6) and is therefore
+ * the CALLER's responsibility, not this function's:
+ *   - parent at turn_start: read-guard history FIRST (a parent usually has
+ *     one), falling back to recency-only for files it hasn't read (a parent
+ *     about to `git commit` needs attribution even for unread files);
+ *   - child at session_start: recency + file-existence only (no read
+ *     history exists yet this early).
+ * `readCrossProcessTouchesForTurnStart` / `...ForSessionStart` in
+ * recent-touches.ts already apply their own recency/existence/self-pid
+ * filtering before entries reach here — this function does not re-derive
+ * relevance, it only merges into the accumulator and marks provenance.
+ *
+ * Self-exclusion (an entry this process itself published never nudges
+ * itself) and path+ts dedup across repeated reads of the record are both
+ * handled upstream in recent-touches.ts (pid filter + last-consumed cursor),
+ * so entries reaching this function are already the "new, foreign" set.
+ */
+export function recordCrossProcessTouches(
+	entries: Array<{ path: string; reason: FilesTouchedPayload["reason"] }>,
+): void {
+	if (!isAgentNudgeEnabled()) return;
+	for (const entry of entries) {
+		const mapKey = normalizeMapKey(entry.path);
+		const existing = _touched.get(mapKey);
+		if (existing) {
+			existing.reasons.add(entry.reason);
+			// "local" is sticky (see AccumulatedFileOrigin) — never downgrade an
+			// already-local entry back to cross-process.
+		} else {
+			_touched.set(mapKey, {
+				displayPath: entry.path,
+				reasons: new Set([entry.reason]),
+				origin: "cross-process",
 			});
 		}
 	}
@@ -186,6 +258,21 @@ export function wireAgentNudgeSubscriber(
  * did not knowingly make. Naming pi-lens as the source lets the agent act
  * (re-read, proceed) instead of investigating.
  *
+ * #492: attribution is three-way by the batch's origin mix (see
+ * AccumulatedFileOrigin) — still ONE message total (never split local vs.
+ * cross-process into two separate injections; the agent gets one coherent
+ * picture of everything unexplained in the working tree), but the wording
+ * must never assign a LOCAL file to another instance:
+ *   - all local         → "after your last turn" (the original #485 wording,
+ *                         unchanged — verified by the pre-existing #485
+ *                         tests);
+ *   - all cross-process → "by another pi-lens instance (e.g. a subagent's)";
+ *   - mixed             → "after your last turn (N of them by another
+ *                         pi-lens instance)" — the base framing stays local
+ *                         and the cross-process portion is counted out
+ *                         precisely, so no local file is ever misattributed
+ *                         to another instance.
+ *
  * Clears the accumulator ONLY here, on actual injection — never on
  * agent_end/agent_settled/turn_start. Files formatted at the last turn_end of
  * a PREVIOUS run must still nudge at the first turn of the NEXT run in the
@@ -232,7 +319,21 @@ export function consumeAgentNudge(
 				? `${names.join(", ")}, and ${remaining} more`
 				: names.join(", ");
 
-		const message = `pi-lens: ${filesTotal} file(s) were ${verbLabel} after your last turn: ${nameList} — working-tree changes to these are expected; re-read before editing.`;
+		const crossProcessCount = entries.filter(
+			(e) => e.origin === "cross-process",
+		).length;
+		const localCount = filesTotal - crossProcessCount;
+
+		// Three-way attribution (see the function doc): never assign a local
+		// file to another instance — a mixed batch keeps the local base framing
+		// and calls out the cross-process portion by exact count.
+		const attribution =
+			localCount === 0
+				? "by another pi-lens instance (e.g. a subagent's)"
+				: crossProcessCount === 0
+					? "after your last turn"
+					: `after your last turn (${crossProcessCount} of them by another pi-lens instance)`;
+		const message = `pi-lens: ${filesTotal} file(s) were ${verbLabel} ${attribution}: ${nameList} — working-tree changes to these are expected; re-read before editing.`;
 
 		logLatency({
 			type: "phase",
@@ -247,6 +348,10 @@ export function consumeAgentNudge(
 				// filesTotal - filesShown.
 				filesFiltered,
 				reasonMix: Array.from(allReasons),
+				// #492: origin mix so cross-process pickup rate is observable
+				// alongside the existing relevance-filter metric.
+				originLocal: localCount,
+				originCrossProcess: crossProcessCount,
 			},
 		});
 
