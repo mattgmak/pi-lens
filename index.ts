@@ -53,6 +53,7 @@ import {
 } from "./clients/lens-config.js";
 import { initLensEvents } from "./clients/lens-events.js";
 import { wireBusEmitter } from "./clients/bus-publish.js";
+import { registerCascadeTierReconcileTask } from "./clients/lsp/cascade-tier.js";
 import { initLSPConfig } from "./clients/lsp/config.js";
 import { getLSPService, resetLSPService } from "./clients/lsp/index.js";
 import { sweepOrphans } from "./clients/instance-reaper.js";
@@ -2273,6 +2274,9 @@ export default function (pi: ExtensionAPI) {
 	// would hold up the host returning control (e.g. blocking the user from
 	// starting a new turn). Kick it off unawaited and return immediately.
 	registerBuiltinQuietWindowTasks(() => runtime);
+	// #458: reconcile any cascade-lane Tier-3 touches that skipped their
+	// in-lane wait (clients/lsp/cascade-tier.ts) in the same quiet window.
+	registerCascadeTierReconcileTask(() => getLSPService());
 	try {
 		(pi as any).on("agent_settled", (_event: unknown, ctx: { cwd?: string }) => {
 			if (!lensEnabled) return;

@@ -52,6 +52,11 @@ import type {
 	CascadeSkipReason,
 } from "../cascade-types.js";
 import { getDiagnosticTracker } from "../diagnostic-tracker.js";
+import {
+	classifyCascadeWaitTier,
+	isTierAwareCascadeEnabled,
+	recordOutstandingCascadeTouch,
+} from "../lsp/cascade-tier.js";
 import { getServersForFileWithConfig } from "../lsp/config.js";
 import { getLSPService } from "../lsp/index.js";
 import { isExternalOrVendorFile, normalizeMapKey } from "../path-utils.js";
@@ -1068,6 +1073,73 @@ export async function computeCascadeForFile(
 
 				// A6: async read to avoid blocking event loop on network-mounted drives
 				const content = await nodeFs.promises.readFile(neighborPath, "utf8");
+
+				// #458: tier-aware cascade-lane wait. A Tier-3 (push-only,
+				// silent-on-clean — typescript is the lone core-set instance today)
+				// primary can never give this in-lane wait an affirmative clean
+				// signal, so the budget is pure cost. Fire the touch (didOpen/
+				// didChange still happens — the server starts real work) and record
+				// it as outstanding for the agent_settled quiet window to reconcile
+				// instead of waiting here. Ambiguous/missing capability data always
+				// classifies as "waits" (today's behavior) — see cascade-tier.ts.
+				// The whole attempt is try/caught: any surprise (a service shape
+				// that doesn't expose getCapabilitySnapshots/getClientForFile, a
+				// thrown rejection) falls through to the existing full-wait path
+				// below rather than skip the wait on a failure.
+				if (isTierAwareCascadeEnabled()) {
+					try {
+						const snapshots =
+							(await lspService.getCapabilitySnapshots?.(neighborPath)) ?? [];
+						const tier = classifyCascadeWaitTier(
+							lspService,
+							neighborPath,
+							snapshots,
+						);
+						if (tier === "tier3-silent") {
+							const spawnedForBaseline =
+								await lspService.getClientForFile(neighborPath);
+							if (spawnedForBaseline) {
+								const baselineVersion =
+									spawnedForBaseline.client.diagnosticsVersion;
+								await lspService.touchFile(neighborPath, content, {
+									diagnostics: "none",
+									collectDiagnostics: false,
+									silent: true,
+									source: "cascade",
+									clientScope: "primary",
+								});
+								recordOutstandingCascadeTouch({
+									filePath: neighborPath,
+									serverId: spawnedForBaseline.client.serverId,
+									baselineVersion,
+									touchedAt: Date.now(),
+								});
+								const durationMs = Date.now() - neighborStart;
+								logCascade({
+									phase: "cascade_tier3_skip",
+									filePath,
+									neighborFile: neighborPath,
+									durationMs,
+									lspServerCount: configuredServerCount,
+									coldSnapshot: isColdSnapshot,
+									metadata: { serverId: spawnedForBaseline.client.serverId },
+								});
+								// Deliberately NOT cached as clean/diagnosed — the wait was
+								// skipped, not resolved, so neither neighborTouchCache nor
+								// recentlyCleanNeighborCache may treat this as a real answer
+								// (#240 doctrine). Return undefined: the degraded-fallback
+								// path below still has a chance to surface a passive/stale
+								// snapshot, same as any other "no fresh data this touch" case.
+								return undefined;
+							}
+						}
+					} catch (tierErr) {
+						dbg?.(
+							`cascade tier-aware skip attempt failed for ${neighborPath}, falling back to full wait: ${tierErr}`,
+						);
+					}
+				}
+
 				// Open with silent=true (suppresses didChangeWatchedFiles rechecks, C2)
 				// and collect diagnostics from the same touched clients.
 				// Cold-snapshot neighbors (autoPropagate LSP, server warm) use a tighter
