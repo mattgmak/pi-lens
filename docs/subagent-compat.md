@@ -198,3 +198,34 @@ Findings that matter to pi-lens:
   worktree is never a pi-lens project root because pi-lens never runs there).
   Edits surface to pi-lens only if/when the parent session touches the
   resulting branch/files.
+
+### pi-delegate (`drsh4dow/pi-delegate`, Codeberg, assessed 2026-07-10)
+
+Single-tool isolation extension: one fresh child agent per `delegate` call,
+bounded task, distilled report back; explicitly not a workflow engine.
+**Execution model = the pi-dynamic-workflows shape**: bare
+`createAgentSession({...})` with a `DefaultResourceLoader` — it **never calls
+`bindExtensions()`** (grep-verified in source + tests), so `session_start`
+never fires in the child and pi-lens is a bystander there (no read-guard,
+diagnostics, or dispatch on the child's edits). Nuance worth recording: the
+loader's `additionalExtensionPaths` makes pi-lens's TOOLS discoverable in the
+child's `getAllTools()` — discoverable-but-inert, since no lifecycle binding
+ever happens. No #473 hazard, no #475 relevance, child disposed via
+`dispose()` in a `finally`. **No contract pinned, no smoke coverage needed.**
+Version-drift flag: imports the pre-rename `@mariozechner/*` SDK scope —
+re-assess if this extension gets adopted against a current pi.
+
+### avtc-pi-feature-flow / avtc-pi-subagent (assessed 2026-07-10 at avtc-pi-subagent@1.0.3)
+
+Feature pipeline (design→plan→implement→verify→review→UAT) fanning out
+child agents via its bundled `avtc-pi-subagent` engine: **real child-process
+spawns of `pi --mode rpc` / `--mode json -p` — the nicobailon shape — but
+with its OWN env vocabulary**: sets `PI_SUBAGENT_CHILD_AGENT` +
+`PI_SUBAGENT_PARENT_PID`, **never `PI_SUBAGENT_CHILD=1`** (grep-verified).
+Consequence: `subagent-mode.ts` light-mode detection silently never engages
+for its children, which DO run full pi-lens session_start — a real waste gap
+multiplied by feature-flow's parallel-reviewer fan-out. Tracked as #507
+(broaden detection vs document-and-scope); once decided, this package gets a
+Layer A env-vocabulary contract + a Layer B both-directions regression case.
+Its per-feature worktree isolation is the same bystander situation as
+pi-dynamic-workflows' isolated worktrees — no separate row needed for that.
