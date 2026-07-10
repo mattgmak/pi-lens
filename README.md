@@ -149,10 +149,11 @@ Thanks goes to these wonderful people:
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/cmptr"><img src="https://avatars.githubusercontent.com/u/32746889?v=4" width="100px;" alt=""/><br /><sub><b>Aaron Bell</b></sub></a><br /><a href="#code-cmptr" title="Code">💻</a> <a href="#bug-cmptr" title="Bug reports">🐛</a></td>
       <td align="center" valign="top" width="14.28%"><a href="http://jasonrimmer.com/"><img src="https://avatars.githubusercontent.com/u/629?v=4" width="100px;" alt=""/><br /><sub><b>Jason Rimmer</b></sub></a><br /><a href="#bug-jrimmer" title="Bug reports">🐛</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/moj02090"><img src="https://avatars.githubusercontent.com/u/57255166?v=4" width="100px;" alt=""/><br /><sub><b>moj02090</b></sub></a><br /><a href="#code-moj02090" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/vkarasen"><img src="https://avatars.githubusercontent.com/u/7932536?v=4" width="100px;" alt=""/><br /><sub><b>Vitali Karasenko</b></sub></a><br /><a href="#code-vkarasen" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/mehalter"><img src="https://avatars.githubusercontent.com/u/1591837?v=4" width="100px;" alt=""/><br /><sub><b>Micah Halter</b></sub></a><br /><a href="#code-mehalter" title="Code">💻</a></td>
     </tr>
 </tbody>
 </table>
-
 
 <!-- markdownlint-restore -->
 <!-- prettier-ignore-end -->

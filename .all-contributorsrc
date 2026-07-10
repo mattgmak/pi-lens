@@ -669,6 +669,24 @@
       "contributions": [
         "code"
       ]
+    },
+    {
+      "login": "vkarasen",
+      "name": "Vitali Karasenko",
+      "avatar_url": "https://avatars.githubusercontent.com/u/7932536?v=4",
+      "profile": "https://github.com/vkarasen",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "mehalter",
+      "name": "Micah Halter",
+      "avatar_url": "https://avatars.githubusercontent.com/u/1591837?v=4",
+      "profile": "https://github.com/mehalter",
+      "contributions": [
+        "code"
+      ]
     }
   ]
 }
