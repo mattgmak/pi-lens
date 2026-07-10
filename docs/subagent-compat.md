@@ -131,3 +131,40 @@ create-or-updates it, never duplicates.
 5. Close the tracking issue once the underlying check is green again — it
    will reopen (well, get a fresh create — see the note in the issue body
    about not manually closing while still failing) if it recurs.
+
+## Known-extension assessments (no contract pinned)
+
+Extensions assessed against the #473/#474/#475 interaction surfaces and found
+to need NO nightly contract check. Recorded so nobody re-derives this; re-assess
+if their execution model visibly changes.
+
+### plannotator (`@plannotator/pi-extension`, assessed 2026-07-10 at ~v0.22)
+
+Browser-based plan/review UI; ~30k npm downloads/mo. **Benign coexistence.**
+Never binds an `AgentSession` in-process (#473 class N/A) and never spawns
+child `pi`s at session start (#475 class N/A). Namespaces fully disjoint
+(`PLANNOTATOR_*`, `~/.pi/plannotator*.json`). Its planning-phase `tool_call`
+blocking coexists additively with the read-guard (either may block; plan files
+are newly-created so never trip `zero_read`). Two second-order notes: (a) its
+own spawned agent jobs are cleaned up via `process.once("exit")` — its own
+#472-class orphan risk on hard kills, internal to plannotator (our reaper
+cleans pi-lens's servers inside any orphaned child `pi` it leaves); (b) its
+on-demand "run agent: pi" jobs spawn child pis WITHOUT a subagent marker, so
+pi-lens runs at full weight there — low-frequency, user-triggered, accepted.
+
+### pi-dynamic-workflows (`@quintinshaw/pi-dynamic-workflows`, assessed 2026-07-10 at v2.12.0)
+
+vm-sandboxed orchestration scripts fanning out to up to 16 in-process
+subagents. **Benign coexistence via a THIRD execution model**: it calls
+`createAgentSession()` directly and never `bindExtensions()`/`reload()` — the
+only two SDK paths that emit `session_start` — so pi-lens's handler never runs
+for its subagents. No #473 hazard by construction; no #475 child processes; no
+#472 kills (disposal via `session.dispose()` in `finally`); zero namespace
+overlap (`~/.pi/workflows/`).
+
+**Known gap, by their design, not a bug**: because pi-lens never binds into
+those subagent sessions, subagent-written edits get NO pi-lens diagnostics,
+read-guard, or dispatch — pi-lens is a bystander until the parent session
+touches the files. Worktree-isolated agents (`.pi/worktrees/<slug>`) are
+additionally out of the parent's project scope. If a user reports "pi-lens
+didn't catch X in my workflow run", this is why.
