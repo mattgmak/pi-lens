@@ -18,6 +18,7 @@
  * it without spamming.
  */
 import { normalizeFilePath } from "./path-utils.js";
+import { appendRecentTouches } from "./recent-touches.js";
 
 export const BUS_FILES_TOUCHED_EVENT = "pilens:files:touched";
 export const BUS_FILES_TOUCHED_VERSION = 1;
@@ -82,6 +83,8 @@ export interface PublishFilesTouchedArgs {
 	 * this is a structural no-op regardless of the kill switch or wiring.
 	 */
 	origin?: "bus";
+	/** Stable session id, for the #492 cross-process record's `sessionId` field. */
+	sessionId?: string;
 	dbg?: (msg: string) => void;
 }
 
@@ -89,11 +92,33 @@ export interface PublishFilesTouchedArgs {
  * Publish one `pilens:files:touched` event for a logical write batch (one
  * event per call site invocation, not per file). Fire-and-forget: never
  * throws, never awaited by the caller's write path.
+ *
+ * #492: this is also the producer seam for the cross-process
+ * `recent-touches.json` record (clients/recent-touches.ts) — parent and
+ * child pi processes run this exact function, so appending here (rather
+ * than at each of the several `publishFilesTouched` call sites) guarantees
+ * every future call site gets cross-process propagation for free. The
+ * append is independent of `busEmit` being wired (a bare/MCP/test host with
+ * no `pi.events` still gets a cross-process record — the in-process bus and
+ * the on-disk record are two separate deliveries of the same payload, and
+ * the record is the ONLY one of the two that survives a process boundary).
+ * Fire-and-forget, same as the bus emit: never awaited, failures swallowed
+ * and dbg-logged (never break the publish path).
  */
 export function publishFilesTouched(args: PublishFilesTouchedArgs): void {
 	if (args.origin === "bus") return;
 	if (args.paths.length === 0) return;
 	if (!isBusPublishEnabled()) return;
+
+	void appendRecentTouches({
+		cwd: args.cwd,
+		reason: args.reason,
+		paths: args.paths,
+		sessionId: args.sessionId,
+	}).catch((err) => {
+		args.dbg?.(`bus-publish: recent-touches append failed: ${err}`);
+	});
+
 	if (!busEmit) return;
 
 	try {

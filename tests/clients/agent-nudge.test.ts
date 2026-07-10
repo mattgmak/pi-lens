@@ -3,6 +3,7 @@ import {
 	_resetAgentNudgeForTests,
 	consumeAgentNudge,
 	isAgentNudgeEnabled,
+	recordCrossProcessTouches,
 	wireAgentNudgeSubscriber,
 } from "../../clients/agent-nudge.js";
 import { createReadGuard, type ReadRecord } from "../../clients/read-guard.js";
@@ -341,5 +342,130 @@ describe("agent-nudge — inline context nudge for out-of-view mutations (#485)"
 		consumeAgentNudge();
 
 		expect(emitSpy).not.toHaveBeenCalled();
+	});
+
+	describe("#492: cross-process origin merge + framing", () => {
+		it("a pure cross-process batch uses the 'another pi-lens instance' framing", () => {
+			recordCrossProcessTouches([
+				{ path: "/repo/src/child.ts", reason: "autofix" },
+			]);
+
+			const result = consumeAgentNudge();
+			expect(result).toBeDefined();
+			expect(result?.messages[0].content).toContain(
+				"by another pi-lens instance (e.g. a subagent's)",
+			);
+			expect(result?.messages[0].content).not.toContain("after your last turn");
+		});
+
+		it("a pure local batch keeps the original #485 wording unchanged", () => {
+			const guard = createReadGuard("s1");
+			guard.recordRead(createReadRecord("/repo/src/a.ts"));
+			const bus = makeBus();
+			wireAgentNudgeSubscriber({ events: bus, getReadGuard: () => guard });
+			bus.emit(touchedPayload({ paths: ["/repo/src/a.ts"] }));
+
+			const result = consumeAgentNudge();
+			expect(result?.messages[0].content).toContain("after your last turn");
+			expect(result?.messages[0].content).not.toContain("another pi-lens instance");
+		});
+
+		it("a mixed batch (local + cross-process) produces ONE message using the cross-process framing", () => {
+			const guard = createReadGuard("s1");
+			guard.recordRead(createReadRecord("/repo/src/a.ts"));
+			const bus = makeBus();
+			wireAgentNudgeSubscriber({ events: bus, getReadGuard: () => guard });
+			bus.emit(touchedPayload({ paths: ["/repo/src/a.ts"] }));
+			recordCrossProcessTouches([
+				{ path: "/repo/src/child.ts", reason: "autofix" },
+			]);
+
+			const result = consumeAgentNudge();
+			expect(result?.messages).toHaveLength(1);
+			expect(result?.messages[0].content).toContain("2 file(s)");
+			expect(result?.messages[0].content).toContain(
+				"by another pi-lens instance (e.g. a subagent's)",
+			);
+		});
+
+		it("local+cross-process merge rule: a file seen via BOTH channels reads as local (sticky), never split", () => {
+			recordCrossProcessTouches([
+				{ path: "/repo/src/shared.ts", reason: "autofix" },
+			]);
+			const guard = createReadGuard("s1");
+			guard.recordRead(createReadRecord("/repo/src/shared.ts"));
+			const bus = makeBus();
+			wireAgentNudgeSubscriber({ events: bus, getReadGuard: () => guard });
+			bus.emit(touchedPayload({ paths: ["/repo/src/shared.ts"] }));
+
+			const result = consumeAgentNudge();
+			// Only one file total (merged, not duplicated) and — because the SAME
+			// file is now also known locally — the batch reads as pure local, not
+			// cross-process (the "local is sticky" rule).
+			expect(result?.messages[0].content).toContain("1 file(s)");
+			expect(result?.messages[0].content).toContain("after your last turn");
+			expect(result?.messages[0].content).not.toContain("another pi-lens instance");
+		});
+
+		it("the reverse order (local first, then the SAME file arrives via cross-process) still reads as local", () => {
+			const guard = createReadGuard("s1");
+			guard.recordRead(createReadRecord("/repo/src/shared.ts"));
+			const bus = makeBus();
+			wireAgentNudgeSubscriber({ events: bus, getReadGuard: () => guard });
+			bus.emit(touchedPayload({ paths: ["/repo/src/shared.ts"] }));
+			recordCrossProcessTouches([
+				{ path: "/repo/src/shared.ts", reason: "format" },
+			]);
+
+			const result = consumeAgentNudge();
+			expect(result?.messages[0].content).toContain("1 file(s)");
+			expect(result?.messages[0].content).not.toContain("another pi-lens instance");
+		});
+
+		it("agent_nudge phase metadata reports the local/cross-process origin mix", () => {
+			logLatency.mockClear();
+			const guard = createReadGuard("s1");
+			guard.recordRead(createReadRecord("/repo/src/a.ts"));
+			const bus = makeBus();
+			wireAgentNudgeSubscriber({ events: bus, getReadGuard: () => guard });
+			bus.emit(touchedPayload({ paths: ["/repo/src/a.ts"] }));
+			recordCrossProcessTouches([
+				{ path: "/repo/src/child1.ts", reason: "autofix" },
+				{ path: "/repo/src/child2.ts", reason: "format" },
+			]);
+
+			expect(consumeAgentNudge()).toBeDefined();
+			const phase = logLatency.mock.calls
+				.map((c) => c[0] as { phase?: string; metadata?: Record<string, unknown> })
+				.find((e) => e.phase === "agent_nudge");
+			expect(phase?.metadata).toMatchObject({
+				originLocal: 1,
+				originCrossProcess: 2,
+			});
+		});
+
+		it("cross-process entries bypass the read-guard relevance filter (recordCrossProcessTouches has no guard dependency)", () => {
+			// No read-guard subscription wired at all — recordCrossProcessTouches
+			// is called directly, as the index.ts turn_start/session_start
+			// consumers do after their OWN upstream relevance decision.
+			recordCrossProcessTouches([
+				{ path: "/repo/src/never-read.ts", reason: "autofix" },
+			]);
+
+			const result = consumeAgentNudge();
+			expect(result).toBeDefined();
+			expect(result?.messages[0].content).toContain("never-read.ts");
+		});
+
+		it("kill switch: PI_LENS_AGENT_NUDGE=0 disables recordCrossProcessTouches too", () => {
+			process.env.PI_LENS_AGENT_NUDGE = "0";
+			_resetAgentNudgeForTests();
+
+			recordCrossProcessTouches([
+				{ path: "/repo/src/child.ts", reason: "autofix" },
+			]);
+
+			expect(consumeAgentNudge()).toBeUndefined();
+		});
 	});
 });
