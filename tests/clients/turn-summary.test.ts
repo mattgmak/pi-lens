@@ -6,6 +6,7 @@ import {
 	formatTurnSummaryLine,
 	TurnSummaryCollector,
 } from "../../clients/turn-summary.js";
+import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 
 describe("TurnSummaryCollector (#484)", () => {
 	it("is empty when nothing has been recorded", () => {
@@ -136,5 +137,34 @@ describe("formatTurnSummaryLine (#484)", () => {
 		const collector = new TurnSummaryCollector();
 		const details = collector.consume(1);
 		expect(formatTurnSummaryLine(details)).toBe("pi-lens: turn summary (empty)");
+	});
+});
+
+describe("RuntimeCoordinator turn-summary lifecycle (#484)", () => {
+	it("is NOT cleared at beginTurn — accumulates across the run's turns", () => {
+		const runtime = new RuntimeCoordinator();
+		runtime.turnSummary.recordFormat("/repo/src/a.ts", { tool: "prettier" });
+		expect(runtime.turnSummary.isEmpty()).toBe(false);
+
+		// A new turn beginning mid-run must NOT drop the pending summary — the
+		// entry is emitted once per RUN at the agent_settled quiet window
+		// (sendMessage during a live stream would steer the agent), so the
+		// collector survives turn boundaries.
+		runtime.beginTurn();
+		expect(runtime.turnSummary.isEmpty()).toBe(false);
+
+		runtime.turnSummary.recordDiagnostic("/repo/src/b.ts", {
+			tool: "eslint",
+		});
+		const details = runtime.turnSummary.consume(runtime.turnIndex);
+		expect(details.files).toHaveLength(2);
+		expect(runtime.turnSummary.isEmpty()).toBe(true);
+	});
+
+	it("IS cleared by resetForSession", () => {
+		const runtime = new RuntimeCoordinator();
+		runtime.turnSummary.recordFormat("/repo/src/a.ts", { tool: "prettier" });
+		runtime.resetForSession();
+		expect(runtime.turnSummary.isEmpty()).toBe(true);
 	});
 });

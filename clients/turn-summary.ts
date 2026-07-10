@@ -1,12 +1,29 @@
 /**
  * Turn-summary collector (#484).
  *
- * Opt-in, transcript-persistent per-turn record of what pi-lens did:
- * diagnostics found, autofixes applied, autoformats applied. Accumulated
- * per-file across the turn's write/edit pipeline runs + the agent_end
- * deferred-format pass, then emitted as ONE `pi.sendMessage` custom entry at
- * turn_end (never per-file — see #484 discussion). Collapsed rendering is
- * tool-grouped; expanded rendering is file-major.
+ * Opt-in, transcript-persistent record of what pi-lens did: diagnostics
+ * found, autofixes applied, autoformats applied. Accumulated per-file across
+ * the RUN's write/edit pipeline runs + the agent_end deferred-format pass,
+ * then emitted as ONE `pi.sendMessage` custom entry at the `agent_settled`
+ * quiet window (never per-file, and per-RUN not per-turn — see the #484
+ * discussion + PR #500 review). The quiet-window emit point is load-bearing,
+ * not cosmetic (verified in the installed pi 0.80.6 SDK):
+ *
+ *   1. `sendCustomMessage` STEERS the live model conversation when the
+ *      session `isStreaming` (dist/core/agent-session.js), and turn_end can
+ *      fire mid-stream — a passive summary must never steer a working agent.
+ *      At settle the session is idle, so sendMessage takes the safe append
+ *      branch (persisted + rendered immediately, no steer).
+ *   2. A CustomMessageEntry DOES participate in LLM context: `display` only
+ *      controls TUI rendering, and `buildSessionContext` converts every such
+ *      entry into a `role: "user"` message on later context builds
+ *      (dist/core/session-manager.js). Only `content` reaches the model —
+ *      `details` never does — so the entry `content` must stay ONE short
+ *      line; the model's exposure is that ~80-char collapsed line, an
+ *      accepted residue (largely redundant with the #493 agent nudge).
+ *
+ * Collapsed rendering is tool-grouped; expanded rendering (from `details`,
+ * human-only) is file-major.
  *
  * All map keys go through `normalizeMapKey` — never a hand-rolled path
  * comparison (see the two red CI rounds on PR #491 the raw-key trap cost).
@@ -50,15 +67,21 @@ export interface TurnSummaryCounts {
 /** Structured payload persisted as the CustomMessage `details` (#484). File-major. */
 export interface TurnSummaryDetails {
 	version: 1;
+	/**
+	 * The run's LAST completed turn index at consume time (the collector
+	 * accumulates across the whole run and is consumed once at the
+	 * agent_settled quiet window, so this marks where the run ended — not a
+	 * single turn the events belong to).
+	 */
 	turnIndex: number;
 	files: TurnSummaryFileEntry[];
 	counts: TurnSummaryCounts;
 }
 
 /**
- * Per-turn accumulator. One instance lives on the runtime coordinator and is
- * cleared at turn boundaries, mirroring the existing
- * `_actionableWarningsThisTurn` / `_codeQualityWarningsThisTurn` pattern.
+ * Per-RUN accumulator. One instance lives on the runtime coordinator; it
+ * survives turn boundaries (NOT cleared in beginTurn) and is cleared only by
+ * `consume()` at the quiet-window emit and by `resetForSession()`.
  */
 export class TurnSummaryCollector {
 	private readonly filesByKey = new Map<string, TurnSummaryFileEntry>();
@@ -116,7 +139,7 @@ export class TurnSummaryCollector {
 		this.filesByKey.clear();
 	}
 
-	/** Consume (snapshot + clear) the turn's collection, building the details payload. */
+	/** Consume (snapshot + clear) the run's collection, building the details payload. */
 	consume(
 		turnIndex: number,
 		toDisplayPath?: (filePath: string) => string,

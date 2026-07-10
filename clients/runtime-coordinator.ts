@@ -103,10 +103,11 @@ export class RuntimeCoordinator {
 		string,
 		CodeQualityWarningRecord
 	>();
-	// #484: opt-in per-turn summary of diagnostics/autofixes/formats. The
-	// collector itself is always constructed (cheap, empty Map) but callers
-	// gate recording behind the `lens-turn-summary` flag so it's a true no-op
-	// when the feature is off.
+	// #484: opt-in per-RUN summary of diagnostics/autofixes/formats,
+	// accumulated across the run's turns and consumed once at the
+	// agent_settled quiet window. The collector itself is always constructed
+	// (cheap, empty Map) but callers gate recording behind the
+	// `lens-turn-summary` flag so it's a true no-op when the feature is off.
 	private readonly _turnSummary = new TurnSummaryCollector();
 
 	resetForSession(): void {
@@ -197,7 +198,12 @@ export class RuntimeCoordinator {
 		this._pendingInlineBlockers.clear();
 		this._actionableWarningsThisTurn.clear();
 		this._codeQualityWarningsThisTurn.clear();
-		this._turnSummary.clear();
+		// _turnSummary is deliberately NOT cleared here (#484 rework): the
+		// summary entry is emitted once per RUN at the agent_settled quiet
+		// window (sendMessage during a live stream would STEER the agent, and
+		// turn_end can fire mid-stream), so the collector must accumulate
+		// across the run's turns. It is cleared only by consume() at emit and
+		// by resetForSession().
 		this._turnStartProjectSeq = this._projectSeq;
 		this._turnIndex += 1;
 		this._writeIndex = 0;
@@ -509,8 +515,10 @@ export class RuntimeCoordinator {
 		this._codeQualityWarningsThisTurn.clear();
 	}
 
-	/** #484: the per-turn diagnostics/autofix/format collector. Always present;
-	 * callers gate recording behind the `lens-turn-summary` opt-in flag. */
+	/** #484: the per-run diagnostics/autofix/format collector (accumulates
+	 * across turns; consumed once at the agent_settled quiet window). Always
+	 * present; callers gate recording behind the `lens-turn-summary` opt-in
+	 * flag. */
 	get turnSummary(): TurnSummaryCollector {
 		return this._turnSummary;
 	}

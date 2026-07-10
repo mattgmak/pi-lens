@@ -103,6 +103,7 @@ import {
 import { cancelLSPIdleReset, handleTurnEnd } from "./clients/runtime-turn.js";
 import {
 	registerBuiltinQuietWindowTasks,
+	registerQuietWindowTask,
 	runQuietWindow,
 } from "./clients/quiet-window.js";
 import { isExternalOrVendorFile } from "./clients/path-utils.js";
@@ -187,6 +188,20 @@ function log(_msg: string) {
 // --- State ---
 
 const runtime = new RuntimeCoordinator();
+// #484: the quiet-window task registry (clients/quiet-window.ts `_tasks`) is
+// module-level and survives factory re-activation in the same process (#473
+// in-process subagent re-binds, reload). Register the turn-summary emit task
+// ONCE (flag below, same pattern as registerCascadeTierReconcileTask) and
+// have it read the CURRENT activation's pi/flag closures through this
+// holder, refreshed on every activation — never a stale captured `pi`.
+let _turnSummaryEmitRegistered = false;
+let _turnSummaryEmitCtx:
+	| {
+			pi: ExtensionAPI;
+			getLensFlag: (name: string) => boolean | string | undefined;
+			isLensEnabled: () => boolean;
+	  }
+	| undefined;
 const _lspConfigInitializedCwds = new Set<string>();
 const _readExpansionClient = new TreeSitterClient();
 const LSP_TOOLCALL_NAV_TOUCH_BUDGET_MS = Math.max(
@@ -2282,51 +2297,13 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
-			// #484: opt-in per-turn summary entry. Emitted here (after
-			// handleTurnEnd, which also folds in the actionable-warnings autofix
-			// pass from agent_end) so the collector reflects the WHOLE turn —
-			// immediate-mode pipeline runs, deferred format completion, and the
-			// experimental LSP quickfix autofix pass all feed the same collector.
-			if (getLensFlag("lens-turn-summary") && !runtime.turnSummary.isEmpty()) {
-				const summaryStart = Date.now();
-				const cwd = ctx.cwd ?? process.cwd();
-				const details = runtime.turnSummary.consume(runtime.turnIndex, (fp) =>
-					toRunnerDisplayPath(cwd, fp),
-				);
-				const line = formatTurnSummaryLine(details);
-				if (typeof (pi as { sendMessage?: unknown }).sendMessage === "function") {
-					try {
-						pi.sendMessage({
-							customType: TURN_SUMMARY_CUSTOM_TYPE,
-							content: line,
-							display: true,
-							details,
-						});
-					} catch (sendErr) {
-						dbg(`turn-summary sendMessage failed: ${sendErr}`);
-					}
-				} else {
-					dbg("turn-summary: pi.sendMessage unavailable on this host, skipping emit");
-				}
-				logLatency({
-					type: "phase",
-					toolName: "turn_end",
-					filePath: cwd,
-					phase: "turn_summary",
-					durationMs: Date.now() - summaryStart,
-					metadata: {
-						files: details.files.length,
-						diagnostics: details.counts.diagnostics,
-						autofixes: details.counts.autofixes,
-						formats: details.counts.formats,
-					},
-				});
-			} else if (getLensFlag("lens-turn-summary")) {
-				// Empty turn — clear defensively even though isEmpty() already
-				// guarded the emit (consume() would also clear, but we never called
-				// it on this branch).
-				runtime.turnSummary.clear();
-			}
+			// #484: the turn-summary entry is deliberately NOT emitted here.
+			// sendMessage while the session is streaming STEERS the live model
+			// conversation (SDK sendCustomMessage's isStreaming branch), and a
+			// mid-run turn_end plausibly fires while streaming — so the emit
+			// lives in the agent_settled quiet window below, where the session
+			// is idle and sendMessage takes the safe append branch. The
+			// collector accumulates across the run's turns until then.
 		} catch (turnEndErr) {
 			dbg(`turn_end crashed: ${turnEndErr}`);
 			dbg(`turn_end crash stack: ${(turnEndErr as Error).stack}`);
@@ -2356,6 +2333,76 @@ export default function (pi: ExtensionAPI) {
 	// #458: reconcile any cascade-lane Tier-3 touches that skipped their
 	// in-lane wait (clients/lsp/cascade-tier.ts) in the same quiet window.
 	registerCascadeTierReconcileTask(() => getLSPService());
+	// #484: emit the opt-in run summary entry HERE, not at turn_end. The SDK's
+	// sendCustomMessage STEERS the live model conversation when the session
+	// isStreaming, and turn_end can fire mid-stream; at agent_settled the
+	// session is idle, so sendMessage takes the safe append branch (persisted
+	// transcript entry, rendered immediately, expandable in place). Note the
+	// entry is NOT display-only: a CustomMessageEntry participates in LLM
+	// context (`display` only controls TUI rendering) — its `content` reaches
+	// the model as a user message on the NEXT context build, which is why
+	// `content` is kept to the single collapsed line (~80 chars, an accepted
+	// residue largely redundant with the #493 agent nudge); `details` (the
+	// file-major expansion) never reaches the model. The collector accumulates
+	// across the run's turns (never cleared at beginTurn) and is consumed
+	// exactly once here; empty run ⇒ no entry, no latency phase. Task
+	// contract per clients/quiet-window.ts: never throws (each task is
+	// try/caught by the scheduler, and sendMessage is additionally
+	// feature-detected + guarded so an older host degrades to a dbg line).
+	// Registration is once-per-process (the quiet-window registry outlives
+	// factory re-activation); the ctx holder keeps the closure current.
+	_turnSummaryEmitCtx = {
+		pi,
+		getLensFlag: (name: string) => getLensFlag(name),
+		isLensEnabled: () => lensEnabled,
+	};
+	if (!_turnSummaryEmitRegistered) {
+		_turnSummaryEmitRegistered = true;
+		registerQuietWindowTask("turn_summary_emit", () => {
+			const emitCtx = _turnSummaryEmitCtx;
+			if (!emitCtx || !emitCtx.isLensEnabled()) return;
+			if (!emitCtx.getLensFlag("lens-turn-summary")) return;
+			if (runtime.turnSummary.isEmpty()) return;
+			const summaryStart = Date.now();
+			const cwd = runtime.projectRoot || process.cwd();
+			const details = runtime.turnSummary.consume(runtime.turnIndex, (fp) =>
+				toRunnerDisplayPath(cwd, fp),
+			);
+			const line = formatTurnSummaryLine(details);
+			const sendMessage = (
+				emitCtx.pi as { sendMessage?: (msg: unknown) => void }
+			).sendMessage;
+			if (typeof sendMessage === "function") {
+				try {
+					sendMessage.call(emitCtx.pi, {
+						customType: TURN_SUMMARY_CUSTOM_TYPE,
+						content: line,
+						display: true,
+						details,
+					});
+				} catch (sendErr) {
+					dbg(`turn-summary sendMessage failed: ${sendErr}`);
+				}
+			} else {
+				dbg(
+					"turn-summary: pi.sendMessage unavailable on this host, skipping emit",
+				);
+			}
+			logLatency({
+				type: "phase",
+				toolName: "agent_settled",
+				filePath: cwd,
+				phase: "turn_summary",
+				durationMs: Date.now() - summaryStart,
+				metadata: {
+					files: details.files.length,
+					diagnostics: details.counts.diagnostics,
+					autofixes: details.counts.autofixes,
+					formats: details.counts.formats,
+				},
+			});
+		});
+	}
 	try {
 		(pi as any).on("agent_settled", (_event: unknown, ctx: { cwd?: string }) => {
 			if (!lensEnabled) return;

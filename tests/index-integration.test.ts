@@ -1043,9 +1043,14 @@ describe("index.ts integration", () => {
 	}, INTEGRATION_TIMEOUT_MS);
 });
 
-describe("#484 turn-summary emit at turn_end", () => {
+describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 	let tmpDir: string;
 	let originalStartupMode: string | undefined;
+	// Recorded quiet-window task registrations (from the stub below). The
+	// real scheduler (clients/quiet-window.ts) is exercised by its own suite;
+	// here we only need "index.ts registered the task" + "running the task
+	// chain at settle produces the emission".
+	let quietTasks: Array<{ name: string; fn: () => Promise<void> | void }>;
 
 	beforeEach(() => {
 		vi.resetModules();
@@ -1060,6 +1065,7 @@ describe("#484 turn-summary emit at turn_end", () => {
 		vi.doUnmock("../clients/installer/index.js");
 		vi.doUnmock("../clients/runtime-session.js");
 		vi.doUnmock("../clients/lsp/index.js");
+		quietTasks = [];
 		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-turn-summary-"));
 		originalStartupMode = process.env.PI_LENS_STARTUP_MODE;
 		process.env.PI_LENS_STARTUP_MODE = "quick";
@@ -1073,7 +1079,7 @@ describe("#484 turn-summary emit at turn_end", () => {
 		vi.restoreAllMocks();
 	});
 
-	function mockBootstrapAndTurnEndDeps() {
+	function mockSuiteDeps() {
 		vi.doMock("../clients/bootstrap.js", () => ({
 			loadBootstrapClients: async () => ({
 				metricsClient: { reset: () => {} },
@@ -1096,18 +1102,61 @@ describe("#484 turn-summary emit at turn_end", () => {
 				},
 			}),
 		}));
-		// The emit-at-turn_end logic under test lives AFTER handleTurnEnd
-		// returns in index.ts's turn_end handler. handleTurnEnd itself is a
-		// heavyweight, separately-tested pass (knip/madge/tests/actionable
-		// warnings — clients/runtime-turn.ts, exercised by its own suite).
-		// Stub it to a no-op here so this suite exercises only the #484 seam
-        // (collector → sendMessage) without depending on that machinery or its
-		// real-filesystem/timer side effects.
+		// handleTurnEnd is a heavyweight, separately-tested pass
+		// (knip/madge/tests/actionable warnings — clients/runtime-turn.ts,
+		// exercised by its own suite). Stub it to a no-op so this suite
+		// exercises only the #484 seam (collector → quiet-window emit) without
+		// depending on that machinery or its real-filesystem/timer effects.
 		vi.doMock("../clients/runtime-turn.js", () => ({
 			handleTurnEnd: vi.fn(async () => undefined),
 			cancelLSPIdleReset: vi.fn(),
 		}));
+		// Light quiet-window stub: record registrations, run them in order on
+		// runQuietWindow (the real scheduler has its own suite; #484 only
+		// needs the registration + the task's behavior). Builtins are elided —
+		// they'd drag real cascade/heartbeat machinery into this test.
+		vi.doMock("../clients/quiet-window.js", () => ({
+			registerQuietWindowTask: (
+				name: string,
+				fn: () => Promise<void> | void,
+			) => {
+				quietTasks.push({ name, fn });
+			},
+			registerBuiltinQuietWindowTasks: () => {},
+			runQuietWindow: async () => {
+				for (const task of quietTasks) {
+					try {
+						await task.fn();
+					} catch {
+						// mirror the real scheduler: task failures are isolated
+					}
+				}
+			},
+			isQuietWindowEnabled: () => true,
+		}));
 	}
+
+	const workingPipelineResult = () => ({
+		output: "✓ no blockers",
+		hasBlockers: false,
+		isError: false,
+		fileModified: true,
+		diagnostics: [
+			{
+				id: "d1",
+				message: "unused var",
+				filePath: path.join(tmpDir, "src", "app.ts"),
+				line: 4,
+				severity: "warning",
+				semantic: "warning",
+				tool: "eslint",
+				rule: "no-unused-vars",
+			},
+		],
+		formattersUsed: ["prettier"],
+		fixedCount: 1,
+		autofixTools: ["ruff:1"],
+	});
 
 	async function driveEditThenTurnEnd(
 		handlers: ReturnType<typeof createMockPi>["handlers"],
@@ -1119,6 +1168,10 @@ describe("#484 turn-summary emit at turn_end", () => {
 		const sessionStart = handlers.session_start?.[0];
 		expect(sessionStart).toBeTypeOf("function");
 		await sessionStart?.({}, { cwd: tmpDir, ui: { notify: vi.fn() } });
+
+		const turnStart = handlers.turn_start?.[0];
+		expect(turnStart).toBeTypeOf("function");
+		await turnStart?.({}, { cwd: tmpDir });
 
 		const toolResult = handlers.tool_result?.[0];
 		expect(toolResult).toBeTypeOf("function");
@@ -1147,31 +1200,32 @@ describe("#484 turn-summary emit at turn_end", () => {
 		);
 	}
 
-	it("emits exactly one pilens:turn-summary entry with correct details shape when opted in and the turn is non-empty", async () => {
+	async function fireAgentSettled(
+		handlers: ReturnType<typeof createMockPi>["handlers"],
+	) {
+		const settled = handlers.agent_settled?.[0];
+		expect(settled).toBeTypeOf("function");
+		await settled?.({}, { cwd: tmpDir });
+		// index.ts kicks runQuietWindow off unawaited (fire-and-forget by
+		// design — the SDK awaits the handler); drain the microtask queue so
+		// the stub's task chain completes before assertions.
+		await new Promise((resolve) => setTimeout(resolve, 0));
+	}
+
+	it("registers the turn_summary_emit quiet-window task", async () => {
+		mockSuiteDeps();
+		const { default: registerExtension } = await import("../index.ts");
+		const { pi } = createMockPi();
+		registerExtension(pi as any);
+
+		expect(quietTasks.map((t) => t.name)).toContain("turn_summary_emit");
+	}, INTEGRATION_TIMEOUT_MS);
+
+	it("emits nothing at turn_end; exactly one entry at agent_settled, surviving an intervening turn_start", async () => {
 		vi.doMock("../clients/pipeline.js", () => ({
-			runPipeline: vi.fn(async () => ({
-				output: "✓ no blockers",
-				hasBlockers: false,
-				isError: false,
-				fileModified: true,
-				diagnostics: [
-					{
-						id: "d1",
-						message: "unused var",
-						filePath: path.join(tmpDir, "src", "app.ts"),
-						line: 4,
-						severity: "warning",
-						semantic: "warning",
-						tool: "eslint",
-						rule: "no-unused-vars",
-					},
-				],
-				formattersUsed: ["prettier"],
-				fixedCount: 1,
-				autofixTools: ["ruff:1"],
-			})),
+			runPipeline: vi.fn(async () => workingPipelineResult()),
 		}));
-		mockBootstrapAndTurnEndDeps();
+		mockSuiteDeps();
 
 		const filePath = path.join(tmpDir, "src", "app.ts");
 		fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -1184,13 +1238,27 @@ describe("#484 turn-summary emit at turn_end", () => {
 		registerExtension(pi as any);
 
 		await driveEditThenTurnEnd(handlers, filePath);
+		// A sendMessage during the run would steer a streaming session — the
+		// turn_end path must NOT emit.
+		expect(sentMessages).toHaveLength(0);
+
+		// A NEW turn begins before the run settles (multi-turn run): the
+		// collector must survive beginTurn (per-RUN grain, not per-turn).
+		const turnStart = handlers.turn_start?.[0];
+		await turnStart?.({}, { cwd: tmpDir });
+
+		await fireAgentSettled(handlers);
 
 		expect(sentMessages).toHaveLength(1);
 		const sent = sentMessages[0];
 		expect(sent.customType).toBe("pilens:turn-summary");
 		expect(sent.display).toBe(true);
+		// The model-visible part is `content` — it must stay a single short
+		// line (a CustomMessageEntry participates in LLM context; details do
+		// not reach the model).
 		expect(typeof sent.content).toBe("string");
 		expect(sent.content).toContain("pi-lens:");
+		expect((sent.content as string).includes("\n")).toBe(false);
 		expect(sent.details).toMatchObject({
 			version: 1,
 			counts: {
@@ -1206,16 +1274,11 @@ describe("#484 turn-summary emit at turn_end", () => {
 		});
 	}, INTEGRATION_TIMEOUT_MS);
 
-	it("emits nothing when the turn's collection is empty, even when opted in", async () => {
+	it("consumes the collection exactly once — a second agent_settled emits nothing more", async () => {
 		vi.doMock("../clients/pipeline.js", () => ({
-			runPipeline: vi.fn(async () => ({
-				output: "✓ no blockers",
-				hasBlockers: false,
-				isError: false,
-				fileModified: false,
-			})),
+			runPipeline: vi.fn(async () => workingPipelineResult()),
 		}));
-		mockBootstrapAndTurnEndDeps();
+		mockSuiteDeps();
 
 		const filePath = path.join(tmpDir, "src", "app.ts");
 		fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -1228,35 +1291,45 @@ describe("#484 turn-summary emit at turn_end", () => {
 		registerExtension(pi as any);
 
 		await driveEditThenTurnEnd(handlers, filePath);
+		await fireAgentSettled(handlers);
+		expect(sentMessages).toHaveLength(1);
+
+		await fireAgentSettled(handlers);
+		expect(sentMessages).toHaveLength(1);
+	}, INTEGRATION_TIMEOUT_MS);
+
+	it("emits nothing at agent_settled when the run's collection is empty, even when opted in", async () => {
+		vi.doMock("../clients/pipeline.js", () => ({
+			runPipeline: vi.fn(async () => ({
+				output: "✓ no blockers",
+				hasBlockers: false,
+				isError: false,
+				fileModified: false,
+			})),
+		}));
+		mockSuiteDeps();
+
+		const filePath = path.join(tmpDir, "src", "app.ts");
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+		fs.writeFileSync(filePath, "export const x = 1;\n");
+
+		const { default: registerExtension } = await import("../index.ts");
+		const { pi, handlers, sentMessages } = createMockPi({
+			"lens-turn-summary": true,
+		});
+		registerExtension(pi as any);
+
+		await driveEditThenTurnEnd(handlers, filePath);
+		await fireAgentSettled(handlers);
 
 		expect(sentMessages).toHaveLength(0);
 	}, INTEGRATION_TIMEOUT_MS);
 
 	it("does not emit or collect when lens-turn-summary is off (default off-by-default)", async () => {
 		vi.doMock("../clients/pipeline.js", () => ({
-			runPipeline: vi.fn(async () => ({
-				output: "✓ no blockers",
-				hasBlockers: false,
-				isError: false,
-				fileModified: true,
-				diagnostics: [
-					{
-						id: "d1",
-						message: "unused var",
-						filePath: path.join(tmpDir, "src", "app.ts"),
-						line: 4,
-						severity: "warning",
-						semantic: "warning",
-						tool: "eslint",
-						rule: "no-unused-vars",
-					},
-				],
-				formattersUsed: ["prettier"],
-				fixedCount: 1,
-				autofixTools: ["ruff:1"],
-			})),
+			runPipeline: vi.fn(async () => workingPipelineResult()),
 		}));
-		mockBootstrapAndTurnEndDeps();
+		mockSuiteDeps();
 
 		const filePath = path.join(tmpDir, "src", "app.ts");
 		fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -1269,12 +1342,13 @@ describe("#484 turn-summary emit at turn_end", () => {
 		registerExtension(pi as any);
 
 		await driveEditThenTurnEnd(handlers, filePath);
+		await fireAgentSettled(handlers);
 
 		expect(sentMessages).toHaveLength(0);
 	}, INTEGRATION_TIMEOUT_MS);
 
 	it("registers the pilens:turn-summary message renderer (feature-detected)", async () => {
-		mockBootstrapAndTurnEndDeps();
+		mockSuiteDeps();
 		const { default: registerExtension } = await import("../index.ts");
 		const { pi, messageRenderers } = createMockPi();
 		registerExtension(pi as any);
@@ -1284,27 +1358,9 @@ describe("#484 turn-summary emit at turn_end", () => {
 
 	it("never throws when the host lacks sendMessage/registerMessageRenderer (feature-detect no-op)", async () => {
 		vi.doMock("../clients/pipeline.js", () => ({
-			runPipeline: vi.fn(async () => ({
-				output: "✓ no blockers",
-				hasBlockers: false,
-				isError: false,
-				fileModified: true,
-				diagnostics: [
-					{
-						id: "d1",
-						message: "unused var",
-						filePath: path.join(tmpDir, "src", "app.ts"),
-						line: 4,
-						severity: "warning",
-						semantic: "warning",
-						tool: "eslint",
-						rule: "no-unused-vars",
-					},
-				],
-				formattersUsed: ["prettier"],
-			})),
+			runPipeline: vi.fn(async () => workingPipelineResult()),
 		}));
-		mockBootstrapAndTurnEndDeps();
+		mockSuiteDeps();
 
 		const filePath = path.join(tmpDir, "src", "app.ts");
 		fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -1313,14 +1369,13 @@ describe("#484 turn-summary emit at turn_end", () => {
 		const { default: registerExtension } = await import("../index.ts");
 		const { pi, handlers } = createMockPi({ "lens-turn-summary": true });
 		// Simulate an older host lacking both APIs entirely — registerExtension
-		// itself feature-detects registerMessageRenderer at setup time, and the
-		// turn_end handler feature-detects sendMessage at emit time.
+		// feature-detects registerMessageRenderer at setup time, and the
+		// quiet-window task feature-detects sendMessage at emit time.
 		delete (pi as unknown as Record<string, unknown>).sendMessage;
 		delete (pi as unknown as Record<string, unknown>).registerMessageRenderer;
 		registerExtension(pi as any);
 
-		await expect(
-			driveEditThenTurnEnd(handlers, filePath),
-		).resolves.not.toThrow();
+		await driveEditThenTurnEnd(handlers, filePath);
+		await expect(fireAgentSettled(handlers)).resolves.not.toThrow();
 	}, INTEGRATION_TIMEOUT_MS);
 });
