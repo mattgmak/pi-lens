@@ -53,6 +53,7 @@ import {
 } from "./clients/lens-config.js";
 import { initLensEvents } from "./clients/lens-events.js";
 import { wireBusEmitter } from "./clients/bus-publish.js";
+import { consumeAgentNudge, wireAgentNudgeSubscriber } from "./clients/agent-nudge.js";
 import { registerCascadeTierReconcileTask } from "./clients/lsp/cascade-tier.js";
 import { initLSPConfig } from "./clients/lsp/config.js";
 import { getLSPService, resetLSPService } from "./clients/lsp/index.js";
@@ -424,6 +425,13 @@ export default function (pi: ExtensionAPI) {
 	initI18n(pi);
 	initLensEvents(pi);
 	wireBusEmitter(pi.events?.emit?.bind(pi.events));
+	// #485: read-only bus subscriber — never publishes, so the #482 loop guard
+	// (ingest -> write -> publish) has no write side to trip here.
+	wireAgentNudgeSubscriber({
+		events: pi.events,
+		getReadGuard: () => runtime.readGuard,
+		dbg,
+	});
 	const astGrepClient = new AstGrepClient();
 	const cacheManager = new CacheManager();
 
@@ -2353,10 +2361,12 @@ export default function (pi: ExtensionAPI) {
 				const turnEndFindings = consumeTurnEndFindings(cacheManager, cwd);
 				const sessionGuidance = consumeSessionStartGuidance(cacheManager, cwd);
 				const testFindings = consumeTestFindings(cacheManager, cwd);
+				const agentNudge = consumeAgentNudge(dbg);
 				const injectedMessages = [
 					...(sessionGuidance?.messages ?? []),
 					...(turnEndFindings?.messages ?? []),
 					...(testFindings?.messages ?? []),
+					...(agentNudge?.messages ?? []),
 				];
 				if (injectedMessages.length === 0) return;
 
