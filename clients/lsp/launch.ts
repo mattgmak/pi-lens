@@ -26,6 +26,12 @@ export interface LSPProcess {
 	stdout: NodeJS.ReadableStream;
 	stderr: NodeJS.ReadableStream;
 	pid: number;
+	/** The actual resolved command that was spawned (post shim/global-bin/ps1
+	 *  resolution) — used by the #449/#472 instance registry to identify and
+	 *  re-find this LSP child process. */
+	command: string;
+	/** The actual resolved args passed to `command` above. */
+	args: string[];
 }
 
 const isWindows = process.platform === "win32";
@@ -695,6 +701,8 @@ export async function launchLSP(
 		stdout: proc.stdout,
 		stderr: proc.stderr,
 		pid: proc.pid ?? 0,
+		command: spawnCommand,
+		args,
 	};
 }
 

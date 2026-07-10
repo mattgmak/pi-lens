@@ -43,6 +43,7 @@ import {
 import { knipIssuesToProjectDiagnostics } from "./project-diagnostics/runner-adapters/knip.js";
 import type { ProjectDiagnostic } from "./project-diagnostics/types.js";
 import { logLatency } from "./latency-logger.js";
+import { updateHeartbeat } from "./instance-registry.js";
 import { emitLensTurnFindings } from "./lens-events.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
@@ -164,6 +165,15 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		resetLSPService,
 		resetFormatService,
 	} = deps;
+
+	// #449 slice 1: piggyback the instance-registry heartbeat on this existing
+	// per-turn touchpoint rather than adding a new timer/interval. Cheap (reads
+	// process.memoryUsage().rss, one read-modify-write of instances.json) and
+	// fire-and-forget — the kill-switch check + no-op behavior live inside
+	// updateHeartbeat itself, so this call site doesn't need to know about it.
+	void updateHeartbeat().catch(() => {
+		// best-effort observability — never fail turn_end over this
+	});
 
 	const cwd = ctxCwd ?? process.cwd();
 	let turnState = cacheManager.readTurnState(cwd);

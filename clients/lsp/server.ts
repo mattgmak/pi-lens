@@ -24,6 +24,7 @@ import { resolveOpengrepConfig } from "../opengrep-config.js";
 import { resolveZizmorGitHubToken } from "../zizmor-config.js";
 import { logLatency } from "../latency-logger.js";
 import { findLocalSgconfig, resolveBaselineSgconfig } from "../sgconfig.js";
+import { resolveAstGrepNativeExe } from "./server-strategies.js";
 import { isCommandAvailableAsync, safeSpawnAsync } from "../safe-spawn.js";
 import { type LSPProcess, launchLSP } from "./launch.js";
 import { createLombokJdtlsArgs } from "./lombok.js";
@@ -2487,9 +2488,15 @@ export const AstGrepServer: LSPServerInfo = {
 			const baseline = resolveBaselineSgconfig();
 			if (baseline) args = ["lsp", "--config", baseline];
 		}
+		// #472: prefer the platform-native exe directly (one less orphanable
+		// node-bin-wrapper layer). Prepended as the first candidate; falls back
+		// to the existing "ast-grep" PATH/global-bin resolution when the
+		// optional native package isn't installed for this platform/arch.
+		const nativeExe = resolveAstGrepNativeExe();
+		const candidates = nativeExe ? [nativeExe, "ast-grep"] : ["ast-grep"];
 		return resolveAndLaunch(
 			{
-				candidates: ["ast-grep"],
+				candidates,
 				args,
 				cwd: root,
 				managedToolId: "ast-grep",
