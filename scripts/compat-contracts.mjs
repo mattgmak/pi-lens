@@ -104,6 +104,19 @@ async function main() {
   for (const [name, version] of Object.entries(versions)) {
     console.log(`  ${name}@${version}`);
   }
+  // Surface the ACTUALLY-INSTALLED versions to the workflow (GITHUB_OUTPUT)
+  // so the drift-alert issue states ground truth — the doc's "verified
+  // against" versions go stale as nightlies silently pass on newer releases.
+  if (process.env.GITHUB_OUTPUT) {
+    const line = Object.entries(versions)
+      .map(([name, version]) => `${name}@${version}`)
+      .join(" ");
+    try {
+      fs.appendFileSync(process.env.GITHUB_OUTPUT, `versions=${line}\n`);
+    } catch {
+      // output plumbing is best-effort; stdout above already has the versions
+    }
+  }
 
   if (infraFailure) {
     console.error(`\nINFRA FAILURE — could not install packages: ${infraFailure}`);

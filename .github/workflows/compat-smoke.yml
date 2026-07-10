@@ -104,6 +104,7 @@ jobs:
             echo ""
             echo "- Layer A (pinned-contract verification): **${{ steps.layer_a.outcome }}**"
             echo "- Layer B (real-pi behavioral smoke): **${{ steps.layer_b.outcome }}**"
+            echo "- Installed versions this run: ${{ steps.layer_a.outputs.versions || 'unavailable (Layer A install did not complete)' }}"
             echo ""
             echo "See the [run log](https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) for which specific check(s) failed, and \`docs/subagent-compat.md\` for what each check verifies and which file:contract it maps back to."
             echo ""
@@ -114,7 +115,7 @@ jobs:
           if [ -n "$EXISTING_ISSUE" ]; then
             echo "updating existing issue #$EXISTING_ISSUE"
             gh issue edit "$EXISTING_ISSUE" --repo "$GITHUB_REPOSITORY" --body-file "$BODY_FILE"
-            gh issue comment "$EXISTING_ISSUE" --repo "$GITHUB_REPOSITORY" --body "Still failing as of this run: Layer A=${{ steps.layer_a.outcome }}, Layer B=${{ steps.layer_b.outcome }}."
+            gh issue comment "$EXISTING_ISSUE" --repo "$GITHUB_REPOSITORY" --body "Still failing as of this run: Layer A=${{ steps.layer_a.outcome }}, Layer B=${{ steps.layer_b.outcome }} (versions: ${{ steps.layer_a.outputs.versions || 'unavailable' }})."
           else
             echo "creating new alert issue"
             gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file "$BODY_FILE" --label "area:session,area:lsp,area:tests"
