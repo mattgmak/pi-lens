@@ -25,8 +25,17 @@ import type { Diagnostic } from "../dispatch/types.js";
 import { detectFileKind } from "../file-kinds.js";
 import { getDiagnosticTracker } from "../diagnostic-tracker.js";
 import { getLSPService } from "../lsp/index.js";
+import { loadProjectSnapshot } from "../project-snapshot.js";
 import { buildOrUpdateGraph } from "../review-graph/service.js";
 import { recordDiagnostics } from "../widget-state.js";
+import {
+	deserializeWordIndex,
+	removeWordIndexDocument,
+	scheduleWordIndexPersist,
+	updateWordIndexDocument,
+	WORD_INDEX_MAX_BYTES,
+	type WordIndex,
+} from "../word-index.js";
 import { createMcpHost } from "./host-shim.js";
 
 // #536: module-scoped FactStore for the warm-analyze graph seam, mirroring the
@@ -36,6 +45,49 @@ import { createMcpHost } from "./host-shim.js";
 // per call would defeat that reuse. Scoped separately from integration.ts's
 // singleton since this file has no dependency on that module's internal state.
 const warmGraphFacts = new FactStore();
+
+// #536 rider (issue body: "when #348 phase 2 lands, the word-index per-edit
+// update should ride the SAME seam so both indexes stay warm together"):
+// MCP has no RuntimeCoordinator/`runtime.wordIndex` to hold a live index the
+// way pi's per-edit seam does (clients/dispatch/integration.ts's
+// `updateWordIndexForCascade`, called from clients/runtime-tool-result.ts with
+// `runtime.wordIndex`) — this process-scoped Map is the MCP-side equivalent: a
+// per-cwd live WordIndex, loaded once from the persisted snapshot and mutated
+// in place thereafter, mirroring `runtime.wordIndex`'s lifecycle for a process
+// that has no other place to hold it. `undefined` cached value = "checked,
+// nothing usable" (index missing or pre-phase-2/no-forward-map), distinct from
+// "never checked" (key absent) — avoids re-attempting a snapshot load with no
+// forward index on every single analyze call.
+const warmWordIndexes = new Map<string, WordIndex | undefined>();
+
+/**
+ * Look up (loading from the persisted snapshot on first use per cwd) the warm
+ * in-memory word index this analyze facade keeps mutated in place. Exported so
+ * `symbolSearch()` (clients/lens-engine.ts) can prefer this live copy over a
+ * fresh disk read when one exists for the cwd — otherwise a query immediately
+ * following a warm `pilens_analyze` call in the SAME process would read a
+ * stale on-disk snapshot until the debounced persist (default 1500ms) flushes.
+ */
+export function getOrLoadWarmWordIndex(cwd: string): WordIndex | undefined {
+	const key = path.resolve(cwd);
+	if (warmWordIndexes.has(key)) return warmWordIndexes.get(key);
+	const snapshot = loadProjectSnapshot(key);
+	const index = deserializeWordIndex(snapshot?.wordIndex) ?? undefined;
+	// Same phase-2 rule as updateWordIndexForCascade: no forward index ⇒ no
+	// incremental primitive available, so don't cache it as "usable" — this
+	// call site's whole point is the incremental single-doc update.
+	const usable = index?.forward ? index : undefined;
+	warmWordIndexes.set(key, usable);
+	return usable;
+}
+
+/**
+ * Test-only reset — the module-level warm cache otherwise survives across
+ * unrelated test cases in the same vitest worker.
+ */
+export function _resetWarmWordIndexCacheForTests(): void {
+	warmWordIndexes.clear();
+}
 
 // Generous warm-up budgets: a cold language server needs to spawn AND publish
 // diagnostics. The per-edit dispatch runner caps these tightly (spawn budget +
@@ -279,6 +331,41 @@ export async function analyzeFile(
 			} catch {
 				// Best-effort — the graph update is additive; a failure here must not
 				// surface as an analyze failure.
+			}
+		}
+
+		// #536 rider: ride the SAME seam for the word index (#348 phase 2's
+		// per-edit primitive), mirroring pi's `updateWordIndexForCascade`
+		// (clients/dispatch/integration.ts) rule-for-rule rather than reusing it
+		// directly — that function is module-private and reads its file-content
+		// argument from the pipeline's already-read buffer, whereas this seam
+		// reads the file itself (no pipeline hook here). Same rules: a cached
+		// index with no `forward` map (or none loaded) ⇒ no-op (no incremental
+		// primitive available — the eventual full rebuild covers it); an
+		// oversized file is REMOVED, never partially indexed; the update is
+		// synchronous (no interleaving hazard — MCP is single-process, same as
+		// pi); a successful update schedules the SAME debounced persist
+		// (`scheduleWordIndexPersist`, `PI_LENS_WORD_INDEX_PERSIST_DEBOUNCE_MS`)
+		// pi's path uses — no second persist mechanism.
+		//
+		// Key shape: `path.resolve(absPath)`, matching the build path's own keys
+		// (collectWordIndexDocs → collectSourceFilesAsync), NOT normalizeMapKey —
+		// see updateWordIndexForCascade's doc comment for why a mismatched key
+		// silently orphans a duplicate entry instead of replacing it.
+		const warmIndex = getOrLoadWarmWordIndex(cwd);
+		if (warmIndex) {
+			try {
+				const content = fs.readFileSync(absPath, "utf8");
+				const byteLength = Buffer.byteLength(content, "utf-8");
+				if (byteLength > WORD_INDEX_MAX_BYTES) {
+					removeWordIndexDocument(warmIndex, absPath);
+				} else {
+					updateWordIndexDocument(warmIndex, { path: absPath, content });
+				}
+				scheduleWordIndexPersist(cwd, warmIndex);
+			} catch {
+				// unreadable/deleted, or an update failure — best-effort, same as the
+				// graph update above.
 			}
 		}
 	}

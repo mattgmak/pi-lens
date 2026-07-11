@@ -17,6 +17,14 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import {
+	buildWordIndex,
+	serializeWordIndex,
+} from "../../clients/word-index.js";
+import {
+	PROJECT_SNAPSHOT_VERSION,
+	saveProjectSnapshot,
+} from "../../clients/project-snapshot.js";
 import { McpHarness } from "./harness.js";
 
 interface ModuleReportShape {
@@ -118,5 +126,115 @@ describe("pilens_analyze (warm) maintains the review graph over MCP", () => {
 		expect(foo?.usedBy?.some((u) => u.file.replace(/\\/g, "/").endsWith("b.ts"))).toBe(
 			true,
 		);
+	}, 30_000);
+});
+
+// #536 rider (issue body: "when #348 phase 2 lands, the word-index per-edit
+// update should ride the SAME seam so both indexes stay warm together") —
+// separate project/harness so this suite's pre-seeded word-index snapshot
+// (with a #348-phase-2 forward index) doesn't interact with the graph suite
+// above.
+describe("pilens_analyze (warm) also maintains the word index over MCP (#536 rider)", () => {
+	let projectDir: string;
+	let harness: McpHarness;
+
+	function parseTrailer(res: Record<string, unknown>): Record<string, unknown> {
+		const text = textOf(res);
+		return JSON.parse(
+			text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1),
+		) as Record<string, unknown>;
+	}
+
+	beforeAll(async () => {
+		projectDir = mkdtempSync(path.join(tmpdir(), "pi-lens-analyze-wordindex-mcp-"));
+		writeFileSync(
+			path.join(projectDir, "tsconfig.json"),
+			JSON.stringify({ compilerOptions: { strict: true } }, null, 2),
+		);
+		writeFileSync(
+			path.join(projectDir, "base.ts"),
+			"export function baseFn(): number {\n  return 1;\n}\n",
+		);
+		// Pre-seed a snapshot with a #348-phase-2 forward index (buildWordIndex
+		// always populates `forward`) covering only base.ts — the new identifier
+		// this test introduces (widgetRenderer) must NOT be in it yet, so a hit on
+		// it can only come from the per-edit update, never the pre-seeded snapshot.
+		const index = buildWordIndex([
+			{
+				path: path.join(projectDir, "base.ts"),
+				content: "export function baseFn(): number {\n  return 1;\n}\n",
+			},
+		]);
+		saveProjectSnapshot(projectDir, {
+			version: PROJECT_SNAPSHOT_VERSION,
+			projectRoot: projectDir,
+			generatedAt: new Date().toISOString(),
+			seq: 0,
+			files: {},
+			symbols: {},
+			reverseDeps: {},
+			cachedExports: [],
+			wordIndex: serializeWordIndex(index),
+		});
+
+		harness = new McpHarness({ cwd: projectDir });
+		const init = await harness.request(1, "initialize", {
+			protocolVersion: "2025-06-18",
+			capabilities: {},
+			clientInfo: { name: "analyze-wordindex-smoke", version: "0" },
+		});
+		expect((init.result as { protocolVersion: string }).protocolVersion).toBe(
+			"2025-06-18",
+		);
+		harness.notify("notifications/initialized");
+	});
+
+	afterAll(() => {
+		harness.dispose();
+		try {
+			rmSync(projectDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+		} catch {
+			// OS reclaims the temp dir eventually.
+		}
+	});
+
+	it("ranks a newly-analyzed file's new identifier via symbol_search, same process, no rebuild", async () => {
+		// Baseline: the new identifier doesn't exist in the pre-seeded snapshot.
+		const before = await harness.request(20, "tools/call", {
+			name: "pilens_symbol_search",
+			arguments: { query: "widget renderer", cwd: projectDir },
+		});
+		const beforePayload = parseTrailer(before) as {
+			results: Array<{ file: string }>;
+		};
+		expect(
+			beforePayload.results.some((r) => r.file.replace(/\\/g, "/").endsWith("widget.ts")),
+		).toBe(false);
+
+		const newFile = path.join(projectDir, "widget.ts");
+		writeFileSync(
+			newFile,
+			"export function widgetRenderer(): number {\n  return 2;\n}\n",
+		);
+
+		const analyzeRes = await harness.request(21, "tools/call", {
+			name: "pilens_analyze",
+			arguments: { file: newFile, cwd: projectDir, flags: { "no-lsp": true } },
+		});
+		expect((analyzeRes.result as { isError?: boolean }).isError).toBeFalsy();
+
+		// No pilens_rebuild / pilens_session_start call in between — the ranked
+		// hit must come from the SAME process's warm in-memory index, updated
+		// in place by the analyze call above, not a fresh full rebuild.
+		const after = await harness.request(22, "tools/call", {
+			name: "pilens_symbol_search",
+			arguments: { query: "widget renderer", cwd: projectDir },
+		});
+		const afterPayload = parseTrailer(after) as {
+			results: Array<{ file: string }>;
+		};
+		expect(
+			afterPayload.results.some((r) => r.file.replace(/\\/g, "/").endsWith("widget.ts")),
+		).toBe(true);
 	}, 30_000);
 });
