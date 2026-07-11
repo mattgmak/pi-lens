@@ -343,6 +343,15 @@
       ]
     },
     {
+      "login": "PeraSite",
+      "name": "정제훈",
+      "avatar_url": "https://avatars.githubusercontent.com/u/19837403?v=4",
+      "profile": "https://github.com/PeraSite",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
       "login": "carolitascl",
       "name": "Carolina",
       "avatar_url": "https://avatars.githubusercontent.com/u/26188349?v=4",
@@ -754,6 +763,15 @@
       "name": "Peter Nagy",
       "avatar_url": "https://avatars.githubusercontent.com/u/4800719?v=4",
       "profile": "https://github.com/xificurC",
+      "contributions": [
+        "bug"
+      ]
+    },
+    {
+      "login": "orest-tokovenko-block",
+      "name": "Orest Tokovenko",
+      "avatar_url": "https://avatars.githubusercontent.com/u/190554467?v=4",
+      "profile": "https://github.com/orest-tokovenko-block",
       "contributions": [
         "bug"
       ]
