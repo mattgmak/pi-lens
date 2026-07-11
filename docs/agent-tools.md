@@ -1,8 +1,9 @@
 # Agent-Facing Tools
 
-pi-lens registers the following tools with the pi agent. They are also exposed
+pi-lens registers the following tools with the pi agent. Most are also exposed
 through the MCP mirror (`clients/lens-engine.ts` is the seam both adapters
-share).
+share) — current exceptions: `ast_grep_outline`, `ast_grep_dump`/`ast_dump`, and
+`read_enclosing` (MCP parity for the latter is tracked in #522).
 
 ## Per-edit
 

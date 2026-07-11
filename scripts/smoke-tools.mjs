@@ -282,6 +282,34 @@ const LSP_FIXTURES = [
 		tools: ["typescript-language-server"],
 		clean: true,
 	},
+	// Native TypeScript 7 launch path (#524/#526, live-guarded by #530). The repo
+	// pins typescript 6.x, so the native `tsc --lsp --stdio` selection can't be
+	// exercised by a committed fixture — `setup` installs a real typescript@7
+	// into the COPIED temp workspace first. `expectLaunchVariant` fails the
+	// fixture if selection silently fell back to classic, even though the
+	// native and classic servers share the same "typescript" server id (so the
+	// diagnostic alone can't tell them apart).
+	{
+		lang: "typescript7",
+		dir: "tests/fixtures/tool-smoke/typescript7",
+		file: "bad.ts",
+		serverHint: "typescript native (tsc --lsp --stdio, TS7+)",
+		tools: [],
+		setup: "npm install typescript@7 --no-save --no-audit --no-fund",
+		expectLaunchVariant: "native-ts7",
+	},
+	// Clean counterpart — doubles as the future #529 clean-signal probe
+	// workspace for the native variant's publish-on-clean behavior.
+	{
+		lang: "typescript7-clean",
+		dir: "tests/fixtures/tool-smoke/typescript7-clean",
+		file: "clean.ts",
+		serverHint: "typescript native (clean file)",
+		tools: [],
+		setup: "npm install typescript@7 --no-save --no-audit --no-fund",
+		expectLaunchVariant: "native-ts7",
+		clean: true,
+	},
 	{
 		lang: "yaml",
 		dir: "tests/fixtures/tool-smoke/yaml",
@@ -1166,6 +1194,49 @@ function downloadFile(url, dest) {
 	});
 }
 
+// Bounded timeout for a fixture's `setup` step (#530): typescript7's `npm
+// install typescript@7` downloads a platform binary, so this is generous but
+// still bounded — a hung install must not hang the whole nightly run.
+const FIXTURE_SETUP_TIMEOUT_MS = 120000;
+
+/**
+ * Run a fixture's optional `setup` step (string command or argv array) in the
+ * COPIED temp workspace, before the touchFile. Used for fixtures whose
+ * workspace-local state (e.g. a real `node_modules/typescript@7` install)
+ * can't be a committed static fixture. Returns `{ ok: true }` on success, or
+ * `{ ok: false, detail }` on failure/timeout — callers must report a distinct
+ * `setup-failed` status and skip the rest of that fixture, never a false pass.
+ */
+function runFixtureSetup(setup, cwd, verbose) {
+	const [cmd, ...args] = Array.isArray(setup) ? setup : setup.split(/\s+/);
+	try {
+		// Windows resolves npm/npx/etc. via the .cmd shim, which `execFileSync`
+		// cannot spawn directly without a shell (EINVAL) — `shell: true` is the
+		// same convention the installer already uses for tool spawns (see
+		// `spawn(..., { shell: process.platform === "win32" })` in
+		// clients/installer/index.ts). Fixture `setup` strings are hand-authored
+		// in this file, not attacker-controlled, so shell interpretation is safe
+		// here.
+		const output = execFileSync(cmd, args, {
+			cwd,
+			timeout: FIXTURE_SETUP_TIMEOUT_MS,
+			stdio: verbose ? "inherit" : "pipe",
+			shell: process.platform === "win32",
+		});
+		if (verbose && output) {
+			console.error(output.toString());
+		}
+		return { ok: true };
+	} catch (err) {
+		const stderr = err?.stderr ? err.stderr.toString().slice(0, 500) : "";
+		const timedOut = err?.signal === "SIGTERM" || err?.killed === true;
+		const detail = timedOut
+			? `setup timed out after ${FIXTURE_SETUP_TIMEOUT_MS}ms: ${cmd} ${args.join(" ")}`
+			: `setup failed (${err?.status ?? err?.message ?? err}): ${cmd} ${args.join(" ")}${stderr ? ` — ${stderr}` : ""}`;
+		return { ok: false, detail };
+	}
+}
+
 async function ensureSmokeLombokJar(workspace, verbose) {
 	const cached = path.join(os.tmpdir(), "pi-lens-smoke-cache", "lombok.jar");
 	if (!fs.existsSync(cached) || fs.statSync(cached).size === 0) {
@@ -1212,7 +1283,11 @@ function classify(outcome) {
 	};
 }
 
-const ICON = { pass: "✓", fail: "✗", skip: "⚠" };
+// `setup-failed` (#530) is a distinct terminal state from `fail`: it means the
+// fixture's pre-touch setup step (e.g. `npm install typescript@7`) itself
+// broke — infrastructure, not the assertion under test — but it still counts
+// toward the failure exit code so it can't silently pass the nightly.
+const ICON = { pass: "✓", fail: "✗", skip: "⚠", "setup-failed": "✗" };
 
 function report(rows, title) {
 	const pad = (s, n) => String(s).padEnd(n);
@@ -1225,13 +1300,15 @@ function report(rows, title) {
 			`${ICON[r.state]}  ${pad(r.lang, 12)} ${pad(r.runner, 28)} ${pad(r.diags, 5)} ${r.detail}`,
 		);
 	}
-	const counts = { pass: 0, fail: 0, skip: 0 };
+	const counts = { pass: 0, fail: 0, skip: 0, "setup-failed": 0 };
 	for (const r of rows) counts[r.state]++;
 	console.log(
-		`\n${counts.pass} passed · ${counts.fail} failed · ${counts.skip} skipped (tool/config unavailable)`,
+		`\n${counts.pass} passed · ${counts.fail} failed · ${counts["setup-failed"]} setup-failed · ${counts.skip} skipped (tool/config unavailable)`,
 	);
-	console.log("Legend: ✓ ok  ✗ failure  ⚠ unavailable (not a failure)\n");
-	return counts.fail;
+	console.log(
+		"Legend: ✓ ok  ✗ failure/setup-failed  ⚠ unavailable (not a failure)\n",
+	);
+	return counts.fail + counts["setup-failed"];
 }
 
 /**
@@ -1294,6 +1371,24 @@ async function runLspHandshake({ langs, install, verbose }) {
 		}
 		const workspace = copyDirToTemp(fx.dir);
 		const absFile = path.join(workspace, fx.file);
+		if (fx.setup) {
+			if (verbose) {
+				const desc = Array.isArray(fx.setup) ? fx.setup.join(" ") : fx.setup;
+				console.error(`[${fx.lang}] setup: ${desc}`);
+			}
+			const setupResult = runFixtureSetup(fx.setup, workspace, verbose);
+			if (!setupResult.ok) {
+				rows.push({
+					lang: fx.lang,
+					runner: fx.serverHint,
+					state: "setup-failed",
+					detail: setupResult.detail,
+					diags: 0,
+				});
+				safeRm(workspace);
+				continue;
+			}
+		}
 		if (fx.lombokJar) {
 			try {
 				const jar = await ensureSmokeLombokJar(workspace, verbose);
@@ -1487,6 +1582,33 @@ async function runLspHandshake({ langs, install, verbose }) {
 			if (threw) {
 				push("fail", `handshake/server error: ${threw}`, diags);
 			} else if (Array.isArray(touched)) {
+				// #530: assert the server that actually answered is the expected launch
+				// variant (e.g. "native-ts7") via the live capability snapshot. A silent
+				// fallback to classic must FAIL even though diagnostics arrived — the
+				// diagnostic alone can't distinguish which concrete server produced it
+				// (native-ts7 and classic share the same server id).
+				if (fx.expectLaunchVariant) {
+					const snapshots = await lsp.getCapabilitySnapshots(absFile);
+					const active = snapshots.find(
+						(s) => s.launchVariant === fx.expectLaunchVariant,
+					);
+					const gotVariants = [
+						...new Set(snapshots.map((s) => s.launchVariant ?? "(unset)")),
+					];
+					if (verbose) {
+						console.error(
+							`[${fx.lang}] capability snapshots launchVariant=${JSON.stringify(gotVariants)}`,
+						);
+					}
+					if (!active) {
+						push(
+							"fail",
+							`expected launchVariant '${fx.expectLaunchVariant}', got [${gotVariants.join(",") || "(no snapshot)"}] — silent fallback?`,
+							diags,
+						);
+						continue;
+					}
+				}
 				if (fx.expectNoMessageMatch) {
 					const re = new RegExp(fx.expectNoMessageMatch, "i");
 					const matched = touched.filter((d) => re.test(d.message || ""));
@@ -1501,7 +1623,7 @@ async function runLspHandshake({ langs, install, verbose }) {
 				}
 				push(
 					"pass",
-					`handshook — server replied${diags ? ` (${diags} diagnostic${diags === 1 ? "" : "s"})` : ""}`,
+					`handshook — server replied${diags ? ` (${diags} diagnostic${diags === 1 ? "" : "s"})` : ""}${fx.expectLaunchVariant ? ` [launchVariant=${fx.expectLaunchVariant}]` : ""}`,
 					diags,
 				);
 			} else {

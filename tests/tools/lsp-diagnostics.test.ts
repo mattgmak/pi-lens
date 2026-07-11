@@ -5,10 +5,19 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocked = vi.hoisted(() => ({
 	service: null as unknown,
+	// #533: classifyCascadeWaitTier is mocked at the module boundary so each
+	// test controls the "tier3-silent vs waits" verdict directly, without
+	// wiring the full getServersForFileWithConfig/capability-snapshot chain
+	// cascade-tier.test.ts already exercises for the classifier itself.
+	cascadeTier: "waits" as "waits" | "tier3-silent",
 }));
 
 vi.mock("../../clients/lsp/index.js", () => ({
 	getLSPService: () => mocked.service,
+}));
+
+vi.mock("../../clients/lsp/cascade-tier.js", () => ({
+	classifyCascadeWaitTier: () => mocked.cascadeTier,
 }));
 
 import { createLspDiagnosticsTool } from "../../tools/lsp-diagnostics.js";
@@ -16,6 +25,7 @@ import { resetProjectLensConfigCache } from "../../clients/project-lens-config.j
 
 describe("lsp_diagnostics tool", () => {
 	beforeEach(() => {
+		mocked.cascadeTier = "waits";
 		mocked.service = {
 			openFile: vi.fn().mockResolvedValue(undefined),
 			getDiagnostics: vi.fn().mockImplementation(async (filePath: string) => {
@@ -35,6 +45,7 @@ describe("lsp_diagnostics tool", () => {
 				return [];
 			}),
 			getDiagnosticsHealth: vi.fn().mockReturnValue(undefined),
+			getCapabilitySnapshots: vi.fn().mockResolvedValue([]),
 		};
 	});
 
@@ -246,5 +257,159 @@ describe("lsp_diagnostics tool", () => {
 		expect(String(result.content[0]?.text)).toContain(
 			"path or paths is required",
 		);
+	});
+
+	// #533: a push-only, silent-on-clean server's empty result is unconfirmed,
+	// not clean — the batch aggregate must preserve that per-file discrimination
+	// rather than collapsing an unconfirmed-majority result to "0 diagnostics".
+	describe("#533 honest emptiness", () => {
+		it("single file: renders unconfirmed instead of a bare clean when the server is tier3-silent", async () => {
+			mocked.cascadeTier = "tier3-silent";
+			const tool = createLspDiagnosticsTool();
+			const tmpDir = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-lsp-diag-unconf-"),
+			);
+			const clean = path.join(tmpDir, "clean.ts");
+			fs.writeFileSync(clean, "const value = 1;\n");
+
+			try {
+				const result = (await tool.execute(
+					"diag-unconfirmed-file",
+					{ path: clean, severity: "all" },
+					new AbortController().signal,
+					null,
+					{ cwd: "." },
+				)) as any;
+
+				expect(result.isError).toBeUndefined();
+				expect(result.details?.totalDiagnostics).toBe(0);
+				expect(result.details?.unconfirmed).toBe(true);
+				expect(String(result.content[0]?.text)).toContain("unconfirmed");
+				expect(String(result.content[0]?.text)).not.toBe(
+					"No diagnostics found.",
+				);
+			} finally {
+				fs.rmSync(tmpDir, { recursive: true, force: true });
+			}
+		});
+
+		it("single file: still renders a plain clean result when the server is NOT tier3-silent", async () => {
+			mocked.cascadeTier = "waits";
+			const tool = createLspDiagnosticsTool();
+			const tmpDir = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-lsp-diag-confirmed-"),
+			);
+			const clean = path.join(tmpDir, "clean.ts");
+			fs.writeFileSync(clean, "const value = 1;\n");
+
+			try {
+				const result = (await tool.execute(
+					"diag-confirmed-file",
+					{ path: clean, severity: "all" },
+					new AbortController().signal,
+					null,
+					{ cwd: "." },
+				)) as any;
+
+				expect(result.isError).toBeUndefined();
+				expect(result.details?.unconfirmed).toBe(false);
+				expect(String(result.content[0]?.text)).toBe("No diagnostics found.");
+			} finally {
+				fs.rmSync(tmpDir, { recursive: true, force: true });
+			}
+		});
+
+		it("batch: mixed found/clean/unconfirmed never collapses to a bare '0 diagnostics'", async () => {
+			mocked.cascadeTier = "tier3-silent";
+			const tool = createLspDiagnosticsTool();
+			const tmpDir = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-lsp-diag-batch-mixed-"),
+			);
+			const bad = path.join(tmpDir, "bad.ts");
+			const clean1 = path.join(tmpDir, "clean1.ts");
+			const clean2 = path.join(tmpDir, "clean2.ts");
+			fs.writeFileSync(bad, "const value: number = 'oops';\n");
+			fs.writeFileSync(clean1, "const value = 1;\n");
+			fs.writeFileSync(clean2, "const value = 2;\n");
+
+			try {
+				const result = (await tool.execute(
+					"diag-batch-mixed",
+					{ paths: [bad, clean1, clean2], severity: "all", concurrency: 2 },
+					new AbortController().signal,
+					null,
+					{ cwd: "." },
+				)) as any;
+
+				expect(result.isError).toBeUndefined();
+				expect(result.details?.totalDiagnostics).toBe(1);
+				// bad.ts found a diagnostic (not counted as clean/unconfirmed); the two
+				// clean-looking files are both unconfirmed since the server is
+				// tier3-silent in this test.
+				expect(result.details?.cleanFiles).toBe(0);
+				expect(result.details?.unconfirmedFiles).toBe(2);
+				expect(String(result.content[0]?.text)).toContain("unconfirmed");
+				expect(String(result.content[0]?.text)).not.toContain(
+					"No diagnostics found.",
+				);
+			} finally {
+				fs.rmSync(tmpDir, { recursive: true, force: true });
+			}
+		});
+
+		it("directory: an all-unconfirmed clean scan never renders as a bare 'No diagnostics found.'", async () => {
+			mocked.cascadeTier = "tier3-silent";
+			const tool = createLspDiagnosticsTool();
+			const tmpDir = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-lsp-diag-dir-unconf-"),
+			);
+			fs.writeFileSync(path.join(tmpDir, "a.ts"), "const value = 1;\n");
+			fs.writeFileSync(path.join(tmpDir, "b.ts"), "const value = 2;\n");
+
+			try {
+				const result = (await tool.execute(
+					"diag-dir-unconfirmed",
+					{ path: tmpDir, severity: "all", concurrency: 2 },
+					new AbortController().signal,
+					null,
+					{ cwd: "." },
+				)) as any;
+
+				expect(result.isError).toBeUndefined();
+				expect(result.details?.mode).toBe("directory");
+				expect(result.details?.totalDiagnostics).toBe(0);
+				expect(result.details?.cleanFiles).toBe(0);
+				expect(result.details?.unconfirmedFiles).toBe(2);
+				expect(String(result.content[0]?.text)).toContain("unconfirmed");
+				expect(String(result.content[0]?.text)).not.toContain(
+					"No diagnostics found.",
+				);
+			} finally {
+				fs.rmSync(tmpDir, { recursive: true, force: true });
+			}
+		});
+
+		it("compact render: batch with unconfirmed files shows the clean/unconfirmed split, not a bare diagnostic count", () => {
+			const tool = createLspDiagnosticsTool();
+			const fakeTheme = { fg: (_c: unknown, t: string) => t } as any;
+			const component = (tool.renderResult as any)(
+				{
+					content: [{ type: "text", text: "Files checked: 3" }],
+					details: {
+						mode: "batch",
+						totalDiagnostics: 1,
+						cleanFiles: 0,
+						unconfirmedFiles: 2,
+					},
+				},
+				{ expanded: false },
+				fakeTheme,
+				{ args: {} },
+			);
+			expect((component as { text: string }).text).toContain("unconfirmed");
+			expect((component as { text: string }).text).not.toMatch(
+				/— 1 diagnostic\s*$/,
+			);
+		});
 	});
 });
