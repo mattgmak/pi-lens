@@ -86,16 +86,44 @@ const EXTRACTORS: ProjectDiagnosticExtractor<any>[] = [
 ];
 
 /**
+ * #533: which trigger warms each extractor's cache, surfaced in the "cold"
+ * honesty note so the note is actionable (names what to do), matching the
+ * #511/#514 house shape. Keep in sync with `EXTRACTORS` — one line per id.
+ */
+const WARM_TRIGGER: Record<string, string> = {
+	knip: "runs at session-start",
+	jscpd: "runs at session-start",
+	madge: "runs at session-start",
+	gitleaks: "runs at session-start",
+	govulncheck: "runs at session-start (Go projects only)",
+	trivy: "runs at session-start",
+	"dead-code": "runs at session-start (Python projects only)",
+};
+
+/** All registered extractor ids, in registry order — exported for tools/tests
+ *  that need to enumerate "what could this section include" without reaching
+ *  into the private `EXTRACTORS` table. */
+export const PROJECT_DIAGNOSTIC_EXTRACTOR_IDS: readonly string[] =
+	EXTRACTORS.map((e) => e.id);
+
+export function warmTriggerFor(extractorId: string): string {
+	return WARM_TRIGGER[extractorId] ?? "runs at session-start";
+}
+
+/**
  * Read every registered analyzer's cached result and adapt it to project
- * diagnostics. Returns the merged diagnostics plus the ids of the analyzers that
- * actually contributed (for the snapshot's `runners` list). Cache-only: no scans.
+ * diagnostics. Returns the merged diagnostics, the ids of the analyzers that
+ * actually contributed findings (for the snapshot's `runners` list), and the
+ * ids of analyzers with NO cache entry at all yet (`cold`) — distinct from an
+ * analyzer that ran and found nothing. Cache-only: no scans.
  */
 export function extractCachedProjectDiagnostics(
 	cacheManager: CacheManager,
 	cwd: string,
-): { diagnostics: ProjectDiagnostic[]; runners: string[] } {
+): { diagnostics: ProjectDiagnostic[]; runners: string[]; cold: string[] } {
 	const diagnostics: ProjectDiagnostic[] = [];
 	const runners: string[] = [];
+	const cold: string[] = [];
 	for (const extractor of EXTRACTORS) {
 		let data: unknown;
 		for (const key of extractor.cacheKeys) {
@@ -105,12 +133,15 @@ export function extractCachedProjectDiagnostics(
 				break;
 			}
 		}
-		if (data === undefined) continue;
+		if (data === undefined) {
+			cold.push(extractor.id);
+			continue;
+		}
 		const adapted = extractor.adapt(cwd, data);
 		if (adapted.length > 0) {
 			diagnostics.push(...adapted);
 			runners.push(extractor.id);
 		}
 	}
-	return { diagnostics, runners };
+	return { diagnostics, runners, cold };
 }

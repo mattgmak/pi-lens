@@ -15,6 +15,7 @@ import {
 import { getLSPService } from "../clients/lsp/index.js";
 import { combineAbortSignals } from "../clients/deadline-utils.js";
 import type { LSPDiagnostic } from "../clients/lsp/client.js";
+import { classifyCascadeWaitTier } from "../clients/lsp/cascade-tier.js";
 import { baseName, compactRenderResult } from "./render-compact.js";
 import { makeProgressReporter, scanningSummaryLine } from "./scan-progress.js";
 
@@ -96,6 +97,17 @@ type FileDiagnosticResult = {
 	diagnostics: FileDiag[];
 	unavailable?: string;
 	error?: string;
+	/**
+	 * #533: discriminated per-file outcome, mirroring the #240 doctrine at the
+	 * LSP layer (found | clean | unresolved) up through the tool's aggregation.
+	 * "found" = diagnostics.length > 0 (self-evident, doesn't need the field).
+	 * "clean" = an empty result the server actually confirmed (a pull server, or
+	 * a push server whose empty result isn't from a known-silent-on-clean tier).
+	 * "unconfirmed" = an empty result from a push-only, silent-on-clean server
+	 * (classic typescript-language-server) — indistinguishable from "still
+	 * analyzing" or "never asked". Never render this bucket as "0 diagnostics".
+	 */
+	confirmation?: "clean" | "unconfirmed";
 };
 
 function lspUnavailableMessage(
@@ -228,6 +240,9 @@ export function createLspDiagnosticsTool() {
 			totalDiagnostics?: number;
 			filesChecked?: number;
 			filesScanned?: number;
+			cleanFiles?: number;
+			unconfirmedFiles?: number;
+			unconfirmed?: boolean;
 		}>(({ details, args, isError, text }) => {
 			// Streaming progress partials render the live bar (see scanningSummaryLine).
 			const scanning = scanningSummaryLine(details, text);
@@ -247,6 +262,19 @@ export function createLspDiagnosticsTool() {
 						? ` ${target}`
 						: "";
 			const noun = count === 1 ? "diagnostic" : "diagnostics";
+			// #533: a batch/directory result with any unconfirmed files must NEVER
+			// compact-render as a bare "N diagnostics" — that erases the fact some
+			// files' clean status was never actually confirmed by the server.
+			const unconfirmedFiles = details?.unconfirmedFiles ?? 0;
+			if (unconfirmedFiles > 0) {
+				const cleanFiles = details?.cleanFiles ?? 0;
+				return `lsp_diagnostics${scope} — ${count} ${noun} · ${cleanFiles} clean · ${unconfirmedFiles} unconfirmed`;
+			}
+			// Single-file mode: 0 diagnostics from an unconfirmed (silent-on-clean)
+			// server is not a clean render either.
+			if (count === 0 && details?.unconfirmed) {
+				return `lsp_diagnostics${scope} — unconfirmed (server cannot confirm clean)`;
+			}
 			return `lsp_diagnostics${scope} — ${count} ${noun}`;
 		}),
 		parameters: Type.Object({
@@ -454,6 +482,33 @@ function diagnosticsToFileDiags(
 	}));
 }
 
+/**
+ * #533: classify an EMPTY diagnostic result as "clean" (the server actually
+ * confirmed no issues) or "unconfirmed" (came from a push-only,
+ * silent-on-clean server — classic typescript-language-server — that
+ * publishes nothing on a clean→clean transition, so an empty result here is
+ * indistinguishable from "still analyzing" or "never asked"). Reuses the same
+ * capability-snapshot classifier the #458 cascade lane already trusts
+ * (`classifyCascadeWaitTier`) so this tool's notion of "silent tier-3" stays
+ * in lockstep with the rest of the LSP layer instead of drifting via a second
+ * copy of the server-strategy table. Fail-safe: any error or missing snapshot
+ * (server not alive, capability probe failure) reads as "clean" — the same
+ * default this tool has always had — rather than manufacturing a new failure
+ * mode from a best-effort classification.
+ */
+async function classifyEmptyResult(
+	file: string,
+	lspService: NonNullable<ReturnType<typeof getLSPService>>,
+): Promise<"clean" | "unconfirmed"> {
+	try {
+		const snapshots = await lspService.getCapabilitySnapshots(file);
+		const tier = classifyCascadeWaitTier(lspService, file, snapshots);
+		return tier === "tier3-silent" ? "unconfirmed" : "clean";
+	} catch {
+		return "clean";
+	}
+}
+
 async function collectFileDiagnosticResult(
 	file: string,
 	severity: string,
@@ -473,13 +528,16 @@ async function collectFileDiagnosticResult(
 	const health = lspService.getDiagnosticsHealth?.(file) as
 		| LspHealthLike
 		| undefined;
+	const filteredDiags = applySeverityFilter(rawDiags, severity);
+	const confirmation =
+		filteredDiags.length === 0
+			? await classifyEmptyResult(file, lspService)
+			: undefined;
 	return {
 		file,
-		diagnostics: diagnosticsToFileDiags(
-			file,
-			applySeverityFilter(rawDiags, severity),
-		),
+		diagnostics: diagnosticsToFileDiags(file, filteredDiags),
 		unavailable: lspUnavailableMessage(file, health),
+		confirmation,
 	};
 }
 
@@ -498,10 +556,23 @@ async function runFileDiagnostics(
 	const total = filtered.length;
 	const truncated = total > MAX_DIAGNOSTICS;
 	const limited = truncated ? filtered.slice(0, MAX_DIAGNOSTICS) : filtered;
+	// #533: an empty result needs a confirmed/unconfirmed verdict — a push-only,
+	// silent-on-clean server (classic typescript) publishes nothing on a
+	// clean→clean edit, so "0 diagnostics" from it is unverifiable, not clean.
+	const confirmation =
+		total === 0 ? await classifyEmptyResult(absPath, lspService) : undefined;
+	const unconfirmed = confirmation === "unconfirmed";
 
 	let text: string;
 	if (total === 0) {
-		text = unavailable ?? "No diagnostics found.";
+		text = unconfirmed
+			? "Diagnostics unconfirmed: the server for this file cannot confirm a " +
+				"clean result (push-only, silent-on-clean — e.g. classic " +
+				"typescript-language-server never publishes on a clean re-check). " +
+				"This is NOT the same as 0 diagnostics; it may still be analyzing or " +
+				"may never have been asked. Re-check after an edit, or use waitMs to " +
+				"wait longer."
+			: (unavailable ?? "No diagnostics found.");
 	} else {
 		const lines = limited.map(formatDiag);
 		if (unavailable) lines.unshift(unavailable, "");
@@ -529,10 +600,33 @@ async function runFileDiagnostics(
 			})),
 			totalDiagnostics: total,
 			truncated,
+			unconfirmed,
 			lspHealth,
 			waitMs,
 		},
 	};
+}
+
+/**
+ * #533: tally the per-file discriminated outcome across a batch/directory
+ * result set. `unconfirmed` files are those whose diagnostics collapsed to an
+ * empty array from a push-only, silent-on-clean server (see
+ * `classifyEmptyResult`) — they must never be folded into "clean" in the
+ * aggregate render, or a majority-unconfirmed result reads as a false "0
+ * diagnostics across N files".
+ */
+function tallyConfirmation(results: FileDiagnosticResult[]): {
+	clean: number;
+	unconfirmed: number;
+} {
+	let clean = 0;
+	let unconfirmed = 0;
+	for (const result of results) {
+		if (result.diagnostics.length > 0) continue;
+		if (result.confirmation === "unconfirmed") unconfirmed += 1;
+		else clean += 1;
+	}
+	return { clean, unconfirmed };
 }
 
 async function runBatchFileDiagnostics(
@@ -567,6 +661,7 @@ async function runBatchFileDiagnostics(
 	const total = allDiags.length;
 	const truncated = total > MAX_DIAGNOSTICS;
 	const display = truncated ? allDiags.slice(0, MAX_DIAGNOSTICS) : allDiags;
+	const { clean, unconfirmed } = tallyConfirmation(results);
 
 	const lines: string[] = [
 		`Files checked: ${results.length}`,
@@ -579,8 +674,23 @@ async function runBatchFileDiagnostics(
 	if (lspHealthWarnings.length > 0) {
 		lines.push("", "LSP health warnings:", ...lspHealthWarnings.slice(0, 10));
 	}
+	// #533: surface unconfirmed files regardless of whether OTHER files in the
+	// batch found real diagnostics — a mixed found/unconfirmed result must not
+	// let the unconfirmed files silently pass as clean just because the batch
+	// as a whole isn't "0 diagnostics".
+	if (unconfirmed > 0) {
+		lines.push(
+			"",
+			`${clean} file${clean === 1 ? "" : "s"} confirmed clean, ${unconfirmed} unconfirmed ` +
+				"(server cannot confirm — push-only, silent-on-clean; e.g. classic " +
+				"typescript-language-server does not publish on a clean re-check). " +
+				"NOT the same as 0 diagnostics.",
+		);
+	}
 	if (display.length === 0) {
-		lines.push("", "No diagnostics found.");
+		if (unconfirmed === 0) {
+			lines.push("", "No diagnostics found.");
+		}
 	} else {
 		lines.push("");
 		for (const d of display) {
@@ -612,6 +722,8 @@ async function runBatchFileDiagnostics(
 			diagnostics: display,
 			totalDiagnostics: total,
 			truncated,
+			cleanFiles: clean,
+			unconfirmedFiles: unconfirmed,
 			fileErrors: fileErrors.length > 0 ? fileErrors : undefined,
 			lspHealthWarnings:
 				lspHealthWarnings.length > 0 ? lspHealthWarnings : undefined,
@@ -674,9 +786,19 @@ async function runDirectoryDiagnostics(
 	const total = allDiags.length;
 	const truncated = total > MAX_DIAGNOSTICS;
 	const display = truncated ? allDiags.slice(0, MAX_DIAGNOSTICS) : allDiags;
+	const { clean, unconfirmed } = tallyConfirmation(results);
 
 	let text: string;
 	if (total === 0) {
+		// #533: an unconfirmed-containing directory result must never render as a
+		// bare "no diagnostics" — that reads as an affirmative clean scan the
+		// server never actually gave for those files.
+		const cleanLine =
+			unconfirmed > 0
+				? `${clean} clean · ${unconfirmed} unconfirmed (server cannot confirm — ` +
+					"push-only, silent-on-clean; e.g. classic typescript-language-server " +
+					"does not publish on a clean re-check). NOT the same as 0 diagnostics."
+				: "No diagnostics found.";
 		text = [
 			`Directory: ${absPath}`,
 			`Files scanned: ${filesToProcess.length}${wasCapped ? ` (capped at ${MAX_FILES})` : ""}`,
@@ -685,7 +807,7 @@ async function runDirectoryDiagnostics(
 						"LSP unavailable for one or more files:",
 						...lspHealthWarnings.slice(0, 10),
 					]
-				: ["No diagnostics found."]),
+				: [cleanLine]),
 		].join("\n");
 	} else {
 		const lines: string[] = [
@@ -695,6 +817,16 @@ async function runDirectoryDiagnostics(
 			`Total diagnostics: ${total}`,
 			...(lspHealthWarnings.length > 0
 				? ["", "LSP health warnings:", ...lspHealthWarnings.slice(0, 10)]
+				: []),
+			// #533: the remaining clean-looking files in a mixed scan may still be
+			// unconfirmed — say so even though the directory as a whole found
+			// diagnostics elsewhere.
+			...(unconfirmed > 0
+				? [
+						"",
+						`${clean} other file${clean === 1 ? "" : "s"} confirmed clean, ${unconfirmed} unconfirmed ` +
+							"(server cannot confirm clean — push-only, silent-on-clean).",
+					]
 				: []),
 			"",
 		];
@@ -737,6 +869,8 @@ async function runDirectoryDiagnostics(
 			})),
 			totalDiagnostics: total,
 			truncated,
+			cleanFiles: clean,
+			unconfirmedFiles: unconfirmed,
 			fileErrors: fileErrors.length > 0 ? fileErrors : undefined,
 			lspHealthWarnings:
 				lspHealthWarnings.length > 0 ? lspHealthWarnings : undefined,

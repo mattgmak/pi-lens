@@ -506,6 +506,46 @@ describe("extractCachedProjectDiagnostics (registry)", () => {
 		expect(diagnostics).toEqual([]);
 		expect(runners).toEqual([]);
 	});
+
+	// #533: a cache-key miss must be reported as `cold`, distinct from an
+	// analyzer that ran and legitimately found nothing (which would still have
+	// written a cache entry — see runtime-session.ts's writeCache calls, always
+	// fired with the full result object even when empty).
+	it("reports every unhit analyzer as cold, never silently as clean", () => {
+		const { diagnostics, runners, cold } = extractCachedProjectDiagnostics(
+			cacheManagerWith({}),
+			tmp,
+		);
+		expect(diagnostics).toEqual([]);
+		expect(runners).toEqual([]);
+		expect(cold.sort()).toEqual(
+			[
+				"knip",
+				"jscpd",
+				"madge",
+				"gitleaks",
+				"govulncheck",
+				"trivy",
+				"dead-code",
+			].sort(),
+		);
+	});
+
+	it("does not mark an analyzer cold once it has a cache entry, clean or not", () => {
+		const { cold } = extractCachedProjectDiagnostics(
+			cacheManagerWith({
+				jscpd: {
+					success: true,
+					duplicatedLines: 0,
+					totalLines: 10,
+					percentage: 0,
+					clones: [],
+				},
+			}),
+			tmp,
+		);
+		expect(cold).not.toContain("jscpd");
+	});
 });
 
 describe("scanProjectDiagnostics", () => {

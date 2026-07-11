@@ -726,6 +726,78 @@ describe("lens_diagnostics mode=full", () => {
 		expect(cm.readCache).not.toHaveBeenCalledWith("jscpd-ts", "/proj");
 	});
 
+	// #533: a cache-only extractor with NO cache entry yet must render as cold,
+	// never as a clean "no issues found" — that would misrepresent an analyzer
+	// that has simply never run this session as having confirmed no findings.
+	it("mode=full refreshRunners=cached: a fully cold extractor registry says COLD, not clean", async () => {
+		mockSummaries.length = 0;
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+		};
+		projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot.mockReturnValue(
+			undefined,
+		);
+
+		// Empty cache manager: every extractor (knip/jscpd/madge/gitleaks/…) misses.
+		const result = await run(makeTool({}, lspService), {
+			mode: "full",
+			refreshRunners: "cached",
+		});
+
+		const text = String(result.content[0].text);
+		expect(text).toContain("cold");
+		expect(text).toContain("not yet scanned this session");
+		expect(text).toContain("knip");
+		expect(text).toContain("jscpd");
+		expect(text).toContain("madge");
+		expect(text).toContain("gitleaks");
+		expect((result.details as { coldRunners?: string[] }).coldRunners).toEqual(
+			expect.arrayContaining(["knip", "jscpd", "madge", "gitleaks"]),
+		);
+	});
+
+	it("mode=full refreshRunners=cached: an extractor WITH a cache entry is not listed as cold", async () => {
+		mockSummaries.length = 0;
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+		};
+		projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot.mockReturnValue(
+			undefined,
+		);
+		const jscpdResult = {
+			success: true,
+			duplicatedLines: 0,
+			totalLines: 100,
+			percentage: 0,
+			clones: [],
+		};
+
+		const result = await run(makeTool({ "jscpd-ts": jscpdResult }, lspService), {
+			mode: "full",
+			refreshRunners: "cached",
+		});
+
+		expect(
+			(result.details as { coldRunners?: string[] }).coldRunners,
+		).not.toContain("jscpd");
+		// Other extractors that truly have no cache entry are still reported cold.
+		expect(
+			(result.details as { coldRunners?: string[] }).coldRunners,
+		).toContain("knip");
+	});
+
+	it("mode=full without refreshRunners never reports cold extractors (they weren't requested)", async () => {
+		mockSummaries.length = 0;
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+		};
+		const result = await run(makeTool({}, lspService), { mode: "full" });
+		expect(String(result.content[0].text)).not.toContain("cold");
+		expect((result.details as { coldRunners?: string[] }).coldRunners).toEqual(
+			[],
+		);
+	});
+
 	it("deduplicates LSP diagnostics already present in widget state by file line and rule", async () => {
 		mockSummaries.length = 0;
 		mockSummaries.push(

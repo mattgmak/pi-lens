@@ -27,7 +27,10 @@ import {
 	PROJECT_DIAGNOSTICS_CACHE_VERSION,
 	reconcileProjectDiagnosticsSnapshot,
 } from "../clients/project-diagnostics/cache.js";
-import { extractCachedProjectDiagnostics } from "../clients/project-diagnostics/extractors.js";
+import {
+	extractCachedProjectDiagnostics,
+	warmTriggerFor,
+} from "../clients/project-diagnostics/extractors.js";
 import { scanProjectDiagnostics } from "../clients/project-diagnostics/scanner.js";
 import type {
 	ProjectDiagnostic,
@@ -136,6 +139,7 @@ export function createLensDiagnosticsTool(
 			totalBlocking?: number;
 			totalErrors?: number;
 			totalWarnings?: number;
+			coldRunners?: string[];
 		}>(({ details, args, isError, text }) => {
 			// Streaming progress partials render the live bar (see scanningSummaryLine)
 			// instead of the details-driven summary, which would show "0 diagnostics"
@@ -147,21 +151,29 @@ export function createLensDiagnosticsTool(
 			if (isError) {
 				return `lens_diagnostics ${mode} — ${text.split("\n")[0] ?? "error"}`;
 			}
+			// #533: a "clean"/zero render must say so when heavyweight analyzers never
+			// ran this session — a bare "clean" would otherwise misrepresent a cold
+			// cache as a confirmed answer from those analyzers.
+			const coldSuffix =
+				details?.coldRunners && details.coldRunners.length > 0
+					? ` (${details.coldRunners.length} cold: ${details.coldRunners.join(", ")})`
+					: "";
 			if (mode === "delta") {
 				const aw = details?.actionableWarnings ?? 0;
 				const cq = details?.qualityIssues ?? 0;
 				const pd = details?.projectDiagnostics ?? 0;
-				if (aw + cq + pd === 0) return `lens_diagnostics delta — clean`;
-				return `lens_diagnostics delta — ${aw} actionable · ${cq} quality · ${pd} project`;
+				if (aw + cq + pd === 0)
+					return `lens_diagnostics delta — clean${coldSuffix}`;
+				return `lens_diagnostics delta — ${aw} actionable · ${cq} quality · ${pd} project${coldSuffix}`;
 			}
 			const b = details?.totalBlocking ?? 0;
 			const e = details?.totalErrors ?? 0;
 			const w = details?.totalWarnings ?? 0;
 			const files = details?.filesWithIssues ?? details?.filesChecked ?? 0;
 			if (b + e + w === 0) {
-				return `lens_diagnostics ${mode} — clean (${files} files)`;
+				return `lens_diagnostics ${mode} — clean (${files} files)${coldSuffix}`;
 			}
-			return `lens_diagnostics ${mode} — ${b} blocking · ${e} errors · ${w} warnings (${files} files)`;
+			return `lens_diagnostics ${mode} — ${b} blocking · ${e} errors · ${w} warnings (${files} files)${coldSuffix}`;
 		}),
 		parameters: Type.Object({
 			mode: Type.Optional(
@@ -962,7 +974,7 @@ async function formatFullMode(
 	// the caller opted into project-runner state.
 	const extracted = shouldIncludeProjectRunners(options.refreshRunners)
 		? extractCachedProjectDiagnostics(cacheManager, cwd)
-		: { diagnostics: [], runners: [] };
+		: { diagnostics: [], runners: [], cold: [] };
 	const projectSnapshot = foldExtraDiagnosticsIntoSnapshot(
 		scannedSnapshot,
 		extracted.diagnostics.filter((d) => includeFile(d.filePath)),
@@ -1006,6 +1018,27 @@ async function formatFullMode(
 					},
 	});
 	const missingNote = pathsScopeMissingNote(pathsScope);
+	// #533: a heavyweight analyzer (knip/jscpd/madge/gitleaks/…) with NO cache
+	// entry yet is COLD, not clean — it has never run this session, so it
+	// contributed zero findings for a reason unrelated to code quality. Silently
+	// folding that into "no issues found" would be exactly the false-empty this
+	// issue is about. Named per #511/#514's actionable-warning shape: say what's
+	// cold and what warms it, only when the caller actually asked for runner
+	// state (extracted.cold is always [] otherwise).
+	const coldNote =
+		extracted.cold.length > 0
+			? `\n\ncold (not yet scanned this session): ${extracted.cold
+					.map((id) => `${id} — ${warmTriggerFor(id)}`)
+					.join(
+						", ",
+					)}. These analyzers have not contributed to this result — absence of their findings is NOT a clean verdict.`
+			: "";
+	// coldRunners always lands in details (even when empty) so a caller can
+	// reliably check "were any extractors cold" without a presence check.
+	const resultWithCold = {
+		...result,
+		details: { ...result.details, coldRunners: extracted.cold },
+	};
 	// Stopped mid-scan: the results above are whatever completed before the abort.
 	// Tell the agent so it doesn't read a partial sweep as "clean" (#341). The
 	// abort is either a user/turn cancel (Escape) or the wall-clock ceiling firing
@@ -1022,20 +1055,26 @@ async function formatFullMode(
 				"Re-run with a smaller maxLspFiles to finish within budget.";
 		return {
 			content: [
-				{ type: "text" as const, text: result.content[0].text + note + missingNote },
+				{
+					type: "text" as const,
+					text: result.content[0].text + note + coldNote + missingNote,
+				},
 			],
-			details: { ...result.details, timedOut },
+			details: { ...resultWithCold.details, timedOut },
 		};
 	}
-	if (missingNote) {
+	if (missingNote || coldNote) {
 		return {
 			content: [
-				{ type: "text" as const, text: result.content[0].text + missingNote },
+				{
+					type: "text" as const,
+					text: result.content[0].text + coldNote + missingNote,
+				},
 			],
-			details: result.details,
+			details: resultWithCold.details,
 		};
 	}
-	return result;
+	return resultWithCold;
 }
 
 function formatAllMode(
