@@ -200,6 +200,15 @@ export interface ModuleReport {
 	/** Cross-file blast radius (#304) — present only when requested via
 	 * `blastRadius` and the cached graph is warm; omitted otherwise. */
 	blastRadius?: BlastRadius;
+	/**
+	 * ISO timestamp the cached review graph was last built (`ReviewGraph.builtAt`),
+	 * present whenever a graph was consulted (warm or cold-but-existing). Omitted
+	 * when no graph exists at all. Additive (#536) — this is the persisted
+	 * timestamp an MCP adapter uses to compute a staleness hint; the pi tool
+	 * surface ignores it (staleness signage is MCP-only, per #536's decision:
+	 * pi's graph is per-edit warm, so a staleness line there would be noise).
+	 */
+	graphBuiltAt?: string;
 	provenance?: {
 		symbols: "syntax" | "none";
 		imports: "cached-review-graph" | "syntax" | "none";
@@ -1721,6 +1730,7 @@ export async function moduleReport(
 		...(summaryView ? { view: "summary" } : {}),
 		...(compactView ? { view: "compact" } : {}),
 		...(blastRadius && !summaryView ? { blastRadius } : {}),
+		...(graph ? { graphBuiltAt: graph.builtAt } : {}),
 		provenance: {
 			symbols: languageId ? "syntax" : "none",
 			imports: importsProvenance,

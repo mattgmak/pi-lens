@@ -44,6 +44,15 @@ vi.mock("../../../clients/lsp/index.js", () => ({
 	}),
 }));
 
+// #536: buildOrUpdateGraph is mocked so this suite asserts the GATING logic
+// (updateGraph flag, blockers, file-kind eligibility) without exercising the
+// real graph builder — that's covered by tests/mcp/analyze-graph.smoke.test.ts
+// (real end-to-end graph build) and the review-graph suite's own unit tests.
+const mockBuildOrUpdateGraph = vi.hoisted(() => vi.fn(async () => undefined));
+vi.mock("../../../clients/review-graph/service.js", () => ({
+	buildOrUpdateGraph: mockBuildOrUpdateGraph,
+}));
+
 import { dispatchForFile, getLatencyReports } from "../../../clients/dispatch/dispatcher.js";
 import { CacheManager } from "../../../clients/cache-manager.js";
 import { resetDispatchBaselines } from "../../../clients/dispatch/integration.js";
@@ -102,6 +111,7 @@ beforeEach(() => {
 	mockTouchFile.mockClear();
 	mockSupportsLSP.mockReset();
 	mockSupportsLSP.mockReturnValue(false);
+	mockBuildOrUpdateGraph.mockClear();
 	tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-mcp-analyze-"));
 	tsFile = path.join(tmpDir, "app.ts");
 	fs.writeFileSync(tsFile, "export const a = 1;\n");
@@ -319,5 +329,50 @@ describe("analyzeFile", () => {
 		await analyzeFile(tsFile, tmpDir);
 		const turnState = new CacheManager().readTurnState(tmpDir);
 		expect(Object.keys(turnState.files).length).toBe(0);
+	});
+
+	// ── #536: warm-mode graph maintenance gating ────────────────────────────
+
+	it("does not update the graph by default (updateGraph unset)", async () => {
+		vi.mocked(dispatchForFile).mockResolvedValue(emptyResult);
+		await analyzeFile(tsFile, tmpDir);
+		expect(mockBuildOrUpdateGraph).not.toHaveBeenCalled();
+	});
+
+	it("updates the graph when updateGraph:true and dispatch has no blockers", async () => {
+		vi.mocked(dispatchForFile).mockResolvedValue(emptyResult);
+		await analyzeFile(tsFile, tmpDir, { updateGraph: true });
+		expect(mockBuildOrUpdateGraph).toHaveBeenCalledTimes(1);
+		expect(mockBuildOrUpdateGraph).toHaveBeenCalledWith(
+			tmpDir,
+			[tsFile],
+			expect.anything(),
+		);
+	});
+
+	it("skips the graph update when the dispatch has blockers, even with updateGraph:true", async () => {
+		vi.mocked(dispatchForFile).mockResolvedValue({
+			...emptyResult,
+			diagnostics: [blockingDiagnostic],
+			blockers: [blockingDiagnostic],
+			hasBlockers: true,
+		});
+		await analyzeFile(tsFile, tmpDir, { updateGraph: true });
+		expect(mockBuildOrUpdateGraph).not.toHaveBeenCalled();
+	});
+
+	it("skips the graph update for a file kind the graph doesn't model", async () => {
+		vi.mocked(dispatchForFile).mockResolvedValue(emptyResult);
+		const csv = path.join(tmpDir, "data.csv");
+		fs.writeFileSync(csv, "a,b\n1,2\n");
+		await analyzeFile(csv, tmpDir, { updateGraph: true });
+		expect(mockBuildOrUpdateGraph).not.toHaveBeenCalled();
+	});
+
+	it("never fails the analysis when the graph update throws", async () => {
+		vi.mocked(dispatchForFile).mockResolvedValue(emptyResult);
+		mockBuildOrUpdateGraph.mockRejectedValueOnce(new Error("graph boom"));
+		const result = await analyzeFile(tsFile, tmpDir, { updateGraph: true });
+		expect(result.counts.diagnostics).toBe(0);
 	});
 });

@@ -20,7 +20,7 @@ A pi coding-agent extension that runs automated checks on every file write/edit.
 ```
 index.ts                  Extension entry point (async factory) — the pi host adapter
 mcp/                      Second host adapter: MCP server + hook bin (see "MCP mirror")
-  server.ts               Hand-rolled stdio JSON-RPC MCP server (15 tools) + warm IPC listener
+  server.ts               Hand-rolled stdio JSON-RPC MCP server (16 tools) + warm IPC listener
   worker.ts               fresh-mode child (loads freshly-built code from disk)
   analyze-cli.ts          pi-lens-analyze bin — PostToolUse hook + CLI (warm channel → cold fallback)
 clients/
@@ -58,7 +58,7 @@ a *second host adapter* alongside `index.ts`. Design rationale + progress: `mcp.
   `npm install --omit=dev` does **not** omit `optionalDependencies` (only
   `--omit=optional` does, which pi doesn't pass), so even an "optional" SDK would
   weigh every pi-lens install. ~200 LOC beats a dep for a tools-only server.
-- **15 tools:** `pilens_analyze` (per-edit; `mode: warm|fresh`), `pilens_diagnostics`,
+- **16 tools:** `pilens_analyze` (per-edit; `mode: warm|fresh`), `pilens_diagnostics`,
   `pilens_project_scan`, `pilens_latency`, `pilens_health`, `pilens_rebuild`,
   `pilens_session_start` / `pilens_turn_end` (drive the REAL lifecycle handlers —
   not re-implementations — via `clients/mcp/session.ts`), `pilens_ast_grep_search`
@@ -138,18 +138,22 @@ a *second host adapter* alongside `index.ts`. Design rationale + progress: `mcp.
   coverage; if `maxLines` would reject an oversized range, `onOversize:"slice"`
   returns bounded partial read coverage around the target line while
   `onOversize:"outline"` returns nested symbol/callback read handles without
-  claiming coverage. MCP parity is intentionally deferred until the pi tool
-  surface settles.
+  claiming coverage. `pilens_read_enclosing` (#536, closes #522 item 1) mirrors
+  this shape on MCP — same params, no read-guard tie-in (MCP has no read-guard
+  at all, same caveat as `pilens_read_symbol`).
   Wrapped pi tools emit their
   typebox `parameters` as the MCP `inputSchema` (via `schemaWithCwd`) — no
   hand-restated schema to drift.
-  `pilens_module_report` / `pilens_read_symbol` are **dual-surface** — also
-  registered as pi agent tools (`tools/module-report.ts`, wired in `index.ts`,
-  backed by `clients/module-report.ts` via the lens-engine seam) — and unlike the
-  MCP-only queries below, `read_symbol` and `read_enclosing` already feed a
-  pi-lens-internal consumer: in pi their returned bodies are recorded into the
-  read-guard (`recordSymbolRead`) as genuine edit-coverage for that
-  symbol/callback range (a `module_report` outline is NOT — shape, not body).
+  `pilens_module_report` / `pilens_read_symbol` / `pilens_read_enclosing` are
+  **dual-surface** — also registered as pi agent tools (`tools/module-report.ts`,
+  wired in `index.ts`, backed by `clients/module-report.ts` via the lens-engine
+  seam) — and unlike the MCP-only queries below, `read_symbol` and
+  `read_enclosing` already feed a pi-lens-internal consumer: in pi their returned
+  bodies are recorded into the read-guard (`recordSymbolRead`) as genuine
+  edit-coverage for that symbol/callback range (a `module_report` outline is NOT
+  — shape, not body). The MCP mirrors have no read-guard to tie into at all, so
+  `pilens_read_symbol`/`pilens_read_enclosing` return the body with no coverage
+  recording — an intentional MCP-side gap, not a bug.
   `pilens_symbol_search` is ALSO dual-surface as of #348 phase 1 — `symbol_search`
   (`tools/symbol-search.ts`, wired in `index.ts`) wraps the same `symbolSearch()`
   engine seam and returns the identical #517-slimmed payload; unlike read_symbol/

@@ -21,6 +21,7 @@ import {
 } from "./dispatch/integration.js";
 import { initLSPConfig } from "./lsp/config.js";
 import { getLSPService } from "./lsp/index.js";
+import { getOrLoadWarmWordIndex } from "./mcp/analyze.js";
 import { scanProjectDiagnostics } from "./project-diagnostics/scanner.js";
 import type { ProjectDiagnosticsSnapshot } from "./project-diagnostics/types.js";
 import * as path from "node:path";
@@ -65,6 +66,9 @@ export {
 	type ModuleReport,
 	type ModuleReportOptions,
 	type ModuleSymbolEntry,
+	readEnclosing,
+	type ReadEnclosingOptions,
+	type ReadEnclosingResult,
 	readSymbol,
 	type ReadSymbolResult,
 	type RecommendedRead,
@@ -143,6 +147,14 @@ export interface SymbolSearchResult {
 	 * index build was kicked off in the background (deduped per cwd), never
 	 * blocking this call — retry shortly. */
 	hint?: string;
+	/**
+	 * ISO timestamp the persisted project snapshot (`ProjectSnapshot.generatedAt`)
+	 * was last written — the snapshot backs BOTH the word index this search ranks
+	 * over and the `reverseDeps` centrality boost. Present whenever `available` is
+	 * true. Additive (#536): an MCP adapter uses this to compute a staleness hint;
+	 * omitted (not surfaced) on the pi tool surface, whose index is per-edit warm.
+	 */
+	snapshotGeneratedAt?: string;
 }
 
 function toSymbolSearchHit(result: RankedFile): SymbolSearchHit {
@@ -157,12 +169,24 @@ function toSymbolSearchHit(result: RankedFile): SymbolSearchHit {
 }
 
 /**
- * Ranked identifier search over the persisted word index (#162). Stateless:
- * loads the index from the project snapshot (built by the session scan, in
- * either the pi extension or the MCP session), so it works without a warm
- * runtime. Returns `available: false` when no index exists yet — and kicks off
- * a single bounded background build for this workspace (deduped per cwd, never
- * blocking this call) so a retry shortly after succeeds (#348 decision 3).
+ * Ranked identifier search over the persisted word index (#162). Mostly
+ * stateless: loads the index from the project snapshot (built by the session
+ * scan, in either the pi extension or the MCP session), so it works without a
+ * warm runtime. Returns `available: false` when no index exists yet — and
+ * kicks off a single bounded background build for this workspace (deduped per
+ * cwd, never blocking this call) so a retry shortly after succeeds (#348
+ * decision 3).
+ *
+ * #536 rider: prefers the warm in-memory index (`getOrLoadWarmWordIndex`,
+ * clients/mcp/analyze.ts) over a fresh disk read when one exists for this
+ * cwd — a warm `pilens_analyze` call updates that live copy synchronously but
+ * persists it to disk on a debounce (default 1500ms), so without this a query
+ * immediately following an analyze in the SAME process would read stale
+ * on-disk state until the debounce flushes. Falls back to the stateless disk
+ * read exactly as before when no warm copy is cached (nothing has called
+ * pilens_analyze yet this process, or #348 phase 2's forward-index isn't
+ * available) — this function's public contract (available/hint/results shape)
+ * is unchanged either way.
  */
 export function symbolSearch(
 	query: string,
@@ -170,7 +194,7 @@ export function symbolSearch(
 	limit = 20,
 ): SymbolSearchResult {
 	const snapshot = loadProjectSnapshot(cwd);
-	const index = deserializeWordIndex(snapshot?.wordIndex);
+	const index = getOrLoadWarmWordIndex(cwd) ?? deserializeWordIndex(snapshot?.wordIndex);
 	if (!index) {
 		triggerBackgroundWordIndexBuild(cwd);
 		return {
@@ -192,6 +216,7 @@ export function symbolSearch(
 		available: true,
 		query,
 		results: results.map(toSymbolSearchHit),
+		snapshotGeneratedAt: snapshot?.generatedAt,
 	};
 }
 

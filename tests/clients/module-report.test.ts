@@ -727,6 +727,31 @@ describe("moduleReport — review-graph who-uses-this", () => {
 		expect(report.recommendedReads.some((r) => r.symbol === "foo")).toBe(true);
 	});
 
+	it("#536: carries graphBuiltAt (the cached graph's persisted ISO timestamp) when a graph was consulted", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"a.ts",
+			"export function foo(x: number): number {\n  return x + 1;\n}\n",
+		);
+		await warmGraph(env.tmpDir);
+		const report = await moduleReport(file, env.tmpDir);
+		expect(report.graphBuiltAt).toBeDefined();
+		expect(Number.isFinite(Date.parse(report.graphBuiltAt as string))).toBe(true);
+	});
+
+	it("#536: omits graphBuiltAt on a genuinely cold cache (no graph at all)", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"a.ts",
+			"export function foo(x: number): number {\n  return x + 1;\n}\n",
+		);
+		// No warmGraph() — genuinely cold.
+		const report = await moduleReport(file, env.tmpDir);
+		expect(report.graphBuiltAt).toBeUndefined();
+	});
+
 	it("#511: warm graph missing a node for THIS file is reported as an actionable stale gap, not silent none", async () => {
 		const env = makeEnv();
 		createTempFile(
