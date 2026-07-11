@@ -311,17 +311,27 @@ scans in a spawned child, the instance registry + orphan reaper (#474)
 cleans up LSP processes left behind by a dead parent, and the
 concurrent-session guard (#473, `clients/session-lifecycle.ts`) stops an
 in-process subagent bind from tearing down the parent's live LSP fleet.
-**Reaping is not pid-liveness alone (#525).** `decideOrphanReaping`
-(`clients/instance-reaper.ts`) classifies a parent instance dead when EITHER
-`isPidAlive(pid)` says so OR its `heartbeatAt` is older than
-`STALE_HEARTBEAT_MS` (6h) — pid-liveness alone is unsound once a long-dead
-parent's pid gets recycled onto an unrelated live process (Windows recycles
-far more aggressively than POSIX, which has no zombie/wait-reaping semantics
-holding a dead pid "reserved"); a real dogfooded case survived 13h stale
-because of exactly this. Unlike child LSP pids (which get a command-line/
-marker identity check via `matchProcess` before a kill), the parent pid has no
-identity to verify against — `InstanceEntry` never recorded the parent's own
-command line — so heartbeat staleness is the only available second signal.
+**Reaping is split by CONSEQUENCE — staleness cleans records, never kills
+(#525).** `decideOrphanReaping` (`clients/instance-reaper.ts`) uses two named
+predicates whose asymmetry is load-bearing: `isInstanceKillEligible`
+(pid-confirmed-dead ONLY — the only path to `childrenToKill`/
+`markerSearches`) and `isInstanceEntryStale` (`heartbeatAt` older than
+`STALE_HEARTBEAT_MS`, 6h — drops the ENTRY from `instances.json` via
+`staleInstances`, kills nothing, and the instance's children stay
+marker-protected). Why staleness must never kill: heartbeats fire only at
+turn end (`runtime-turn.ts`) and run settle (`quiet-window.ts`) — no timer
+exists — so a pi session left open but unused overnight legitimately goes
+>6h stale while genuinely ALIVE with a warm LSP fleet; `matchProcess`
+identity verification would not save that fleet (the children really are
+that instance's servers — the matcher guards against pid reuse, not against
+misclassifying a live parent). Why staleness must still drop entries:
+pid-liveness alone is unsound once a long-dead parent's pid gets recycled
+onto an unrelated live process (Windows recycles far more aggressively than
+POSIX; a real dogfooded fixture entry survived 13h stale because of exactly
+this), and the parent pid has no identity to verify against —
+`InstanceEntry` never recorded the parent's own command line. Marker
+protection (`collectLiveMarkers`) is keyed on pid-liveness alone —
+conservative on the destructive side, matching the kill predicate.
 `isSubagentSession()` (`clients/subagent-mode.ts`) detects TWO env
 vocabularies: nicobailon/pi-subagents' `PI_SUBAGENT_CHILD=1`, and
 avtc-pi-subagent's `PI_SUBAGENT_CHILD_AGENT` + `PI_SUBAGENT_PARENT_PID` pair
