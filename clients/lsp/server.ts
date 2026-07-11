@@ -8,13 +8,21 @@
  */
 
 import { existsSync, mkdirSync, readdirSync } from "node:fs";
-import { access, appendFile, mkdir, readdir, stat } from "node:fs/promises";
+import {
+	access,
+	appendFile,
+	mkdir,
+	readFile,
+	readdir,
+	stat,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { minimatch } from "../deps/minimatch.js";
 import { isTestMode } from "../env-utils.js";
 import { getGlobalPiLensDir } from "../file-utils.js";
 import { KIND_EXTENSIONS } from "../file-kinds.js";
+import { isAtOrAboveHomeDir } from "../path-utils.js";
 import {
 	ensureTool,
 	getToolEnvironment,
@@ -1063,6 +1071,86 @@ async function findTsserverPath(
 	return undefined;
 }
 
+interface NativeTypeScriptLsp {
+	command: string;
+	version: string;
+}
+
+/**
+ * TypeScript 7+ ships the native typescript-go language server through the
+ * workspace-local `tsc --lsp --stdio` entrypoint and no longer includes
+ * `lib/tsserver.js`. Resolve the nearest TypeScript package using normal
+ * node_modules ancestor semantics so a monorepo package can use its hoisted
+ * compiler, while never falling through to a PATH/global `tsc`.
+ */
+async function findNativeTypeScriptLsp(
+	root: string,
+): Promise<NativeTypeScriptLsp | undefined> {
+	let currentDir = path.resolve(root);
+
+	while (!isAtOrAboveHomeDir(currentDir)) {
+		const packageJsonPath = path.join(
+			currentDir,
+			"node_modules",
+			"typescript",
+			"package.json",
+		);
+
+		let packageJsonText: string;
+		try {
+			packageJsonText = await readFile(packageJsonPath, "utf8");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+				return undefined;
+			}
+			const parent = path.dirname(currentDir);
+			if (parent === currentDir) return undefined;
+			currentDir = parent;
+			continue;
+		}
+
+		let version: string;
+		try {
+			const parsed: unknown = JSON.parse(packageJsonText);
+			if (
+				typeof parsed !== "object" ||
+				parsed === null ||
+				!("version" in parsed) ||
+				typeof parsed.version !== "string"
+			) {
+				return undefined;
+			}
+			version = parsed.version;
+		} catch {
+			return undefined;
+		}
+
+		// The nearest installed package shadows any ancestor TypeScript package,
+		// matching Node/package-manager resolution. Never skip a local TS <=6 or
+		// malformed install just to select an unrelated ancestor TS 7 binary.
+		const majorText = version.split(".", 1)[0] ?? "";
+		const major = /^\d+$/.test(majorText) ? Number(majorText) : Number.NaN;
+		if (!Number.isFinite(major) || major < 7) return undefined;
+
+		const localTsc = path.join(currentDir, "node_modules", ".bin", "tsc");
+		const candidates =
+			process.platform === "win32"
+				? [`${localTsc}.cmd`, `${localTsc}.exe`, localTsc]
+				: [localTsc];
+
+		for (const command of candidates) {
+			try {
+				await access(command);
+				return { command, version };
+			} catch {
+				/* not found */
+			}
+		}
+		return undefined;
+	}
+	return undefined;
+}
+
 function dotnetToolCandidates(tool: string): string[] {
 	const home = os.homedir();
 	return [
@@ -1288,9 +1376,23 @@ export const TypeScriptServer: LSPServerInfo = {
 	root: TypeScriptRoot,
 	async spawn(root, options) {
 		const fs = await import("node:fs/promises");
+		const nativeLsp = await findNativeTypeScriptLsp(root);
+		if (nativeLsp) {
+			const env = await getToolEnvironment();
+			logSessionStart(
+				`lsp typescript-native: version=${nativeLsp.version} command=${nativeLsp.command}`,
+			);
+			const proc = await launchLSP(nativeLsp.command, ["--lsp", "--stdio"], {
+				cwd: root,
+				env,
+			});
+			return { process: proc, source: "direct" };
+		}
+
 		let source: "direct" | "managed" = "direct";
 
-		// Find typescript-language-server - prefer local project version
+		// TypeScript <=6 uses typescript-language-server + tsserver.js. Prefer a
+		// project-local wrapper, then fall back to discovered/managed tooling.
 		let lspPath: string | undefined;
 		const localLsp = path.join(
 			root,
