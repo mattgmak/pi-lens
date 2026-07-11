@@ -1200,8 +1200,7 @@ export function cargoBinCandidates(tool: string): string[] {
  */
 export async function tryGemInstall(gem: string): Promise<boolean> {
 	const { join } = await import("node:path");
-	const { homedir } = await import("node:os");
-	const binDir = join(homedir(), ".pi-lens", "bin");
+	const binDir = join(getGlobalPiLensDir(), "bin");
 	const { mkdir } = await import("node:fs/promises");
 	await mkdir(binDir, { recursive: true });
 

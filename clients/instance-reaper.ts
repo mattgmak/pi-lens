@@ -15,7 +15,53 @@
  * a command-line marker fallback for the case where the pid itself was
  * recycled or the mid-tree pid link is broken (e.g. a dead node-wrapper whose
  * native-exe grandchild is still alive under a different, unrecorded pid).
+ *
+ * #525 root cause: a parent instance was ONLY ever considered dead via
+ * `isPidAlive(instance.pid)` — a raw `process.kill(pid, 0)` check. Unlike
+ * child pids (which get a command-line/marker identity check via
+ * `matchProcess` to guard against a recycled pid), the PARENT pid had no
+ * identity verification at all, because `InstanceEntry` never recorded the
+ * parent's own command line. Windows recycles pids far more aggressively than
+ * POSIX (no zombie/wait-reaping semantics holding a dead pid "reserved"), so
+ * over a long enough window (observed: ~13h) a dead parent's pid is very
+ * plausibly reassigned to a live, unrelated process — `isPidAlive` then
+ * (correctly, per its own conservative contract) reports "alive", and the
+ * stale instance is never reaped, no matter how old its heartbeat is.
+ *
+ * The #525 fix is deliberately ASYMMETRIC by consequence:
+ *
+ * - **Heartbeat staleness (`STALE_HEARTBEAT_MS`) cleans REGISTRY ENTRIES,
+ *   never kills.** A stale-heartbeat-but-pid-alive instance goes into
+ *   `staleInstances` (entry dropped from instances.json) with ZERO process
+ *   kills and its children still marker-protected. Why: the heartbeat call
+ *   sites are runtime-turn.ts (per turn end) and quiet-window.ts (per run
+ *   settle) ONLY — no timer exists. A pi session left OPEN but UNUSED
+ *   overnight fires neither, so its heartbeat legitimately goes >6h stale
+ *   while the session and its warm LSP fleet are genuinely alive. Killing on
+ *   staleness would take that fleet down under the idle session — and
+ *   `matchProcess` would NOT save it (its children really ARE that
+ *   instance's LSP servers; identity verification guards against pid reuse,
+ *   not against misclassifying a live parent). Removing just the entry is
+ *   safe: the idle session's next turn re-registers via `registerInstance`.
+ * - **Process kills require a pid-confirmed-DEAD parent** (`deadInstances`),
+ *   exactly as before #525. Only then are its children classified for
+ *   kill/marker-search.
+ *
+ * This still fixes both observed #525 cases: the 13h-stale test-fixture
+ * entry AND the recycled-parent-pid case (a dead parent whose pid now
+ * belongs to an unrelated live process — `isPidAlive` lies, but the stale
+ * heartbeat gets the ENTRY dropped, which is all the pollution fix needs).
  */
+
+/**
+ * A pid-ALIVE instance whose heartbeat is older than this gets its registry
+ * ENTRY removed — it is NEVER kill-eligible on staleness alone (see the
+ * module docstring's asymmetry note: an overnight-idle-but-alive session
+ * legitimately exceeds this threshold because heartbeats only fire at turn
+ * end / run settle, so staleness must clean records, not kill processes).
+ * 6 hours comfortably catches the observed 13h-stale pollution case.
+ */
+export const STALE_HEARTBEAT_MS = 6 * 60 * 60 * 1000;
 
 import { spawn as nodeSpawn } from "node:child_process";
 import * as fs from "node:fs";
@@ -42,9 +88,16 @@ export interface MarkerSearch {
 }
 
 export interface OrphanReapDecision {
-	/** Registry entries whose owning pid is confirmed dead — to be dropped
-	 *  from the registry once their children are reaped. */
+	/** Registry entries whose owning pid is confirmed DEAD — kill-eligible:
+	 *  their children are classified into `childrenToKill`/`markerSearches`,
+	 *  and the entry is dropped from the registry. */
 	deadInstances: InstanceEntry[];
+	/** Registry entries whose pid is ALIVE but whose heartbeat is stale
+	 *  beyond `STALE_HEARTBEAT_MS` (#525) — RECORD cleanup ONLY: the entry is
+	 *  dropped from instances.json, but NOTHING is ever killed on staleness
+	 *  (the parent may be an overnight-idle-but-alive session; see the module
+	 *  docstring). Their children stay marker-protected. */
+	staleInstances: InstanceEntry[];
 	/** Live-pid LSP children belonging to a dead-parent instance — kill these. */
 	childrenToKill: ChildToKill[];
 	/** Children whose pid is ALSO dead (or already gone) but that carried a
@@ -55,9 +108,43 @@ export interface OrphanReapDecision {
 }
 
 /**
- * Markers claimed by any LIVE instance's children. A marker search kills by
- * command-line match, so a marker that a live session also uses must never
- * be searched — killing it would take down the live session's server.
+ * KILL eligibility: pid-confirmed-dead ONLY. Heartbeat staleness must never
+ * make an instance kill-eligible — an overnight-idle-but-alive session
+ * legitimately goes >STALE_HEARTBEAT_MS stale (heartbeats fire only at turn
+ * end / run settle; no timer exists), and killing its genuine live LSP
+ * children would pass `matchProcess` identity verification (they really are
+ * that instance's servers — the matcher guards against pid reuse, not
+ * against misclassifying a live parent). See the module docstring (#525).
+ */
+function isInstanceKillEligible(
+	instance: InstanceEntry,
+	isPidAlive: (pid: number) => boolean,
+): boolean {
+	return !isPidAlive(instance.pid);
+}
+
+/**
+ * REGISTRY-ENTRY staleness: heartbeat older than `STALE_HEARTBEAT_MS` (or
+ * unparseable — missing data must never keep a polluted entry alive
+ * forever). Drives entry removal ONLY, never kills (#525). This is what
+ * cleans the recycled-parent-pid case: `isPidAlive` lies for a long-dead
+ * parent whose pid the OS reassigned to an unrelated live process, but the
+ * stale heartbeat still gets the ENTRY dropped.
+ */
+function isInstanceEntryStale(instance: InstanceEntry, now: number): boolean {
+	const heartbeatMs = Date.parse(instance.heartbeatAt);
+	if (Number.isNaN(heartbeatMs)) return true;
+	return now - heartbeatMs > STALE_HEARTBEAT_MS;
+}
+
+/**
+ * Markers claimed by any pid-ALIVE instance's children. A marker search
+ * kills by command-line match, so a marker that a live session also uses
+ * must never be searched — killing it would take down the live session's
+ * server. Protection is deliberately keyed on pid-liveness ALONE, regardless
+ * of heartbeat staleness (#525): a stale-heartbeat-but-alive instance (e.g.
+ * overnight-idle) must keep its children protected — protection stays
+ * conservative even where entry cleanup does not.
  * Markers are per-process-unique by construction (sgconfig.ts embeds the
  * pid), so this is defense in depth against non-unique markers ever
  * reappearing (#472: the original shared baseline.sgconfig.yml would have
@@ -131,6 +218,13 @@ function classifyDeadInstanceChildren(
  * @param matchProcess - optional identity verification (e.g. confirm the
  *   live pid's command line still matches what we recorded) to guard against
  *   a recycled pid coincidentally matching. If omitted, liveness alone is used.
+ * @param now - epoch ms "now", for heartbeat-staleness comparison (#525).
+ *   Injectable for deterministic tests; defaults to `Date.now()`. The two
+ *   signals are ASYMMETRIC by consequence: pid-confirmed-dead ⇒
+ *   `deadInstances` (kill-eligible + entry removal); pid-alive but heartbeat
+ *   older than `STALE_HEARTBEAT_MS` ⇒ `staleInstances` (entry removal ONLY —
+ *   never kills, never loses marker protection; the parent may be an
+ *   overnight-idle-but-alive session). See the module docstring.
  */
 export function decideOrphanReaping(
 	registry: InstanceEntry[],
@@ -139,25 +233,33 @@ export function decideOrphanReaping(
 		pid: number,
 		expected: { command: string; marker?: string },
 	) => boolean,
+	now: number = Date.now(),
 ): OrphanReapDecision {
 	const deadInstances: InstanceEntry[] = [];
+	const staleInstances: InstanceEntry[] = [];
 	const childrenToKill: ChildToKill[] = [];
 	const markerSearches: MarkerSearch[] = [];
 
+	// Marker protection is pid-liveness ONLY — a stale-heartbeat-but-alive
+	// instance keeps its children protected (conservative on the kill side).
 	const liveMarkers = collectLiveMarkers(registry, isPidAlive);
 
 	for (const instance of registry) {
-		if (isPidAlive(instance.pid)) {
-			continue; // parent still alive — leave its children alone entirely
+		if (isInstanceKillEligible(instance, isPidAlive)) {
+			// pid-confirmed-dead: entry removal + children classified for kills.
+			deadInstances.push(instance);
+			classifyDeadInstanceChildren(instance, isPidAlive, matchProcess, liveMarkers, {
+				childrenToKill,
+				markerSearches,
+			});
+		} else if (isInstanceEntryStale(instance, now)) {
+			// pid-alive but stale heartbeat: record cleanup only — NO kills.
+			staleInstances.push(instance);
 		}
-		deadInstances.push(instance);
-		classifyDeadInstanceChildren(instance, isPidAlive, matchProcess, liveMarkers, {
-			childrenToKill,
-			markerSearches,
-		});
+		// else: alive + fresh heartbeat — leave it alone entirely.
 	}
 
-	return { deadInstances, childrenToKill, markerSearches };
+	return { deadInstances, staleInstances, childrenToKill, markerSearches };
 }
 
 // --- Impure liveness / identity / kill helpers ---
@@ -425,10 +527,16 @@ export async function sweepOrphans(): Promise<void> {
 			}
 		}
 
-		if (decision.deadInstances.length > 0) {
+		// Entry removal covers BOTH sets: pid-dead instances AND stale-heartbeat
+		// (pid-alive) instances — the latter is record cleanup only (#525);
+		// nothing belonging to a stale instance was killed above.
+		if (decision.deadInstances.length > 0 || decision.staleInstances.length > 0) {
 			try {
-				const deadPids = new Set(decision.deadInstances.map((i) => i.pid));
-				await pruneDeadInstances(deadPids);
+				const prunePids = new Set([
+					...decision.deadInstances.map((i) => i.pid),
+					...decision.staleInstances.map((i) => i.pid),
+				]);
+				await pruneDeadInstances(prunePids);
 			} catch {
 				// best-effort — a stale registry entry is re-evaluated next sweep
 			}
@@ -442,6 +550,7 @@ export async function sweepOrphans(): Promise<void> {
 				durationMs: Date.now() - startedAt,
 				metadata: {
 					deadInstances: decision.deadInstances.length,
+					staleInstances: decision.staleInstances.length,
 					killed: killedCount,
 					serverIds: killedServerIds,
 					markerSearches: decision.markerSearches.length,
@@ -455,7 +564,8 @@ export async function sweepOrphans(): Promise<void> {
 	}
 }
 
-/** Drop dead-parent instances from the registry. Re-reads immediately before
+/** Drop dead-parent AND stale-heartbeat (#525, record-cleanup-only)
+ *  instances from the registry. Re-reads immediately before
  *  writing (rather than reusing the earlier `readInstanceRegistry()` snapshot)
  *  to narrow — not eliminate — the last-writer-wins race already accepted for
  *  slice 1's read-modify-write model. */

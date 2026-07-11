@@ -235,9 +235,11 @@ const cacheFile = path.join(getProjectDataDir(cwd), "cache", "my-file.json");
 
 **Project-scoped** (must use `getProjectDataDir`): caches, snapshots, indexes, worklogs, change-log, code-quality-warnings, actionable-warning-state, review-graph, install-choices.
 
-**Machine-global** (intentionally hardcoded to `~/.pi-lens/`): latency.log, cascade.log, tree-sitter.log, sessionstart.log, read-guard.log, actionable-warnings.log, tools/, bin/, intelephense/, logs/. These are shared across all projects.
+**Machine-global** (all routed through `getGlobalPiLensDir()`, `clients/file-utils.ts` — never hand-rolled `os.homedir()` + `.pi-lens`): latency.log, cascade.log, tree-sitter.log, sessionstart.log, read-guard.log, actionable-warnings.log, dead-code.log, diagnostic-logger's `logs/`, tools/, bin/, intelephense/, probe-cache.json, and the #449 instance registry (`instances.json`). These are shared across all projects. `getGlobalPiLensDir()` respects `PI_LENS_HOME` (#525) — the machine-scoped sibling of `PILENS_DATA_DIR` above; setting it relocates the entire `~/.pi-lens` root for every one of those writers in one shot, since they all route through this single function.
 
-Never write `path.join(cwd, ".pi-lens", ...)` for a project cache — it breaks when `PILENS_DATA_DIR` is set.
+Never write `path.join(cwd, ".pi-lens", ...)` for a project cache — it breaks when `PILENS_DATA_DIR` is set. Likewise never write `path.join(os.homedir(), ".pi-lens", ...)` directly for machine-global state — always call `getGlobalPiLensDir()`, or `PI_LENS_HOME` silently stops covering that writer.
+
+**Test hermeticity for machine-global state (#525, refs #515).** `tests/support/vitest-setup.ts` sets `PI_LENS_HOME` to a per-worker `mkdtemp` directory for every test run — unlike `PI_LENS_CONFIG_PATH` (#515, pointed at a nonexistent path since config-loading is read-only-by-default), this MUST be a real, writable directory because the instance registry and loggers actively `mkdir`+write into it. Dogfooding caught the gap live: a test-fixture instance (`registerInstance` called from a test with no override) survived in the developer's REAL `~/.pi-lens/instances.json` for ~17h. A test that deliberately exercises the real (non-overridden) resolver — e.g. asserting the literal `~/.pi-lens` default, or a `node:os` mock forcing a fake homedir — must construct its OWN explicit override (`delete process.env.PI_LENS_HOME` / restore afterward) rather than relying on unsetting the global vitest-setup value; see `tests/clients/file-utils.test.ts`'s `getGlobalPiLensDir` suite and `tests/clients/installer/tool-discovery.test.ts` (which clears `PI_LENS_HOME` via `vi.hoisted`, before its module-level `const GITHUB_BIN_DIR = path.join(getGlobalPiLensDir(), ...)` import ever runs) for the pattern. `tests/clients/pi-lens-home-hermeticity.test.ts` is the regression guard proving `registerInstance` never touches the real homedir when the override is set.
 
 ## Debug logs
 
@@ -309,6 +311,27 @@ scans in a spawned child, the instance registry + orphan reaper (#474)
 cleans up LSP processes left behind by a dead parent, and the
 concurrent-session guard (#473, `clients/session-lifecycle.ts`) stops an
 in-process subagent bind from tearing down the parent's live LSP fleet.
+**Reaping is split by CONSEQUENCE — staleness cleans records, never kills
+(#525).** `decideOrphanReaping` (`clients/instance-reaper.ts`) uses two named
+predicates whose asymmetry is load-bearing: `isInstanceKillEligible`
+(pid-confirmed-dead ONLY — the only path to `childrenToKill`/
+`markerSearches`) and `isInstanceEntryStale` (`heartbeatAt` older than
+`STALE_HEARTBEAT_MS`, 6h — drops the ENTRY from `instances.json` via
+`staleInstances`, kills nothing, and the instance's children stay
+marker-protected). Why staleness must never kill: heartbeats fire only at
+turn end (`runtime-turn.ts`) and run settle (`quiet-window.ts`) — no timer
+exists — so a pi session left open but unused overnight legitimately goes
+>6h stale while genuinely ALIVE with a warm LSP fleet; `matchProcess`
+identity verification would not save that fleet (the children really are
+that instance's servers — the matcher guards against pid reuse, not against
+misclassifying a live parent). Why staleness must still drop entries:
+pid-liveness alone is unsound once a long-dead parent's pid gets recycled
+onto an unrelated live process (Windows recycles far more aggressively than
+POSIX; a real dogfooded fixture entry survived 13h stale because of exactly
+this), and the parent pid has no identity to verify against —
+`InstanceEntry` never recorded the parent's own command line. Marker
+protection (`collectLiveMarkers`) is keyed on pid-liveness alone —
+conservative on the destructive side, matching the kill predicate.
 `isSubagentSession()` (`clients/subagent-mode.ts`) detects TWO env
 vocabularies: nicobailon/pi-subagents' `PI_SUBAGENT_CHILD=1`, and
 avtc-pi-subagent's `PI_SUBAGENT_CHILD_AGENT` + `PI_SUBAGENT_PARENT_PID` pair

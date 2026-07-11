@@ -38,8 +38,7 @@ export function getProjectDataDir(cwd: string): string {
 	if (!configuredBase && fs.existsSync(legacyProjectDir)) {
 		return legacyProjectDir;
 	}
-	const base =
-		configuredBase || path.join(os.homedir(), ".pi-lens", "projects");
+	const base = configuredBase || path.join(getGlobalPiLensDir(), "projects");
 	const normalized = normalizeFilePath(path.resolve(cwd));
 	const slug = normalized
 		.replace(/^[a-z]:/i, "") // strip Windows drive letter
@@ -51,18 +50,30 @@ export function getProjectDataDir(cwd: string): string {
 }
 
 /**
- * Machine-global pi-lens directory: `~/.pi-lens/`.
+ * Machine-global pi-lens directory: `~/.pi-lens/` by default.
  *
  * Used for logs (latency, cascade, read-guard, tree-sitter, actionable-warnings,
- * sessionstart), tool binaries (`~/.pi-lens/tools/`, `~/.pi-lens/bin/`), LSP
- * server storage, and other state that is intentionally NOT project-scoped
- * — it spans every project pi-lens has touched.
+ * sessionstart), tool binaries (`~/.pi-lens/tools/`, `~/.pi-lens/bin/`), the
+ * cross-process instance registry (`instances.json`, #449/#525), the
+ * auto-install probe cache, and other state that is intentionally NOT
+ * project-scoped — it spans every project pi-lens has touched.
+ *
+ * Override: set `PI_LENS_HOME=/some/path` to relocate this ENTIRE root (every
+ * caller below routes through this one function, so one env var covers all of
+ * them — see #525). Tests MUST set this to a per-worker temp dir in
+ * `tests/support/vitest-setup.ts` rather than mocking each caller separately;
+ * otherwise a test that exercises `registerInstance`/`sweepOrphans` or any
+ * logger writes into the developer's REAL `~/.pi-lens` (dogfooded live: a
+ * test-fixture instance survived in the real `instances.json` for 17h).
  *
  * Distinct from `getProjectDataDir(cwd)`, which respects `PILENS_DATA_DIR`
- * and produces per-project subdirectories. Callers writing project caches,
- * snapshots, or worklogs should use `getProjectDataDir(cwd)` instead.
+ * (project-scoped) and produces per-project subdirectories. Callers writing
+ * project caches, snapshots, or worklogs should use `getProjectDataDir(cwd)`
+ * instead — `PI_LENS_HOME` is the MACHINE-scoped sibling of that override.
  */
 export function getGlobalPiLensDir(): string {
+	const override = process.env.PI_LENS_HOME?.trim();
+	if (override) return path.resolve(override);
 	return path.join(os.homedir(), ".pi-lens");
 }
 

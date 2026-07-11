@@ -265,6 +265,9 @@ describe("lsp server policy", () => {
 
 	it("tries pi-lens managed csharp candidates before legacy global dotnet tools", async () => {
 		const { CSharpServer } = await import("../../../clients/lsp/server.js");
+		const { getGlobalPiLensDir } = await import(
+			"../../../clients/file-utils.js"
+		);
 		const tmp = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-csharp-candidates-"),
 		);
@@ -276,10 +279,11 @@ describe("lsp server policy", () => {
 		expect(spawned).toBeUndefined();
 		expect(launchLSP).toHaveBeenCalled();
 		const commands = launchLSP.mock.calls.map((call) => String(call[0] ?? ""));
+		// Asserts against the actual machine-global root (respects #525's
+		// PI_LENS_HOME test override) rather than hardcoding ".pi-lens".
+		const managedBinDir = path.join(getGlobalPiLensDir(), "bin", "csharp-ls");
 		expect(
-			commands.some((command) =>
-				command.includes(path.join(".pi-lens", "bin", "csharp-ls")),
-			),
+			commands.some((command) => command.includes(managedBinDir)),
 		).toBe(true);
 	});
 

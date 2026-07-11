@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 import {
 	buildIdentityMatcher,
 	decideOrphanReaping,
+	STALE_HEARTBEAT_MS,
 	type ChildToKill,
 } from "../../clients/instance-reaper.js";
 import type { InstanceEntry, LspChildEntry } from "../../clients/instance-registry.js";
@@ -231,6 +232,149 @@ describe("decideOrphanReaping", () => {
 				serverId: "ast-grep",
 			},
 		]);
+	});
+});
+
+/**
+ * #525 root-cause regression: heartbeat staleness cleans REGISTRY ENTRIES,
+ * never enables kills — the asymmetry is load-bearing (see the
+ * clients/instance-reaper.ts module docstring). Pins BOTH scenarios:
+ * - the dogfooded pollution case (heartbeat 2026-07-10T17:00, ~13h stale by
+ *   a 2026-07-11T06:35 session_start sweep, pid recycled onto an unrelated
+ *   live process ⇒ entry dropped, nothing killed), and
+ * - the overnight-idle case that FORBIDS kills on staleness (a pi session
+ *   left open but unused fires no heartbeat — runtime-turn.ts / quiet-window
+ *   are the only call sites, no timer exists — so a GENUINELY ALIVE session
+ *   legitimately goes >6h stale; its warm LSP fleet must never be killed
+ *   under it, and its markers must stay protected).
+ */
+describe("decideOrphanReaping — heartbeat staleness (#525)", () => {
+	const NOW = Date.parse("2026-07-11T06:35:00.000Z");
+
+	it("stale heartbeat + dead pid ⇒ kill-eligible deadInstances (the pre-#525 baseline stays fixed)", () => {
+		const reg = [
+			instance({
+				pid: 1,
+				heartbeatAt: "2026-07-10T17:00:00.000Z", // ~13h30m before NOW
+			}),
+		];
+		const decision = decideOrphanReaping(reg, alivePids(), undefined, NOW);
+
+		expect(decision.deadInstances).toHaveLength(1);
+		expect(decision.deadInstances[0].pid).toBe(1);
+		expect(decision.staleInstances).toHaveLength(0); // dead wins — not double-listed
+	});
+
+	it("stale heartbeat + LIVE (recycled) pid ⇒ staleInstances (entry removal), NEVER deadInstances — the #525 pollution fix", () => {
+		const reg = [
+			instance({
+				pid: 1,
+				heartbeatAt: "2026-07-10T17:00:00.000Z", // ~13h30m before NOW
+			}),
+		];
+		// pid 1 reports ALIVE (simulates Windows pid-recycling: the original
+		// process is long dead, but the OS reassigned pid 1 to some unrelated
+		// live process). Before the #525 fix this entry was never removed.
+		const decision = decideOrphanReaping(reg, alivePids(1), undefined, NOW);
+
+		expect(decision.staleInstances).toHaveLength(1);
+		expect(decision.staleInstances[0].pid).toBe(1);
+		expect(decision.deadInstances).toHaveLength(0); // record cleanup, not a kill
+		expect(decision.childrenToKill).toHaveLength(0);
+	});
+
+	it("OVERNIGHT-IDLE scenario: pid ALIVE + heartbeat 8h stale ⇒ entry removed, ZERO kills, children still marker-protected", () => {
+		const idleMarker = "C:/temp/pi-lens-ast-grep/baseline-1.sgconfig.yml";
+		const reg = [
+			// The overnight-idle-but-genuinely-alive session with a live LSP child.
+			instance({
+				pid: 1,
+				heartbeatAt: new Date(NOW - 8 * 60 * 60 * 1000).toISOString(), // 8h stale
+				lspChildren: [
+					child({ pid: 100, serverId: "ast-grep", marker: idleMarker }),
+				],
+			}),
+			// A DEAD instance whose dead child carries the SAME marker — without
+			// pid-liveness-only marker protection, this dead instance's marker
+			// search would kill the idle session's live server by command-line
+			// match. (Markers are per-process-unique in production; this is the
+			// defense-in-depth case the protection loop exists for.)
+			instance({
+				pid: 2,
+				heartbeatAt: new Date(NOW - 8 * 60 * 60 * 1000).toISOString(),
+				lspChildren: [
+					child({ pid: 200, serverId: "ast-grep", marker: idleMarker }),
+				],
+			}),
+		];
+		// pids 1 and 100 alive (the idle session + its LSP child); 2 and 200 dead.
+		// matchProcess would verify child 100's identity as GENUINE — that must
+		// not matter, because the kill path must never be reached on staleness.
+		const matchProcess = () => true;
+		const decision = decideOrphanReaping(reg, alivePids(1, 100), matchProcess, NOW);
+
+		// Idle-but-alive instance: entry removed (record cleanup) but NO kills.
+		expect(decision.staleInstances.map((i) => i.pid)).toEqual([1]);
+		expect(decision.childrenToKill).toHaveLength(0);
+		// Dead instance 2 is kill-eligible, but its dead child's marker is
+		// claimed by the pid-ALIVE instance 1 — protection held despite the
+		// stale heartbeat, so no marker search targets the live server.
+		expect(decision.deadInstances.map((i) => i.pid)).toEqual([2]);
+		expect(decision.markerSearches).toHaveLength(0);
+	});
+
+	it("fresh heartbeat + live pid ⇒ untouched (neither dead nor stale)", () => {
+		const reg = [
+			instance({
+				pid: 1,
+				heartbeatAt: new Date(NOW - 5 * 60 * 1000).toISOString(), // 5 min ago
+			}),
+		];
+		const decision = decideOrphanReaping(reg, alivePids(1), undefined, NOW);
+
+		expect(decision.deadInstances).toHaveLength(0);
+		expect(decision.staleInstances).toHaveLength(0);
+	});
+
+	it("heartbeat exactly at the staleness boundary is NOT yet stale (strictly greater-than)", () => {
+		const reg = [
+			instance({
+				pid: 1,
+				heartbeatAt: new Date(NOW - STALE_HEARTBEAT_MS).toISOString(),
+			}),
+		];
+		const decision = decideOrphanReaping(reg, alivePids(1), undefined, NOW);
+
+		expect(decision.deadInstances).toHaveLength(0);
+		expect(decision.staleInstances).toHaveLength(0);
+	});
+
+	it("heartbeat one ms past the staleness boundary IS stale (entry removal only)", () => {
+		const reg = [
+			instance({
+				pid: 1,
+				heartbeatAt: new Date(NOW - STALE_HEARTBEAT_MS - 1).toISOString(),
+			}),
+		];
+		const decision = decideOrphanReaping(reg, alivePids(1), undefined, NOW);
+
+		expect(decision.staleInstances).toHaveLength(1);
+		expect(decision.deadInstances).toHaveLength(0);
+	});
+
+	it("unparseable heartbeatAt on a live pid is treated as stale (entry removal only, no kills)", () => {
+		const reg = [
+			instance({
+				pid: 1,
+				heartbeatAt: "not-a-date",
+				lspChildren: [child({ pid: 100 })],
+			}),
+		];
+		const decision = decideOrphanReaping(reg, alivePids(1, 100), () => true, NOW);
+
+		expect(decision.staleInstances).toHaveLength(1);
+		expect(decision.deadInstances).toHaveLength(0);
+		expect(decision.childrenToKill).toHaveLength(0);
 	});
 });
 

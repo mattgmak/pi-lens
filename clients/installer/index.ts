@@ -1196,11 +1196,7 @@ interface ProbeCacheEntry {
 
 type ProbeCache = Record<string, ProbeCacheEntry>;
 
-const PROBE_CACHE_PATH = path.join(
-	os.homedir(),
-	".pi-lens",
-	"probe-cache.json",
-);
+const PROBE_CACHE_PATH = path.join(getGlobalPiLensDir(), "probe-cache.json");
 const PROBE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 let _probeCache: ProbeCache | null = null;

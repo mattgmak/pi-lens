@@ -1,4 +1,3 @@
-import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { GITHUB_TOOLS, GitHubToolId } from "../../../clients/installer/index.ts";
@@ -266,18 +265,22 @@ describe("GitHub release asset selection", () => {
 });
 
 describe("getToolEnvironment PATH", () => {
-	it("prepends ~/.pi-lens/bin to PATH", async () => {
+	it("prepends the managed pi-lens bin dir (~/.pi-lens/bin by default) to PATH", async () => {
 		const { getToolEnvironment } = await import("../../../clients/installer/index.ts");
+		const { getGlobalPiLensDir } = await import("../../../clients/file-utils.js");
 		const env = await getToolEnvironment();
-		const githubBin = path.join(os.homedir(), ".pi-lens", "bin");
+		// Asserts against the actual machine-global root (respects #525's
+		// PI_LENS_HOME test override) rather than hardcoding os.homedir().
+		const githubBin = path.join(getGlobalPiLensDir(), "bin");
 		const separator = process.platform === "win32" ? ";" : ":";
 		expect(env.PATH?.startsWith(githubBin + separator)).toBe(true);
 	});
 
 	it("also includes local npm tools dir in PATH", async () => {
 		const { getToolEnvironment } = await import("../../../clients/installer/index.ts");
+		const { getGlobalPiLensDir } = await import("../../../clients/file-utils.js");
 		const env = await getToolEnvironment();
-		const localBin = path.join(os.homedir(), ".pi-lens", "tools", "node_modules", ".bin");
+		const localBin = path.join(getGlobalPiLensDir(), "tools", "node_modules", ".bin");
 		expect(env.PATH).toContain(localBin);
 	});
 

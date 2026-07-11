@@ -4,9 +4,9 @@
  * Log file: ~/.pi-lens/logs/{date}.jsonl
  */
 
-import * as os from "node:os";
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
+import { getGlobalPiLensDir } from "./file-utils.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
 
 export interface DiagnosticEntry {
@@ -66,7 +66,7 @@ export interface LogContext {
 }
 
 function getLogDir(): string {
-	return path.join(os.homedir(), ".pi-lens", "logs");
+	return path.join(getGlobalPiLensDir(), "logs");
 }
 
 function getLogFile(): string {

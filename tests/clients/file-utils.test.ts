@@ -3,10 +3,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { RuleCache } from "../../clients/cache/rule-cache.js";
-import { getProjectDataDir } from "../../clients/file-utils.js";
+import { getGlobalPiLensDir, getProjectDataDir } from "../../clients/file-utils.js";
 import { appendToWorklog } from "../../clients/fix-worklog.js";
 
 const originalDataDir = process.env.PILENS_DATA_DIR;
+const originalHome = process.env.PI_LENS_HOME;
 
 afterEach(() => {
 	if (originalDataDir === undefined) {
@@ -14,11 +15,21 @@ afterEach(() => {
 	} else {
 		process.env.PILENS_DATA_DIR = originalDataDir;
 	}
+	if (originalHome === undefined) {
+		delete process.env.PI_LENS_HOME;
+	} else {
+		process.env.PI_LENS_HOME = originalHome;
+	}
 });
 
 describe("getProjectDataDir", () => {
 	it("defaults to a global pi-lens projects directory instead of the project folder", () => {
 		delete process.env.PILENS_DATA_DIR;
+		// This test deliberately exercises the real (non-PI_LENS_HOME-overridden)
+		// resolver, so it constructs its own explicit override back to the real
+		// homedir rather than relying on vitest-setup's PI_LENS_HOME (#525) — see
+		// tests/support/vitest-setup.ts.
+		delete process.env.PI_LENS_HOME;
 		const cwd = path.resolve("/tmp/demo-project");
 
 		const result = getProjectDataDir(cwd);
@@ -109,5 +120,31 @@ describe("getProjectDataDir", () => {
 			if (prev === undefined) delete process.env.PILENS_DATA_DIR;
 			else process.env.PILENS_DATA_DIR = prev;
 		}
+	});
+});
+
+describe("getGlobalPiLensDir (#525 hermeticity)", () => {
+	it("defaults to ~/.pi-lens when PI_LENS_HOME is unset", () => {
+		delete process.env.PI_LENS_HOME;
+
+		expect(getGlobalPiLensDir()).toBe(path.join(os.homedir(), ".pi-lens"));
+	});
+
+	it("respects PI_LENS_HOME as a full override of the machine-global root", () => {
+		const override = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-global-home-"),
+		);
+		process.env.PI_LENS_HOME = override;
+
+		expect(getGlobalPiLensDir()).toBe(path.resolve(override));
+	});
+
+	it("PI_LENS_HOME is trimmed of surrounding whitespace", () => {
+		const override = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-global-home-ws-"),
+		);
+		process.env.PI_LENS_HOME = `  ${override}  `;
+
+		expect(getGlobalPiLensDir()).toBe(path.resolve(override));
 	});
 });

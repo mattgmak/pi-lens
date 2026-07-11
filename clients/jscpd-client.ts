@@ -14,6 +14,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	getExcludedDirGlobs,
+	getGlobalPiLensDir,
 	getProjectIgnoreGlobs,
 	getProjectIgnoreMatcher,
 	isExcludedDirName,
@@ -141,8 +142,7 @@ export class JscpdClient {
 		// Fast path: check local install before any spawn
 		const isWin = process.platform === "win32";
 		const localBase = path.join(
-			os.homedir(),
-			".pi-lens",
+			getGlobalPiLensDir(),
 			"tools",
 			"node_modules",
 			".bin",

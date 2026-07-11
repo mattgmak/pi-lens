@@ -100,13 +100,20 @@ describe("LSP server install actions (#197)", () => {
 		const originalPath = process.env.PATH;
 		try {
 			const { tryGemInstall } = await import("../../clients/lsp/server.js");
+			const { getGlobalPiLensDir } = await import(
+				"../../clients/file-utils.js"
+			);
 
 			expect(await tryGemInstall("ruby-lsp")).toBe(true);
 			const [cmd, args, opts] = mockSafeSpawnAsync.mock.calls[0];
 			expect(cmd).toBe("gem");
 			expect(args.slice(0, 2)).toEqual(["install", "ruby-lsp"]);
 			expect(opts).toMatchObject({ ignoreAmbientSignal: true });
-			expect(process.env.PATH).toContain(".pi-lens");
+			// Asserts against the actual machine-global root (respects #525's
+			// PI_LENS_HOME override in tests) rather than hardcoding ".pi-lens" —
+			// vitest-setup points PI_LENS_HOME at a temp dir that doesn't contain
+			// that literal substring.
+			expect(process.env.PATH).toContain(getGlobalPiLensDir());
 
 			process.env.PATH = originalPath;
 			mockSafeSpawnAsync.mockResolvedValueOnce(ok({ status: 1 }));

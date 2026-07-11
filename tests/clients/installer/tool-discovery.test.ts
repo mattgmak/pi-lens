@@ -2,6 +2,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.unmock("../../../clients/installer/index.ts");
 
+// This file deliberately exercises the REAL getGlobalPiLensDir() resolver
+// (via the node:os mock below forcing TEST_HOME) rather than #525's
+// PI_LENS_HOME test override from vitest-setup.ts. clients/installer/index.ts
+// computes GITHUB_BIN_DIR as a module-level const at first import, so
+// PI_LENS_HOME must be cleared BEFORE that static import below runs — hence
+// vi.hoisted (runs before all imports, including the module under test).
+vi.hoisted(() => {
+	delete process.env.PI_LENS_HOME;
+});
+
 // ── os mock ────────────────────────────────────────────────────────────
 const TEST_HOME = vi.hoisted(() =>
 	process.platform === "win32" ? String.raw`C:\Users\test` : "/home/test",
@@ -188,7 +198,15 @@ async function withEmptyPath<T>(fn: () => Promise<T>): Promise<T> {
 	}
 }
 
+// This file deliberately exercises the REAL getGlobalPiLensDir() resolver
+// (via the node:os mock above forcing TEST_HOME) rather than #525's
+// PI_LENS_HOME test override from vitest-setup.ts — construct our own
+// explicit override (unset) for the duration of this file so paths resolve
+// against the mocked TEST_HOME as originally intended.
+const savedPiLensHome = process.env.PI_LENS_HOME;
+
 beforeEach(() => {
+	delete process.env.PI_LENS_HOME;
 	vi.clearAllMocks();
 	spawnCalls.length = 0;
 	httpsGetCalls.length = 0;
@@ -200,6 +218,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	if (savedPiLensHome === undefined) delete process.env.PI_LENS_HOME;
+	else process.env.PI_LENS_HOME = savedPiLensHome;
 	vi.useRealTimers();
 });
 
