@@ -11,8 +11,6 @@
  * Surfaces covered:
  *   - collectSourceFiles            (the canonical collector; no role filter)
  *   - TreeSitterClient.collectFiles (structural search walk; no role filter)
- *   - production-readiness source   (role-filtered: tests excluded)
- *   - production-readiness tests    (role-filtered: returns only tests)
  *
  * Global-ignore precedence is exercised indirectly (getProjectIgnoreMatcher
  * merges global + .gitignore + .pi-lens.json); we assert the project-config
@@ -23,7 +21,6 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { __readinessWalkersForTest } from "../../clients/production-readiness.js";
 import { resetProjectLensConfigCache } from "../../clients/project-lens-config.js";
 import { collectSourceFiles } from "../../clients/source-filter.js";
 import { TreeSitterClient } from "../../clients/tree-sitter-client.js";
@@ -110,12 +107,6 @@ function surfaces(): Surface[] {
 			mustInclude: ["src/real.ts"],
 			excludesTests: false,
 		},
-		{
-			name: "production-readiness findSourceFiles (role-filtered, all langs)",
-			collect: () => __readinessWalkersForTest.findSourceFiles(tmpDir),
-			mustInclude: ["src/real.ts", "src/real.go", "src/real.rs"],
-			excludesTests: true,
-		},
 	];
 }
 
@@ -155,26 +146,10 @@ describe("#262 — exclusion stack is respected by every scan surface", () => {
 		});
 	}
 
-	describe("production-readiness findTestFiles (role-filtered, tests-only)", () => {
-		it("returns the test file and still honors all exclusions", () => {
-			const rel = relUnix(__readinessWalkersForTest.findTestFiles(tmpDir));
-			expect(rel).toContain("src/real.test.ts");
-			expect(rel).not.toContain("src/real.ts");
-			for (const excluded of ALWAYS_EXCLUDED) {
-				expect(rel.some((f) => f === excluded || f.startsWith(excluded))).toBe(
-					false,
-				);
-			}
-		});
-	});
-
 	it("excludes ignored files regardless of language (.go/.rs under ignored dirs)", () => {
 		// The exclusion stack keys on path/dir, not extension — a non-TS file
 		// under an ignored dir must be dropped just like a TS one.
-		for (const collect of [
-			() => collectSourceFiles(tmpDir),
-			() => __readinessWalkersForTest.findSourceFiles(tmpDir),
-		]) {
+		for (const collect of [() => collectSourceFiles(tmpDir)]) {
 			const rel = relUnix(collect());
 			expect(rel).not.toContain("gitignored/x.go");
 			expect(rel).not.toContain("lensignored/y.rs");
@@ -182,13 +157,5 @@ describe("#262 — exclusion stack is respected by every scan surface", () => {
 			expect(rel).toContain("src/real.go");
 			expect(rel).toContain("src/real.rs");
 		}
-	});
-
-	it("isTestFile catches Go/Java/Python test-naming styles the role classifier alone misses", () => {
-		const { isTestFile } = __readinessWalkersForTest;
-		expect(isTestFile("/p/foo_test.go")).toBe(true);
-		expect(isTestFile("/p/FooTest.java")).toBe(true);
-		expect(isTestFile("/p/foo.test.ts")).toBe(true);
-		expect(isTestFile("/p/src/real.ts")).toBe(false);
 	});
 });
