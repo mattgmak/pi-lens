@@ -271,7 +271,7 @@ function getPatternHint(
 		}
 	}
 
-	return "Hint: No matches. Retry once with a smaller valid AST pattern scoped to the same paths (for example a call like `foo($$$ARGS)`, an import statement, or `function $NAME($$$ARGS) { $$$BODY }`). If that also fails, use grep for text search, lsp_navigation for symbol lookup, or ast_grep_dump on a small representative snippet to inspect node kinds.";
+	return "Hint: No matches. Retry once with a smaller valid AST pattern scoped to the same paths (for example a call like `foo($$$ARGS)`, an import statement, or `function $NAME($$$ARGS) { $$$BODY }`). If you're actually looking for a name/usage rather than a structural pattern, prefer symbol_search (ranked identifier search) or module_report (file outline) over another AST retry; lsp_navigation findReferences finds exact call sites once you have a definition. If that also fails, use grep for text search, or ast_grep_dump on a small representative snippet to inspect node kinds.";
 }
 
 export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {

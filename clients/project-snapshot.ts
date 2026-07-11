@@ -213,8 +213,13 @@ export function saveRuntimeProjectSnapshot(args: {
 			snapshot.reverseDeps = existing.reverseDeps ?? {};
 			// The word index is built by its own session task, which may not have
 			// finished when another task triggers a save — keep the prior index
-			// rather than clobbering it with undefined.
-			if (!snapshot.wordIndex && existing.wordIndex) {
+			// rather than clobbering it with undefined. #348: only carry it forward
+			// when `existing` was built AT THIS SAME seq — otherwise a stale
+			// snapshot's leftover index (already correctly rejected as stale by
+			// isProjectSnapshotFresh on load, seq mismatch) would get silently
+			// re-stamped with the CURRENT seq by this save, "laundering" a stale
+			// index into looking fresh before the word-index task even runs.
+			if (!snapshot.wordIndex && existing.wordIndex && existing.seq === snapshot.seq) {
 				snapshot.wordIndex = existing.wordIndex;
 			}
 		}

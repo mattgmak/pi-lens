@@ -395,6 +395,58 @@ async function collectTodoBaselineItems(
 	return items;
 }
 
+// word-index — identifier inverted index + BM25 for ranked symbol search
+// (#162). Shared load -> rebuild-if-stale -> persist lifecycle (#348), the same
+// shape the call-graph task uses: reuse a fresh persisted index when the
+// project `seq` hasn't moved since it was built, otherwise do a bounded
+// rebuild and persist. Called from the full-mode background task AND the
+// quick-mode cold-start warmup pass (below) so every startup mode ends up
+// with a queryable index once per session, off the hot path.
+async function buildOrRefreshWordIndex(args: {
+	runtime: RuntimeCoordinator;
+	sessionGeneration: number;
+	analysisRoot: string;
+	snapshotRoot: string;
+	dbg: (msg: string) => void;
+}): Promise<void> {
+	const { runtime, sessionGeneration, analysisRoot, snapshotRoot, dbg } = args;
+	if (!runtime.isCurrentSession(sessionGeneration)) return;
+	const startMs = Date.now();
+
+	const latestSeq = readLatestProjectSequence(snapshotRoot);
+	const effectiveSeq = runtime.projectSeq ?? latestSeq.projectSeq;
+	const snapshot = loadProjectSnapshot(snapshotRoot);
+	if (isProjectSnapshotFresh(snapshot, effectiveSeq) && snapshot.wordIndex) {
+		const { deserializeWordIndex } = await import("./word-index.js");
+		const index = deserializeWordIndex(snapshot.wordIndex);
+		if (index) {
+			runtime.wordIndex = index;
+			dbg(
+				`session_start word-index: reused fresh snapshot (seq=${effectiveSeq}, ${index.docCount} files, ${Date.now() - startMs}ms)`,
+			);
+			return;
+		}
+	}
+
+	// Shared file-walk-and-read helper (#348): the ONE collectWordIndexDocs
+	// implementation backs this task, the quick-mode warmup call below, AND the
+	// stateless cold-query background trigger in word-index.ts — a bound/skip
+	// -rule change lands once, not in three copies.
+	const { buildWordIndex, collectWordIndexDocs } = await import(
+		"./word-index.js"
+	);
+	const docs = await collectWordIndexDocs(analysisRoot, () =>
+		runtime.isCurrentSession(sessionGeneration),
+	);
+	if (!runtime.isCurrentSession(sessionGeneration)) return;
+	runtime.wordIndex = buildWordIndex(docs);
+	saveRuntimeProjectSnapshot({ cwd: snapshotRoot, runtime, dbg });
+	dbg(
+		`session_start word-index: rebuilt (absent/stale, seq=${effectiveSeq}) ` +
+			`${runtime.wordIndex.docCount} files, ${runtime.wordIndex.postings.size} tokens (${Date.now() - startMs}ms)`,
+	);
+}
+
 // Fire off heavy scans as background tasks — don't block session start.
 // Each consumer already handles the "not ready yet" case gracefully
 // (cachedExports.size > 0, cache miss paths).
@@ -876,44 +928,17 @@ function scheduleStartupScans(
 		}
 	});
 
-	// word-index — identifier inverted index + BM25 for ranked symbol search (#162)
+	// word-index — identifier inverted index + BM25 for ranked symbol search
+	// (#162). Load -> rebuild-if-stale -> persist lifecycle (#348), shared with
+	// the quick-mode cold-start warmup pass below.
 	runTask("word-index", async () => {
-		if (!runtime.isCurrentSession(sessionGeneration)) return;
-		const { collectSourceFilesAsync } = await import("./source-filter.js");
-		const { buildWordIndex } = await import("./word-index.js");
-		const startMs = Date.now();
-		// Bounds keep the build off the critical path on large repos: cap the file
-		// count and skip files too large to be hand-written source (generated /
-		// bundled output the source filter didn't already exclude).
-		const MAX_FILES = 6000;
-		const MAX_BYTES = 512 * 1024;
-		const files = await collectSourceFilesAsync(analysisRoot);
-		if (!runtime.isCurrentSession(sessionGeneration)) return;
-		const docs: Array<{ path: string; content: string }> = [];
-		let processed = 0;
-		for (const file of files.slice(0, MAX_FILES)) {
-			try {
-				const stat = nodeFs.statSync(file);
-				if (stat.size <= MAX_BYTES) {
-					docs.push({
-						path: file,
-						content: nodeFs.readFileSync(file, "utf-8"),
-					});
-				}
-			} catch {
-				// unreadable / vanished file — skip
-			}
-			if (++processed % 100 === 0) {
-				await new Promise<void>((resolve) => setImmediate(resolve));
-				if (!runtime.isCurrentSession(sessionGeneration)) return;
-			}
-		}
-		runtime.wordIndex = buildWordIndex(docs);
-		saveRuntimeProjectSnapshot({ cwd: snapshotRoot, runtime, dbg });
-		dbg(
-			`session_start word-index: ${runtime.wordIndex.docCount} files, ` +
-				`${runtime.wordIndex.postings.size} tokens (${Date.now() - startMs}ms)`,
-		);
+		await buildOrRefreshWordIndex({
+			runtime,
+			sessionGeneration,
+			analysisRoot,
+			snapshotRoot,
+			dbg,
+		});
 	});
 }
 
@@ -978,7 +1003,7 @@ export const SESSION_START_GUIDANCE: string[] = [
 	"📌 pi-lens active — automated checks run on every edit/write; blocking errors (including pre-existing) show inline and must be fixed.\n" +
 		"Key tools (see each tool's own description for args):\n" +
 		"• lens_diagnostics — session-wide diagnostic state; mode=all resurfaces stale blocking errors that dropped from turn context.\n" +
-		"• module_report + read_symbol/read_enclosing — navigable outline/callback handles + exact body reads; cheaper than reading a whole file before editing.\n" +
+		"• symbol_search → module_report → read_symbol/read_enclosing — ranked identifier search, then navigable outline/callback handles + exact body reads; cheaper than reading a whole file before editing.\n" +
 		"• lsp_navigation / lsp_diagnostics — definitions/references/rename; probe LSP for errors in a file/folder/workspace.\n" +
 		"• ast_grep_search / ast_grep_replace — structural code patterns (ast_grep_dump to discover node kinds).",
 ];
@@ -1067,6 +1092,24 @@ export async function handleSessionStart(
 					);
 					warmupDbg(
 						`warmup: language-profile done in ${Date.now() - languageProfileStartedAt}ms`,
+					);
+					// #348: fold the word-index build/refresh into this existing
+					// cold-start warmup pass so quick-mode (and any session whose very
+					// first session_start is forced quick) still ends up with a
+					// queryable index — full-mode sessions get it via the "word-index"
+					// runTask above; this is the quick-mode equivalent, once per
+					// process, off the hot path.
+					const wordIndexStartedAt = Date.now();
+					const warmupSnapshotRoot = resolveSnapshotRoot(warmupCwd);
+					await buildOrRefreshWordIndex({
+						runtime: deps.runtime,
+						sessionGeneration: deps.runtime.sessionGeneration,
+						analysisRoot: languageRoot,
+						snapshotRoot: warmupSnapshotRoot,
+						dbg: warmupDbg,
+					});
+					warmupDbg(
+						`warmup: word-index done in ${Date.now() - wordIndexStartedAt}ms`,
 					);
 					warmupDbg(`warmup: total ${Date.now() - warmupStartedAt}ms`);
 				} catch (err) {

@@ -31,6 +31,7 @@ import {
 	deserializeWordIndex,
 	type RankedFile,
 	searchWordIndex,
+	triggerBackgroundWordIndexBuild,
 } from "./word-index.js";
 
 // --- Facades (re-exported so adapters import only this module) ---------------
@@ -118,18 +119,50 @@ export function ensureLspConfig(cwd: string): Promise<void> {
 	return initLSPConfig(cwd);
 }
 
+/** Slimmed wire shape (#517 conformity): `startLine`/`endLine` mark the hit's
+ * best-matching line (`lines[0]`, the file's own best-scoring identifier hit);
+ * a single-line span rather than a fabricated whole-file range, since the word
+ * index tracks scattered per-line matches, not a symbol span. Read derivation:
+ * offset=startLine, limit=endLine-startLine+1 for a one-line peek — prefer
+ * module_report on `file` for the real outline. No per-hit `read` block, no
+ * repeated raw `lines[]` array on the wire. */
+export interface SymbolSearchHit {
+	file: string;
+	score: number;
+	hits: number;
+	startLine: number;
+	endLine: number;
+}
+
 export interface SymbolSearchResult {
 	/** False when no word index has been built/persisted for this workspace yet. */
 	available: boolean;
 	query: string;
-	results: RankedFile[];
+	results: SymbolSearchHit[];
+	/** Actionable guidance when `available` is false (#348 decision 3): the
+	 * index build was kicked off in the background (deduped per cwd), never
+	 * blocking this call — retry shortly. */
+	hint?: string;
+}
+
+function toSymbolSearchHit(result: RankedFile): SymbolSearchHit {
+	const line = result.lines[0] ?? 1;
+	return {
+		file: result.file,
+		score: result.score,
+		hits: result.hits,
+		startLine: line,
+		endLine: line,
+	};
 }
 
 /**
  * Ranked identifier search over the persisted word index (#162). Stateless:
  * loads the index from the project snapshot (built by the session scan, in
  * either the pi extension or the MCP session), so it works without a warm
- * runtime. Returns `available: false` when no index exists yet.
+ * runtime. Returns `available: false` when no index exists yet — and kicks off
+ * a single bounded background build for this workspace (deduped per cwd, never
+ * blocking this call) so a retry shortly after succeeds (#348 decision 3).
  */
 export function symbolSearch(
 	query: string,
@@ -138,7 +171,15 @@ export function symbolSearch(
 ): SymbolSearchResult {
 	const snapshot = loadProjectSnapshot(cwd);
 	const index = deserializeWordIndex(snapshot?.wordIndex);
-	if (!index) return { available: false, query, results: [] };
+	if (!index) {
+		triggerBackgroundWordIndexBuild(cwd);
+		return {
+			available: false,
+			query,
+			results: [],
+			hint: "Word index is building in the background for this workspace — retry this query shortly.",
+		};
+	}
 	// Boost well-connected files using the snapshot's reverse-dependency
 	// (importedBy) counts; snapshot keys are normalized, index keys are raw.
 	const centrality = centralityFromReverseDeps(
@@ -146,10 +187,11 @@ export function symbolSearch(
 		snapshot?.reverseDeps,
 		(file) => normalizeMapKey(path.resolve(file)),
 	);
+	const results = searchWordIndex(index, query, { limit, centrality });
 	return {
 		available: true,
 		query,
-		results: searchWordIndex(index, query, { limit, centrality }),
+		results: results.map(toSymbolSearchHit),
 	};
 }
 

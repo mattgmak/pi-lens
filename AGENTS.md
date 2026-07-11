@@ -64,7 +64,15 @@ a *second host adapter* alongside `index.ts`. Design rationale + progress: `mcp.
   not re-implementations — via `clients/mcp/session.ts`), `pilens_ast_grep_search`
   / `pilens_ast_grep_replace`, `pilens_lsp_navigation` / `pilens_lsp_diagnostics`,
   `pilens_symbol_search` (ranked identifier search over the persisted word index —
-  BM25 + priors + reverse-dep centrality), `pilens_module_report` (navigable outline + signatures
+  BM25 + priors + reverse-dep centrality; the funnel's entry point: symbol_search
+  finds candidates, module_report explains one, read_symbol reads the body. #348
+  phase 1 gave the word index a load→rebuild-if-stale→persist lifecycle in ALL
+  startup modes — quick-mode's cold-start warmup pass now also refreshes it, not
+  just the full-mode session task — and a cold query (no index yet) triggers one
+  bounded background build per cwd instead of blocking, returning `available: false`
+  + an actionable retry hint. Hits carry `startLine`/`endLine` (best-matching line;
+  `offset=startLine, limit=endLine-startLine+1`) instead of a raw `lines[]` array or
+  a per-hit `read` block — #517 conformity, same as module_report below), `pilens_module_report` (navigable outline + signatures
   the outline is module-level declarations + class members only — function-locals
   are dropped (#259). Class/interface members nest under their container by
   line-range containment (`members[]`, #301); the `api`/`internal` split is over
@@ -142,10 +150,13 @@ a *second host adapter* alongside `index.ts`. Design rationale + progress: `mcp.
   pi-lens-internal consumer: in pi their returned bodies are recorded into the
   read-guard (`recordSymbolRead`) as genuine edit-coverage for that
   symbol/callback range (a `module_report` outline is NOT — shape, not body).
+  `pilens_symbol_search` is ALSO dual-surface as of #348 phase 1 — `symbol_search`
+  (`tools/symbol-search.ts`, wired in `index.ts`) wraps the same `symbolSearch()`
+  engine seam and returns the identical #517-slimmed payload; unlike read_symbol/
+  read_enclosing it does not feed the read-guard (a ranked file list is discovery,
+  not a body read).
 - **MCP-only vs pi-lens-internal (a real gap to close, not a finished story).**
-  `pilens_symbol_search` is currently an **agent-facing query only**: the word index
-  is built during pi-lens's own session scan (pi pays the cost) but nothing in
-  pi-lens consumes it. Likewise `module_report`'s blast-radius (#304) uses
+  Likewise `module_report`'s blast-radius (#304) uses
   *transitive* BFS (`computeTransitiveImpact`) while
   the in-pi **cascade still derives neighbors one-hop** (`computeImpactCascade` in
   `dispatch/integration.ts`). The higher-value move is to feed the transitive impact
