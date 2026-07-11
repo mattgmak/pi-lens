@@ -24,6 +24,16 @@ export interface LspFixture {
 	disableServers?: string[];
 	expectServerId?: string;
 	expectSourceMatch?: string;
+	/** Optional pre-touch setup step, run in the COPIED temp workspace (#530) — a
+	 * string command (split on whitespace) or an argv array. Bounded by
+	 * FIXTURE_SETUP_TIMEOUT_MS; failure reports a distinct `setup-failed`
+	 * status, never a false pass. */
+	setup?: string | string[];
+	/** Optional expected `launchVariant` from the live capability snapshot
+	 * (`getCapabilitySnapshots`), e.g. "native-ts7" (#526/#530). A mismatch —
+	 * including a silent fallback to classic — is a FAILURE even when
+	 * diagnostics arrived. */
+	expectLaunchVariant?: string;
 }
 export interface FormatFixture {
 	lang: string;
