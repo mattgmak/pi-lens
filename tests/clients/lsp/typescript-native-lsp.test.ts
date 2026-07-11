@@ -234,4 +234,38 @@ describe("TypeScript native LSP selection", () => {
 			tsserver: { path: tsserverPath },
 		});
 	});
+
+	// Copilot review (PR #526): a nearer `node_modules/typescript/` directory
+	// that exists but has no `package.json` (a broken/partial install) must be
+	// treated as malformed AT THAT LEVEL and stop the walk — never silently
+	// skipped as "not installed here" in favor of an ancestor TS 7 hoist. That
+	// would violate "nearest package shadows ancestors" for exactly the
+	// malformed-install case the doc comment already calls out.
+	it("does not skip a nearer TypeScript install whose package.json is missing (directory exists) to select an ancestor TS 7 hoist", async () => {
+		const workspaceRoot = makeProject("7.0.2"); // ancestor: valid TS 7 install
+		addNativeTsc(workspaceRoot);
+		const { packageRoot } = addWorkspacePackage(workspaceRoot);
+
+		// Nearer install: the `typescript` directory exists (e.g. a partial /
+		// interrupted install) but package.json is missing entirely.
+		fs.mkdirSync(path.join(packageRoot, "node_modules", "typescript"), {
+			recursive: true,
+		});
+		const { lspPath, tsserverPath } = addClassicServer(packageRoot);
+
+		const result = await TypeScriptServer.spawn(packageRoot, {
+			allowInstall: false,
+		});
+
+		// Must fall back to the classic path AT packageRoot, not launch the
+		// ancestor's native tsc.
+		expect(launchLSP).toHaveBeenCalledWith(lspPath, ["--stdio"], {
+			cwd: packageRoot,
+			env: {
+				PI_LENS_TEST_TOOLCHAIN: "1",
+				TSSERVER_PATH: tsserverPath,
+			},
+		});
+		expect(result?.launchVariant).toBe("classic");
+	});
 });

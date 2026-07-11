@@ -1102,12 +1102,8 @@ async function findNativeTypeScriptLsp(
 	let currentDir = path.resolve(root);
 
 	while (!isAtOrAboveHomeDir(currentDir)) {
-		const packageJsonPath = path.join(
-			currentDir,
-			"node_modules",
-			"typescript",
-			"package.json",
-		);
+		const typescriptDir = path.join(currentDir, "node_modules", "typescript");
+		const packageJsonPath = path.join(typescriptDir, "package.json");
 
 		let packageJsonText: string;
 		try {
@@ -1115,6 +1111,17 @@ async function findNativeTypeScriptLsp(
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
 				return undefined;
+			}
+			// A `node_modules/typescript/` directory that exists but has no
+			// `package.json` is a malformed/partial install at THIS level, not an
+			// absent one — stop here (fall back to classic) rather than walking up
+			// to an ancestor, or a broken nearest install would let an unrelated
+			// ancestor TS 7 binary silently shadow it (Copilot review, PR #526).
+			try {
+				const dirStat = await stat(typescriptDir);
+				if (dirStat.isDirectory()) return undefined;
+			} catch {
+				/* typescript dir itself doesn't exist here — keep walking up */
 			}
 			const parent = path.dirname(currentDir);
 			if (parent === currentDir) return undefined;
