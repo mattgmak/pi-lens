@@ -40,6 +40,7 @@ const EXPECTED_TOOLS = [
 	"lens_diagnostics",
 	"lsp_diagnostics",
 	"lsp_navigation",
+	"symbol_search",
 	"module_report",
 	"read_symbol",
 	"read_enclosing",

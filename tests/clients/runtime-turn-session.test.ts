@@ -589,6 +589,10 @@ describe("context injection framing", () => {
 		// never reached for them. Keep them (and the other key tools) advertised.
 		for (const tool of [
 			"lens_diagnostics",
+			// #348: symbol_search is now a registered pi tool (the discovery
+			// funnel's entry point) — advertise it alongside module_report/
+			// read_symbol like the other read-substitute tools.
+			"symbol_search",
 			"module_report",
 			"read_symbol",
 			"lsp_navigation",
@@ -600,13 +604,8 @@ describe("context injection framing", () => {
 			expect(text).toContain(tool);
 		}
 
-		// Never advertise a tool that isn't a registered pi tool — symbol_search is
-		// MCP-only (no tools/ entry), so naming it here would point the agent at a
-		// phantom tool. This guards against re-introducing that mismatch.
-		expect(text).not.toContain("symbol_search");
-
 		// Stay lean: the orientation is a nudge, not re-documentation of every arg.
-		expect(text.length).toBeLessThan(700);
+		expect(text.length).toBeLessThan(750);
 	});
 });
 

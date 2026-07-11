@@ -363,9 +363,15 @@ const TOOLS = [
 		description:
 			"Ranked identifier search over the persisted word index (BM25 + priors " +
 			"that demote tests/vendor and doc files). Answers 'which files are most " +
-			"relevant to <query>' by identifier — complements grep (raw substrings) " +
-			"and LSP (exact symbols). Requires pilens_session_start to have built the " +
-			"index for this workspace.",
+			"relevant to <query>' by identifier — first step of the discovery funnel: " +
+			"symbol_search finds candidate files, pilens_module_report explains one, " +
+			"pilens_read_symbol reads a body. Complements grep (raw substrings) and " +
+			"LSP (exact symbols). Each hit's `startLine`/`endLine` mark its best-matching " +
+			"line (offset=startLine, limit=endLine-startLine+1 for a one-line peek) — " +
+			"use pilens_module_report on `file` for the real outline. Returns " +
+			"`available: false` with a retry hint if the index isn't built yet for this " +
+			"workspace (pilens_session_start builds it, or it self-builds in the background " +
+			"on first query).",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -654,38 +660,48 @@ async function callTool(
 			typeof args.limit === "number" && Number.isFinite(args.limit)
 				? Math.max(1, Math.floor(args.limit))
 				: 20;
-		const { available, results } = symbolSearch(query, cwd, limit);
+		const { available, results, hint } = symbolSearch(query, cwd, limit);
 		if (!available) {
 			return toolText(
-				"No word index for this workspace yet — run pilens_session_start first.",
-				{ available: false, query },
+				hint ?? "No word index for this workspace yet — run pilens_session_start first.",
+				{ available: false, query, hint },
+				true,
 			);
 		}
 		if (results.length === 0) {
-			return toolText(`No files matched "${query}".`, {
-				available: true,
-				query,
-				results: [],
-			});
+			return toolText(
+				`No files matched "${query}".`,
+				{ available: true, query, results: [] },
+				true,
+			);
 		}
 		const lines = [
 			`Top ${results.length} file(s) for "${query}":`,
 			...results.map(
 				(result, i) =>
 					`  ${i + 1}. ${path.relative(cwd, result.file)} ` +
-					`(score ${result.score.toFixed(2)}, ${result.hits} hit(s), lines ` +
-					`${result.lines.slice(0, 5).join(", ")}${result.lines.length > 5 ? "…" : ""})`,
+					`(score ${result.score.toFixed(2)}, ${result.hits} hit(s), ` +
+					`line ${result.startLine})`,
 			),
 		];
-		return toolText(lines.join("\n"), {
-			query,
-			results: results.map((result) => ({
-				file: path.relative(cwd, result.file),
-				score: result.score,
-				hits: result.hits,
-				lines: result.lines,
-			})),
-		});
+		// Compact (unindented) JSON — matches the module_report / read_symbol
+		// convention (#517): an agent parses this payload, it doesn't read it
+		// formatted. Path is relative-to-cwd once per hit, no repeated per-hit
+		// `read` block — startLine/endLine already derive offset/limit.
+		return toolText(
+			lines.join("\n"),
+			{
+				query,
+				results: results.map((result) => ({
+					file: path.relative(cwd, result.file),
+					score: result.score,
+					hits: result.hits,
+					startLine: result.startLine,
+					endLine: result.endLine,
+				})),
+			},
+			true,
+		);
 	}
 
 
