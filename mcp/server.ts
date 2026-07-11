@@ -36,6 +36,7 @@ import {
 	type McpAnalyzeResult,
 	moduleReport,
 	projectScan,
+	readEnclosing,
 	readSymbol,
 	recentLatency,
 	renderCompactModuleReport,
@@ -165,9 +166,12 @@ function startIpcServer(): void {
 				try {
 					const req = JSON.parse(line) as WarmAnalyzeRequest;
 					console.error(`[pi-lens-mcp] warm analyze: ${req.file}`);
-					// Warm = full LSP + an edit-detection path (register turn-state).
+					// Warm = full LSP + an edit-detection path (register turn-state) +
+					// review-graph maintenance (#536 — this is an in-process, long-lived
+					// path, unlike the ephemeral `fresh` worker).
 					const result = await analyzeFile(req.file, req.cwd, {
 						registerTurnState: true,
+						updateGraph: true,
 					});
 					socket.end(`${JSON.stringify({ result })}\n`);
 				} catch (err) {
@@ -245,9 +249,61 @@ function toolText(
 	return { content: [{ type: "text" as const, text }] };
 }
 
+// --- Graph-staleness signal (#536) -------------------------------------------
+//
+// Extends #514's honesty-warning shape from "missing node" (module_report's
+// existing `usedBy`-unavailable warning, #511) to "aging graph": when graph
+// data IS present, a caller still can't tell whether it's fresh or stale
+// without this. MCP-only per #536's decision — pi's graph is maintained
+// per-edit (warm), so the same line there would be pure noise.
+
+/** Below this age, no staleness note is added — a graph this fresh is never
+ * worth flagging even if the workspace has had zero pilens_analyze calls yet. */
+const GRAPH_STALENESS_THRESHOLD_MS = 10 * 60_000; // 10 minutes
+
+function formatRelativeAge(ms: number): string {
+	if (ms < 60_000) return `${Math.round(ms / 1000)}s ago`;
+	if (ms < 60 * 60_000) return `${Math.round(ms / 60_000)}m ago`;
+	if (ms < 24 * 60 * 60_000) return `${Math.round(ms / (60 * 60_000))}h ago`;
+	return `${Math.round(ms / (24 * 60 * 60_000))}d ago`;
+}
+
+/**
+ * Builds a staleness note for a graph-derived MCP result when its persisted
+ * timestamp is older than the threshold. Returns undefined when the timestamp
+ * is missing/unparseable (no graph consulted — the existing #511 "no node"
+ * warning already covers that case) or fresh enough not to flag.
+ */
+function graphStalenessNote(
+	builtAtIso: string | undefined,
+	label: string,
+): string | undefined {
+	if (!builtAtIso) return undefined;
+	const builtAtMs = Date.parse(builtAtIso);
+	if (!Number.isFinite(builtAtMs)) return undefined;
+	const ageMs = Date.now() - builtAtMs;
+	if (ageMs < GRAPH_STALENESS_THRESHOLD_MS) return undefined;
+	return (
+		`${label} last updated ${formatRelativeAge(ageMs)}; run pilens_analyze ` +
+		"on recently-changed files, pilens_session_start, or pilens_rebuild to refresh it."
+	);
+}
+
 // --- Tools -------------------------------------------------------------------
 
 const cacheManager = new CacheManager();
+// #536: investigated wiring the same `flushPending` 4th arg pi's index.ts passes
+// (() => flushDebouncedToolResults()) before reading pilens_diagnostics. Verdict:
+// genuinely not applicable here, not just unwired. `flushDebouncedToolResults`
+// (clients/runtime-tool-result.ts) drains a module-level `debouncedPipelines` map
+// that ONLY `handleToolResult` populates — pi's tool_result event handler, which
+// this MCP process never calls (pilens_analyze routes through the independent
+// clients/mcp/analyze.ts facade, calling dispatchLintWithResult directly, never
+// handleToolResult). So that map is provably always empty in this process; a call
+// to flushDebouncedToolResults() here would resolve immediately having flushed
+// nothing — a no-op dressed as a fix, not a real parity gap. The 4th arg is left
+// at its default (`async () => {}`, already a no-op) rather than importing and
+// wiring a flush with nothing to flush.
 const lensDiagnosticsTool = createLensDiagnosticsTool(
 	cacheManager,
 	() => DEFAULT_CWD,
@@ -461,6 +517,53 @@ const TOOLS = [
 		},
 	},
 	{
+		name: "pilens_read_enclosing",
+		description:
+			"Return the verbatim source for the smallest useful symbol/callback " +
+			"enclosing a line in a file. Use after pilens_ast_grep_search, " +
+			"pilens_diagnostics, or pilens_lsp_navigation locations when you need " +
+			"exact body text without reading the whole file. Uses tree-sitter only — " +
+			"no LSP or graph build. MCP has no read-guard, so unlike the pi tool this " +
+			"does not record edit-coverage.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				file: {
+					type: "string",
+					description: "Absolute or workspace-relative path to the source file.",
+				},
+				line: {
+					type: "number",
+					description: "1-based line number inside the desired symbol/callback.",
+				},
+				cwd: { type: "string" },
+				kinds: {
+					type: "array",
+					items: { type: "string" },
+					description:
+						"Optional kind filter, e.g. function, method, callback, class.",
+				},
+				maxLines: {
+					type: "number",
+					description:
+						"Optional maximum body size to return. Oversized matches obey onOversize.",
+				},
+				onOversize: {
+					type: "string",
+					enum: ["error", "slice", "outline"],
+					description:
+						"Behavior when the enclosing body exceeds maxLines. error (default) returns metadata only; slice returns a bounded partial read around line; outline returns nested symbols/callbacks with read handles.",
+				},
+				aroundLine: {
+					type: "number",
+					description:
+						"Maximum lines for onOversize=slice; defaults to maxLines, then 80.",
+				},
+			},
+			required: ["file", "line"],
+		},
+	},
+	{
 		name: "pilens_health",
 		description:
 			"pi-lens runtime health for THIS server: alive LSP servers, last dispatch " +
@@ -593,10 +696,14 @@ async function callTool(
 
 		await ensureReady(cwd);
 		// Warm = an edit-detection path: register the file so pilens_turn_end picks
-		// it up without an explicit file list.
+		// it up without an explicit file list, and maintain the review graph
+		// (#536) so pilens_module_report/pilens_symbol_search reflect files
+		// analyzed via MCP, not just session-start state. `fresh` (above) stays
+		// read-only — it's an ephemeral forked worker.
 		const result = await analyzeFile(file, cwd, {
 			flags,
 			registerTurnState: true,
+			updateGraph: true,
 		});
 		return formatAnalyze(result, cwd, "warm");
 	}
@@ -660,7 +767,11 @@ async function callTool(
 			typeof args.limit === "number" && Number.isFinite(args.limit)
 				? Math.max(1, Math.floor(args.limit))
 				: 20;
-		const { available, results, hint } = symbolSearch(query, cwd, limit);
+		const { available, results, hint, snapshotGeneratedAt } = symbolSearch(
+			query,
+			cwd,
+			limit,
+		);
 		if (!available) {
 			return toolText(
 				hint ?? "No word index for this workspace yet — run pilens_session_start first.",
@@ -668,10 +779,16 @@ async function callTool(
 				true,
 			);
 		}
+		const stalenessNote = graphStalenessNote(snapshotGeneratedAt, "Project snapshot");
 		if (results.length === 0) {
 			return toolText(
-				`No files matched "${query}".`,
-				{ available: true, query, results: [] },
+				`No files matched "${query}".` + (stalenessNote ? `\n\n${stalenessNote}` : ""),
+				{
+					available: true,
+					query,
+					results: [],
+					...(stalenessNote ? { staleness: stalenessNote } : {}),
+				},
 				true,
 			);
 		}
@@ -683,6 +800,7 @@ async function callTool(
 					`(score ${result.score.toFixed(2)}, ${result.hits} hit(s), ` +
 					`line ${result.startLine})`,
 			),
+			...(stalenessNote ? ["", stalenessNote] : []),
 		];
 		// Compact (unindented) JSON — matches the module_report / read_symbol
 		// convention (#517): an agent parses this payload, it doesn't read it
@@ -699,6 +817,7 @@ async function callTool(
 					startLine: result.startLine,
 					endLine: result.endLine,
 				})),
+				...(stalenessNote ? { staleness: stalenessNote } : {}),
 			},
 			true,
 		);
@@ -740,16 +859,30 @@ async function callTool(
 				isError: true,
 			};
 		}
+		const graphStaleness = graphStalenessNote(report.graphBuiltAt, "Review graph");
 		const summary =
 			`${path.relative(cwd, report.path) || report.path} [${report.staleness}] — ` +
 			`${report.summary.symbols} symbol(s), ${report.summary.exports} exported, ` +
-			`${report.api.length} in public API`;
+			`${report.api.length} in public API` +
+			(graphStaleness ? `\n\n${graphStaleness}` : "");
 		if (view === "compact") {
-			return { content: [{ type: "text" as const, text: renderCompactModuleReport(report) }] };
+			const compactText = renderCompactModuleReport(report);
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: graphStaleness ? `${compactText}\n\n${graphStaleness}` : compactText,
+					},
+				],
+			};
 		}
 		// Compact (unindented) JSON — matches the pi tool's mirror (#512); an
 		// agent parses this payload, it doesn't read it formatted.
-		return toolText(summary, report, true);
+		return toolText(
+			summary,
+			graphStaleness ? { ...report, graphStalenessNote: graphStaleness } : report,
+			true,
+		);
 	}
 
 	if (name === "pilens_read_symbol") {
@@ -774,6 +907,60 @@ async function callTool(
 		// `signature` was ever new, so fold it into the header text instead.
 		const sigSuffix = result.signature ? `  ${result.signature}` : "";
 		const header = `${result.kind} ${result.name}${sigSuffix}  ${path.relative(cwd, result.path)}:${result.startLine}-${result.endLine}`;
+		return { content: [{ type: "text" as const, text: `${header}\n\n${result.source ?? ""}` }] };
+	}
+
+	if (name === "pilens_read_enclosing") {
+		const file = typeof args.file === "string" ? args.file : "";
+		const line = typeof args.line === "number" ? args.line : Number.NaN;
+		if (!file.trim() || !Number.isFinite(line)) {
+			return { ...toolText("Provide `file` and a numeric `line`."), isError: true };
+		}
+		const cwd = typeof args.cwd === "string" ? args.cwd : DEFAULT_CWD;
+		const kinds = Array.isArray(args.kinds)
+			? args.kinds.filter((k): k is string => typeof k === "string")
+			: undefined;
+		const maxLines =
+			typeof args.maxLines === "number" && Number.isFinite(args.maxLines)
+				? Math.max(1, Math.floor(args.maxLines))
+				: undefined;
+		const onOversize =
+			args.onOversize === "error" ||
+			args.onOversize === "slice" ||
+			args.onOversize === "outline"
+				? args.onOversize
+				: undefined;
+		const aroundLine =
+			typeof args.aroundLine === "number" && Number.isFinite(args.aroundLine)
+				? Math.max(1, Math.floor(args.aroundLine))
+				: undefined;
+		const result = await readEnclosing(file, line, cwd, {
+			kinds,
+			maxLines,
+			onOversize,
+			aroundLine,
+		});
+		if (!result.found) {
+			const warningSuffix = result.warnings?.length
+				? ` Warnings: ${result.warnings.join("; ")}`
+				: "";
+			const outlineSuffix = result.outline?.length
+				? `\n\nNested outline:\n${JSON.stringify(result.outline)}`
+				: "";
+			const text = result.error
+				? `Could not read enclosing range in ${path.basename(file)}:${result.line}: ${result.error}${warningSuffix}${outlineSuffix}`
+				: `No enclosing symbol/callback found in ${path.basename(file)}:${result.line}.${warningSuffix}`;
+			return {
+				...toolText(text, { found: false, line: result.line }),
+				isError: true,
+			};
+		}
+		// Same #512 convention as pilens_read_symbol: the header line already
+		// states kind/name/path/range, so no trailing JSON restates them.
+		const range = result.partial
+			? `${result.startLine}-${result.endLine} (partial of ${result.enclosingStartLine}-${result.enclosingEndLine})`
+			: `${result.startLine}-${result.endLine}`;
+		const header = `${result.kind} ${result.name}  ${path.relative(cwd, result.path)}:${range}`;
 		return { content: [{ type: "text" as const, text: `${header}\n\n${result.source ?? ""}` }] };
 	}
 

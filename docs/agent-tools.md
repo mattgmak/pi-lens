@@ -2,8 +2,9 @@
 
 pi-lens registers the following tools with the pi agent. Most are also exposed
 through the MCP mirror (`clients/lens-engine.ts` is the seam both adapters
-share) — current exceptions: `ast_grep_outline`, `ast_grep_dump`/`ast_dump`, and
-`read_enclosing` (MCP parity for the latter is tracked in #522).
+share) — current exceptions: `ast_grep_outline` and `ast_grep_dump`/`ast_dump`
+(module_report supersedes them for discovery). `read_enclosing` gained MCP
+parity (`pilens_read_enclosing`) as of #536, closing #522 item 1.
 
 ## Per-edit
 

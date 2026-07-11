@@ -520,7 +520,11 @@ const CASCADE_NEIGHBOUR_BUDGET = Math.max(
 	Number.parseInt(process.env.PI_LENS_CASCADE_NEIGHBOUR_BUDGET ?? "40", 10) ||
 		40,
 );
-const CASCADE_GRAPH_KINDS = new Set([
+// Exported (not just module-local) so the MCP warm-analyze seam
+// (clients/mcp/analyze.ts, #536) can gate its own buildOrUpdateGraph call on
+// the SAME file-kind eligibility this cascade path uses — one source of truth
+// for "does this language get graph nodes at all", never a second hardcoded copy.
+export const CASCADE_GRAPH_KINDS = new Set([
 	"jsts",
 	"python",
 	"go",
