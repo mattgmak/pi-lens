@@ -64,7 +64,15 @@ a *second host adapter* alongside `index.ts`. Design rationale + progress: `mcp.
   not re-implementations — via `clients/mcp/session.ts`), `pilens_ast_grep_search`
   / `pilens_ast_grep_replace`, `pilens_lsp_navigation` / `pilens_lsp_diagnostics`,
   `pilens_symbol_search` (ranked identifier search over the persisted word index —
-  BM25 + priors + reverse-dep centrality), `pilens_module_report` (navigable outline + signatures
+  BM25 + priors + reverse-dep centrality; the funnel's entry point: symbol_search
+  finds candidates, module_report explains one, read_symbol reads the body. #348
+  phase 1 gave the word index a load→rebuild-if-stale→persist lifecycle in ALL
+  startup modes — quick-mode's cold-start warmup pass now also refreshes it, not
+  just the full-mode session task — and a cold query (no index yet) triggers one
+  bounded background build per cwd instead of blocking, returning `available: false`
+  + an actionable retry hint. Hits carry `startLine`/`endLine` (best-matching line;
+  `offset=startLine, limit=endLine-startLine+1`) instead of a raw `lines[]` array or
+  a per-hit `read` block — #517 conformity, same as module_report below), `pilens_module_report` (navigable outline + signatures
   the outline is module-level declarations + class members only — function-locals
   are dropped (#259). Class/interface members nest under their container by
   line-range containment (`members[]`, #301); the `api`/`internal` split is over
@@ -142,10 +150,13 @@ a *second host adapter* alongside `index.ts`. Design rationale + progress: `mcp.
   pi-lens-internal consumer: in pi their returned bodies are recorded into the
   read-guard (`recordSymbolRead`) as genuine edit-coverage for that
   symbol/callback range (a `module_report` outline is NOT — shape, not body).
+  `pilens_symbol_search` is ALSO dual-surface as of #348 phase 1 — `symbol_search`
+  (`tools/symbol-search.ts`, wired in `index.ts`) wraps the same `symbolSearch()`
+  engine seam and returns the identical #517-slimmed payload; unlike read_symbol/
+  read_enclosing it does not feed the read-guard (a ranked file list is discovery,
+  not a body read).
 - **MCP-only vs pi-lens-internal (a real gap to close, not a finished story).**
-  `pilens_symbol_search` is currently an **agent-facing query only**: the word index
-  is built during pi-lens's own session scan (pi pays the cost) but nothing in
-  pi-lens consumes it. Likewise `module_report`'s blast-radius (#304) uses
+  Likewise `module_report`'s blast-radius (#304) uses
   *transitive* BFS (`computeTransitiveImpact`) while
   the in-pi **cascade still derives neighbors one-hop** (`computeImpactCascade` in
   `dispatch/integration.ts`). The higher-value move is to feed the transitive impact
@@ -199,6 +210,7 @@ npx tsc --project tsconfig.json --noEmit   # type-check
 npm run lint          # same as type-check
 npm run build         # emit JS from TS; run before tests after source changes if stale JS may be present
 node scripts/smoke-tools.mjs [--install] [--step2] [--verbose] [lang ...]   # live tool-smoke (#209, opt-in/nightly): installs + runs each tool through the REAL dispatch path against tests/fixtures/tool-smoke/<lang>/; --step2 also asserts a parseable diagnostic. Add --lsp for the LSP-handshake layer, --format for the formatter pipeline, or --autofix for the pipeline safe-autofix phase. Not a per-PR gate, not shipped in the tarball.
+#   --lsp fixtures support two optional per-fixture fields (#530): `setup` (string/argv command run in the COPIED temp workspace before touchFile — e.g. `typescript7`/`typescript7-clean` run `npm install typescript@7 --no-save --no-audit --no-fund` there, since typescript-go's per-platform native binary can't be a committed static fixture; setup failure reports a distinct `setup-failed` status, never a false pass, bounded by a 120s timeout) and `expectLaunchVariant` (asserts the live `getCapabilitySnapshots(file)` `launchVariant` — e.g. `"native-ts7"` — so a silent fallback to the classic `typescript-language-server` FAILS even though a diagnostic arrived; the native and classic servers share the same `"typescript"` server id, so the diagnostic alone can't distinguish them). Both fixtures verified live 2026-07: typescript@7.0.2 installs from npm, its `tsc --lsp --stdio` genuinely speaks LSP framing (`\r\n\r\n` Content-Length headers over stdio, confirmed via a hand-rolled initialize), and PR #526's assumed invocation is correct.
 #   --format drives getFormattersForFile→formatFile via FormatService (what runFormatPhase uses; the lint path NEVER runs formatters): asserts the expected formatter is selected (config-gated ones ship the config their detect() needs — .prettierrc/gleam.toml/Gemfile/pyproject[tool.black]/stylua.toml/.cljfmt.edn/.php-cs-fixer.php/.editorconfig) and that it actually reformats a mis-formatted fixture (changed===true). Covers 28/31 formatters (tests/fixtures/format-smoke/<lang>/); only nixfmt/ocamlformat/swiftformat remain (no Windows toolchain). Plain-command formatters (stylua/cljfmt/php-cs-fixer/google-java-format/clang-format) need their binary ON PATH or formatFile reports changed=false; managed-dir ones (taplo/shfmt/ktlint) don't.
 #   --autofix drives runAutofix (the pipeline phase that applies fixable linters in --fix mode — distinct from lint-only dispatch AND from formatters; it MUTATES files): asserts the policy-selected tool applied a fix (fixedCount>0). Live-validates 11 (ruff/biome/rubocop/sqlfluff/rust-clippy/dart-analyze/stylelint/eslint/golangci-lint/markdownlint/oxlint in tests/fixtures/autofix-smoke/<lang>/); ktlint blocked by #218; detekt wired but CI-deferred (needs detekt CLI+formatting plugin). Workspaces are git-init'd so VCS-gated fixers (cargo fix) run. Autofix gating MIRRORS each tool's lint-policy strategy (config-first: eslint/oxlint/golangci-lint/detekt; smart-default: the rest) — guarded by tests/clients/autofix-policy-consistency.test.ts (autofix policy ↔ AUTOFIX_CAPABILITIES ↔ lint policy gates).
 #   Lint covers ts/py/yaml/js/markdown/shell/css/html/toml/sql/dockerfile/terraform + toolchain-gated go/rust/csharp/powershell/zig/java/dart/php/ruby/kotlin/gleam/elixir (toolchain must be installed locally; CI nightly sets them up).

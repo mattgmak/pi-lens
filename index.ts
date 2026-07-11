@@ -131,6 +131,7 @@ import {
 	createReadEnclosingTool,
 	createReadSymbolTool,
 } from "./tools/module-report.js";
+import { createSymbolSearchTool } from "./tools/symbol-search.js";
 import { logLatency } from "./clients/latency-logger.js";
 import {
 	markPiLensLoaded,
@@ -1099,6 +1100,7 @@ export default function (pi: ExtensionAPI) {
 		),
 		createLspDiagnosticsTool(),
 		createLspNavigationTool((name) => getLensFlag(name)),
+		createSymbolSearchTool(() => runtime.projectRoot),
 		createModuleReportTool(() => runtime.projectRoot),
 		createReadSymbolTool(
 			() => runtime.projectRoot,

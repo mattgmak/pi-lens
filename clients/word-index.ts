@@ -14,6 +14,9 @@
  * embeddings, no native deps, no daemon — pure in-process TypeScript.
  */
 
+import * as fs from "node:fs";
+import * as path from "node:path";
+
 export interface WordHit {
 	file: string;
 	line: number;
@@ -146,6 +149,47 @@ export function buildWordIndex(
 	}
 
 	return { postings, docLengths, totalTokens, docCount: files.length };
+}
+
+/** Bounds shared by every word-index build path — keep the walk off the
+ * critical path on large repos: cap the file count, and skip files too large
+ * to be hand-written source (generated/bundled output the source filter
+ * didn't already exclude). */
+export const WORD_INDEX_MAX_FILES = 6000;
+export const WORD_INDEX_MAX_BYTES = 512 * 1024;
+
+/**
+ * Collect the bounded `{path, content}` doc set `buildWordIndex` consumes —
+ * the ONE file-walk-and-read implementation shared by every build path
+ * (session-start task, quick-mode warmup, cold-query background trigger),
+ * so a bound/skip-rule change lands in one place instead of three copies.
+ * `shouldContinue` lets a session-scoped caller abort early (session
+ * superseded) without this module knowing about RuntimeCoordinator.
+ */
+export async function collectWordIndexDocs(
+	root: string,
+	shouldContinue: () => boolean = () => true,
+): Promise<Array<{ path: string; content: string }>> {
+	const { collectSourceFilesAsync } = await import("./source-filter.js");
+	const files = await collectSourceFilesAsync(root);
+	if (!shouldContinue()) return [];
+	const docs: Array<{ path: string; content: string }> = [];
+	let processed = 0;
+	for (const file of files.slice(0, WORD_INDEX_MAX_FILES)) {
+		try {
+			const stat = fs.statSync(file);
+			if (stat.size <= WORD_INDEX_MAX_BYTES) {
+				docs.push({ path: file, content: fs.readFileSync(file, "utf-8") });
+			}
+		} catch {
+			// unreadable / vanished file — skip
+		}
+		if (++processed % 100 === 0) {
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			if (!shouldContinue()) return docs;
+		}
+	}
+	return docs;
 }
 
 /**
@@ -330,4 +374,69 @@ export function deserializeWordIndex(
 			typeof data.totalTokens === "number" ? data.totalTokens : 0,
 		docCount: data.files.length,
 	};
+}
+
+// --- Cold-query background build trigger (#348) -------------------------------
+//
+// `symbol_search` (pi tool) / `pilens_symbol_search` (MCP) are stateless callers:
+// no RuntimeCoordinator, no session lifecycle — just a synchronous read of the
+// persisted snapshot via `symbolSearch()`. When the index is missing (e.g. the
+// session-start / warmup lifecycle in runtime-session.ts hasn't run yet, or this
+// is an MCP-only session that never ran pilens_session_start), the tool must
+// never block the query on a project walk (#348 decision 3): it triggers a
+// single background build, keyed by the resolved cwd so a burst of queries in
+// the same cold window only pays for one walk, and returns immediately.
+
+const inFlightBuilds = new Set<string>();
+
+/** Test-only: reset the in-flight-build guard between test files/cases. */
+export function _resetWordIndexBuildGuardForTests(): void {
+	inFlightBuilds.clear();
+}
+
+/**
+ * Fire a one-time bounded background build for `cwd` if one isn't already
+ * running. Persists into the existing project snapshot (preserving its other
+ * fields) so the next query — or the next real session — picks it up. Errors
+ * are swallowed (this is best-effort warmth, not a request the caller is
+ * waiting on); the guard always clears in a `finally` so a failed build can be
+ * retried by a later query.
+ */
+export function triggerBackgroundWordIndexBuild(
+	cwd: string,
+	dbg?: (msg: string) => void,
+): void {
+	const key = path.resolve(cwd);
+	if (inFlightBuilds.has(key)) return;
+	inFlightBuilds.add(key);
+	void (async () => {
+		const startMs = Date.now();
+		try {
+			const { loadProjectSnapshot, saveProjectSnapshot, PROJECT_SNAPSHOT_VERSION } =
+				await import("./project-snapshot.js");
+			const docs = await collectWordIndexDocs(key);
+			const index = buildWordIndex(docs);
+			const existing = loadProjectSnapshot(key);
+			const snapshot = existing ?? {
+				version: PROJECT_SNAPSHOT_VERSION,
+				projectRoot: key,
+				generatedAt: new Date().toISOString(),
+				seq: 0,
+				files: {},
+				symbols: {},
+				reverseDeps: {},
+				cachedExports: [],
+			};
+			snapshot.generatedAt = new Date().toISOString();
+			snapshot.wordIndex = serializeWordIndex(index);
+			saveProjectSnapshot(key, snapshot);
+			dbg?.(
+				`word-index cold-build: ${index.docCount} files, ${index.postings.size} tokens (${Date.now() - startMs}ms)`,
+			);
+		} catch (err) {
+			dbg?.(`word-index cold-build: failed: ${err}`);
+		} finally {
+			inFlightBuilds.delete(key);
+		}
+	})();
 }
