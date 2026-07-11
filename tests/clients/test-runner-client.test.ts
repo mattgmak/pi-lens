@@ -368,4 +368,183 @@ describe("test-runner-client", () => {
 			expect(found?.testFile).toBe(mirroredTest);
 		});
 	});
+
+	describe("getTestRunTarget — editing a test file directly (#547 follow-up)", () => {
+		it("returns a .test.ts file itself as the target, not a discovered nonsense file", () => {
+			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
+			cleanups.push(cleanup);
+
+			fs.writeFileSync(path.join(tmpDir, "vitest.config.ts"), "export default {}\n");
+			const src = path.join(tmpDir, "foo.test.ts");
+			fs.writeFileSync(src, "// test\n");
+
+			const client = new TestRunnerClient(false);
+			const target = client.getTestRunTarget(src, tmpDir);
+			expect(target?.testFile).toBe(path.resolve(src));
+			expect(target?.strategy).toBe("self");
+		});
+
+		it("returns a .spec.ts file itself as the target", () => {
+			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
+			cleanups.push(cleanup);
+
+			fs.writeFileSync(path.join(tmpDir, "vitest.config.ts"), "export default {}\n");
+			const src = path.join(tmpDir, "bar.spec.ts");
+			fs.writeFileSync(src, "// test\n");
+
+			const client = new TestRunnerClient(false);
+			const target = client.getTestRunTarget(src, tmpDir);
+			expect(target?.testFile).toBe(path.resolve(src));
+			expect(target?.strategy).toBe("self");
+		});
+
+		it("returns a Python test_foo.py file itself as the target", () => {
+			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
+			cleanups.push(cleanup);
+
+			fs.writeFileSync(path.join(tmpDir, "pytest.ini"), "[pytest]\n");
+			const src = path.join(tmpDir, "test_foo.py");
+			fs.writeFileSync(src, "def test_x(): pass\n");
+
+			const client = new TestRunnerClient(false);
+			const target = client.getTestRunTarget(src, tmpDir);
+			expect(target?.testFile).toBe(path.resolve(src));
+			expect(target?.strategy).toBe("self");
+		});
+
+		it("still uses findTestFile discovery for a normal (non-test) source file — no regression", () => {
+			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
+			cleanups.push(cleanup);
+
+			fs.writeFileSync(path.join(tmpDir, "vitest.config.ts"), "export default {}\n");
+			const src = path.join(tmpDir, "widget.ts");
+			fs.writeFileSync(src, "export const x = 1;\n");
+			const testFile = path.join(tmpDir, "widget.test.ts");
+			fs.writeFileSync(testFile, "// test\n");
+
+			const client = new TestRunnerClient(false);
+			const target = client.getTestRunTarget(src, tmpDir);
+			expect(target?.testFile).toBe(path.resolve(testFile));
+			expect(target?.strategy).toBe("related");
+		});
+
+		it("prefers failed-first over self when the edited test file is itself in the failed set", () => {
+			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
+			cleanups.push(cleanup);
+
+			fs.writeFileSync(path.join(tmpDir, "vitest.config.ts"), "export default {}\n");
+			const src = path.join(tmpDir, "flaky.test.ts");
+			fs.writeFileSync(src, "// test\n");
+
+			const client = new TestRunnerClient(false) as any;
+			client.failedTestsByRunner.set(
+				`${path.resolve(tmpDir)}:vitest`,
+				new Set([path.resolve(src)]),
+			);
+
+			const target = client.getTestRunTarget(src, tmpDir);
+			expect(target?.strategy).toBe("failed-first");
+			expect(target?.testFile).toBe(path.resolve(src));
+		});
+	});
+
+	describe("parseVitestTestGlobs — best-effort vitest config scrape", () => {
+		it("extracts include/exclude string-literal arrays from a simple config", () => {
+			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
+			cleanups.push(cleanup);
+
+			fs.writeFileSync(
+				path.join(tmpDir, "vitest.config.ts"),
+				[
+					"export default {",
+					"  test: {",
+					"    include: ['src/**/*.check.ts', \"e2e/**/*.flow.ts\"],",
+					"    exclude: ['src/legacy/**'],",
+					"  },",
+					"};",
+				].join("\n"),
+			);
+
+			const client = new TestRunnerClient(false);
+			const globs = client.parseVitestTestGlobs(tmpDir);
+			expect(globs?.include).toEqual(["src/**/*.check.ts", "e2e/**/*.flow.ts"]);
+			expect(globs?.exclude).toEqual(["src/legacy/**"]);
+		});
+
+		it("returns null when there is no vitest config", () => {
+			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
+			cleanups.push(cleanup);
+
+			const client = new TestRunnerClient(false);
+			expect(client.parseVitestTestGlobs(tmpDir)).toBeNull();
+		});
+
+		it("returns null when include/exclude is built dynamically (unparseable)", () => {
+			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
+			cleanups.push(cleanup);
+
+			fs.writeFileSync(
+				path.join(tmpDir, "vitest.config.ts"),
+				[
+					"export default {",
+					"  test: {",
+					"    include: computeIncludes(),",
+					"  },",
+					"};",
+				].join("\n"),
+			);
+
+			const client = new TestRunnerClient(false);
+			expect(client.parseVitestTestGlobs(tmpDir)).toBeNull();
+		});
+
+		it("caches the parsed result — does not re-read the config file on repeated calls", () => {
+			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
+			cleanups.push(cleanup);
+
+			const configPath = path.join(tmpDir, "vitest.config.ts");
+			fs.writeFileSync(
+				configPath,
+				"export default { test: { include: ['a.ts'] } };\n",
+			);
+
+			const client = new TestRunnerClient(false);
+			const first = client.parseVitestTestGlobs(tmpDir);
+			expect(first?.include).toEqual(["a.ts"]);
+
+			// Rewrite the config with a different include array. If the result
+			// were re-read/re-parsed on the next call, this would change the
+			// returned globs — the cache must keep returning the first result.
+			fs.writeFileSync(
+				configPath,
+				"export default { test: { include: ['b.ts', 'c.ts'] } };\n",
+			);
+			const second = client.parseVitestTestGlobs(tmpDir);
+			expect(second?.include).toEqual(["a.ts"]);
+			expect(second).toBe(first);
+		});
+
+		it("uses a custom include glob to correct classification of an unconventionally-named test file", () => {
+			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
+			cleanups.push(cleanup);
+
+			fs.writeFileSync(
+				path.join(tmpDir, "vitest.config.ts"),
+				[
+					"export default {",
+					"  test: {",
+					"    include: ['**/*.check.ts'],",
+					"  },",
+					"};",
+				].join("\n"),
+			);
+			const src = path.join(tmpDir, "widget.check.ts");
+			fs.writeFileSync(src, "// unconventional test naming\n");
+
+			const client = new TestRunnerClient(false);
+			const target = client.getTestRunTarget(src, tmpDir);
+			expect(target?.strategy).toBe("self");
+			expect(target?.testFile).toBe(path.resolve(src));
+		});
+	});
 });

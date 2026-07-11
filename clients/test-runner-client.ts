@@ -12,6 +12,8 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { minimatch } from "./deps/minimatch.js";
+import { detectFileRole } from "./file-role.js";
 import { findGlobalBinary } from "./package-manager.js";
 import { safeSpawn, safeSpawnAsync } from "./safe-spawn.js";
 
@@ -188,6 +190,16 @@ export class TestRunnerClient {
 	private log: (msg: string) => void;
 	private availableRunners: Map<string, boolean> = new Map();
 	private failedTestsByRunner: Map<string, Set<string>> = new Map();
+	// Best-effort vitest config `test.include`/`test.exclude` globs, scraped as
+	// plain text (never executed) and cached per cwd so the config file is
+	// only read/parsed once, not on every edit. `null` means "no config found
+	// or it couldn't be parsed in the simple shape we look for" — callers
+	// treat that as "no additional signal" and fall back to naming-convention
+	// detection only.
+	private vitestTestGlobsCache: Map<
+		string,
+		{ include?: string[]; exclude?: string[] } | null
+	> = new Map();
 
 	constructor(verbose = false) {
 		this.log = verbose
@@ -426,6 +438,141 @@ export class TestRunnerClient {
 	}
 
 	/**
+	 * Best-effort, text-only scrape of a vitest config's `test.include` /
+	 * `test.exclude` arrays. This deliberately does NOT execute the config
+	 * file (that would mean loading arbitrary ESM/TS via Vite's config
+	 * loader — too heavy for a per-edit hot path). It just looks for a
+	 * simple `include: [ ... ]` / `exclude: [ ... ]` shape with string
+	 * literals inside and pulls those out with a regex.
+	 *
+	 * Returns `null` (never throws) when there's no vitest config file, it
+	 * can't be read, or the include/exclude shape isn't a plain array of
+	 * string literals (e.g. it's built from a function call, spread, or
+	 * template expression) — anything more dynamic than that is out of
+	 * scope for this heuristic.
+	 *
+	 * Cached per `cwd` so the file is only read/parsed once per project,
+	 * not on every edit.
+	 */
+	parseVitestTestGlobs(
+		cwd: string,
+	): { include?: string[]; exclude?: string[] } | null {
+		if (this.vitestTestGlobsCache.has(cwd)) {
+			return this.vitestTestGlobsCache.get(cwd) ?? null;
+		}
+
+		// .mts isn't in RUNNERS.vitest.configFiles (that list drives runner
+		// *detection* priority) but is a legal vitest config extension, so it's
+		// included here for the scrape even though detectRunner doesn't check it.
+		const candidates = [...RUNNERS.vitest.configFiles, "vitest.config.mts"];
+
+		let content: string | null = null;
+		for (const cf of candidates) {
+			try {
+				content = fs.readFileSync(path.join(cwd, cf), "utf-8");
+				break;
+			} catch {
+				continue;
+			}
+		}
+
+		let result: { include?: string[]; exclude?: string[] } | null = null;
+		if (content !== null) {
+			const include = this.extractGlobArrayLiteral(content, "include");
+			const exclude = this.extractGlobArrayLiteral(content, "exclude");
+			if (include || exclude) {
+				result = {};
+				if (include) result.include = include;
+				if (exclude) result.exclude = exclude;
+			}
+		}
+
+		this.vitestTestGlobsCache.set(cwd, result);
+		return result;
+	}
+
+	/**
+	 * Extract `<key>: [ 'a', "b", `c` ]` as a plain string array from raw
+	 * config text. Returns undefined if the key isn't present, or if the
+	 * array body contains anything besides string literals and commas/
+	 * whitespace (a function call, spread, variable reference, etc.) —
+	 * that's a sign the value is dynamic and this best-effort scrape can't
+	 * safely interpret it.
+	 */
+	private extractGlobArrayLiteral(
+		content: string,
+		key: string,
+	): string[] | undefined {
+		const arrayMatch = content.match(
+			new RegExp(`\\b${key}\\s*:\\s*\\[([^\\]]*)\\]`),
+		);
+		if (!arrayMatch) return undefined;
+
+		const body = arrayMatch[1];
+		const literalPattern = /'([^'\\]*)'|"([^"\\]*)"|`([^`\\]*)`/g;
+		const literals: string[] = [];
+		let lastEnd = 0;
+		let match: RegExpExecArray | null;
+		while ((match = literalPattern.exec(body)) !== null) {
+			const between = body.slice(lastEnd, match.index).trim();
+			// Only whitespace/commas may appear between literals — anything
+			// else (identifiers, parens, spreads) means the array isn't a
+			// plain list of string literals.
+			if (between !== "" && !/^,$/.test(between)) return undefined;
+			literals.push(match[1] ?? match[2] ?? match[3] ?? "");
+			lastEnd = literalPattern.lastIndex;
+		}
+		const trailing = body.slice(lastEnd).trim();
+		if (trailing !== "" && trailing !== ",") return undefined;
+
+		return literals.length > 0 ? literals : undefined;
+	}
+
+	/**
+	 * Whether `sourceFilePath` is itself a test file (as opposed to a source
+	 * file whose *related* test file needs to be discovered).
+	 *
+	 * Primary signal: `detectFileRole` (naming convention: `.test.`/`.spec.`
+	 * basenames, `test_`/`spec_` prefixes, `__tests__/`/`tests/`/`spec/`
+	 * directories — shared with the rest of the codebase, not a second
+	 * parallel detector).
+	 *
+	 * Secondary signal (vitest only): the project's own `test.include` /
+	 * `test.exclude` globs, best-effort scraped by `parseVitestTestGlobs`.
+	 * This can correct the naming-convention answer in both directions —
+	 * an `exclude` glob can rule out a path that looks like a test by name,
+	 * and an `include` glob can catch a project that puts tests somewhere
+	 * unconventional. When no config is found or it can't be parsed, this
+	 * is a no-op and behavior is unchanged.
+	 */
+	private isTestFile(
+		sourceFilePath: string,
+		cwd: string,
+		runner: string,
+	): boolean {
+		let result = detectFileRole(sourceFilePath) === "test";
+
+		if (runner === "vitest") {
+			const globs = this.parseVitestTestGlobs(cwd);
+			if (globs) {
+				const rel = path
+					.relative(cwd, path.resolve(cwd, sourceFilePath))
+					.replace(/\\/g, "/");
+				const matches = (globs_: string[] | undefined) =>
+					!!globs_?.some((g) => minimatch(rel, g, { dot: true }));
+
+				if (matches(globs.exclude)) {
+					result = false;
+				} else if (!result && matches(globs.include)) {
+					result = true;
+				}
+			}
+		}
+
+		return result;
+	}
+
+	/**
 	 * Find test file for a given source file
 	 * Returns the test file path if it exists, null otherwise
 	 */
@@ -557,14 +704,22 @@ export class TestRunnerClient {
 		testFile: string;
 		runner: string;
 		config: RunnerConfig;
-		strategy: "failed-first" | "related";
+		strategy: "failed-first" | "related" | "self";
 	} | null {
 		const detected = this.detectRunner(cwd, sourceFilePath);
 		if (!detected) return null;
 
 		const key = this.failedKey(cwd, detected.runner);
 		const failedSet = this.failedTestsByRunner.get(key);
-		const related = this.findTestFile(sourceFilePath, cwd, detected.runner);
+
+		// If the edited file is itself a test file, there's no "related test"
+		// to discover — running findTestFile on it would strip its own
+		// extension and search for nonsense like foo.test.test.ts. Skip
+		// discovery entirely and treat the file as its own target.
+		const selfIsTest = this.isTestFile(sourceFilePath, cwd, detected.runner);
+		const related = selfIsTest
+			? null
+			: this.findTestFile(sourceFilePath, cwd, detected.runner);
 
 		if (failedSet && failedSet.size > 0) {
 			if (related) {
@@ -579,11 +734,32 @@ export class TestRunnerClient {
 				}
 			}
 
+			if (selfIsTest) {
+				const selfAbs = path.resolve(sourceFilePath);
+				if (failedSet.has(selfAbs)) {
+					return {
+						testFile: selfAbs,
+						runner: detected.runner,
+						config: detected.config,
+						strategy: "failed-first",
+					};
+				}
+			}
+
 			return {
 				testFile: [...failedSet][0],
 				runner: detected.runner,
 				config: detected.config,
 				strategy: "failed-first",
+			};
+		}
+
+		if (selfIsTest) {
+			return {
+				testFile: path.resolve(sourceFilePath),
+				runner: detected.runner,
+				config: detected.config,
+				strategy: "self",
 			};
 		}
 
