@@ -130,6 +130,11 @@ const lspRunner: RunnerDefinition = {
 		// spawn that didn't complete in the budget, or LSP unavailable for this
 		// file) — distinct from `[]`, which means the server replied with zero.
 		let lspClientReady = true;
+		// True when touchFile ran but couldn't confirm its result within
+		// budget (notify write and/or diagnostics wait timed out on at least
+		// one spawned server) — an empty `lspDiags` in that case is NOT a
+		// confirmed clean result and must not be reported as one (#570).
+		let diagnosticsInconclusive = false;
 		let failureReason = "";
 		const content = readFileContent(ctx.filePath);
 		if (!content) {
@@ -162,6 +167,7 @@ const lspRunner: RunnerDefinition = {
 				lspClientReady = false;
 			} else {
 				lspDiags = touched;
+				diagnosticsInconclusive = touched.inconclusive === true;
 			}
 		} catch (err) {
 			serverFailed = true;
@@ -205,6 +211,19 @@ const lspRunner: RunnerDefinition = {
 			// reply. Report "skipped" so the coverage notice can flag the gap and
 			// the next edit re-checks once the server has warmed; any diagnostics
 			// published late still land in the client cache and surface then.
+			return { status: "skipped", diagnostics: [], semantic: "none" };
+		}
+
+		if (diagnosticsInconclusive) {
+			// The touch ran and a client was ready, but the notify write and/or
+			// diagnostics wait hit their deadline before the server confirmed
+			// completion — `lspDiags` (even if non-empty) is not a trustworthy
+			// merged result. Same treatment as `!lspClientReady`: report
+			// "skipped" rather than "succeeded" with a possibly-incomplete
+			// diagnostics list, so the coverage notice flags the gap instead of
+			// the footer reading this as a confirmed clean/partial result (#570).
+			// Diagnostics that do arrive late still land in the client cache and
+			// surface on the next edit.
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 

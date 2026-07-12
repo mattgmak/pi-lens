@@ -423,4 +423,116 @@ describe("LSPService.touchFile collectDiagnostics", () => {
 			}
 		}
 	});
+
+	// #570: a touch whose diagnostics wait TIMES OUT must never present as a
+	// confirmed clean result — the returned array must be flagged
+	// `inconclusive`, and (critically) a previously-confirmed non-empty
+	// `lastKnownDiagnostics` record must survive the timeout untouched rather
+	// than being wiped by an unconfirmed empty result.
+	describe("#570 timeout does not present as confirmed-clean", () => {
+		it("a timed-out touch does NOT clear lastKnownDiagnostics when there was a prior confirmed non-empty result", async () => {
+			const { LSPService } = await import("../../../clients/lsp/index.js");
+			const service = new LSPService();
+			const diagnostic = makeDiagnostic("real error");
+			// First client call: confirms one real diagnostic (fast, no timeout).
+			let diagnosticsToReturn = [diagnostic];
+			const client = {
+				isAlive: () => true,
+				shutdown: async () => {},
+				getWorkspaceDiagnosticsSupport: () => ({
+					advertised: false,
+					mode: "push-only" as const,
+					diagnosticProviderKind: "none",
+				}),
+				getOperationSupport: () => ({}),
+				notify: { open: vi.fn().mockResolvedValue(undefined) },
+				waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
+				getDiagnostics: vi.fn(() => diagnosticsToReturn),
+			};
+			createLSPClient.mockResolvedValue(client);
+			getServersForFileWithConfig.mockReturnValue([makeServer("python")]);
+
+			const firstResult = await service.touchFile(FILE, "print('x')\n", {
+				clientScope: "primary",
+				diagnostics: "document",
+				collectDiagnostics: true,
+				maxClientWaitMs: 8000,
+				maxDiagnosticsWaitMs: 8000,
+				source: "dispatch-lsp-runner",
+			});
+			expect(firstResult).toEqual([diagnostic]);
+			expect((firstResult as any).inconclusive).not.toBe(true);
+			expect(service.getLastKnownDiagnostics(FILE)).toEqual([diagnostic]);
+
+			// Second touch: content changed (so notify isn't skipped) and the
+			// diagnostics wait is forced to time out via maxDiagnosticsWaitMs: 0
+			// (timeoutMs resolves to 0, so `waitedMs + 20 >= timeoutMs` is always
+			// true even though the mock wait resolves instantly). The server's
+			// diagnostics cache reads back empty (as if cleared by the fresh
+			// notify.open and nothing arrived yet) — this must NOT be read as a
+			// confirmed clean result.
+			diagnosticsToReturn = [];
+			const secondResult = await service.touchFile(FILE, "print('y')\n", {
+				clientScope: "primary",
+				diagnostics: "document",
+				collectDiagnostics: true,
+				maxClientWaitMs: 8000,
+				maxDiagnosticsWaitMs: 0,
+				source: "dispatch-lsp-runner",
+			});
+
+			expect((secondResult as any).inconclusive).toBe(true);
+			// The prior confirmed non-empty record must survive untouched.
+			expect(service.getLastKnownDiagnostics(FILE)).toEqual([diagnostic]);
+		});
+
+		it("a confirmed (non-timeout) empty result still clears lastKnownDiagnostics as before", async () => {
+			const { LSPService } = await import("../../../clients/lsp/index.js");
+			const service = new LSPService();
+			const diagnostic = makeDiagnostic("real error");
+			let diagnosticsToReturn = [diagnostic];
+			const client = {
+				isAlive: () => true,
+				shutdown: async () => {},
+				getWorkspaceDiagnosticsSupport: () => ({
+					advertised: false,
+					mode: "push-only" as const,
+					diagnosticProviderKind: "none",
+				}),
+				getOperationSupport: () => ({}),
+				notify: { open: vi.fn().mockResolvedValue(undefined) },
+				waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
+				getDiagnostics: vi.fn(() => diagnosticsToReturn),
+			};
+			createLSPClient.mockResolvedValue(client);
+			getServersForFileWithConfig.mockReturnValue([makeServer("python")]);
+
+			await service.touchFile(FILE, "print('x')\n", {
+				clientScope: "primary",
+				diagnostics: "document",
+				collectDiagnostics: true,
+				maxClientWaitMs: 8000,
+				maxDiagnosticsWaitMs: 8000,
+				source: "dispatch-lsp-runner",
+			});
+			expect(service.getLastKnownDiagnostics(FILE)).toEqual([diagnostic]);
+
+			// Second touch: content changed, generous budget (no timeout), and the
+			// server genuinely reports zero diagnostics this time — the existing
+			// behavior (clear the cache, report clean) must be unchanged.
+			diagnosticsToReturn = [];
+			const secondResult = await service.touchFile(FILE, "print('y')\n", {
+				clientScope: "primary",
+				diagnostics: "document",
+				collectDiagnostics: true,
+				maxClientWaitMs: 8000,
+				maxDiagnosticsWaitMs: 8000,
+				source: "dispatch-lsp-runner",
+			});
+
+			expect(secondResult).toEqual([]);
+			expect((secondResult as any).inconclusive).not.toBe(true);
+			expect(service.getLastKnownDiagnostics(FILE)).toBeUndefined();
+		});
+	});
 });

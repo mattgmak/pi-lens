@@ -108,6 +108,14 @@ type FileDiagnosticResult = {
 	 * analyzing" or "never asked". Never render this bucket as "0 diagnostics".
 	 */
 	confirmation?: "clean" | "unconfirmed";
+	/**
+	 * #570: true when `confirmation === "unconfirmed"` specifically because
+	 * the priming LSP check TIMED OUT (notify write and/or diagnostics wait
+	 * hit its deadline), as opposed to the server being a known silent-on-
+	 * clean tier. Both land in the same "unconfirmed" bucket for counting
+	 * purposes, but the reason differs and the rendered text should say so.
+	 */
+	timedOut?: boolean;
 };
 
 function lspUnavailableMessage(
@@ -242,7 +250,9 @@ export function createLspDiagnosticsTool() {
 			filesScanned?: number;
 			cleanFiles?: number;
 			unconfirmedFiles?: number;
+			timedOutFiles?: number;
 			unconfirmed?: boolean;
+			timedOut?: boolean;
 		}>(({ details, args, isError, text }) => {
 			// Streaming progress partials render the live bar (see scanningSummaryLine).
 			const scanning = scanningSummaryLine(details, text);
@@ -268,12 +278,18 @@ export function createLspDiagnosticsTool() {
 			const unconfirmedFiles = details?.unconfirmedFiles ?? 0;
 			if (unconfirmedFiles > 0) {
 				const cleanFiles = details?.cleanFiles ?? 0;
-				return `lsp_diagnostics${scope} — ${count} ${noun} · ${cleanFiles} clean · ${unconfirmedFiles} unconfirmed`;
+				const timedOutFiles = details?.timedOutFiles ?? 0;
+				const suffix =
+					timedOutFiles > 0 ? ` (${timedOutFiles} timed out)` : "";
+				return `lsp_diagnostics${scope} — ${count} ${noun} · ${cleanFiles} clean · ${unconfirmedFiles} unconfirmed${suffix}`;
 			}
-			// Single-file mode: 0 diagnostics from an unconfirmed (silent-on-clean)
-			// server is not a clean render either.
+			// Single-file mode: 0 diagnostics from an unconfirmed result — either a
+			// silent-on-clean server or (#570) a timed-out check — is not a clean
+			// render either.
 			if (count === 0 && details?.unconfirmed) {
-				return `lsp_diagnostics${scope} — unconfirmed (server cannot confirm clean)`;
+				return details?.timedOut
+					? `lsp_diagnostics${scope} — timed out (result may be incomplete)`
+					: `lsp_diagnostics${scope} — unconfirmed (server cannot confirm clean)`;
 			}
 			return `lsp_diagnostics${scope} — ${count} ${noun}`;
 		}),
@@ -419,11 +435,25 @@ export function createLspDiagnosticsTool() {
 	};
 }
 
+type DiagnosticsCollectionResult = {
+	diagnostics: LSPDiagnostic[];
+	/**
+	 * #570: true when the priming `touchFile` call could not confirm its
+	 * result (notify write and/or diagnostics wait timed out) before the
+	 * follow-up `getDiagnostics` read below. An empty result in that case is
+	 * NOT a confirmed clean answer — treat it the same as the existing
+	 * "unconfirmed" (silent-on-clean server) bucket rather than reporting a
+	 * bare 0.
+	 */
+	timedOut: boolean;
+};
+
 async function collectDiagnosticsForFile(
 	absPath: string,
 	lspService: NonNullable<ReturnType<typeof getLSPService>>,
 	waitMs?: number,
-): Promise<LSPDiagnostic[]> {
+): Promise<DiagnosticsCollectionResult> {
+	let timedOut = false;
 	try {
 		const content = fs.readFileSync(absPath, "utf-8");
 		const serviceWithTouch = lspService as NonNullable<
@@ -439,19 +469,22 @@ async function collectDiagnosticsForFile(
 					source: string;
 					clientScope: "all";
 				},
-			) => Promise<LSPDiagnostic[] | undefined>;
+			) => Promise<
+				(LSPDiagnostic[] & { inconclusive?: boolean }) | undefined
+			>;
 		};
 		if (
 			waitMs !== undefined &&
 			typeof serviceWithTouch.touchFile === "function"
 		) {
-			await serviceWithTouch.touchFile(absPath, content, {
+			const touched = await serviceWithTouch.touchFile(absPath, content, {
 				diagnostics: "document",
 				collectDiagnostics: true,
 				maxClientWaitMs: waitMs,
 				source: "lsp_diagnostics",
 				clientScope: "all",
 			});
+			timedOut = touched?.inconclusive === true;
 		} else {
 			await lspService.openFile(absPath, content, {
 				preserveDiagnostics: false,
@@ -461,10 +494,11 @@ async function collectDiagnosticsForFile(
 		// Non-fatal: getDiagnostics may still have stale/health information.
 	}
 
-	return lspService.getDiagnostics(
+	const diagnostics = await lspService.getDiagnostics(
 		absPath,
 		waitMs !== undefined ? "document" : "full",
 	);
+	return { diagnostics, timedOut };
 }
 
 function diagnosticsToFileDiags(
@@ -524,20 +558,30 @@ async function collectFileDiagnosticResult(
 		return { file, diagnostics: [], error: `${file}: path not found` };
 	}
 
-	const rawDiags = await collectDiagnosticsForFile(file, lspService, waitMs);
+	const { diagnostics: rawDiags, timedOut } = await collectDiagnosticsForFile(
+		file,
+		lspService,
+		waitMs,
+	);
 	const health = lspService.getDiagnosticsHealth?.(file) as
 		| LspHealthLike
 		| undefined;
 	const filteredDiags = applySeverityFilter(rawDiags, severity);
+	// #570: a timed-out priming check is never a confirmed "clean" — treat it
+	// as unconfirmed without consulting the (unrelated) silent-tier
+	// classifier, and remember why so the rendered text is accurate.
 	const confirmation =
 		filteredDiags.length === 0
-			? await classifyEmptyResult(file, lspService)
+			? timedOut
+				? "unconfirmed"
+				: await classifyEmptyResult(file, lspService)
 			: undefined;
 	return {
 		file,
 		diagnostics: diagnosticsToFileDiags(file, filteredDiags),
 		unavailable: lspUnavailableMessage(file, health),
 		confirmation,
+		timedOut: confirmation === "unconfirmed" ? timedOut : undefined,
 	};
 }
 
@@ -547,7 +591,11 @@ async function runFileDiagnostics(
 	lspService: NonNullable<ReturnType<typeof getLSPService>>,
 	waitMs?: number,
 ) {
-	const rawDiags = await collectDiagnosticsForFile(absPath, lspService, waitMs);
+	const { diagnostics: rawDiags, timedOut } = await collectDiagnosticsForFile(
+		absPath,
+		lspService,
+		waitMs,
+	);
 	const lspHealth = lspService.getDiagnosticsHealth?.(absPath) as
 		| LspHealthLike
 		| undefined;
@@ -559,20 +607,32 @@ async function runFileDiagnostics(
 	// #533: an empty result needs a confirmed/unconfirmed verdict — a push-only,
 	// silent-on-clean server (classic typescript) publishes nothing on a
 	// clean→clean edit, so "0 diagnostics" from it is unverifiable, not clean.
+	// #570: a timed-out priming check is a second, distinct reason a result
+	// can be unconfirmed — checked first since it's a property of THIS check,
+	// not a general server-capability classification.
 	const confirmation =
-		total === 0 ? await classifyEmptyResult(absPath, lspService) : undefined;
+		total === 0
+			? timedOut
+				? "unconfirmed"
+				: await classifyEmptyResult(absPath, lspService)
+			: undefined;
 	const unconfirmed = confirmation === "unconfirmed";
 
 	let text: string;
 	if (total === 0) {
-		text = unconfirmed
-			? "Diagnostics unconfirmed: the server for this file cannot confirm a " +
-				"clean result (push-only, silent-on-clean — e.g. classic " +
-				"typescript-language-server never publishes on a clean re-check). " +
-				"This is NOT the same as 0 diagnostics; it may still be analyzing or " +
-				"may never have been asked. Re-check after an edit, or use waitMs to " +
-				"wait longer."
-			: (unavailable ?? "No diagnostics found.");
+		text = timedOut
+			? "Diagnostics check timed out: the LSP server didn't confirm a result " +
+				"within the wait budget. This is NOT the same as 0 diagnostics; the " +
+				"file may still have errors that just hadn't been reported yet. " +
+				"Re-check after the server settles, or increase waitMs."
+			: unconfirmed
+				? "Diagnostics unconfirmed: the server for this file cannot confirm a " +
+					"clean result (push-only, silent-on-clean — e.g. classic " +
+					"typescript-language-server never publishes on a clean re-check). " +
+					"This is NOT the same as 0 diagnostics; it may still be analyzing or " +
+					"may never have been asked. Re-check after an edit, or use waitMs to " +
+					"wait longer."
+				: (unavailable ?? "No diagnostics found.");
 	} else {
 		const lines = limited.map(formatDiag);
 		if (unavailable) lines.unshift(unavailable, "");
@@ -601,6 +661,7 @@ async function runFileDiagnostics(
 			totalDiagnostics: total,
 			truncated,
 			unconfirmed,
+			timedOut: unconfirmed ? timedOut : undefined,
 			lspHealth,
 			waitMs,
 		},
@@ -618,15 +679,49 @@ async function runFileDiagnostics(
 function tallyConfirmation(results: FileDiagnosticResult[]): {
 	clean: number;
 	unconfirmed: number;
+	timedOut: number;
 } {
 	let clean = 0;
 	let unconfirmed = 0;
+	let timedOut = 0;
 	for (const result of results) {
 		if (result.diagnostics.length > 0) continue;
-		if (result.confirmation === "unconfirmed") unconfirmed += 1;
-		else clean += 1;
+		if (result.confirmation === "unconfirmed") {
+			unconfirmed += 1;
+			// #570: timed-out checks are a subset of "unconfirmed" — tallied
+			// separately so the aggregate text can say WHY, not just THAT.
+			if (result.timedOut) timedOut += 1;
+		} else {
+			clean += 1;
+		}
 	}
-	return { clean, unconfirmed };
+	return { clean, unconfirmed, timedOut };
+}
+
+/**
+ * #570: build the explanatory clause for a batch/directory result that has
+ * unconfirmed files, distinguishing timed-out checks from the pre-existing
+ * #533 silent-on-clean-server bucket — both are "unconfirmed" for counting,
+ * but the reason differs and misreporting a timeout as "server can't confirm
+ * clean" would itself be misleading.
+ */
+function unconfirmedReasonClause(unconfirmed: number, timedOut: number): string {
+	const silent = unconfirmed - timedOut;
+	if (timedOut > 0 && silent > 0) {
+		return (
+			`${timedOut} timed out (check didn't complete within budget) and ` +
+			`${silent} from a server that cannot confirm clean (push-only, ` +
+			"silent-on-clean)."
+		);
+	}
+	if (timedOut > 0) {
+		return `${timedOut} timed out (check didn't complete within the wait budget).`;
+	}
+	return (
+		"from a server that cannot confirm clean (push-only, silent-on-clean; " +
+		"e.g. classic typescript-language-server does not publish on a clean " +
+		"re-check)."
+	);
 }
 
 async function runBatchFileDiagnostics(
@@ -661,7 +756,7 @@ async function runBatchFileDiagnostics(
 	const total = allDiags.length;
 	const truncated = total > MAX_DIAGNOSTICS;
 	const display = truncated ? allDiags.slice(0, MAX_DIAGNOSTICS) : allDiags;
-	const { clean, unconfirmed } = tallyConfirmation(results);
+	const { clean, unconfirmed, timedOut } = tallyConfirmation(results);
 
 	const lines: string[] = [
 		`Files checked: ${results.length}`,
@@ -674,17 +769,15 @@ async function runBatchFileDiagnostics(
 	if (lspHealthWarnings.length > 0) {
 		lines.push("", "LSP health warnings:", ...lspHealthWarnings.slice(0, 10));
 	}
-	// #533: surface unconfirmed files regardless of whether OTHER files in the
-	// batch found real diagnostics — a mixed found/unconfirmed result must not
-	// let the unconfirmed files silently pass as clean just because the batch
-	// as a whole isn't "0 diagnostics".
+	// #533/#570: surface unconfirmed files regardless of whether OTHER files in
+	// the batch found real diagnostics — a mixed found/unconfirmed result must
+	// not let the unconfirmed files silently pass as clean just because the
+	// batch as a whole isn't "0 diagnostics".
 	if (unconfirmed > 0) {
 		lines.push(
 			"",
-			`${clean} file${clean === 1 ? "" : "s"} confirmed clean, ${unconfirmed} unconfirmed ` +
-				"(server cannot confirm — push-only, silent-on-clean; e.g. classic " +
-				"typescript-language-server does not publish on a clean re-check). " +
-				"NOT the same as 0 diagnostics.",
+			`${clean} file${clean === 1 ? "" : "s"} confirmed clean, ${unconfirmed} unconfirmed: ` +
+				`${unconfirmedReasonClause(unconfirmed, timedOut)} NOT the same as 0 diagnostics.`,
 		);
 	}
 	if (display.length === 0) {
@@ -724,6 +817,7 @@ async function runBatchFileDiagnostics(
 			truncated,
 			cleanFiles: clean,
 			unconfirmedFiles: unconfirmed,
+			timedOutFiles: timedOut > 0 ? timedOut : undefined,
 			fileErrors: fileErrors.length > 0 ? fileErrors : undefined,
 			lspHealthWarnings:
 				lspHealthWarnings.length > 0 ? lspHealthWarnings : undefined,
@@ -786,18 +880,17 @@ async function runDirectoryDiagnostics(
 	const total = allDiags.length;
 	const truncated = total > MAX_DIAGNOSTICS;
 	const display = truncated ? allDiags.slice(0, MAX_DIAGNOSTICS) : allDiags;
-	const { clean, unconfirmed } = tallyConfirmation(results);
+	const { clean, unconfirmed, timedOut } = tallyConfirmation(results);
 
 	let text: string;
 	if (total === 0) {
-		// #533: an unconfirmed-containing directory result must never render as a
-		// bare "no diagnostics" — that reads as an affirmative clean scan the
-		// server never actually gave for those files.
+		// #533/#570: an unconfirmed-containing directory result must never
+		// render as a bare "no diagnostics" — that reads as an affirmative
+		// clean scan the server never actually gave for those files.
 		const cleanLine =
 			unconfirmed > 0
-				? `${clean} clean · ${unconfirmed} unconfirmed (server cannot confirm — ` +
-					"push-only, silent-on-clean; e.g. classic typescript-language-server " +
-					"does not publish on a clean re-check). NOT the same as 0 diagnostics."
+				? `${clean} clean · ${unconfirmed} unconfirmed: ` +
+					`${unconfirmedReasonClause(unconfirmed, timedOut)} NOT the same as 0 diagnostics.`
 				: "No diagnostics found.";
 		text = [
 			`Directory: ${absPath}`,
@@ -818,14 +911,14 @@ async function runDirectoryDiagnostics(
 			...(lspHealthWarnings.length > 0
 				? ["", "LSP health warnings:", ...lspHealthWarnings.slice(0, 10)]
 				: []),
-			// #533: the remaining clean-looking files in a mixed scan may still be
-			// unconfirmed — say so even though the directory as a whole found
-			// diagnostics elsewhere.
+			// #533/#570: the remaining clean-looking files in a mixed scan may
+			// still be unconfirmed — say so even though the directory as a
+			// whole found diagnostics elsewhere.
 			...(unconfirmed > 0
 				? [
 						"",
-						`${clean} other file${clean === 1 ? "" : "s"} confirmed clean, ${unconfirmed} unconfirmed ` +
-							"(server cannot confirm clean — push-only, silent-on-clean).",
+						`${clean} other file${clean === 1 ? "" : "s"} confirmed clean, ${unconfirmed} unconfirmed: ` +
+							unconfirmedReasonClause(unconfirmed, timedOut),
 					]
 				: []),
 			"",
@@ -871,6 +964,7 @@ async function runDirectoryDiagnostics(
 			truncated,
 			cleanFiles: clean,
 			unconfirmedFiles: unconfirmed,
+			timedOutFiles: timedOut > 0 ? timedOut : undefined,
 			fileErrors: fileErrors.length > 0 ? fileErrors : undefined,
 			lspHealthWarnings:
 				lspHealthWarnings.length > 0 ? lspHealthWarnings : undefined,

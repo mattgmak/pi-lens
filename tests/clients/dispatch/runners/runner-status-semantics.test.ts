@@ -257,6 +257,35 @@ describe("runner status/semantic edge cases", () => {
 		}
 	});
 
+	it("lsp runner returns skipped (not succeeded) when the touch is inconclusive (timed out) (#570)", async () => {
+		// touchFile resolves an array flagged `inconclusive` — the notify write
+		// and/or diagnostics wait hit their deadline without the server
+		// confirming completion. Reporting "succeeded, 0 diagnostics" here would
+		// read as a confirmed clean bill of health when the check simply never
+		// completed; the runner must report "skipped" (same treatment as the
+		// no-client-ready case) so the coverage notice flags the gap.
+		const runner = (await import("../../../../clients/dispatch/runners/lsp.js"))
+			.default;
+		const env = setupTestEnvironment("pi-lens-lsp-inconclusive-");
+		try {
+			const filePath = path.join(env.tmpDir, "main.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+
+			supportsLSP.mockReturnValue(true);
+			const inconclusiveResult: unknown[] = [];
+			Object.defineProperty(inconclusiveResult, "inconclusive", {
+				value: true,
+			});
+			touchFile.mockResolvedValue(inconclusiveResult);
+
+			const result = await runner.run(ctx(filePath, env.tmpDir) as never);
+			expect(result.status).toBe("skipped");
+			expect(result.diagnostics).toEqual([]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("lsp runner returns warning semantic when server open fails", async () => {
 		const runner = (await import("../../../../clients/dispatch/runners/lsp.js"))
 			.default;

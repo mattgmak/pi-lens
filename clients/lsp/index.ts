@@ -991,7 +991,26 @@ export class LSPService {
 		filePath: string,
 		content: string,
 		options: LSPTouchFileOptions = {},
-	): Promise<import("./client.js").LSPDiagnostic[] | undefined> {
+	): Promise<
+		| (import("./client.js").LSPDiagnostic[] & {
+				/**
+				 * True when this touch could NOT confirm its result — the notify
+				 * write and/or the diagnostics wait hit their deadline before the
+				 * server(s) confirmed completion. An `inconclusive` result must
+				 * never be read as "confirmed clean": the returned array may be
+				 * `[]` simply because nothing arrived in time, not because the
+				 * server actually reported zero diagnostics. Callers that care
+				 * about trustworthiness (dispatch runners, the `lsp_diagnostics`
+				 * tool) must check this before treating an empty result as clean.
+				 * Absent/`false` on a genuinely confirmed (fast or debounced-skip)
+				 * result — existing callers that only read the array are
+				 * unaffected (arrays are plain objects; this is a non-enumerable
+				 * bonus field, not a shape change).
+				 */
+				inconclusive?: boolean;
+			})
+		| undefined
+	> {
 		if (this.checkDestroyed()) return;
 		const startedAt = Date.now();
 		const normalizedPath = normalizeMapKey(filePath);
@@ -1202,12 +1221,27 @@ export class LSPService {
 				)
 			: undefined;
 
+		// A touch is inconclusive when EITHER the notify write or the
+		// diagnostics wait hit their deadline for ANY of the spawned servers
+		// (these flags are touch-wide, covering the whole `Promise.all` over
+		// `spawned` — see the field doc on the return type). We deliberately
+		// err toward caution here: `collected` merges diagnostics across every
+		// spawned server, so even a partial timeout (e.g. a slow auxiliary
+		// while the primary answered) means the merged result may be missing
+		// findings that just hadn't arrived yet — it must not be trusted as a
+		// confirmed answer.
+		const inconclusive = notifyWriteTimedOut || diagnosticsTimedOut;
+
 		// Prime the last-known cache WITH the hash of the content we just synced,
 		// so a hot-path consumer (actionable-warnings at turn_end) can verify the
 		// cached diagnostics are for the current bytes before reusing them instead
 		// of paying for a second open+wait. Only when we actually collected — a
 		// non-collecting touch (didChange-only) leaves the prior entry intact.
-		if (collected !== undefined) {
+		// Skip this entirely when the touch was inconclusive: an unconfirmed
+		// empty `collected` must never erase a previously-confirmed non-empty
+		// record (that's the #570 bug — a timeout silently reporting as clean
+		// and wiping out known-good diagnostic state).
+		if (collected !== undefined && !inconclusive) {
 			const normalizedKey = normalizeMapKey(filePath);
 			if (collected.length > 0) {
 				this.lastKnownDiagnostics.set(normalizedKey, collected);
@@ -1216,6 +1250,18 @@ export class LSPService {
 				this.lastKnownDiagnostics.delete(normalizedKey);
 				this.lastKnownContentHash.delete(normalizedKey);
 			}
+		}
+
+		if (collected !== undefined && inconclusive) {
+			// Non-enumerable so JSON.stringify / spread / logging of the
+			// diagnostics array is unaffected — this is a query-only bonus
+			// field, not a shape change existing array consumers need to know
+			// about.
+			Object.defineProperty(collected, "inconclusive", {
+				value: true,
+				enumerable: false,
+				configurable: true,
+			});
 		}
 
 		// Only refresh the recent-touches entry when we actually pushed. Skipping
@@ -1240,6 +1286,7 @@ export class LSPService {
 				notifySkipped,
 				notifyWriteTimedOut,
 				diagnosticsTimedOut,
+				inconclusive,
 			},
 		});
 		return collected ?? [];

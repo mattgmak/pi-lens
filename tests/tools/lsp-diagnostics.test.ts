@@ -412,4 +412,116 @@ describe("lsp_diagnostics tool", () => {
 			);
 		});
 	});
+
+	// #570: a timed-out priming touchFile() must never present as a confirmed
+	// clean result — it's a distinct "unconfirmed" reason from #533's
+	// silent-on-clean-server tier, and the tool's own touchFile call is the
+	// only path that can observe it (only exercised when waitMs is passed).
+	describe("#570 timed-out check is not confirmed-clean", () => {
+		it("single file: renders 'timed out' instead of a bare clean when touchFile is inconclusive", async () => {
+			const touchFile = vi.fn().mockImplementation(async () => {
+				const result: any[] = [];
+				Object.defineProperty(result, "inconclusive", { value: true });
+				return result;
+			});
+			(mocked.service as any).touchFile = touchFile;
+			const tool = createLspDiagnosticsTool();
+			const tmpDir = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-lsp-diag-timeout-"),
+			);
+			const clean = path.join(tmpDir, "clean.ts");
+			fs.writeFileSync(clean, "const value = 1;\n");
+
+			try {
+				const result = (await tool.execute(
+					"diag-timeout-file",
+					{ path: clean, severity: "all", waitMs: 500 },
+					new AbortController().signal,
+					null,
+					{ cwd: "." },
+				)) as any;
+
+				expect(result.isError).toBeUndefined();
+				expect(touchFile).toHaveBeenCalled();
+				expect(result.details?.totalDiagnostics).toBe(0);
+				expect(result.details?.unconfirmed).toBe(true);
+				expect(result.details?.timedOut).toBe(true);
+				expect(String(result.content[0]?.text)).toContain("timed out");
+				expect(String(result.content[0]?.text)).not.toBe(
+					"No diagnostics found.",
+				);
+			} finally {
+				fs.rmSync(tmpDir, { recursive: true, force: true });
+			}
+		});
+
+		it("single file: a confirmed (non-inconclusive) touchFile result still renders plain clean", async () => {
+			const touchFile = vi.fn().mockResolvedValue([]);
+			(mocked.service as any).touchFile = touchFile;
+			const tool = createLspDiagnosticsTool();
+			const tmpDir = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-lsp-diag-confirmed-touch-"),
+			);
+			const clean = path.join(tmpDir, "clean.ts");
+			fs.writeFileSync(clean, "const value = 1;\n");
+
+			try {
+				const result = (await tool.execute(
+					"diag-confirmed-touch",
+					{ path: clean, severity: "all", waitMs: 500 },
+					new AbortController().signal,
+					null,
+					{ cwd: "." },
+				)) as any;
+
+				expect(result.isError).toBeUndefined();
+				expect(result.details?.unconfirmed).toBe(false);
+				expect(result.details?.timedOut).toBeUndefined();
+				expect(String(result.content[0]?.text)).toBe("No diagnostics found.");
+			} finally {
+				fs.rmSync(tmpDir, { recursive: true, force: true });
+			}
+		});
+
+		it("batch: tallies timedOutFiles separately from silent-on-clean unconfirmed files", async () => {
+			let call = 0;
+			const touchFile = vi.fn().mockImplementation(async () => {
+				call += 1;
+				const result: any[] = [];
+				// First file's touch times out; second file's touch is confirmed but
+				// its server is a #533 silent-on-clean tier (mocked.cascadeTier below).
+				if (call === 1) {
+					Object.defineProperty(result, "inconclusive", { value: true });
+				}
+				return result;
+			});
+			(mocked.service as any).touchFile = touchFile;
+			mocked.cascadeTier = "tier3-silent";
+			const tool = createLspDiagnosticsTool();
+			const tmpDir = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-lsp-diag-batch-timeout-"),
+			);
+			const a = path.join(tmpDir, "a.ts");
+			const b = path.join(tmpDir, "b.ts");
+			fs.writeFileSync(a, "const value = 1;\n");
+			fs.writeFileSync(b, "const value = 2;\n");
+
+			try {
+				const result = (await tool.execute(
+					"diag-batch-timeout",
+					{ paths: [a, b], severity: "all", concurrency: 1, waitMs: 500 },
+					new AbortController().signal,
+					null,
+					{ cwd: "." },
+				)) as any;
+
+				expect(result.isError).toBeUndefined();
+				expect(result.details?.unconfirmedFiles).toBe(2);
+				expect(result.details?.timedOutFiles).toBe(1);
+				expect(String(result.content[0]?.text)).toContain("timed out");
+			} finally {
+				fs.rmSync(tmpDir, { recursive: true, force: true });
+			}
+		});
+	});
 });
