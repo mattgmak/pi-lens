@@ -61,7 +61,7 @@ describe("classifyCascadeWaitTier", () => {
 		expect(tier).toBe("tier3-silent");
 	});
 
-	// #524/#529/#541/#544: "typescript" can be either the classic
+	// #524/#529/#541/#558: "typescript" can be either the classic
 	// typescript-language-server or TS7's native `tsc --lsp --stdio` (PR #526).
 	// Classic is confirmed silentOnClean (re-measured 2026-07-12, unaffected by
 	// the native-ts7 drift below) — the classifier's `launchVariant` branch
@@ -84,7 +84,7 @@ describe("classifyCascadeWaitTier", () => {
 		).toBe("tier3-silent");
 	});
 
-	// #541/#544: PR #541 (2026-07-11) briefly classified native-ts7 as
+	// #541/#558: PR #541 (2026-07-11) briefly classified native-ts7 as
 	// tier3-silent after a clean-signal probe run appeared to show it silent,
 	// same as classic. A 2026-07-12 dual-environment re-measurement (nightly
 	// CI Linux + local Windows dev, same `typescript@7.0.2` both times) found
@@ -93,7 +93,7 @@ describe("classifyCascadeWaitTier", () => {
 	// Classic was re-confirmed silent in the same run and is unaffected. This
 	// is an evidence-based revert: the classifier again routes a native-ts7
 	// snapshot through the fail-safe "waits" path via its `launchVariant`.
-	it("classifies a native-ts7 typescript snapshot as waits — native-ts7 drifted off silent-on-clean, re-measured 2026-07-12 (#544)", () => {
+	it("classifies a native-ts7 typescript snapshot as waits — native-ts7 drifted off silent-on-clean, re-measured 2026-07-12 (#558)", () => {
 		getServersForFileWithConfig.mockReturnValue([server("typescript")]);
 		const snapshots = [
 			{

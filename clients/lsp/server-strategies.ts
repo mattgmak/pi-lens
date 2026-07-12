@@ -104,7 +104,7 @@ export interface DiagnosticStrategy {
 	 * they DO resolve the wait early at runtime, just without a proven version,
 	 * so shortening their in-lane wait would be a behavior change, not a no-op.
 	 *
-	 * #524/#529/#541/#544: this table is keyed by server ID, but "typescript"
+	 * #524/#529/#541/#558: this table is keyed by server ID, but "typescript"
 	 * can now launch as either the classic typescript-language-server (what
 	 * this flag was measured against) or TS7's native `tsc --lsp --stdio`
 	 * (PR #526), a different Go-native binary. PR #526 originally scoped this
@@ -137,7 +137,7 @@ export const SERVER_DIAGNOSTIC_STRATEGIES: Record<string, DiagnosticStrategy> =
 			// clean→clean edit (docs/lsp-capability-matrix.md, re-confirmed
 			// 2026-07-12). It's the lone core-set tier-3 server, which is exactly
 			// why the cascade lane's in-lane wait is worth skipping for it
-			// specifically. Applies to the CLASSIC server only (#524/#529/#544)
+			// specifically. Applies to the CLASSIC server only (#524/#529/#558)
 			// — TS7's native `tsc --lsp --stdio` variant shares this
 			// "typescript" server id but the 2026-07-12 dual-environment
 			// re-measurement found it now publishes on clean (a drift from the

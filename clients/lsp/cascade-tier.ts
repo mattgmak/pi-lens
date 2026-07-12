@@ -32,7 +32,7 @@
  * NOT tier-3 — the caller keeps today's full in-lane wait. Fail-safe is
  * always "wait like before".
  *
- * #524/#529/#541/#544: a server id can now be backed by more than one actual
+ * #524/#529/#541/#558: a server id can now be backed by more than one actual
  * binary — "typescript" is classic typescript-language-server OR TS7's
  * native `tsc --lsp --stdio` (PR #526). PR #526 originally routed the
  * native-ts7 variant through the fail-safe "waits" path because
@@ -110,7 +110,7 @@ export function classifyCascadeWaitTier(
 	const strategy = getStrategy(primary.id);
 	if (strategy.silentOnClean !== true) return "waits"; // 2*/unknown push-only
 
-	// #524/#529/#541/#544: `silentOnClean` on a server-id-keyed strategy is
+	// #524/#529/#541/#558: `silentOnClean` on a server-id-keyed strategy is
 	// only proven against the variant it was actually measured against.
 	// "typescript" today means either classic typescript-language-server
 	// (confirmed silent-on-clean, 2026-07-12 dual-environment re-measurement)

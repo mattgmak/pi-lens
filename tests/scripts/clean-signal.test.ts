@@ -159,7 +159,7 @@ describe("checkCleanSignalDrift (#529)", () => {
     expect(d.kind).toBe("silent-not-marked");
   });
 
-  // #544: PR #541 (2026-07-11) briefly routed typescript7/typescript7-clean
+  // #558: PR #541 (2026-07-11) briefly routed typescript7/typescript7-clean
   // through the shared "typescript" strategy key (`true`), on the strength of
   // a probe run that appeared to show native-ts7 silent too. A 2026-07-12
   // dual-environment re-measurement found native-ts7 now publishes on clean —
@@ -170,7 +170,7 @@ describe("checkCleanSignalDrift (#529)", () => {
   // instead of classic's shared marker. These cases exercise that against the
   // pure checker (the routing itself lives in the script's
   // lookupSilentOnClean, out of unit-test scope — see the file header).
-  it("is consistent when native-ts7 is observed publishing on clean against its own expected-false marker (#544, today's steady state)", () => {
+  it("is consistent when native-ts7 is observed publishing on clean against its own expected-false marker (#558, today's steady state)", () => {
     const d = checkCleanSignalDrift(
       { lang: "typescript7-clean", behavior: "publishes-unversioned" },
       false,
@@ -178,7 +178,7 @@ describe("checkCleanSignalDrift (#529)", () => {
     expect(d.kind).toBe("consistent");
   });
 
-  it("flags silent-not-marked if a FUTURE native-ts7 build goes silent again (#544 regression watch)", () => {
+  it("flags silent-not-marked if a FUTURE native-ts7 build goes silent again (#558 regression watch)", () => {
     // The safety net this change exists for: if a future TS7 build becomes
     // silent on clean again, the explicit `false` expectation surfaces it as
     // a positive signal ("consider re-enabling tier3-silent for native-ts7")
@@ -217,13 +217,13 @@ describe("findCleanSignalDrift (#529)", () => {
     expect(warnings).toHaveLength(0);
   });
 
-  // #544: a native-ts7 row participates in the drift scan like any other row,
+  // #558: a native-ts7 row participates in the drift scan like any other row,
   // but the caller's lookup (mirroring probe-clean-signal.mjs's
   // lookupSilentOnClean) gives it an explicit `false` expectation instead of
   // routing it to classic's shared "typescript" marker. Today's
   // publishes-* observation is therefore consistent (no false alarm), while
   // classic's own row is unaffected.
-  it("includes a native-ts7 row with its own expected-false marker, staying consistent while classic's row is unaffected (#544)", () => {
+  it("includes a native-ts7 row with its own expected-false marker, staying consistent while classic's row is unaffected (#558)", () => {
     const rows = [
       { lang: "typescript", behavior: "silent" }, // consistent (classic, marked true)
       { lang: "typescript7-clean", behavior: "publishes-unversioned" }, // consistent (native-ts7, expected false)
