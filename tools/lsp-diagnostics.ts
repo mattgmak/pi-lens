@@ -785,22 +785,38 @@ function unconfirmedReasonClause(unconfirmed: number, timedOut: number): string 
 	);
 }
 
-async function runBatchFileDiagnostics(
-	absPaths: string[],
+/**
+ * Fan out `collectFileDiagnosticResult` across a file list at bounded
+ * concurrency and reduce the results into the shape both batch-style callers
+ * (`runBatchFileDiagnostics`/`runDirectoryDiagnostics`) render from —
+ * previously duplicated identically between them (SonarCloud
+ * `new_duplicated_lines_density` gate, surfaced when #571 added the
+ * `nextWriteIndex` threading to both call sites). Purely mechanical
+ * extraction: no behavior change, and does NOT touch the confirmed/
+ * unconfirmed semantics `collectFileDiagnosticResult`/`tallyConfirmation`
+ * already encode — those, and `lens_diagnostics` mode=full's separate,
+ * deliberately different confirmation gate in `tools/lens-diagnostics.ts`,
+ * are unrelated to this file's internal duplication and are left exactly
+ * as they were.
+ */
+async function collectBatchDiagnostics(
+	files: string[],
 	severity: string,
 	lspService: NonNullable<ReturnType<typeof getLSPService>>,
 	options: BatchOptions,
-) {
-	if (absPaths.length === 0) {
-		return {
-			content: [{ type: "text" as const, text: "No file paths provided." }],
-			isError: true,
-			details: { mode: "batch", severity, filesChecked: 0 },
-		};
-	}
-
+): Promise<{
+	results: FileDiagnosticResult[];
+	fileErrors: string[];
+	lspHealthWarnings: string[];
+	total: number;
+	truncated: boolean;
+	display: FileDiag[];
+	clean: number;
+	unconfirmed: number;
+	timedOut: number;
+}> {
 	const results = await mapWithConcurrency(
-		absPaths,
+		files,
 		options.concurrency,
 		(file) =>
 			collectFileDiagnosticResult(
@@ -824,6 +840,44 @@ async function runBatchFileDiagnostics(
 	const truncated = total > MAX_DIAGNOSTICS;
 	const display = truncated ? allDiags.slice(0, MAX_DIAGNOSTICS) : allDiags;
 	const { clean, unconfirmed, timedOut } = tallyConfirmation(results);
+	return {
+		results,
+		fileErrors,
+		lspHealthWarnings,
+		total,
+		truncated,
+		display,
+		clean,
+		unconfirmed,
+		timedOut,
+	};
+}
+
+async function runBatchFileDiagnostics(
+	absPaths: string[],
+	severity: string,
+	lspService: NonNullable<ReturnType<typeof getLSPService>>,
+	options: BatchOptions,
+) {
+	if (absPaths.length === 0) {
+		return {
+			content: [{ type: "text" as const, text: "No file paths provided." }],
+			isError: true,
+			details: { mode: "batch", severity, filesChecked: 0 },
+		};
+	}
+
+	const {
+		results,
+		fileErrors,
+		lspHealthWarnings,
+		total,
+		truncated,
+		display,
+		clean,
+		unconfirmed,
+		timedOut,
+	} = await collectBatchDiagnostics(absPaths, severity, lspService, options);
 
 	const lines: string[] = [
 		`Files checked: ${results.length}`,
@@ -929,31 +983,21 @@ async function runDirectoryDiagnostics(
 
 	const wasCapped = collectedFiles.length > MAX_FILES;
 	const filesToProcess = collectedFiles.slice(0, MAX_FILES);
-	const results = await mapWithConcurrency(
+	const {
+		fileErrors,
+		lspHealthWarnings,
+		total,
+		truncated,
+		display,
+		clean,
+		unconfirmed,
+		timedOut,
+	} = await collectBatchDiagnostics(
 		filesToProcess,
-		options.concurrency,
-		(file) =>
-			collectFileDiagnosticResult(
-				file,
-				severity,
-				lspService,
-				options.waitMs,
-				options.nextWriteIndex,
-			),
-		options.signal,
-		options.onProgress,
+		severity,
+		lspService,
+		options,
 	);
-	const fileErrors = results.flatMap((result) =>
-		result.error ? [result.error] : [],
-	);
-	const lspHealthWarnings = results.flatMap((result) =>
-		result.unavailable ? [result.unavailable] : [],
-	);
-	const allDiags = results.flatMap((result) => result.diagnostics);
-	const total = allDiags.length;
-	const truncated = total > MAX_DIAGNOSTICS;
-	const display = truncated ? allDiags.slice(0, MAX_DIAGNOSTICS) : allDiags;
-	const { clean, unconfirmed, timedOut } = tallyConfirmation(results);
 
 	let text: string;
 	if (total === 0) {
