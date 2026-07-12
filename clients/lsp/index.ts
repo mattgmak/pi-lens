@@ -272,6 +272,20 @@ export interface LSPWorkspaceDiagnosticResult {
 	diagnostics: import("./client.js").LSPDiagnostic[];
 	count: number;
 	error?: string;
+	/**
+	 * True when this file's per-file check was NOT confirmed — either
+	 * `touchFile`'s own `.inconclusive` flag was set (#570: the notify write
+	 * or the diagnostics wait itself timed out), the OUTER `perFileMs`
+	 * `withDeadline` wrapper never got a result back at all, or the check
+	 * threw. `diagnostics` is a default-empty placeholder in every one of
+	 * those cases, not a confirmed result, and must not be treated as
+	 * "confirmed clean" by any caller reconciling this into cached state
+	 * (#571). Absent/false means the per-file check completed within budget
+	 * AND was confirmed; workspace-pull results (`tryWorkspacePull`) are
+	 * always confirmed (a pull either returns a real report or the caller
+	 * falls back to per-file, never a silent empty default).
+	 */
+	timedOut?: boolean;
 }
 
 const WORKSPACE_DIAGNOSTICS_CONCURRENCY = 8;
@@ -1147,7 +1161,23 @@ export class LSPService {
 			// (TypeScript ~1s) isn't held to a flat multi-second wait while a slow
 			// one (rust-analyzer 3s) gets the time it needs — bounded by any caller
 			// ceiling that exists to protect the per-edit pipeline budget (#203).
-			// The multi-server "full"/cascade path keeps the flat resolution.
+			// #573: clientScope "all" (lsp_diagnostics, lens_diagnostics_full) now
+			// gets the same per-server treatment as "with-auxiliary" — each spawned
+			// server (primary + any auxiliaries) is bounded by ITS OWN strategy
+			// budget instead of one flat number shared by every server. This was
+			// never a deliberate "all means wait for the group ceiling" semantic:
+			// #203 introduced perServerTimeout only for the single-server primary
+			// path and left "full"/"all" on the pre-existing flat resolution
+			// ("full/cascade path unchanged"); #242 later added "with-auxiliary"
+			// without revisiting "all". The one property "all" genuinely needs —
+			// the touch's overall detection deadline is the SLOWEST spawned
+			// server's budget, not the fastest — is unaffected: `timeoutMs` below
+			// is always `Math.max(...spawned.map(timeoutFor))` regardless of which
+			// timeoutFor is selected, so a slow auxiliary still gets to run to its
+			// own budget before the touch is logged as timed out. What changes is
+			// only that a fast server's *individual* `waitForDiagnostics` call
+			// (further below) now resolves/times out against its own budget
+			// instead of blocking to the flat multi-server number.
 			const envWait = readEnvDiagnosticsWaitMs();
 			const callerCap = options.maxDiagnosticsWaitMs ?? options.maxClientWaitMs;
 			const modeFloor = diagnosticsMode === "full" ? 3000 : 1200;
@@ -1169,10 +1199,14 @@ export class LSPService {
 				timeoutFor = () => envWait;
 			} else if (
 				(!useAllClients && spawned.length === 1) ||
-				clientScope === "with-auxiliary"
+				clientScope === "with-auxiliary" ||
+				clientScope === "all"
 			) {
 				timeoutFor = perServerTimeout;
 			} else {
+				// Fail-safe for any future clientScope this branch hasn't been
+				// taught about yet — keep the old flat resolution rather than
+				// silently mis-budgeting an unrecognized scope.
 				timeoutFor = () => callerCap ?? modeFloor;
 			}
 			// Detection deadline = the slowest individual server's budget.
@@ -2091,11 +2125,22 @@ export class LSPService {
 					}),
 					{ ms: perFileMs, onTimeout: "undefined" },
 				);
-				if (diagnostics === undefined) timedOutFiles += 1;
+				// #571: prefer #570's real per-touch inconclusive signal
+				// (`touchFile`'s non-enumerable `.inconclusive` flag — set when the
+				// notify write or the diagnostics wait itself timed out) over this
+				// sweep's own OUTER `perFileMs` deadline, which only catches a touch
+				// that never returned at all within budget. Either one means the
+				// result wasn't confirmed.
+				const inconclusive =
+					(diagnostics as (typeof diagnostics & { inconclusive?: boolean }))
+						?.inconclusive === true;
+				const timedOut = diagnostics === undefined || inconclusive;
+				if (timedOut) timedOutFiles += 1;
 				results.push({
 					filePath,
 					diagnostics: diagnostics ?? [],
 					count: diagnostics?.length ?? 0,
+					timedOut,
 				});
 			} catch (err) {
 				results.push({
@@ -2103,6 +2148,10 @@ export class LSPService {
 					diagnostics: [],
 					count: 0,
 					error: err instanceof Error ? err.message : String(err),
+					// An errored check is exactly as inconclusive as a timed-out one —
+					// no confirmed result was obtained, so reconciliation (#571) must
+					// skip it the same way.
+					timedOut: true,
 				});
 			}
 			completed += 1;
@@ -2215,7 +2264,10 @@ export class LSPService {
 			}
 			return groupFiles.map((filePath) => {
 				const diagnostics = byPath.get(normalizeMapKey(filePath)) ?? [];
-				return { filePath, diagnostics, count: diagnostics.length };
+				// A pull that got here returned a real workspace/diagnostic report
+				// (see the `!report` guard above) — always confirmed, unlike a
+				// per-file touchFile default-empty on timeout.
+				return { filePath, diagnostics, count: diagnostics.length, timedOut: false };
 			});
 		} catch {
 			return undefined;
