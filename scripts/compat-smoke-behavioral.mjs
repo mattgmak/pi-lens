@@ -32,7 +32,16 @@
  *   3. After each pi exit (graceful RPC shutdown, not SIGKILL): zero
  *      surviving LSP-server child processes that were not already running
  *      before the smoke started (#472 orphan class, #474's fix).
- *   4. concurrent_session_bind (#473's in-process guard) — NOT asserted.
+ *   4. avtc-pi-subagent PAIR only (PI_SUBAGENT_CHILD_AGENT +
+ *      PI_SUBAGENT_PARENT_PID, no PI_SUBAGENT_CHILD) -> `subagent_light_mode`
+ *      phase logged, no heavyweight-scan phase logged — the same detection
+ *      as assertion 1, exercised through the second vocabulary (#507/#518).
+ *   5. avtc-pi-subagent LONE var (only PI_SUBAGENT_CHILD_AGENT set, no
+ *      PI_SUBAGENT_PARENT_PID) -> the inverse guard: NO
+ *      `subagent_light_mode` phase logged. `subagent-mode.ts`'s doc comment
+ *      requires the PAIR — a lone var set by some unrelated tool must not
+ *      trigger light mode (#507/#518).
+ *   6. concurrent_session_bind (#473's in-process guard) — NOT asserted.
  *      The guard IS fully wired on master (PR #477: `decideSessionStart` is
  *      called from `index.ts`'s `session_start` handler), so the phase
  *      exists — but OBSERVING it requires reproducing tintinweb's in-process
@@ -421,7 +430,68 @@ async function main() {
 		}
 	}
 
-	// --- Assertion 4 (concurrent_session_bind, #473) — documented TODO ---
+	// --- Assertion 4: avtc-pi-subagent PAIR engages light mode (#507/#518) ---
+	{
+		const sinceIso = new Date().toISOString();
+		try {
+			await runPiRpc({
+				piBin,
+				extensionPath,
+				cwd: projectDir,
+				env: {
+					PI_SUBAGENT_CHILD_AGENT: "compat-smoke-worker",
+					PI_SUBAGENT_PARENT_PID: "4242",
+					PI_LENS_STARTUP_MODE: "full",
+				},
+			});
+			const entries = readLatencyLogEntries();
+			const lightModeLogged = phaseWasLogged(entries, "subagent_light_mode", sinceIso);
+			const heavyweightSkipped = noPhasesLogged(entries, HEAVYWEIGHT_SCAN_PHASES, sinceIso);
+			results.push({
+				id: "avtc-pair-engages-light-mode",
+				pass: lightModeLogged && heavyweightSkipped,
+				detail: `subagent_light_mode logged=${lightModeLogged}, heavyweight scans absent=${heavyweightSkipped}`,
+			});
+		} catch (err) {
+			results.push({
+				id: "avtc-pair-engages-light-mode",
+				pass: false,
+				detail: `pi invocation failed: ${err instanceof Error ? err.message : err}`,
+			});
+		}
+	}
+
+	// --- Assertion 5: avtc-pi-subagent LONE var must NOT engage light mode
+	// (the inverse guard subagent-mode.ts's doc comment calls out — #507/#518) ---
+	{
+		const sinceIso = new Date().toISOString();
+		try {
+			await runPiRpc({
+				piBin,
+				extensionPath,
+				cwd: projectDir,
+				env: {
+					PI_SUBAGENT_CHILD_AGENT: "compat-smoke-worker",
+					PI_LENS_STARTUP_MODE: "full",
+				},
+			});
+			const entries = readLatencyLogEntries();
+			const lightModeAbsent = !phaseWasLogged(entries, "subagent_light_mode", sinceIso);
+			results.push({
+				id: "avtc-lone-var-does-not-engage-light-mode",
+				pass: lightModeAbsent,
+				detail: `subagent_light_mode absent with only PI_SUBAGENT_CHILD_AGENT set (no PI_SUBAGENT_PARENT_PID): ${lightModeAbsent}`,
+			});
+		} catch (err) {
+			results.push({
+				id: "avtc-lone-var-does-not-engage-light-mode",
+				pass: false,
+				detail: `pi invocation failed: ${err instanceof Error ? err.message : err}`,
+			});
+		}
+	}
+
+	// --- Assertion 6 (concurrent_session_bind, #473) — documented TODO ---
 	results.push({
 		id: "concurrent-session-bind-in-process",
 		pass: true,

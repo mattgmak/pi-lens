@@ -6,6 +6,7 @@ export interface ContractCheckResult {
 }
 
 export function checkNicobailonChildEnv(source: string): ContractCheckResult;
+export function checkAvtcChildEnv(source: string): ContractCheckResult;
 export function checkSdkExtensionCache(source: string): ContractCheckResult;
 export function checkSdkBindExtensionsEmitsSessionStart(
   source: string,
@@ -22,6 +23,7 @@ export interface ContractCheckEntry extends ContractCheckResult {
 
 export interface ContractCheckInputs {
   nicobailonPiArgsSource: string;
+  avtcProcessRunnerSource: string;
   sdkLoaderSource: string;
   sdkAgentSessionSource: string;
   tintinwebAgentRunnerSource: string;

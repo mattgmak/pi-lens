@@ -10,6 +10,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  checkAvtcChildEnv,
   checkNicobailonChildEnv,
   checkSdkBindExtensionsEmitsSessionStart,
   checkSdkExtensionCache,
@@ -52,6 +53,54 @@ env[SUBAGENT_CHILD_ENV] = "1";
   it("fails on an unrelated source", () => {
     const result = checkNicobailonChildEnv("export const X = 1;");
     expect(result.pass).toBe(false);
+  });
+});
+
+describe("checkAvtcChildEnv", () => {
+  const GOOD = `
+if (agent.name) subagentEnv.PI_SUBAGENT_CHILD_AGENT = agent.name;
+subagentEnv.PI_SUBAGENT_PARENT_PID = String(process.pid);
+`;
+
+  it("passes when both the child-agent and parent-pid assignments exist", () => {
+    const result = checkAvtcChildEnv(GOOD);
+    expect(result.pass).toBe(true);
+  });
+
+  it("fails when the child-agent assignment is missing", () => {
+    const noChildAgent = GOOD.replace(
+      "if (agent.name) subagentEnv.PI_SUBAGENT_CHILD_AGENT = agent.name;",
+      "",
+    );
+    const result = checkAvtcChildEnv(noChildAgent);
+    expect(result.pass).toBe(false);
+    expect(result.detail).toContain("PI_SUBAGENT_CHILD_AGENT");
+  });
+
+  it("fails when the parent-pid assignment is missing", () => {
+    const noParentPid = GOOD.replace(
+      "subagentEnv.PI_SUBAGENT_PARENT_PID = String(process.pid);",
+      "",
+    );
+    const result = checkAvtcChildEnv(noParentPid);
+    expect(result.pass).toBe(false);
+    expect(result.detail).toContain("PI_SUBAGENT_PARENT_PID");
+  });
+
+  it("fails when the parent-pid assignment doesn't use String(process.pid)", () => {
+    const wrongShape = GOOD.replace(
+      "subagentEnv.PI_SUBAGENT_PARENT_PID = String(process.pid);",
+      "subagentEnv.PI_SUBAGENT_PARENT_PID = process.pid;",
+    );
+    const result = checkAvtcChildEnv(wrongShape);
+    expect(result.pass).toBe(false);
+  });
+
+  it("fails on an unrelated source", () => {
+    const result = checkAvtcChildEnv("export const X = 1;");
+    expect(result.pass).toBe(false);
+    expect(result.detail).toContain("PI_SUBAGENT_CHILD_AGENT");
+    expect(result.detail).toContain("PI_SUBAGENT_PARENT_PID");
   });
 });
 
@@ -184,9 +233,13 @@ await session.bindExtensions({ onError });
 });
 
 describe("runAllContractChecks", () => {
-  it("aggregates all six checks and reports allPass=false on any single failure", () => {
+  it("aggregates all seven checks and reports allPass=false on any single failure", () => {
     const inputs = {
       nicobailonPiArgsSource: "export const X = 1;", // fails
+      avtcProcessRunnerSource: `
+if (agent.name) subagentEnv.PI_SUBAGENT_CHILD_AGENT = agent.name;
+subagentEnv.PI_SUBAGENT_PARENT_PID = String(process.pid);
+`,
       sdkLoaderSource: "const extensionCache = new Map();",
       sdkAgentSessionSource: `
     async bindExtensions(bindings) {
@@ -200,7 +253,7 @@ await session.bindExtensions({});
 `,
     };
     const { results, allPass } = runAllContractChecks(inputs);
-    expect(results).toHaveLength(6);
+    expect(results).toHaveLength(7);
     expect(allPass).toBe(false);
     const failed = results.filter((r) => !r.pass);
     expect(failed.map((r) => r.id)).toEqual(["nicobailon.child-env"]);
@@ -213,6 +266,10 @@ export const SUBAGENT_CHILD_ENV = "PI_SUBAGENT_CHILD";
 export const SUBAGENT_RUN_ID_ENV = "PI_SUBAGENT_RUN_ID";
 export const SUBAGENT_CHILD_AGENT_ENV = "PI_SUBAGENT_CHILD_AGENT";
 env[SUBAGENT_CHILD_ENV] = "1";
+`,
+      avtcProcessRunnerSource: `
+if (agent.name) subagentEnv.PI_SUBAGENT_CHILD_AGENT = agent.name;
+subagentEnv.PI_SUBAGENT_PARENT_PID = String(process.pid);
 `,
       sdkLoaderSource: "const extensionCache = new Map();",
       sdkAgentSessionSource: `

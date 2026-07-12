@@ -3,7 +3,7 @@
  * Layer A: pinned-contract verification (#476).
  *
  * pi-lens's subagent-compatibility features (#473/#474/#475) were built on
- * reverse-engineered facts about two third-party pi extensions and the pi
+ * reverse-engineered facts about three third-party pi extensions and the pi
  * SDK itself — nobody has promised us these stay true across their releases.
  * This script npm-installs the real packages into a scratch directory and
  * mechanically re-verifies each pinned contract with RESILIENT pattern
@@ -36,6 +36,7 @@ import { runAllContractChecks } from "./lib/compat-contracts.mjs";
 const PACKAGES = {
   sdk: "@earendil-works/pi-coding-agent",
   nicobailon: "pi-subagents",
+  avtc: "avtc-pi-subagent",
   tintinweb: "@tintinweb/pi-subagents",
 };
 
@@ -98,6 +99,7 @@ async function main() {
   const versions = {
     "@earendil-works/pi-coding-agent": installedVersion(dir, "@earendil-works/pi-coding-agent"),
     "pi-subagents": installedVersion(dir, "pi-subagents"),
+    "avtc-pi-subagent": installedVersion(dir, "avtc-pi-subagent"),
     "@tintinweb/pi-subagents": installedVersion(dir, "@tintinweb/pi-subagents"),
   };
   console.log("\nversions installed:");
@@ -128,6 +130,7 @@ async function main() {
   try {
     inputs = {
       nicobailonPiArgsSource: readSource(dir, "pi-subagents", "src/runs/shared/pi-args.ts"),
+      avtcProcessRunnerSource: readSource(dir, "avtc-pi-subagent", "src/process-runner.ts"),
       sdkLoaderSource: readSource(
         dir,
         "@earendil-works/pi-coding-agent",

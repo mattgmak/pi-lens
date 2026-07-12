@@ -44,6 +44,38 @@ export function checkNicobailonChildEnv(source) {
 }
 
 /**
+ * Contract 1b (avtc-pi-subagent): the spawn-env pair set on every real
+ * child-process `pi` spawn — `PI_SUBAGENT_CHILD_AGENT` (the agent's name,
+ * assigned to the spawn env when the agent has one) and
+ * `PI_SUBAGENT_PARENT_PID` (unconditionally `String(process.pid)`).
+ * `subagent-mode.ts`'s `classifySubagentSession()` requires the PAIR (both
+ * non-empty) to detect this vocabulary — a lone var must not trip light
+ * mode — so this check asserts BOTH assignments exist, not either alone.
+ * Verified against `avtc-pi-subagent@1.0.3` — `src/process-runner.ts`.
+ *
+ * @param {string} source contents of process-runner.ts (or wherever the
+ *   per-spawn subagent env is built)
+ * @returns {{ pass: boolean, detail: string }}
+ */
+export function checkAvtcChildEnv(source) {
+  const setsChildAgent = /\w+\.PI_SUBAGENT_CHILD_AGENT\s*=/.test(source);
+  const setsParentPid =
+    /\w+\.PI_SUBAGENT_PARENT_PID\s*=\s*String\(\s*process\.pid\s*\)/.test(source);
+  const pass = setsChildAgent && setsParentPid;
+  return {
+    pass,
+    detail: pass
+      ? "PI_SUBAGENT_CHILD_AGENT + PI_SUBAGENT_PARENT_PID both assigned on the per-spawn subagent env"
+      : `missing: ${[
+          !setsChildAgent && "PI_SUBAGENT_CHILD_AGENT assignment",
+          !setsParentPid && "PI_SUBAGENT_PARENT_PID = String(process.pid) assignment",
+        ]
+          .filter(Boolean)
+          .join(", ")}`,
+  };
+}
+
+/**
  * Contract 2a (pi SDK): the extension loader keeps a process-global cache
  * named `extensionCache`. This is what makes an in-process
  * `bindExtensions()` (tintinweb-style) reuse pi-lens's own module-scope
@@ -173,6 +205,7 @@ export function checkTintinwebInProcessBind(source) {
  *
  * @param {{
  *   nicobailonPiArgsSource: string,
+ *   avtcProcessRunnerSource: string,
  *   sdkLoaderSource: string,
  *   sdkAgentSessionSource: string,
  *   tintinwebAgentRunnerSource: string,
@@ -185,6 +218,12 @@ export function runAllContractChecks(inputs) {
       package: "pi-subagents",
       description: "PI_SUBAGENT_CHILD/RUN_ID/CHILD_AGENT env vars set on every spawned child",
       ...checkNicobailonChildEnv(inputs.nicobailonPiArgsSource),
+    },
+    {
+      id: "avtc.child-env",
+      package: "avtc-pi-subagent",
+      description: "PI_SUBAGENT_CHILD_AGENT + PI_SUBAGENT_PARENT_PID pair set on every spawned child",
+      ...checkAvtcChildEnv(inputs.avtcProcessRunnerSource),
     },
     {
       id: "sdk.extension-cache",

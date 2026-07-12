@@ -18,17 +18,18 @@ every run.
 | # | Contract | Depended on by | Third-party file (as of the versions below) | Verified against |
 |---|----------|-----------------|-------------------------------------------------|-------------------|
 | 1 | `PI_SUBAGENT_CHILD` is set to the literal string `"1"` in every spawned child's env; `PI_SUBAGENT_RUN_ID` / `PI_SUBAGENT_CHILD_AGENT` are set alongside it for best-effort identity. | `clients/subagent-mode.ts` (`isSubagentSession()`, `getSubagentIdentity()`) | `pi-subagents@0.34.0` — `src/runs/shared/pi-args.ts` (`SUBAGENT_CHILD_ENV`/`SUBAGENT_RUN_ID_ENV`/`SUBAGENT_CHILD_AGENT_ENV` consts + the `env[SUBAGENT_CHILD_ENV] = "1"` assignment) | `checkNicobailonChildEnv` |
-| 1b | avtc-pi-subagent sets `PI_SUBAGENT_CHILD_AGENT` + `PI_SUBAGENT_PARENT_PID` (never `PI_SUBAGENT_CHILD`); `isSubagentSession()` treats the PAIR (both non-empty) as an additional subagent signal (#507). Not yet Layer-A pinned — see the avtc-pi-feature-flow row below. | `clients/subagent-mode.ts` (`isSubagentSession()`, `getSubagentIdentity()`) | `avtc-pi-subagent@1.0.3` (package not yet installed by `compat-contracts.mjs`) | not yet smoke-covered (deferred follow-up) |
+| 1b | avtc-pi-subagent sets `PI_SUBAGENT_CHILD_AGENT` + `PI_SUBAGENT_PARENT_PID` (never `PI_SUBAGENT_CHILD`) on the per-spawn subagent env; `isSubagentSession()` treats the PAIR (both non-empty) as an additional subagent signal (#507). | `clients/subagent-mode.ts` (`isSubagentSession()`, `getSubagentIdentity()`) | `avtc-pi-subagent@1.0.3` — `src/process-runner.ts` (`subagentEnv.PI_SUBAGENT_CHILD_AGENT = agent.name` + `subagentEnv.PI_SUBAGENT_PARENT_PID = String(process.pid)`) | `checkAvtcChildEnv` |
 | 2a | The pi SDK's extension loader keeps a **process-global** cache (`extensionCache = new Map()`). This is what makes an in-process `bindExtensions()` reuse pi-lens's own module-scope singletons instead of a fresh isolated instance. | `clients/session-lifecycle.ts` (the whole premise of the concurrent-session guard) | `@earendil-works/pi-coding-agent@0.80.6` — `dist/core/extensions/loader.js` | `checkSdkExtensionCache` |
 | 2b | `AgentSession.bindExtensions()` **unconditionally** emits a `session_start`-typed event (`this._extensionRunner.emit(this._sessionStartEvent)`). | Same as 2a — this is why an in-process subagent bind re-triggers pi-lens's `session_start` handler at all. | `@earendil-works/pi-coding-agent@0.80.6` — `dist/core/agent-session.js` (`bindExtensions()`, ~line 1717) | `checkSdkBindExtensionsEmitsSessionStart` |
 | 2c | `_extensionRunner.invalidate(...)` is called from the sequential session-replacement path (`newSession`/`fork`/`switchSession`/`reload`'s dispose route), never from a concurrent sibling bind. | `clients/session-lifecycle.ts` (`probeCtxActive()` — the asymmetry this whole guard relies on) | `@earendil-works/pi-coding-agent@0.80.6` — `dist/core/agent-session.js` (~line 551) | `checkSdkInvalidateCalled` |
 | 2d | The stale-ctx error thrown by an invalidated context's accessors contains the literal fragment `"stale after session replacement"`. | `clients/session-lifecycle.ts` (`probeCtxActive()` matches on this exact fragment) | `@earendil-works/pi-coding-agent@0.80.6` — `dist/core/agent-session.js` (the `invalidate(...)` message string) | `checkSdkStaleCtxMessage` |
 | 3 | tintinweb's subagent runner constructs a `DefaultResourceLoader` and calls `session.bindExtensions(...)` on a freshly created `AgentSession`, **inside the same Node process** as the parent pi session. | `clients/session-lifecycle.ts` (the concurrent-secondary case #473 exists to protect against) | `@tintinweb/pi-subagents@0.13.0` — `src/agent-runner.ts` (`new DefaultResourceLoader({...})` ~line 433, `await session.bindExtensions({...})` ~line 597) | `checkTintinwebInProcessBind` |
 
-All six checks live in `scripts/lib/compat-contracts.mjs` as pure, unit-tested
-regex matchers against RESILIENT semantic shapes (never a line number — those
-drift on every third-party release). `scripts/compat-contracts.mjs` is the
-orchestration script: it `npm install`s the three packages into a scratch
+All seven checks live in `scripts/lib/compat-contracts.mjs` as pure,
+unit-tested regex matchers against RESILIENT semantic shapes (never a line
+number — those drift on every third-party release). `scripts/compat-contracts.mjs`
+is the orchestration script: it `npm install`s the four packages (SDK,
+`pi-subagents`, `avtc-pi-subagent`, `@tintinweb/pi-subagents`) into a scratch
 directory, reads the specific files above, and runs every check.
 
 ## The three env levers
@@ -88,7 +89,17 @@ Assertions:
    (`typescript-language-server`, `ast-grep lsp`, `pyright-langserver`, …,
    `scripts/lib/process-scan.mjs`). This is the #472 orphan class #474
    fixed.
-4. **`concurrent_session_bind` (#473) — NOT asserted, documented TODO.**
+4. **avtc-pi-subagent PAIR engages light mode** (#507/#518) — with only
+   `PI_SUBAGENT_CHILD_AGENT` + `PI_SUBAGENT_PARENT_PID` set (no
+   `PI_SUBAGENT_CHILD`), `subagent_light_mode` is logged and none of the
+   seven heavyweight-scan phases are — same detection as assertion 1,
+   exercised through the second vocabulary.
+5. **avtc-pi-subagent LONE var does NOT engage light mode** (#507/#518) — the
+   inverse guard: with only `PI_SUBAGENT_CHILD_AGENT` set (no
+   `PI_SUBAGENT_PARENT_PID`), no `subagent_light_mode` phase is logged.
+   `subagent-mode.ts`'s doc comment requires the PAIR — a lone var set by
+   some unrelated tool must not trigger light mode.
+6. **`concurrent_session_bind` (#473) — NOT asserted, documented TODO.**
    The guard is fully wired on master (PR #477): `index.ts`'s `session_start`
    handler calls `decideSessionStart()` and logs a `concurrent_session_bind`
    latency phase for a concurrent-secondary bind — so the phase exists to
@@ -236,11 +247,14 @@ ecosystems apart. Its per-feature worktree isolation is the same bystander
 situation as pi-dynamic-workflows' isolated worktrees — no separate row
 needed for that.
 
-Still open (deferred, tracked as #518 — #507 itself is CLOSED, fixed by PR
-#508): a Layer A pinned env-vocabulary contract for avtc-pi-subagent in
-`scripts/lib/compat-contracts.mjs`, and a Layer B behavioral regression case
-asserting light mode engages for an avtc-only-marker child. Both are an
-M-effort follow-up, not part of the detection fix itself.
+Closed (#518, #507 itself was already CLOSED by PR #508): `avtc.child-env` is
+now a Layer A pinned contract in `scripts/lib/compat-contracts.mjs`
+(`checkAvtcChildEnv`, verified against `src/process-runner.ts`'s
+`subagentEnv.PI_SUBAGENT_CHILD_AGENT = agent.name` +
+`subagentEnv.PI_SUBAGENT_PARENT_PID = String(process.pid)` assignments), and
+Layer B (`scripts/compat-smoke-behavioral.mjs`) gained two behavioral
+assertions: the PAIR engages light mode, and a LONE `PI_SUBAGENT_CHILD_AGENT`
+(without `PI_SUBAGENT_PARENT_PID`) correctly does NOT.
 
 ### pi-swarm (`gjczone/pi-swarm`, assessed 2026-07-11)
 
