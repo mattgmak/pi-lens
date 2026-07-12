@@ -89,7 +89,7 @@ export function getManagedLogFiles(dir: string = LOG_DIR): string[] {
 		// best-effort backstop — registry + straggler list still apply
 	}
 
-	return [...names].sort();
+	return [...names].sort((a, b) => a.localeCompare(b));
 }
 
 /**
