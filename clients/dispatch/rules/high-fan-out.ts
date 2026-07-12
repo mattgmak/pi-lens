@@ -64,7 +64,7 @@ export const highFanOutRule: FactRule = {
 
 			diagnostics.push({
 				id: `high-fan-out:${ctx.filePath}:${f.line}`,
-				tool: "high-fan-out",
+				tool: "fact-rules",
 				rule: "high-fan-out",
 				filePath: ctx.filePath,
 				line: f.line,

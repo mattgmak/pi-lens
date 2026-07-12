@@ -59,7 +59,7 @@ export const highComplexityRule: FactRule = {
 
 			diagnostics.push({
 				id: `high-complexity:${ctx.filePath}:${f.line}`,
-				tool: "high-complexity",
+				tool: "fact-rules",
 				rule: "high-complexity",
 				filePath: ctx.filePath,
 				line: f.line,
