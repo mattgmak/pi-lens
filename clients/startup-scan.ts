@@ -10,8 +10,9 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getProjectIgnoreMatcher, isExcludedDirName } from "./file-utils.js";
+import { getProjectIgnoreMatcher } from "./file-utils.js";
 import { isAtOrAboveHomeDir } from "./path-utils.js";
+import { readDirEntriesSafe, shouldRecurseIntoDir } from "./source-walker.js";
 
 export const PROJECT_ROOT_MARKERS = [
 	".git",
@@ -69,18 +70,16 @@ export function countSourceFilesWithinLimit(
 		const current = stack.pop();
 		if (!current) continue;
 
-		let entries: fs.Dirent[] = [];
-		try {
-			entries = fs.readdirSync(current, { withFileTypes: true });
-		} catch {
-			continue;
-		}
+		const entries = readDirEntriesSafe(current);
 
 		for (const entry of entries) {
 			const fullPath = path.join(current, entry.name);
 			if (entry.isDirectory()) {
-				if (isExcludedDirName(entry.name)) continue;
-				if (ignoreMatcher.isIgnored(fullPath, true)) continue;
+				// Never checked symlinks — always follows them (unlike
+				// source-filter.ts's collectSourceFiles*, refs #191).
+				if (!shouldRecurseIntoDir(entry, fullPath, { ignoreMatcher, followSymlinks: true })) {
+					continue;
+				}
 				stack.push(fullPath);
 				continue;
 			}
@@ -219,18 +218,16 @@ export async function countSourceFilesWithinLimitAsync(
 		const current = stack.pop();
 		if (!current) continue;
 
-		let entries: fs.Dirent[] = [];
-		try {
-			entries = fs.readdirSync(current, { withFileTypes: true });
-		} catch {
-			continue;
-		}
+		const entries = readDirEntriesSafe(current);
 
 		for (const entry of entries) {
 			const fullPath = path.join(current, entry.name);
 			if (entry.isDirectory()) {
-				if (isExcludedDirName(entry.name)) continue;
-				if (ignoreMatcher.isIgnored(fullPath, true)) continue;
+				// Never checked symlinks — always follows them (unlike
+				// source-filter.ts's collectSourceFiles*, refs #191).
+				if (!shouldRecurseIntoDir(entry, fullPath, { ignoreMatcher, followSymlinks: true })) {
+					continue;
+				}
 				stack.push(fullPath);
 			} else if (
 				entry.isFile() &&
