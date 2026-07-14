@@ -82,14 +82,19 @@ export interface ModuleSymbolUsedBy {
 	provenance?: "ast" | "lsp";
 	/**
 	 * Resolution confidence for an `ast`-provenance hit (refs #655). `"exact"` =
-	 * this caller/reference was matched to exactly one same-named symbol
-	 * graph-wide — unambiguous. `"name-only"` = the callee/reference name has 0
-	 * or 2+ same-named candidates in the graph, so this entry may be a
-	 * name-collision guess rather than a confirmed call to THIS symbol —
-	 * weight it accordingly. Undefined for `lsp`-provenance hits (out of scope
-	 * here; LSP resolution has its own, separate confidence story per #236).
+	 * matched to exactly one same-named symbol graph-wide — unambiguous.
+	 * `"import"` = the caller's own import statements named exactly which file
+	 * the bare-name callee comes from, narrowing to that file. `"receiver-type"`
+	 * = a `obj.method()` call whose receiver's class was determined from the
+	 * same file's tree-sitter parse (a `new ClassName()` assignment or a typed
+	 * parameter) and resolved directly to that class's method. `"name-only"` =
+	 * the callee/reference name has 0 or 2+ same-named candidates even after any
+	 * import/receiver-type narrowing, so this entry may be a name-collision
+	 * guess rather than a confirmed call to THIS symbol — weight it
+	 * accordingly. Undefined for `lsp`-provenance hits (out of scope here; LSP
+	 * resolution has its own, separate confidence story per #236).
 	 */
-	resolution?: "exact" | "name-only";
+	resolution?: "exact" | "import" | "receiver-type" | "name-only";
 }
 
 export interface ModuleSymbolEntry {
@@ -501,7 +506,13 @@ function resolveUsedBy(
 			(edge.from.startsWith("file:") ? edge.from.slice("file:".length) : "");
 		if (!rawFile) continue;
 		const file = toDisplayPath(rawFile, projectRoot);
-		const symbol = from?.symbolName ?? "";
+		// refs #655 phase 2: prefer the owner-qualified display name
+		// (`UserService.run`) when the caller has one, so two different classes'
+		// same-named methods are distinguishable in `usedBy`/`blastRadius` output
+		// without cross-referencing line numbers. This exact dotted string is a
+		// valid `read_symbol` qualifier (see `ReviewGraphNode.qualifiedName`'s doc
+		// comment) — both derive from the same containment notion of "owner".
+		const symbol = from?.qualifiedName ?? from?.symbolName ?? "";
 		// Caller line: a symbol caller node carries metadata.line; a file-level
 		// `references` edge carries the line on the edge metadata.
 		const line =

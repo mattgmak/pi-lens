@@ -1,4 +1,5 @@
 import type { FactProvider } from "../fact-provider-types.js";
+import { findOwnerName } from "../../symbol-containment.js";
 import {
 	extractFactsFromTree,
 	firstChildOfType,
@@ -17,10 +18,20 @@ const BOUNDARY_PREFIXES = [
 	"res.",
 ];
 
+/** A `obj.method(...)` call site (refs #655 phase 2 — "receiver-type" resolution). */
+export interface MemberCallSite {
+	/** The receiver expression's text, when it's a simple identifier (e.g. `userService`). */
+	receiver: string;
+	/** The called method/property name. */
+	method: string;
+}
+
 export interface FunctionSummary {
 	name: string;
 	line: number;
 	column: number;
+	/** 1-based end line of the function body (refs #655 phase 2 — owner/qualified-name computation). */
+	endLine?: number;
 	isAsync: boolean;
 	hasAwait: boolean;
 	hasReturnAwaitCall: boolean;
@@ -35,6 +46,29 @@ export interface FunctionSummary {
 	maxNestingDepth: number;
 	/** Distinct callees invoked within the function body */
 	outgoingCalls: string[];
+	/**
+	 * Owner-qualified display name (e.g. `UserService.run`) when this function
+	 * is nested inside a class/interface — refs #655 phase 2. Computed via the
+	 * shared `findOwnerName` containment helper over this file's class/interface
+	 * declarations; undefined for a top-level function.
+	 */
+	owner?: string;
+	/**
+	 * `obj.method()` call sites with a simple-identifier receiver, kept
+	 * SEPARATE from `outgoingCalls` (which flattens these to `"obj.method"` and
+	 * treats them as external, refs #655 phase 2) so the review-graph builder
+	 * can attempt same-file "receiver-type" resolution instead.
+	 */
+	memberCallSites?: MemberCallSite[];
+	/**
+	 * Best-effort local variable/parameter -> class-name map for THIS function
+	 * only (refs #655 phase 2). Covers the clearest, most common shapes: a
+	 * `const x = new ClassName(...)` assignment, and a typed parameter
+	 * (`function f(x: ClassName)`). Anything else (reassignment, destructuring,
+	 * cross-function flow, generics) is simply absent — conservative by
+	 * omission, never a guess.
+	 */
+	receiverTypes?: Record<string, string>;
 }
 
 const FUNCTION_TYPES = new Set([
@@ -206,6 +240,64 @@ function collectOutgoingCalls(body: TsNode): string[] {
 	return [...calls];
 }
 
+/**
+ * `obj.method()` call sites with a simple-identifier receiver (refs #655
+ * phase 2). Only the plain shape `identifier.identifier(...)` is captured —
+ * chained (`a.b.c()`), computed (`a[x]()`), and `this.`-receiver calls are
+ * left out of this list (they still show up in `outgoingCalls`'s flattened
+ * text form as before); those richer shapes need real type inference to
+ * resolve safely, which is out of scope for this bounded slice.
+ */
+function collectMemberCallSites(body: TsNode): MemberCallSite[] {
+	const sites: MemberCallSite[] = [];
+	walk(body, (node) => {
+		if (node.type !== "call_expression") return;
+		const callee = (node.children ?? [])[0];
+		if (!callee || callee.type !== "member_expression") return;
+		const object = (callee.children ?? [])[0];
+		const property = (callee.children ?? []).find(
+			(c: TsNode) => c?.type === "property_identifier",
+		);
+		if (!object || object.type !== "identifier" || !property) return;
+		sites.push({ receiver: object.text, method: property.text });
+	});
+	return sites;
+}
+
+/**
+ * Best-effort receiver -> class-name map for one function (refs #655 phase
+ * 2). Two clear, common shapes only — see {@link FunctionSummary.receiverTypes}.
+ */
+function collectReceiverTypes(
+	body: TsNode,
+	params: TsNode[],
+): Record<string, string> {
+	const types: Record<string, string> = {};
+	for (const param of params) {
+		const id = firstNamedChild(param);
+		if (!id || id.type !== "identifier") continue;
+		const typeAnnotation = (param.children ?? []).find(
+			(c: TsNode) => c?.type === "type_annotation",
+		);
+		const typeId = typeAnnotation
+			? firstChildOfType(typeAnnotation, "type_identifier")
+			: undefined;
+		if (typeId) types[id.text] = typeId.text;
+	}
+	walk(body, (node) => {
+		if (node.type !== "variable_declarator") return;
+		const id = firstChildOfType(node, "identifier");
+		if (!id) return;
+		const value = (node.children ?? []).find(
+			(c: TsNode) => c?.type === "new_expression",
+		);
+		if (!value) return;
+		const ctor = firstNamedChild(value);
+		if (ctor?.type === "identifier") types[id.text] = ctor.text;
+	});
+	return types;
+}
+
 function hasAwaitInNode(node: TsNode): boolean {
 	let found = false;
 	walk(node, (n) => {
@@ -240,6 +332,14 @@ export const functionFactProvider: FactProvider = {
 			{ "file.functionSummaries": [] },
 			(root) => {
 				const summaries: FunctionSummary[] = [];
+				// Class/interface declarations, collected in the SAME walk over the
+				// already-parsed tree (refs #655 phase 2) so owner/qualified-name
+				// computation for jsts needs no second parse — see
+				// `symbol-containment.ts`'s doc comment for why this can't literally
+				// share code with module-report.ts's tree-sitter-symbol-extractor path
+				// (different tree-sitter integration), only the same algorithm.
+				const containers: { name: string; startLine: number; endLine: number }[] =
+					[];
 
 				const addSummary = (node: TsNode): void => {
 					const body = getBody(node);
@@ -264,6 +364,7 @@ export const functionFactProvider: FactProvider = {
 						name: getFunctionName(node),
 						line: node.startPosition.row + 1,
 						column: node.startPosition.column + 1,
+						endLine: body.endPosition.row + 1,
 						isAsync: Boolean(firstChildOfType(node, "async")),
 						hasAwait: hasAwaitInNode(body),
 						hasReturnAwaitCall: hasReturnAwaitCall(body),
@@ -275,12 +376,36 @@ export const functionFactProvider: FactProvider = {
 						cyclomaticComplexity: calcCyclomaticComplexity(body),
 						maxNestingDepth: calcMaxNestingDepth(body),
 						outgoingCalls: collectOutgoingCalls(body),
+						memberCallSites: collectMemberCallSites(body),
+						receiverTypes: collectReceiverTypes(body, params),
 					});
 				};
 
 				walk(root, (node) => {
 					if (FUNCTION_TYPES.has(node.type)) addSummary(node);
+					if (
+						node.type === "class_declaration" ||
+						node.type === "interface_declaration"
+					) {
+						const nameNode = firstChildOfType(node, "type_identifier");
+						if (nameNode) {
+							containers.push({
+								name: nameNode.text,
+								startLine: node.startPosition.row + 1,
+								endLine: node.endPosition.row + 1,
+							});
+						}
+					}
 				});
+
+				for (const summary of summaries) {
+					const owner = findOwnerName(
+					containers,
+					summary.line,
+					summary.endLine ?? summary.line,
+				);
+					if (owner) summary.owner = owner;
+				}
 
 				return { "file.functionSummaries": summaries };
 			},
