@@ -174,17 +174,48 @@ describe("ast-grep Sonar gap rules (integration via real runner)", () => {
 		});
 
 		describe("nested-ternary (has stopBy: end, no self-match)", () => {
-			// The TypeScript-tagged `nested-ternary` id is in TREE_SITTER_OVERLAP
-			// (skipped by this runner, on the assumption the tree-sitter query
-			// runner covers .ts — separately stale since that query currently
-			// lives under tree-sitter-queries/typescript-disabled/, but that's a
-			// pre-existing gap unrelated to #657). Before the #657 fix, this
-			// suite exercised the `has`/stopBy semantics via the JavaScript-
-			// tagged `nested-ternary-js` twin cross-firing on a .ts sample file —
-			// exactly the double-firing bug #657 closes. Test against a real
-			// .js sample instead so `nested-ternary-js` fires for the RIGHT
-			// reason (its own language match, not a superset-grammar leak).
-			it("flags a chained ternary", async () => {
+			// #660: `nested-ternary` (TypeScript-tagged) used to be skipped by
+			// this runner via TREE_SITTER_OVERLAP, on the false assumption that
+			// the tree-sitter query runner covers .ts files — that query
+			// actually lives under tree-sitter-queries/typescript-disabled/ and
+			// is never loaded in production, so the assumption gave ZERO
+			// coverage. TREE_SITTER_OVERLAP has been removed; `nested-ternary`
+			// now fires directly on .ts files again, same as `nested-ternary-js`
+			// on .js files. Cover both, plus confirm #657's language scoping
+			// still holds (no cross-firing of the JS twin on a .ts file).
+			it("flags a chained ternary on .ts", async () => {
+				expect(
+					await rulesFiredOn(
+						"const x = a ? b : c ? d : e;\n",
+						{},
+						"sample.ts",
+					),
+				).toContain("nested-ternary");
+			});
+			it("flags a parenthesized nested ternary on .ts (needs stopBy: end)", async () => {
+				expect(
+					await rulesFiredOn(
+						"const x = a ? (b ? c : d) : e;\n",
+						{},
+						"sample.ts",
+					),
+				).toContain("nested-ternary");
+			});
+			it("does NOT flag a single ternary on .ts (the has self-match bug)", async () => {
+				expect(
+					await rulesFiredOn("const x = a ? b : c;\n", {}, "sample.ts"),
+				).not.toContain("nested-ternary");
+			});
+			it("does NOT cross-fire the JavaScript-tagged twin on a .ts file (#657)", async () => {
+				expect(
+					await rulesFiredOn(
+						"const x = a ? b : c ? d : e;\n",
+						{},
+						"sample.ts",
+					),
+				).not.toContain("nested-ternary-js");
+			});
+			it("flags a chained ternary on .js via the JavaScript-tagged twin", async () => {
 				expect(
 					await rulesFiredOn(
 						"const x = a ? b : c ? d : e;\n",
@@ -193,19 +224,50 @@ describe("ast-grep Sonar gap rules (integration via real runner)", () => {
 					),
 				).toContain("nested-ternary-js");
 			});
-			it("flags a parenthesized nested ternary (needs stopBy: end)", async () => {
-				expect(
-					await rulesFiredOn(
-						"const x = a ? (b ? c : d) : e;\n",
-						{},
-						"sample.js",
-					),
-				).toContain("nested-ternary-js");
-			});
-			it("does NOT flag a single ternary (the has self-match bug)", async () => {
+			it("does NOT flag a single ternary on .js", async () => {
 				expect(
 					await rulesFiredOn("const x = a ? b : c;\n", {}, "sample.js"),
 				).not.toContain("nested-ternary-js");
+			});
+		});
+
+		describe("long-parameter-list (#660: no longer wrongly skipped for .ts)", () => {
+			// #660: this rule id was in the removed TREE_SITTER_OVERLAP set, on
+			// the false assumption tree-sitter covers it (its tree-sitter query
+			// lives under typescript-disabled/ and was never loaded in
+			// production). Confirm the shipped ast-grep rule now actually fires.
+			it("flags a function with 5 required parameters", async () => {
+				expect(
+					await rulesFiredOn(
+						"function make(a: string, b: string, c: string, d: string, e: string) {}\n",
+					),
+				).toContain("long-parameter-list");
+			});
+			it("does NOT flag a function with 4 required parameters", async () => {
+				expect(
+					await rulesFiredOn(
+						"function make(a: string, b: string, c: string, d: string) {}\n",
+					),
+				).not.toContain("long-parameter-list");
+			});
+		});
+
+		describe("no-dupe-class-members (#660 removed the skip; #663 tracks a separate gap)", () => {
+			// #660: this rule id was also in the removed TREE_SITTER_OVERLAP set
+			// despite never having had ANY tree-sitter query (active or
+			// disabled) — a pure coverage gap from that angle. However, unlike
+			// `nested-ternary`/`long-parameter-list`, it does NOT actually start
+			// firing once unskipped: this rule's YAML declares a top-level
+			// `utils:` block (reusable matchers via `matches: <name>`), which
+			// `yaml-rule-parser.ts`/`ast-grep-napi.ts` silently drop before
+			// calling napi's native `findAll` — a pre-existing, unrelated bug
+			// filed as #663. Document the current (still-gapped) behavior here
+			// rather than asserting a fix that hasn't landed; #663 should flip
+			// this to `.toContain(...)` once `utils:` passthrough is added.
+			it("does not yet flag a duplicate method — utils: block dropped (#663)", async () => {
+				expect(
+					await rulesFiredOn("class A { foo() {} foo() {} }\n"),
+				).not.toContain("no-dupe-class-members");
 			});
 		});
 

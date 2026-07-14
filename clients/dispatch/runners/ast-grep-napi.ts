@@ -65,14 +65,31 @@ const MAX_MATCHES_PER_RULE = 10;
 /** Maximum total diagnostics per file to prevent output spam */
 const MAX_TOTAL_DIAGNOSTICS = 50;
 
-/** Rules already covered by tree-sitter runner (priority 14, runs first) */
-const TREE_SITTER_OVERLAP = new Set([
-	"constructor-super",
-	"empty-catch",
-	"long-parameter-list",
-	"nested-ternary",
-	"no-dupe-class-members",
-]);
+/**
+ * #660: this runner used to skip a hardcoded set of rule ids
+ * (`constructor-super`, `empty-catch`, `long-parameter-list`,
+ * `nested-ternary`, `no-dupe-class-members`) on the assumption that the
+ * tree-sitter query runner (priority 14) already covered them, to avoid
+ * double-reporting. That assumption was false for every entry: three of
+ * them (`nested-ternary`, `long-parameter-list`, `no-dupe-class-members`)
+ * have no active tree-sitter query — their would-be queries either live
+ * under `rules/tree-sitter-queries/typescript-disabled/` (excluded from
+ * loading, see clients/tree-sitter-query-loader.ts) or were never written —
+ * so those three rule ids had ZERO coverage in the NAPI fallback runner
+ * (used when the ast-grep binary isn't installed) despite having a
+ * perfectly good, shipped, active ast-grep rule sitting right there. The
+ * other two (`constructor-super`, `empty-catch`) are disabled everywhere
+ * (ast-grep AND tree-sitter, see rules-disabled/, #206), so skipping them
+ * was already a no-op. The whole skip-set has been removed; if tree-sitter
+ * coverage is ever added back for one of these rule ids, reintroduce a
+ * scoped skip alongside the query that actually covers it — don't recreate
+ * a blanket assumption-based list.
+ *
+ * Note: `no-dupe-class-members` still doesn't fire post-removal — its rule
+ * YAML uses a top-level `utils:` block that this runner's native-config
+ * passthrough drops entirely, a separate pre-existing bug tracked in #663
+ * (affects 5 shipped rules, not just this one).
+ */
 
 /**
  * Rules commonly covered by ESLint/Biome correctness checks.
@@ -313,9 +330,6 @@ export function evaluateAstGrepRules(
 			) {
 				continue;
 			}
-
-			// Skip rules already handled by tree-sitter runner (priority 14)
-			if (TREE_SITTER_OVERLAP.has(rule.id)) continue;
 
 			// Skip rules whose top-level pattern is overly broad ($NAME, $X, etc.)
 			// without additional structural constraints to narrow matches.
