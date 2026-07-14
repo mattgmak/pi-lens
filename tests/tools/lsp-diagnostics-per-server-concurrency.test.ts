@@ -30,6 +30,10 @@ const { getServersForFileWithConfig } = vi.hoisted(() => ({
 vi.mock("../../clients/lsp/config.js", () => ({
 	getServersForFileWithConfig,
 	getServerInitOverride: vi.fn().mockReturnValue(undefined),
+	// #646: `primaryServerId` moved here from `tools/lsp-diagnostics.ts` — this
+	// mock's fake server list has no `role`, so every entry is non-auxiliary
+	// (matching the real getServersForFileWithConfig contract this test fakes).
+	primaryServerId: (fp: string) => getServersForFileWithConfig(fp)[0]?.id,
 }));
 
 // Real `groupFilesByPrimaryServer`/`runPerServerGroups` — only `getLSPService`

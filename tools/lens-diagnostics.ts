@@ -19,6 +19,7 @@ import { combineAbortSignals } from "../clients/deadline-utils.js";
 import { getProjectIgnoreMatcher } from "../clients/file-utils.js";
 import { normalizeFilePath } from "../clients/path-utils.js";
 import { getLSPService } from "../clients/lsp/index.js";
+import { primaryServerId } from "../clients/lsp/config.js";
 import type { LSPDiagnostic } from "../clients/lsp/client.js";
 import type { CacheManager } from "../clients/cache-manager.js";
 import {
@@ -757,6 +758,87 @@ function summarizeDiagnostics(
 	};
 }
 
+/**
+ * #646: break the confirmed/unconfirmed LSP-sweep tally down PER primary
+ * server id (typescript, pyright, marksman, ...) instead of one flat
+ * aggregate count. Mirrors `tools/lsp-diagnostics.ts`'s `primaryServerId`/
+ * `tallyConfirmation` split — both tools now use the SAME
+ * `primaryServerId` (clients/lsp/config.ts) so a file's classification as
+ * "primary language server" vs "auxiliary scanner" agrees between them.
+ *
+ * Motivating case (#646): a real sweep came back 34/155 unconfirmed, and
+ * diagnosing WHICH server was responsible required grepping
+ * `~/.pi-lens/latency.log` by hand — it turned out to be 100% one push-only
+ * server (marksman). This tally makes that visible directly: `{ marksman:
+ * { confirmed: 0, total: 34 }, typescript: { confirmed: 121, total: 121 } }`.
+ *
+ * Purely an additional reporting dimension — does NOT change what counts as
+ * confirmed/unconfirmed (the existing `confirmedLspResults`/
+ * `unconfirmedLspResults` partition in `formatFullMode` is unchanged and
+ * still the source of truth this reads from).
+ */
+function tallyLspByPrimaryServer(
+	confirmed: WorkspaceLspDiagnosticResult[],
+	unconfirmed: WorkspaceLspDiagnosticResult[],
+): Map<string, { confirmed: number; total: number }> {
+	const byServer = new Map<string, { confirmed: number; total: number }>();
+	const bump = (filePath: string, wasConfirmed: boolean) => {
+		const id = primaryServerId(filePath) ?? "unknown";
+		const entry = byServer.get(id) ?? { confirmed: 0, total: 0 };
+		entry.total += 1;
+		if (wasConfirmed) entry.confirmed += 1;
+		byServer.set(id, entry);
+	};
+	for (const result of confirmed) bump(result.filePath, true);
+	for (const result of unconfirmed) bump(result.filePath, false);
+	return byServer;
+}
+
+/**
+ * Render the per-server tally from `tallyLspByPrimaryServer` as a short
+ * clause, e.g. "typescript: 121/121, marksman: 0/34" — sorted so the
+ * worst-confirmed server (the one most likely to be why a sweep looks
+ * unconfirmed) is called out first.
+ */
+function formatLspServerBreakdown(
+	byServer: Map<string, { confirmed: number; total: number }>,
+): string {
+	return [...byServer.entries()]
+		.sort((a, b) => {
+			const rateA = a[1].confirmed / a[1].total;
+			const rateB = b[1].confirmed / b[1].total;
+			return rateA - rateB;
+		})
+		.map(([id, { confirmed, total }]) => `${id}: ${confirmed}/${total}`)
+		.join(", ");
+}
+
+/**
+ * #646: split a raw LSP-sweep result set's diagnostics into "primary" (the
+ * real language server, e.g. typescript/pyright) vs "auxiliary" (cross-
+ * cutting scanners attached via clientScope "all" — ast-grep, opengrep,
+ * zizmor, typos, marksman, ...), the same separation `lsp_diagnostics`
+ * already applies to its own findings rendering (see
+ * `tools/lsp-diagnostics.ts`'s `collectBatchDiagnostics`). Computed from the
+ * raw per-file LSP results (not the merged widget-state summaries further
+ * down `formatFullMode`) so it doesn't disturb the existing merge/dedup
+ * logic those summaries feed into.
+ */
+function tallyLspPrimaryVsAuxiliary(
+	results: WorkspaceLspDiagnosticResult[],
+): { primary: number; auxiliary: number } {
+	let primary = 0;
+	let auxiliary = 0;
+	for (const result of results) {
+		const primaryId = primaryServerId(result.filePath);
+		for (const diagnostic of result.diagnostics ?? []) {
+			if (diagnostic.source === primaryId) primary += 1;
+			else auxiliary += 1;
+		}
+	}
+	return { primary, auxiliary };
+}
+
 function mergeDiagnosticsWithWidgetSummaries(
 	widgetSummaries: FileDiagnosticSummary[],
 	lspResults: WorkspaceLspDiagnosticResult[],
@@ -1120,6 +1202,22 @@ async function formatFullMode(
 		(result) => result.timedOut,
 	).length;
 	const unconfirmedErrored = unconfirmedLspResults.length - unconfirmedTimedOut;
+	// #646: per-primary-server breakdown of the same confirmed/unconfirmed
+	// tally — lets an agent see AT A GLANCE which server is responsible for
+	// any unconfirmed files (e.g. "marksman: 0/34") instead of having to
+	// cross-reference latency.log by hand. Computed unconditionally so it's
+	// always available in `details` even on an all-confirmed sweep; only
+	// rendered in the text note when more than one server is involved (with
+	// a single server the breakdown is redundant with the totals already
+	// stated).
+	const lspServerBreakdown = tallyLspByPrimaryServer(
+		confirmedLspResults,
+		unconfirmedLspResults,
+	);
+	const serverBreakdownClause =
+		lspServerBreakdown.size > 1
+			? ` — by server: ${formatLspServerBreakdown(lspServerBreakdown)}.`
+			: "";
 	const unconfirmedLspNote =
 		unconfirmedLspResults.length > 0
 			? `\n\n⚠ LSP sweep: ${confirmedLspResults.length} file(s) confirmed via LSP, ` +
@@ -1129,12 +1227,23 @@ async function formatFullMode(
 						: unconfirmedTimedOut > 0
 							? "check didn't complete within budget"
 							: "check errored"
-				}) — NOT the same as 0 diagnostics for: ${unconfirmedLspResults
+				})${serverBreakdownClause} — NOT the same as 0 diagnostics for: ${unconfirmedLspResults
 					.slice(0, 20)
 					.map((result) => result.filePath)
 					.join(
 						", ",
 					)}${unconfirmedLspResults.length > 20 ? ", …" : ""}. These files' LSP contribution is excluded from this result; re-run mode=full to retry them (they may still show findings above from cached/project-runner state).`
+			: "";
+	// #646: primary-vs-auxiliary split of the raw LSP-sweep findings (before
+	// they're merged into the widget-state summaries below), mirroring
+	// `lsp_diagnostics`' "Primary findings"/"Auxiliary findings" separation —
+	// so a page of ast-grep/opengrep/marksman noise never buries whether the
+	// real language server itself found anything in this sweep.
+	const lspPrimaryVsAuxiliary = tallyLspPrimaryVsAuxiliary(confirmedLspResults);
+	const lspPrimaryVsAuxiliaryNote =
+		lspPrimaryVsAuxiliary.primary + lspPrimaryVsAuxiliary.auxiliary > 0
+			? `\n\nLSP sweep findings: ${lspPrimaryVsAuxiliary.primary} primary (language server), ` +
+				`${lspPrimaryVsAuxiliary.auxiliary} auxiliary (ast-grep/opengrep/zizmor/typos/marksman/...).`
 			: "";
 	// #533/#585: a heavyweight analyzer (knip/jscpd/madge/gitleaks/govulncheck/
 	// trivy/dead-code) that contributed nothing this run is either COLD (not
@@ -1201,6 +1310,13 @@ async function formatFullMode(
 			unconfirmedLspFiles: unconfirmedLspResults.map(
 				(result) => result.filePath,
 			),
+			// #646: per-primary-server breakdown of the same tally, plus the
+			// primary/auxiliary findings split — mirrors `lsp_diagnostics`'
+			// per-server reporting granularity (always present, even when every
+			// server confirmed cleanly, so a caller can check it unconditionally).
+			lspServerBreakdown: Object.fromEntries(lspServerBreakdown),
+			lspPrimaryDiagnosticsCount: lspPrimaryVsAuxiliary.primary,
+			lspAuxiliaryDiagnosticsCount: lspPrimaryVsAuxiliary.auxiliary,
 		},
 	};
 	// Stopped mid-scan: the results above are whatever completed before the abort.
@@ -1225,6 +1341,7 @@ async function formatFullMode(
 						result.content[0].text +
 						note +
 						unconfirmedLspNote +
+						lspPrimaryVsAuxiliaryNote +
 						coldNote +
 						abortedNote +
 						freshNote +
@@ -1234,7 +1351,14 @@ async function formatFullMode(
 			details: { ...resultWithCold.details, timedOut },
 		};
 	}
-	if (missingNote || coldNote || abortedNote || freshNote || unconfirmedLspNote) {
+	if (
+		missingNote ||
+		coldNote ||
+		abortedNote ||
+		freshNote ||
+		unconfirmedLspNote ||
+		lspPrimaryVsAuxiliaryNote
+	) {
 		return {
 			content: [
 				{
@@ -1242,6 +1366,7 @@ async function formatFullMode(
 					text:
 						result.content[0].text +
 						unconfirmedLspNote +
+						lspPrimaryVsAuxiliaryNote +
 						coldNote +
 						abortedNote +
 						freshNote +
