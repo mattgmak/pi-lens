@@ -19,6 +19,7 @@ import {
 import { collectProjectSourceFilesAsync } from "../project-scan-policy.js";
 import { resolveImportToFiles } from "./import-resolvers.js";
 import { RUNTIME_CONFIG } from "../runtime-config.js";
+import { buildQualifiedName, findOwnerName } from "../symbol-containment.js";
 import { getSharedTreeSitterClient } from "../tree-sitter-shared.js";
 import {
 	type ExtractedSymbols,
@@ -873,6 +874,16 @@ export function flushReviewGraphPersistsForTests(): void {
 	for (const key of [..._pendingPersist.keys()]) writePending(key);
 }
 
+// TS-as-ESM sources commonly write `import { x } from "./service.js"` while
+// the real file on disk is `service.ts` (Node's ESM resolver requires the
+// RUNTIME extension in the specifier, which is `.js` even for a `.ts` source —
+// this repo's own `clients/**/*.ts` does this throughout). Stripping a known
+// JS/TS extension from the specifier before re-appending candidate extensions
+// below lets that universal pattern resolve to the real `.ts` file; refs #655
+// phase 2, where this directly gates the new "import" resolution tier, but it
+// was already a latent gap for the plain file->file `imports` edge too.
+const JS_TS_EXT_RE = /\.(mjs|cjs|jsx?|tsx?)$/i;
+
 function localImportToFile(
 	cwd: string,
 	filePath: string,
@@ -880,12 +891,18 @@ function localImportToFile(
 ): string | undefined {
 	if (!source.startsWith(".")) return undefined;
 	const base = path.resolve(path.dirname(filePath), source);
+	const strippedSource = source.replace(JS_TS_EXT_RE, "");
+	const strippedBase =
+		strippedSource === source
+			? base
+			: path.resolve(path.dirname(filePath), strippedSource);
 	const candidates = [
 		base,
-		`${base}.ts`,
-		`${base}.tsx`,
-		`${base}.js`,
-		`${base}.jsx`,
+		strippedBase,
+		`${strippedBase}.ts`,
+		`${strippedBase}.tsx`,
+		`${strippedBase}.js`,
+		`${strippedBase}.jsx`,
 		path.join(base, "index.ts"),
 		path.join(base, "index.tsx"),
 		path.join(base, "index.js"),
@@ -1004,8 +1021,37 @@ function addJsTsFile(
 		}
 	}
 
+	// refs #655 phase 2 ("import" resolution tier): a bare-name callee that
+	// matches a named/default import specifier hints exactly which in-project
+	// FILE it should resolve against, narrowing resolveDeferredSymbolEdges'
+	// candidate search below (before it falls back to the graph-wide
+	// uniqueness check). Only local (in-project) import sources produce a
+	// hint — third-party/stdlib imports have no graph file to narrow to.
+	const importedNameToFile = new Map<string, string>();
+	for (const entry of imports) {
+		const localFile = localImportToFile(cwd, normalized, entry.source);
+		if (!localFile) continue;
+		for (const name of entry.names) importedNameToFile.set(name, localFile);
+		if (entry.defaultName) importedNameToFile.set(entry.defaultName, localFile);
+	}
+
+	// refs #655 phase 2 (qualified names + "receiver-type" resolution): build
+	// the per-file `Owner.method -> symbolId[]` map alongside each node so the
+	// second pass below (call-site resolution) can look up SAME-FILE receiver
+	// types without a second traversal. Collecting ALL matches (not just the
+	// last-written one) lets the resolver below tell "exactly one real target"
+	// apart from "this owner+name pair is itself ambiguous" (duplicate/overload
+	// declarations sharing one qualified name) — the latter must stay
+	// "name-only", never guess one of the 2+ candidates.
+	const methodsByQualifiedName = new Map<string, string[]>();
 	for (const fn of functions) {
 		const symbolId = buildSymbolId(normalized, fn.name, "function", fn.line);
+		const qualifiedName = buildQualifiedName(fn.owner, fn.name);
+		if (qualifiedName) {
+			const existing = methodsByQualifiedName.get(qualifiedName) ?? [];
+			existing.push(symbolId);
+			methodsByQualifiedName.set(qualifiedName, existing);
+		}
 		addNode(graph, {
 			id: symbolId,
 			kind: "symbol",
@@ -1013,6 +1059,7 @@ function addJsTsFile(
 			filePath: normalized,
 			symbolName: fn.name,
 			symbolKind: "function",
+			...(qualifiedName ? { qualifiedName } : {}),
 			exported: new RegExp(
 				String.raw`export\s+(?:async\s+)?(?:function|const|let|var)\s+${escapeRegExp(fn.name)}\b`,
 			).test(content),
@@ -1028,7 +1075,89 @@ function addJsTsFile(
 		});
 		addEdge(graph, { from: fileNodeId, to: symbolId, kind: "contains" });
 		addEdge(graph, { from: fileNodeId, to: symbolId, kind: "defines" });
+	}
+
+	for (const fn of functions) {
+		const symbolId = buildSymbolId(normalized, fn.name, "function", fn.line);
+		// Member call sites (`obj.method()`) with a same-file, structurally
+		// determinable receiver type resolve directly here — refs #655 phase 2
+		// "receiver-type" tier. Skip their text form in the outgoingCalls loop
+		// below (memberCallText) so the same call site doesn't double-edge.
+		const memberCallTexts = new Set<string>();
+		for (const site of fn.memberCallSites ?? []) {
+			const callText = `${site.receiver}.${site.method}`;
+			memberCallTexts.add(callText);
+			const receiverClass = fn.receiverTypes?.[site.receiver];
+			const candidates = receiverClass
+				? (methodsByQualifiedName.get(`${receiverClass}.${site.method}`) ?? [])
+				: [];
+			if (candidates.length === 1) {
+				addEdge(graph, {
+					from: symbolId,
+					to: candidates[0],
+					kind: "calls",
+					metadata: {
+						unresolvedName: callText,
+						receiver: site.receiver,
+						receiverType: receiverClass,
+					},
+					resolution: "receiver-type",
+				});
+				continue;
+			}
+			if (candidates.length > 1) {
+				// The receiver's class is known, but that class has 2+ same-named
+				// methods (duplicate/overload declarations) — the owner+name pair
+				// itself is ambiguous. Point at a qualified-name placeholder (not the
+				// bare-name one, which would incorrectly conflate this with unrelated
+				// same-named methods elsewhere) and stay "name-only": never guess
+				// which of the 2+ candidates this call reaches.
+				const qualifiedPlaceholderId = `symbol-qualified-name:${receiverClass}.${site.method}`;
+				if (!graph.nodes.has(qualifiedPlaceholderId)) {
+					addNode(graph, {
+						id: qualifiedPlaceholderId,
+						kind: "symbol",
+						language: "jsts",
+						symbolName: site.method,
+						qualifiedName: `${receiverClass}.${site.method}`,
+						metadata: { unresolvedName: callText, ambiguousCandidates: candidates.length },
+					});
+				}
+				addEdge(graph, {
+					from: symbolId,
+					to: qualifiedPlaceholderId,
+					kind: "calls",
+					metadata: {
+						unresolvedName: callText,
+						receiver: site.receiver,
+						receiverType: receiverClass,
+					},
+					resolution: "name-only",
+				});
+				continue;
+			}
+			// Receiver type unknown — falls back to the same "definite external"
+			// placeholder the pre-#655 code used for every dotted call;
+			// conservative (never claims a resolution tier it can't back up).
+			const externalId = `external:${callText}`;
+			if (!graph.nodes.has(externalId)) {
+				addNode(graph, {
+					id: externalId,
+					kind: "external",
+					language: "jsts",
+					metadata: { unresolvedName: callText },
+				});
+			}
+			addEdge(graph, {
+				from: symbolId,
+				to: externalId,
+				kind: "calls",
+				metadata: { unresolvedName: callText },
+			});
+		}
+
 		for (const callee of fn.outgoingCalls) {
+			if (memberCallTexts.has(callee)) continue;
 			const targetId = callee.includes(".")
 				? `external:${callee}`
 				: `symbol-name:${callee}`;
@@ -1041,16 +1170,23 @@ function addJsTsFile(
 					metadata: { unresolvedName: callee },
 				});
 			}
+			const importHintFile = !callee.includes(".")
+				? importedNameToFile.get(callee)
+				: undefined;
 			addEdge(graph, {
 				from: symbolId,
 				to: targetId,
 				kind: "calls",
-				metadata: { unresolvedName: callee },
+				metadata: {
+					unresolvedName: callee,
+					...(importHintFile ? { importHintFile } : {}),
+				},
 				// A definite external call (`callee.includes(".")`) is never
 				// ambiguous — no in-project candidate to collide with, so no
 				// resolution marker. An in-project bare-name callee starts
 				// "name-only" and resolveDeferredSymbolEdges below may upgrade it
-				// to "exact" once every file has been added.
+				// to "import" (when importHintFile narrows it) or "exact" once
+				// every file has been added.
 				...(callee.includes(".") ? {} : { resolution: "name-only" }),
 			});
 		}
@@ -1169,13 +1305,32 @@ function addTreeSitterFile(
 		metadata: featureHintMetadata(normalized),
 	});
 
-	for (const symbol of dedupeSamePositionSymbols(extracted.symbols)) {
+	const dedupedSymbols = dedupeSamePositionSymbols(extracted.symbols);
+	// refs #655 phase 2: qualified (owner-chain) display name, computed via the
+	// SAME strict-containment/smallest-span algorithm module-report.ts's outline
+	// nesting (`nestEntries`, #301) uses over its own tree-sitter-symbol-extractor
+	// output — see symbol-containment.ts. Candidates are the file's OWN deduped
+	// symbol list; a symbol with no strictly-containing entry (top-level) gets
+	// no qualifiedName.
+	const containers = dedupedSymbols.map((s) => ({
+		name: s.name,
+		startLine: s.line,
+		endLine: s.endLine ?? s.line,
+	}));
+
+	for (const symbol of dedupedSymbols) {
 		const symbolId = buildSymbolId(
 			normalized,
 			symbol.name,
 			symbol.kind,
 			symbol.line,
 		);
+		const owner = findOwnerName(
+			containers,
+			symbol.line,
+			symbol.endLine ?? symbol.line,
+		);
+		const qualifiedName = buildQualifiedName(owner, symbol.name);
 		addNode(graph, {
 			id: symbolId,
 			kind: "symbol",
@@ -1183,6 +1338,7 @@ function addTreeSitterFile(
 			filePath: normalized,
 			symbolName: symbol.name,
 			symbolKind: symbol.kind,
+			...(qualifiedName ? { qualifiedName } : {}),
 			exported: symbol.isExported,
 			metadata: {
 				line: symbol.line,
@@ -1458,14 +1614,29 @@ function resolveDeferredSymbolEdges(graph: ReviewGraph): void {
 		const targetNode = graph.nodes.get(edge.to);
 		if (!targetNode?.metadata?.unresolvedName) return edge;
 		const candidates = symbolNameToIds.get(targetNode.symbolName ?? "") ?? [];
+		// refs #655 phase 2 ("import" tier): the calling file's own imports named
+		// exactly which in-project file this bare callee comes from (see
+		// `addJsTsFile`'s `importHintFile`). Narrow to that file BEFORE the
+		// graph-wide uniqueness check — a name that's ambiguous project-wide can
+		// still be unambiguous once scoped to the one file it was imported from.
+		const importHintFile = edge.metadata?.importHintFile as string | undefined;
+		if (importHintFile) {
+			const scoped = candidates.filter(
+				(id) => graph.nodes.get(id)?.filePath === importHintFile,
+			);
+			if (scoped.length === 1) {
+				return { ...edge, to: scoped[0], resolution: "import" };
+			}
+		}
 		if (candidates.length === 1) {
 			// Exactly one same-named real symbol exists graph-wide: the bare-name
 			// match is provably unambiguous (refs #655 — resolution confidence).
 			return { ...edge, to: candidates[0], resolution: "exact" };
 		}
-		// 0 or 2+ candidates: stays on the unresolved placeholder, resolution
-		// stays "name-only" (set at edge creation) — a consumer must not treat
-		// this edge's target as a confirmed graph node.
+		// 0 or 2+ candidates (and no import hint narrowed it): stays on the
+		// unresolved placeholder, resolution stays "name-only" (set at edge
+		// creation) — a consumer must not treat this edge's target as a
+		// confirmed graph node.
 		return edge;
 	});
 	rebuildIndexes(graph);

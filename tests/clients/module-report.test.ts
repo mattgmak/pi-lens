@@ -725,10 +725,14 @@ describe("moduleReport — review-graph who-uses-this", () => {
 		expect(foo?.usedBy?.every((u) => !path.isAbsolute(u.file))).toBe(true);
 		// recommendedReads should surface the referenced, exported symbol.
 		expect(report.recommendedReads.some((r) => r.symbol === "foo")).toBe(true);
-		// refs #655: `foo` is the only symbol named "foo" anywhere in the graph,
-		// so the caller edge is provably unambiguous — "exact" resolution.
+		// refs #655 phase 1: `foo` is the only symbol named "foo" anywhere in the
+		// graph, so the caller edge is provably unambiguous. refs #655 phase 2:
+		// b.ts's own `import { foo } from "./a.js"` also narrows this callee to
+		// a.ts BEFORE the graph-wide uniqueness check runs, which is a strictly
+		// more specific tier than plain global-uniqueness "exact" — so this now
+		// resolves as "import" instead.
 		const fooHit = foo?.usedBy?.find((u) => u.file.endsWith("b.ts"));
-		expect(fooHit?.resolution).toBe("exact");
+		expect(fooHit?.resolution).toBe("import");
 	});
 
 	it("refs #655: a TS class METHOD still finds its graph node under the new collision-safe ID scheme", async () => {
