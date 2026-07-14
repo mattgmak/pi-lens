@@ -18,6 +18,7 @@
  */
 
 import type { LSPDiagnostic } from "../lsp/client.js";
+import { shouldDegradeAuxiliaryLsp } from "../lsp-budget.js";
 import { findLocalOpengrepConfig } from "../opengrep-config.js";
 import { findLocalTyposConfig } from "../typos-config.js";
 import { findLocalZizmorConfig } from "../zizmor-config.js";
@@ -178,8 +179,16 @@ export const AUXILIARY_LSP_PROFILES: readonly AuxiliaryLspProfile[] = [
 export type GetFlag = (flag: string) => boolean | string | undefined;
 
 /** The auxiliary server ids enabled for this turn (the lsp runner passes these
- *  to `touchFile` since it — not the LSP service — owns flag access). */
+ *  to `touchFile` since it — not the LSP service — owns flag access).
+ *
+ * #449 slice 2 (prototype): when this process decided at `session_start` that
+ * the machine-wide LSP budget is exceeded (`clients/lsp-budget.ts`), auxiliary
+ * servers are skipped entirely for the rest of the session — the primary
+ * language server per file is unaffected. This is a per-SESSION degrade, not
+ * per-file: once over budget, this session never spawns its auxiliary fleet,
+ * rather than flip-flopping file to file. */
 export function enabledAuxiliaryLspServerIds(getFlag: GetFlag): string[] {
+	if (shouldDegradeAuxiliaryLsp()) return [];
 	return AUXILIARY_LSP_PROFILES.flatMap((p) =>
 		p.enabledByDefault &&
 		!(p.killSwitchFlag && getFlag(p.killSwitchFlag) === true)

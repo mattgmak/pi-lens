@@ -265,8 +265,10 @@ export function decideOrphanReaping(
 // --- Impure liveness / identity / kill helpers ---
 
 /** `process.kill(pid, 0)` liveness check: ESRCH ⇒ dead, anything else
- *  (EPERM, or no error thrown at all) ⇒ conservatively alive. */
-function realIsPidAlive(pid: number): boolean {
+ *  (EPERM, or no error thrown at all) ⇒ conservatively alive. Exported so
+ *  other registry consumers (clients/lsp-budget.ts, #449 slice 2) reuse this
+ *  exact liveness check rather than inventing a second one. */
+export function realIsPidAlive(pid: number): boolean {
 	if (!Number.isFinite(pid) || pid <= 0) return false;
 	try {
 		process.kill(pid, 0);
