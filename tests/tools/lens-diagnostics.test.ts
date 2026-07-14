@@ -691,6 +691,107 @@ describe("lens_diagnostics mode=full", () => {
 		});
 	});
 
+	it("breaks the confirmed/unconfirmed LSP tally down per primary server (#646)", async () => {
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([
+				// typescript-served files: both confirmed.
+				{ filePath: "/proj/src/a.ts", diagnostics: [], count: 0 },
+				{ filePath: "/proj/src/b.ts", diagnostics: [], count: 0 },
+				// marksman-served files: both unconfirmed (push-only, timed out) —
+				// mirrors #646's motivating dogfooding case (34/155 unconfirmed
+				// files were 100% one push-only server, marksman).
+				{
+					filePath: "/proj/docs/a.md",
+					diagnostics: [],
+					count: 0,
+					timedOut: true,
+				},
+				{
+					filePath: "/proj/docs/b.md",
+					diagnostics: [],
+					count: 0,
+					timedOut: true,
+				},
+			]),
+		};
+		const result = await run(makeTool({}, lspService), { mode: "full" });
+		const text = String(result.content[0].text);
+
+		expect(result.details).toMatchObject({
+			lspFilesConfirmed: 2,
+			lspFilesUnconfirmed: 2,
+			lspServerBreakdown: {
+				typescript: { confirmed: 2, total: 2 },
+				marksman: { confirmed: 0, total: 2 },
+			},
+		});
+		// Rendered note calls out which server is responsible for the
+		// unconfirmed files, sorted worst-confirmed first.
+		expect(text).toContain("by server: marksman: 0/2, typescript: 2/2");
+	});
+
+	it("does not render a per-server breakdown clause when only one primary server is involved (#646)", async () => {
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([
+				{ filePath: "/proj/src/a.ts", diagnostics: [], count: 0 },
+				{
+					filePath: "/proj/src/b.ts",
+					diagnostics: [],
+					count: 0,
+					timedOut: true,
+				},
+			]),
+		};
+		const result = await run(makeTool({}, lspService), { mode: "full" });
+		const text = String(result.content[0].text);
+
+		expect(result.details).toMatchObject({
+			lspServerBreakdown: { typescript: { confirmed: 1, total: 2 } },
+		});
+		expect(text).not.toContain("by server:");
+	});
+
+	it("splits raw LSP-sweep findings into primary vs auxiliary counts (#646)", async () => {
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([
+				{
+					filePath: "/proj/src/a.ts",
+					diagnostics: [
+						{
+							severity: 1,
+							message: "real type error",
+							range: {
+								start: { line: 1, character: 0 },
+								end: { line: 1, character: 5 },
+							},
+							source: "typescript",
+							code: 2322,
+						},
+						{
+							severity: 2,
+							message: "ast-grep rule hit",
+							range: {
+								start: { line: 2, character: 0 },
+								end: { line: 2, character: 5 },
+							},
+							source: "ast-grep",
+						},
+					],
+					count: 2,
+				},
+			]),
+		};
+		const result = await run(makeTool({}, lspService), { mode: "full" });
+		const text = String(result.content[0].text);
+
+		expect(result.details).toMatchObject({
+			lspPrimaryDiagnosticsCount: 1,
+			lspAuxiliaryDiagnosticsCount: 1,
+		});
+		expect(text).toContain("LSP sweep findings: 1 primary");
+		expect(text).toContain("1 auxiliary");
+	});
+
 	it("honors inline `# pi-lens-ignore` like mode=all (#442)", async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-diag-suppress-"));
 		resetProjectLensConfigCache();

@@ -284,6 +284,26 @@ export function getServersForFileWithConfig(filePath: string): LSPServerInfo[] {
 }
 
 /**
+ * The primary language server for a file (e.g. "typescript"), as opposed to a
+ * cross-cutting auxiliary scanner attached via clientScope "all"/
+ * "with-auxiliary" (ast-grep, opengrep, zizmor, typos, marksman, ...). `role`
+ * is only ever set to "auxiliary" on those auxiliary entries (see
+ * clients/lsp/server.ts) — undefined means a real language server. Used to
+ * split a file's diagnostics into "primary confirmation" vs "auxiliary
+ * findings" so a page of ast-grep/opengrep/marksman noise never buries
+ * whether the actual type checker/compiler confirmed the file clean.
+ *
+ * #646: extracted from `tools/lsp-diagnostics.ts` (where it originated) so
+ * `tools/lens-diagnostics.ts`'s `mode=full` sweep can share the exact same
+ * primary/auxiliary classification instead of hand-copying it — both tools
+ * now report the same primary-vs-auxiliary split for the same file.
+ */
+export function primaryServerId(filePath: string): string | undefined {
+	return getServersForFileWithConfig(filePath).find((s) => s.role !== "auxiliary")
+		?.id;
+}
+
+/**
  * Look up an initializationOptions override for a built-in server.
  * Returns undefined when no config was loaded or no override was specified
  * for this server ID.

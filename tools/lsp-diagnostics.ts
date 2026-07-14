@@ -17,7 +17,7 @@ import {
 	groupFilesByPrimaryServer,
 	runPerServerGroups,
 } from "../clients/lsp/index.js";
-import { getServersForFileWithConfig } from "../clients/lsp/config.js";
+import { primaryServerId } from "../clients/lsp/config.js";
 import { combineAbortSignals } from "../clients/deadline-utils.js";
 import { applyAuxiliarySuppressions } from "../clients/dispatch/auxiliary-lsp.js";
 import type { LSPDiagnostic } from "../clients/lsp/client.js";
@@ -143,20 +143,9 @@ type FileDiagnosticResult = {
 	primaryServerId?: string;
 };
 
-/**
- * The primary language server for a file (e.g. "typescript"), as opposed to
- * a cross-cutting auxiliary scanner attached via clientScope "all"/
- * "with-auxiliary" (ast-grep, opengrep, zizmor, typos, marksman, ...).
- * `role` is only ever set to "auxiliary" on those auxiliary entries (see
- * clients/lsp/server.ts) — undefined means a language server. Used to split
- * a file's diagnostics into "primary confirmation" vs "auxiliary findings"
- * so a page of ast-grep/opengrep noise never buries whether the actual type
- * checker confirmed the file clean.
- */
-function primaryServerId(filePath: string): string | undefined {
-	return getServersForFileWithConfig(filePath).find((s) => s.role !== "auxiliary")
-		?.id;
-}
+// #646: `primaryServerId` moved to clients/lsp/config.ts so this tool and
+// tools/lens-diagnostics.ts's mode=full sweep share the exact same
+// primary-vs-auxiliary classification instead of each keeping its own copy.
 
 function lspUnavailableMessage(
 	filePath: string,
