@@ -71,6 +71,7 @@ import {
 	deregisterInstance,
 	registerInstance,
 } from "./clients/instance-registry.js";
+import { checkCrossProcessLspBudget } from "./clients/lsp-budget.js";
 import {
 	EXPANSION_BUDGET_MS,
 	EXPANSION_LIMIT_LINES,
@@ -1320,6 +1321,14 @@ export default function (pi: ExtensionAPI) {
 				// best-effort observability — never fail session_start over this
 			});
 			void sweepOrphans();
+			// #449 slice 2 (prototype): machine-wide LSP budget check. Reads the
+			// same registry, decides locally whether THIS session should skip
+			// spawning auxiliary LSP servers, and caches the decision for
+			// clients/dispatch/auxiliary-lsp.ts to read on later dispatch calls.
+			// Never awaited — a registry read must not delay session start, and
+			// dispatch doesn't happen until later in the turn anyway, so the cache
+			// is populated well before it's first read in practice.
+			void checkCrossProcessLspBudget();
 			// #492: child-at-session_start cross-process nudge consumer. Reads
 			// `recent-touches.json` (clients/recent-touches.ts) for entries from
 			// OTHER pi-lens instances (pid-excluded) within the 15-minute
