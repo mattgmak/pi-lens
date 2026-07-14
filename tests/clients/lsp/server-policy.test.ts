@@ -1111,3 +1111,44 @@ describe("heavy workspace servers do not fall back to per-file dirs (#201)", () 
 	// exact filename, so `.csproj` never matches a real `Foo.csproj` and C# still
 	// depends on the FileDirRoot fallback. See the standalone-csharp test above.
 });
+
+describe("zizmor LSP candidacy path gate (#636)", () => {
+	// zizmor's extension match is "any YAML" — the real filter that keeps it out
+	// of the candidate list for a guaranteed-no-op file (measured directly
+	// against a real `zizmor --lsp` process: no publishDiagnostics at all for a
+	// non-workflow YAML, so `waitForDiagnostics` would otherwise burn its full
+	// budget for zero signal) is `getServersForFileWithConfig`'s pathFilter gate.
+	it("includes zizmor as a candidate for a real GitHub Actions workflow file", async () => {
+		const { getServersForFileWithConfig } = await import(
+			"../../../clients/lsp/config.js"
+		);
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-zizmor-candidacy-"),
+		);
+		dirs.push(tmp);
+		const file = path.join(tmp, ".github", "workflows", "ci.yml");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, "on: push\njobs: {}\n");
+
+		const ids = getServersForFileWithConfig(file).map((s) => s.id);
+		expect(ids).toContain("zizmor");
+	});
+
+	it("excludes zizmor as a candidate for a plain, non-workflow YAML file", async () => {
+		const { getServersForFileWithConfig } = await import(
+			"../../../clients/lsp/config.js"
+		);
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-zizmor-candidacy-"),
+		);
+		dirs.push(tmp);
+		const file = path.join(tmp, "docker-compose.yml");
+		fs.writeFileSync(file, "version: '3.8'\nservices: {}\n");
+
+		const ids = getServersForFileWithConfig(file).map((s) => s.id);
+		expect(ids).not.toContain("zizmor");
+		// The primary yaml language server still attaches — only zizmor (the
+		// auxiliary that can never report on this file) is gated out.
+		expect(ids).toContain("yaml");
+	});
+});

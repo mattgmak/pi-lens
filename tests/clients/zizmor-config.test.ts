@@ -12,8 +12,43 @@ vi.mock("../../clients/safe-spawn.js", () => ({
 import {
 	_resetZizmorTokenCacheForTests,
 	findLocalZizmorConfig,
+	isZizmorAuditTarget,
 	resolveZizmorGitHubToken,
 } from "../../clients/zizmor-config.js";
+
+describe("isZizmorAuditTarget (#636)", () => {
+	it("matches workflow YAML under .github/workflows/", () => {
+		expect(isZizmorAuditTarget(".github/workflows/ci.yml")).toBe(true);
+		expect(isZizmorAuditTarget(".github/workflows/release.yaml")).toBe(true);
+		expect(isZizmorAuditTarget("repo\\.github\\workflows\\ci.yml")).toBe(true);
+		expect(
+			isZizmorAuditTarget("/abs/path/repo/.github/workflows/ci.yml"),
+		).toBe(true);
+	});
+
+	it("matches action.yml/action.yaml anywhere in the repo (composite actions)", () => {
+		expect(isZizmorAuditTarget("action.yml")).toBe(true);
+		expect(isZizmorAuditTarget("action.yaml")).toBe(true);
+		expect(isZizmorAuditTarget("actions/my-action/action.yml")).toBe(true);
+		expect(isZizmorAuditTarget("ACTION.YML")).toBe(true);
+	});
+
+	it("matches .github/dependabot.yml", () => {
+		expect(isZizmorAuditTarget(".github/dependabot.yml")).toBe(true);
+		expect(isZizmorAuditTarget(".github/dependabot.yaml")).toBe(true);
+	});
+
+	it("does NOT match a root-level dependabot.yml (GitHub only reads it under .github/)", () => {
+		expect(isZizmorAuditTarget("dependabot.yml")).toBe(false);
+	});
+
+	it("does NOT match plain, non-workflow YAML files", () => {
+		expect(isZizmorAuditTarget("docker-compose.yml")).toBe(false);
+		expect(isZizmorAuditTarget("k8s/deployment.yaml")).toBe(false);
+		expect(isZizmorAuditTarget(".github/ISSUE_TEMPLATE/bug.yml")).toBe(false);
+		expect(isZizmorAuditTarget("charts/app/values.yaml")).toBe(false);
+	});
+});
 
 describe("findLocalZizmorConfig (#272)", () => {
 	let root: string;

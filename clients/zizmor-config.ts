@@ -33,6 +33,31 @@ export function findLocalZizmorConfig(startDir: string): string | undefined {
 	return undefined;
 }
 
+// zizmor's own input collection (see `zizmor --collect`) only ever audits three
+// path shapes: workflow YAML under `.github/workflows/`, a composite/reusable
+// action definition (`action.yml`/`action.yaml`, anywhere in the repo — GitHub
+// resolves these relative to whichever directory references them, not just the
+// root), and the repo's Dependabot config (`.github/dependabot.yml`/`.yaml`,
+// GitHub only ever reads this one location). Every other YAML file is a
+// guaranteed no-op: measured directly against a real `zizmor --lsp` process
+// (#<issue>), a non-matching file gets NO `publishDiagnostics` at all — not
+// even an empty one — so `waitForDiagnostics` burns its full aggregateWaitMs
+// budget (2000ms, bounded by the per-edit caller cap) on every such edit for
+// zero signal (#636). This predicate is the LSP-candidacy gate (server.ts's
+// `ZizmorServer.pathFilter`) that keeps zizmor out of the candidate list for
+// files it can never report on, mirroring its own collection rules exactly —
+// under-matching would silently drop real workflow/action coverage,
+// over-matching would leave the wasted-wait gap in place for common
+// non-GitHub YAML (docker-compose.yml, k8s manifests, …).
+export function isZizmorAuditTarget(filePath: string): boolean {
+	const normalized = filePath.replace(/\\/g, "/");
+	const base = path.basename(normalized).toLowerCase();
+	if (/(^|\/)\.github\/workflows\/[^/]+\.ya?ml$/i.test(normalized)) return true;
+	if (base === "action.yml" || base === "action.yaml") return true;
+	if (/(^|\/)\.github\/dependabot\.ya?ml$/i.test(normalized)) return true;
+	return false;
+}
+
 let cachedGhToken: { value: string | undefined } | undefined;
 
 /** Test-only: clear the memoized `gh auth token` lookup. */

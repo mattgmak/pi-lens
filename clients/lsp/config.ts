@@ -273,7 +273,13 @@ export function getServersForFileWithConfig(filePath: string): LSPServerInfo[] {
 	const base = path.basename(filePath).toLowerCase();
 	return getAllServers(filePath).filter((server) => {
 		const extensions = server.extensions.map((value) => value.toLowerCase());
-		return extensions.includes(ext) || extensions.includes(base);
+		const extensionMatch = extensions.includes(ext) || extensions.includes(base);
+		if (!extensionMatch) return false;
+		// #636: a server's extension match can be intentionally broader than what
+		// it can usefully act on (zizmor attaches to "yaml" but only ever reports
+		// on GitHub Actions workflow/action/dependabot paths). `pathFilter`, when
+		// present, is an ADDITIONAL narrowing gate — never a widening one.
+		return server.pathFilter ? server.pathFilter(filePath) : true;
 	});
 }
 
