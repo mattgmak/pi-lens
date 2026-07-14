@@ -29,7 +29,7 @@ import {
 	getToolPath,
 } from "../installer/index.js";
 import { resolveOpengrepConfig } from "../opengrep-config.js";
-import { resolveZizmorGitHubToken } from "../zizmor-config.js";
+import { isZizmorAuditTarget, resolveZizmorGitHubToken } from "../zizmor-config.js";
 import { logLatency } from "../latency-logger.js";
 import { findLocalSgconfig, resolveBaselineSgconfig } from "../sgconfig.js";
 import { resolveAstGrepNativeExe } from "./server-strategies.js";
@@ -62,6 +62,16 @@ export interface LSPServerInfo {
 	role?: "language" | "auxiliary";
 	/** Simple command name whose absence disables spawn attempts briefly across roots. */
 	availabilityKey?: string;
+	/**
+	 * Optional extra candidacy gate beyond `extensions`. When present, a file
+	 * must ALSO satisfy this predicate to be a candidate server for it — for a
+	 * server whose extension match is necessarily broader than what it can
+	 * actually do useful work on (e.g. zizmor attaches to the "yaml" extension
+	 * set but only ever reports on GitHub Actions workflow/action/dependabot
+	 * paths, #636). Keeps a guaranteed-no-op file out of the candidate list
+	 * entirely — no spawn, no notify, no diagnostics-wait budget spent.
+	 */
+	pathFilter?: (filePath: string) => boolean;
 	/**
 	 * Optional per-server initialize timeout.
 	 * Useful for servers like Ruby LSP that do real project bootstrap work
@@ -2690,14 +2700,20 @@ export const AstGrepServer: LSPServerInfo = {
 };
 
 // zizmor — a GitHub Actions workflow-security scanner that speaks LSP (#272).
-// Like Opengrep/ast-grep it is a cross-cutting, diagnostic-only auxiliary: it
-// attaches to YAML and only ever emits findings for actual workflow/action
-// files (`.github/workflows/*`, `action.yml`, `dependabot.yaml`) — other YAML
-// is a quiet no-op. Its audit set ("regular" persona) is compiled-in and runs
-// with NO config; a repo `zizmor.yml` only tunes/ignores rules (the blocking
-// opt-in, see the auxiliary profile). Online audits (known-vulnerable-actions,
-// unpinned-uses, …) need a GitHub token — resolveZizmorGitHubToken forwards one
-// (env, else `gh auth token`); without it zizmor runs its offline audit subset.
+// Like Opengrep/ast-grep it is a cross-cutting, diagnostic-only auxiliary. Its
+// extension match (any YAML) is intentionally broad — actual candidacy is
+// narrowed by `pathFilter` (`isZizmorAuditTarget`, #636) to the exact paths
+// zizmor's own input collection audits (`.github/workflows/*`, `action.yml`,
+// `.github/dependabot.yaml`); every other YAML file is a guaranteed no-op —
+// measured directly against a real `zizmor --lsp` process, a non-matching
+// file gets NO `publishDiagnostics` at all, so without the path gate every
+// edit of e.g. a `docker-compose.yml` would burn zizmor's full
+// diagnostics-wait budget for zero signal. Its audit set ("regular" persona)
+// is compiled-in and runs with NO config; a repo `zizmor.yml` only
+// tunes/ignores rules (the blocking opt-in, see the auxiliary profile).
+// Online audits (known-vulnerable-actions, unpinned-uses, …) need a GitHub
+// token — resolveZizmorGitHubToken forwards one (env, else `gh auth token`);
+// without it zizmor runs its offline audit subset.
 const ZIZMOR_EXTENSIONS: readonly string[] = KIND_EXTENSIONS["yaml"];
 
 export const ZizmorServer: LSPServerInfo = {
@@ -2705,6 +2721,7 @@ export const ZizmorServer: LSPServerInfo = {
 	name: "zizmor Actions Security Scanner",
 	role: "auxiliary",
 	extensions: ZIZMOR_EXTENSIONS,
+	pathFilter: isZizmorAuditTarget,
 	// Stable per-repo root so ONE warm server serves the whole project (like
 	// Opengrep) — config + workflow discovery is repo-relative.
 	root: RootWithFallback(NearestRoot([".git"]), async () => process.cwd()),
