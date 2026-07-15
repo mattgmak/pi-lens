@@ -10,6 +10,7 @@ import type {
 } from "../types.js";
 import {
 	createAvailabilityChecker,
+	lspPrimaryCoversFile,
 	resolveToolCommandWithInstallFallback,
 } from "./utils/runner-helpers.js";
 
@@ -58,6 +59,14 @@ const taploRunner: RunnerDefinition = {
 		const cwd = ctx.cwd || process.cwd();
 		const policy = getLinterPolicyForCwd(ctx.filePath, cwd);
 		if (policy && !policy.preferredRunners.includes("taplo")) {
+			return { status: "skipped", diagnostics: [], semantic: "none" };
+		}
+
+		// #233: the `toml` LSP server IS `taplo lsp` (same binary). When that LSP
+		// covers this file, the warm server already produces these diagnostics —
+		// skip the redundant CLI scan to avoid double-reporting. Stays active when
+		// the LSP is disabled/unavailable so TOML coverage never regresses.
+		if (lspPrimaryCoversFile(ctx, "toml") && (await ctx.hasTool("taplo"))) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 

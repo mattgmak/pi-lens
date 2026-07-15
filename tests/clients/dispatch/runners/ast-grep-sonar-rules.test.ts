@@ -15,10 +15,11 @@ afterAll(() => {
 async function rulesFiredOn(
 	code: string,
 	flags: Record<string, unknown> = {},
+	sampleFile = "sample.ts",
 ): Promise<Set<string>> {
 	const env = setupTestEnvironment("pi-lens-sonar-sg-");
 	cleanups.push(env.cleanup);
-	const filePath = createTempFile(env.tmpDir, "sample.ts", code);
+	const filePath = createTempFile(env.tmpDir, sampleFile, code);
 	const mod = await import(
 		"../../../../clients/dispatch/runners/ast-grep-napi.js"
 	);
@@ -33,7 +34,10 @@ async function rulesFiredOn(
 		deltaMode: true,
 		blockingOnly: false,
 		facts: new FactStore(),
-		hasTool: async () => true,
+		// napi is the fallback now (the ast-grep LSP supersedes it when its binary
+		// is available, #239 Phase 2); simulate the binary absent so this runner's
+		// rule matching actually executes.
+		hasTool: async (cmd: string) => cmd !== "ast-grep",
 		log: () => {},
 	};
 	const result = await runner.run(ctx as never);
@@ -170,20 +174,100 @@ describe("ast-grep Sonar gap rules (integration via real runner)", () => {
 		});
 
 		describe("nested-ternary (has stopBy: end, no self-match)", () => {
-			it("flags a chained ternary", async () => {
-				expect(await rulesFiredOn("const x = a ? b : c ? d : e;\n")).toContain(
-					"nested-ternary-js",
-				);
-			});
-			it("flags a parenthesized nested ternary (needs stopBy: end)", async () => {
+			// #660: `nested-ternary` (TypeScript-tagged) used to be skipped by
+			// this runner via TREE_SITTER_OVERLAP, on the false assumption that
+			// the tree-sitter query runner covers .ts files — that query
+			// actually lives under tree-sitter-queries/typescript-disabled/ and
+			// is never loaded in production, so the assumption gave ZERO
+			// coverage. TREE_SITTER_OVERLAP has been removed; `nested-ternary`
+			// now fires directly on .ts files again, same as `nested-ternary-js`
+			// on .js files. Cover both, plus confirm #657's language scoping
+			// still holds (no cross-firing of the JS twin on a .ts file).
+			it("flags a chained ternary on .ts", async () => {
 				expect(
-					await rulesFiredOn("const x = a ? (b ? c : d) : e;\n"),
+					await rulesFiredOn(
+						"const x = a ? b : c ? d : e;\n",
+						{},
+						"sample.ts",
+					),
+				).toContain("nested-ternary");
+			});
+			it("flags a parenthesized nested ternary on .ts (needs stopBy: end)", async () => {
+				expect(
+					await rulesFiredOn(
+						"const x = a ? (b ? c : d) : e;\n",
+						{},
+						"sample.ts",
+					),
+				).toContain("nested-ternary");
+			});
+			it("does NOT flag a single ternary on .ts (the has self-match bug)", async () => {
+				expect(
+					await rulesFiredOn("const x = a ? b : c;\n", {}, "sample.ts"),
+				).not.toContain("nested-ternary");
+			});
+			it("does NOT cross-fire the JavaScript-tagged twin on a .ts file (#657)", async () => {
+				expect(
+					await rulesFiredOn(
+						"const x = a ? b : c ? d : e;\n",
+						{},
+						"sample.ts",
+					),
+				).not.toContain("nested-ternary-js");
+			});
+			it("flags a chained ternary on .js via the JavaScript-tagged twin", async () => {
+				expect(
+					await rulesFiredOn(
+						"const x = a ? b : c ? d : e;\n",
+						{},
+						"sample.js",
+					),
 				).toContain("nested-ternary-js");
 			});
-			it("does NOT flag a single ternary (the has self-match bug)", async () => {
-				expect(await rulesFiredOn("const x = a ? b : c;\n")).not.toContain(
-					"nested-ternary-js",
-				);
+			it("does NOT flag a single ternary on .js", async () => {
+				expect(
+					await rulesFiredOn("const x = a ? b : c;\n", {}, "sample.js"),
+				).not.toContain("nested-ternary-js");
+			});
+		});
+
+		describe("long-parameter-list (#660: no longer wrongly skipped for .ts)", () => {
+			// #660: this rule id was in the removed TREE_SITTER_OVERLAP set, on
+			// the false assumption tree-sitter covers it (its tree-sitter query
+			// lives under typescript-disabled/ and was never loaded in
+			// production). Confirm the shipped ast-grep rule now actually fires.
+			it("flags a function with 5 required parameters", async () => {
+				expect(
+					await rulesFiredOn(
+						"function make(a: string, b: string, c: string, d: string, e: string) {}\n",
+					),
+				).toContain("long-parameter-list");
+			});
+			it("does NOT flag a function with 4 required parameters", async () => {
+				expect(
+					await rulesFiredOn(
+						"function make(a: string, b: string, c: string, d: string) {}\n",
+					),
+				).not.toContain("long-parameter-list");
+			});
+		});
+
+		describe("no-dupe-class-members (#660 removed the skip; #663 fixed the utils: gap)", () => {
+			// #660: this rule id was also in the removed TREE_SITTER_OVERLAP set
+			// despite never having had ANY tree-sitter query (active or
+			// disabled) — a pure coverage gap from that angle. It did NOT
+			// actually fire once unskipped, though: this rule's YAML declares a
+			// top-level `utils:` block (reusable matchers via `matches: <name>`),
+			// which `yaml-rule-parser.ts`/`ast-grep-napi.ts` silently dropped
+			// before calling napi's native `findAll` — a pre-existing, unrelated
+			// bug fixed in #663 (see also
+			// tests/clients/dispatch/runners/ast-grep-utils-block.test.ts for
+			// dedicated utils:-passthrough regression coverage across all 5
+			// affected rules).
+			it("flags a duplicate method", async () => {
+				expect(
+					await rulesFiredOn("class A { foo() {} foo() {} }\n"),
+				).toContain("no-dupe-class-members");
 			});
 		});
 

@@ -5,6 +5,12 @@ import * as path from "node:path";
 export type PiLensFormatMode = "deferred" | "immediate";
 
 export interface PiLensGlobalConfig {
+	/**
+	 * Gitignore-style patterns excluded from pi-lens scans across ALL projects.
+	 * Merged at LOWEST precedence: a project `.gitignore` or `.pi-lens.json`
+	 * `ignore` (including `!negation`) overrides these. See #252.
+	 */
+	ignore?: string[];
 	dispatch?: {
 		/**
 		 * Minimum wall-clock budget (ms) for every dispatch runner.
@@ -43,6 +49,15 @@ export interface PiLensGlobalConfig {
 		 * `context` hook. Defaults true. Set false to keep tools/LSP/read-guard/
 		 * formatting running while avoiding prompt-cache invalidation from injected
 		 * messages. Findings are still cached for `lens_diagnostics` / `/lens-health`.
+		 */
+		enabled?: boolean;
+	};
+	turnSummary?: {
+		/**
+		 * Opt-in, transcript-persistent per-turn summary of diagnostics found,
+		 * autofixes applied, and autoformats applied (#484). Defaults false —
+		 * absence of this key means off. One collapsed/expandable entry per turn,
+		 * only emitted when the turn's collection is non-empty.
 		 */
 		enabled?: boolean;
 	};
@@ -93,12 +108,21 @@ export function loadPiLensGlobalConfig(
 			contextInjectionRaw && typeof contextInjectionRaw === "object"
 				? (contextInjectionRaw as Record<string, unknown>)
 				: undefined;
+		const turnSummaryRaw = raw.turnSummary;
+		const turnSummary =
+			turnSummaryRaw && typeof turnSummaryRaw === "object"
+				? (turnSummaryRaw as Record<string, unknown>)
+				: undefined;
 		const formatMode =
 			format?.mode === "immediate" || format?.mode === "deferred"
 				? format.mode
 				: undefined;
+		const ignore = Array.isArray(raw.ignore)
+			? raw.ignore.filter((p): p is string => typeof p === "string")
+			: undefined;
 
 		return {
+			ignore: ignore && ignore.length > 0 ? ignore : undefined,
 			dispatch: dispatch
 				? {
 						runnerTimeoutFloorMs:
@@ -154,10 +178,22 @@ export function loadPiLensGlobalConfig(
 								: undefined,
 					}
 				: undefined,
+			turnSummary: turnSummary
+				? {
+						enabled:
+							typeof turnSummary.enabled === "boolean"
+								? turnSummary.enabled
+								: undefined,
+					}
+				: undefined,
 		};
 	} catch {
 		return undefined;
 	}
+}
+
+export function getGlobalIgnorePatterns(configPath?: string): string[] {
+	return loadPiLensGlobalConfig(configPath)?.ignore ?? [];
 }
 
 export function getGlobalWidgetDefaultVisible(configPath?: string): boolean {
@@ -176,6 +212,10 @@ export function getGlobalContextInjectionEnabled(configPath?: string): boolean {
 	return (
 		loadPiLensGlobalConfig(configPath)?.contextInjection?.enabled !== false
 	);
+}
+
+export function getGlobalTurnSummaryEnabled(configPath?: string): boolean {
+	return loadPiLensGlobalConfig(configPath)?.turnSummary?.enabled === true;
 }
 
 export function resolvePiLensFlag(
@@ -204,6 +244,9 @@ export function resolvePiLensFlag(
 	}
 	if (name === "no-lens-context") {
 		return config?.contextInjection?.enabled === false;
+	}
+	if (name === "lens-turn-summary") {
+		return config?.turnSummary?.enabled === true;
 	}
 	return value;
 }

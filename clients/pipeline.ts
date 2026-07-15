@@ -50,13 +50,20 @@ import {
 import type { FormatService } from "./format-service.js";
 import { logLatency } from "./latency-logger.js";
 import { emitLensAnalysisComplete } from "./lens-events.js";
+import { publishFilesTouched } from "./bus-publish.js";
+import {
+	publishDiagnostics,
+	wasPreviouslyReportedDirty,
+	type PilensDiagnosticEntry,
+} from "./diagnostics-publish.js";
 import { getLSPService } from "./lsp/index.js";
 import type { MetricsClient } from "./metrics-client.js";
 import { clearGraphCache } from "./review-graph/builder.js";
 import type { RuffClient } from "./ruff-client.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
-import { safeSpawnAsync } from "./safe-spawn.js";
-import { formatSecrets, scanForSecrets } from "./secrets-scanner.js";
+import type { WordIndex } from "./word-index.js";
+import { getAmbientAbortSignal, safeSpawnAsync } from "./safe-spawn.js";
+import { combineAbortSignals } from "./deadline-utils.js";
 import {
 	getAutofixPolicyForFile,
 	getPreferredAutofixTools,
@@ -77,50 +84,95 @@ const LSP_MAX_FILE_LINES = RUNTIME_CONFIG.pipeline.lspMaxFileLines;
 const LSP_SPAWN_BUDGET_MS = RUNTIME_CONFIG.pipeline.lspSpawnBudgetMs;
 const AUTOFIX_CHANGED_FILE_SCAN_LIMIT = 5000;
 
+/**
+ * Hard ceiling for the pre-dispatch LSP sync (`resyncLspFile`). The sync sends a
+ * didChange/didOpen; that write can backpressure indefinitely when the language
+ * server's stdin isn't being drained (a wedged/CPU-bound server), which would
+ * hang the whole edit with no per-call bound — client acquisition is capped, but
+ * the notify write is not. So the sync is abandoned after this budget (the edit
+ * proceeds; the dispatch LSP runner, which has its own 30s cap, still tries).
+ */
+function lspSyncBudgetMs(): number {
+	const raw = Number(process.env.PI_LENS_LSP_SYNC_BUDGET_MS);
+	return Number.isFinite(raw) && raw > 0 ? raw : 3000;
+}
+
 type FileSnapshot = Map<string, { mtimeMs: number; size: number }>;
 
-function snapshotProjectFiles(root: string): FileSnapshot {
+// Scan one directory's entries into `snapshot`, pushing walkable subdirs onto
+// `stack`. Extracted from the walk loop to keep each function's cognitive
+// complexity low. Excluded/ignored dirs are not descended; ignored/vanished
+// files are skipped.
+// Files stat'd between event-loop yields. The walk stays on the tool_result
+// hot path; yielding every N keeps its longest synchronous stretch well under
+// the <50ms hook-burst budget even at the AUTOFIX_CHANGED_FILE_SCAN_LIMIT cap.
+const SNAPSHOT_YIELD_EVERY = 500;
+
+// Scan one directory's entries into `snapshot`, pushing walkable subdirs onto
+// `stack`. Yields to the event loop every SNAPSHOT_YIELD_EVERY files (shared
+// `counter`) so a single huge directory can't hold the loop. Excluded/ignored
+// dirs are not descended; ignored/vanished files are skipped.
+async function snapshotDirInto(
+	dir: string,
+	ignoreMatcher: ReturnType<typeof getProjectIgnoreMatcher>,
+	stack: string[],
+	snapshot: FileSnapshot,
+	counter: { n: number },
+): Promise<void> {
+	let entries: nodeFs.Dirent[];
+	try {
+		entries = nodeFs.readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	for (const entry of entries) {
+		const fullPath = path.join(dir, entry.name);
+		if (entry.isDirectory()) {
+			if (
+				!isExcludedDirName(entry.name) &&
+				!ignoreMatcher.isIgnored(fullPath, true)
+			) {
+				stack.push(fullPath);
+			}
+			continue;
+		}
+		if (!entry.isFile()) continue;
+		if (ignoreMatcher.isIgnored(fullPath, false)) continue;
+		try {
+			const stat = nodeFs.statSync(fullPath);
+			snapshot.set(path.resolve(fullPath), {
+				mtimeMs: stat.mtimeMs,
+				size: stat.size,
+			});
+		} catch {
+			// ignore vanished files
+		}
+		if (++counter.n % SNAPSHOT_YIELD_EVERY === 0) {
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		}
+	}
+}
+
+// Exported for the event-loop occupancy guard (#361/#368): an O(files) walk on
+// the tool_result autofix path, bounded by AUTOFIX_CHANGED_FILE_SCAN_LIMIT and
+// chunk-yielding every SNAPSHOT_YIELD_EVERY files so it never blocks the TUI.
+export async function snapshotProjectFiles(root: string): Promise<FileSnapshot> {
 	const snapshot: FileSnapshot = new Map();
 	const projectRoot = path.resolve(root);
 	const ignoreMatcher = getProjectIgnoreMatcher(projectRoot);
 	const stack = [projectRoot];
+	const counter = { n: 0 };
 	while (stack.length > 0 && snapshot.size < AUTOFIX_CHANGED_FILE_SCAN_LIMIT) {
-		const dir = stack.pop()!;
-		let entries: nodeFs.Dirent[];
-		try {
-			entries = nodeFs.readdirSync(dir, { withFileTypes: true });
-		} catch {
-			continue;
-		}
-		for (const entry of entries) {
-			const fullPath = path.join(dir, entry.name);
-			if (entry.isDirectory()) {
-				if (
-					!isExcludedDirName(entry.name) &&
-					!ignoreMatcher.isIgnored(fullPath, true)
-				) {
-					stack.push(fullPath);
-				}
-				continue;
-			}
-			if (!entry.isFile()) continue;
-			if (ignoreMatcher.isIgnored(fullPath, false)) continue;
-			try {
-				const stat = nodeFs.statSync(fullPath);
-				snapshot.set(path.resolve(fullPath), {
-					mtimeMs: stat.mtimeMs,
-					size: stat.size,
-				});
-			} catch {
-				// ignore vanished files
-			}
-		}
+		await snapshotDirInto(stack.pop()!, ignoreMatcher, stack, snapshot, counter);
 	}
 	return snapshot;
 }
 
-function diffProjectSnapshot(root: string, before: FileSnapshot): string[] {
-	const after = snapshotProjectFiles(root);
+async function diffProjectSnapshot(
+	root: string,
+	before: FileSnapshot,
+): Promise<string[]> {
+	const after = await snapshotProjectFiles(root);
 	const changed = new Set<string>();
 	for (const [filePath, next] of after) {
 		const prev = before.get(filePath);
@@ -177,6 +229,28 @@ export interface PipelineContext {
 	getFlag: (name: string) => boolean | string | undefined;
 	/** Debug logger */
 	dbg: (msg: string) => void;
+	/**
+	 * RuntimeCoordinator sequence state, threaded to the deferred cascade so the
+	 * review-graph builder can skip its per-build O(project) walk+stat sweep when
+	 * only pi-observed edits occurred since the last build (#451). `projectSeq` is
+	 * a function (not a captured number) because the cascade runs AFTER this
+	 * pipeline returns (#450) — it must read the CURRENT seq at build time.
+	 * Absent ⇒ builder behaves exactly as before (full sweep).
+	 */
+	seqState?: {
+		projectSeq: () => number;
+		getFilesChangedSince: (seq: number) => string[];
+	};
+	/**
+	 * Live reference to `runtime.wordIndex` (#348 phase 2), threaded to the
+	 * deferred cascade so it can update the warm in-memory word index at the
+	 * same seam as the graph rebuild. `null`/absent ⇒ documented no-op (see
+	 * `updateWordIndexForCascade` in dispatch/integration.ts) — never a
+	 * synchronous build here.
+	 */
+	wordIndex?: WordIndex | null;
+	/** Debounced-persist hook fired after a successful per-edit update. */
+	onWordIndexUpdated?: (index: WordIndex) => void;
 }
 
 export interface PipelineDeps {
@@ -194,10 +268,12 @@ export interface PipelineResult {
 	hasBlockers: boolean;
 	/**
 	 * Cascade diagnostics (errors in OTHER files caused by this edit).
-	 * Intentionally NOT included in output — surfaced at turn_end instead
-	 * so mid-refactor intermediate errors don't derail the agent.
+	 * Runs concurrently AFTER the edit returns — the pipeline no longer awaits it,
+	 * so it is off the write hot path. Intentionally NOT included in output;
+	 * settled (bounded) and surfaced at turn_end so mid-refactor intermediate
+	 * errors don't derail the agent. Never rejects (see the `.catch` below).
 	 */
-	cascadeRun?: import("./cascade-types.js").CascadeRun;
+	cascadePromise?: Promise<import("./cascade-types.js").CascadeRun>;
 	/** True if secrets found — block the agent */
 	isError: boolean;
 	/** True if file was modified by format/autofix */
@@ -210,6 +286,18 @@ export interface PipelineResult {
 	actionableWarnings?: ActionableWarningRecord[];
 	/** Non-fixable code-quality warnings introduced/touched by this pipeline run. */
 	codeQualityWarnings?: CodeQualityWarningRecord[];
+	/**
+	 * Raw dispatch diagnostics surfaced this run (blockers + warnings + fixed),
+	 * for #484 turn-summary collection. Same list `recordDiagnostics`/the
+	 * diagnostic logger already consume — not a new collection path.
+	 */
+	diagnostics?: Diagnostic[];
+	/** Immediate-mode formatters that actually changed this file this run. */
+	formattersUsed?: string[];
+	/** Count of autofix violations resolved this run (dispatch --fix runners). */
+	fixedCount?: number;
+	/** `tool:count` labels for autofix tools that ran this run. */
+	autofixTools?: string[];
 }
 
 // --- Phase timing helpers ---
@@ -262,8 +350,12 @@ const _eslintCache = new Map<
 >();
 
 /**
- * Run eslint --fix on a file. Returns number of fixable issues resolved,
- * or 0 if ESLint is not configured / not available.
+ * Run eslint --fix on a file. Runs a single spawn and diffs the file before/after,
+ * same idiom as the other autofix helpers below. Exit code 1 (unfixable problems
+ * remain) is allowed because fixes may still have been applied; only exit code 2
+ * (config/fatal error) is treated as failure.
+ * Returns 1 if the file changed, 0 if ESLint is not configured / not available /
+ * made no changes.
  */
 async function tryEslintFix(filePath: string, cwd: string): Promise<number> {
 	const userHasConfig = hasEslintConfig(cwd);
@@ -284,52 +376,14 @@ async function tryEslintFix(filePath: string, cwd: string): Promise<number> {
 	}
 	if (!cached.available || !cached.bin) return 0;
 	const cmd = cached.bin;
-	const configArgs: string[] = [];
-	// --fix-dry-run returns JSON with fixable counts without writing to disk.
-	// Use it to get the real count, then apply with --fix only if needed.
-	const dry = await safeSpawnAsync(
+
+	return detectFileChangedAfterCommand(
+		filePath,
 		cmd,
-		[
-			"--fix-dry-run",
-			"--format",
-			"json",
-			"--no-error-on-unmatched-pattern",
-			...configArgs,
-			filePath,
-		],
-		{ timeout: 30000, cwd },
+		["--fix", "--no-error-on-unmatched-pattern", filePath],
+		cwd,
+		[1],
 	);
-	if (dry.status === 2) return 0;
-	let fixableCount = 0;
-	let anyDryRunOutput = false;
-	try {
-		const results: Array<{
-			fixableErrorCount?: number;
-			fixableWarningCount?: number;
-			output?: string;
-		}> = JSON.parse(dry.stdout);
-		fixableCount = results.reduce(
-			(sum, r) =>
-				sum + (r.fixableErrorCount ?? 0) + (r.fixableWarningCount ?? 0),
-			0,
-		);
-		// `--fix-dry-run` reports the POST-fix state: when every problem is
-		// auto-fixable, `messages`/`fixableErrorCount` are 0 and the fixed source
-		// lands in the `output` field instead. Keying on `fixableErrorCount` alone
-		// therefore misses the common "all fixable" case and never applies fixes.
-		anyDryRunOutput = results.some((r) => typeof r.output === "string");
-	} catch {
-		/* treat as zero fixable on error */
-	}
-	if (fixableCount === 0 && !anyDryRunOutput) return 0;
-	// Apply the fixes
-	const fix = await safeSpawnAsync(
-		cmd,
-		["--fix", "--no-error-on-unmatched-pattern", ...configArgs, filePath],
-		{ timeout: 30000, cwd },
-	);
-	if (fix.status === 2) return 0;
-	return fixableCount > 0 ? fixableCount : anyDryRunOutput ? 1 : 0;
 }
 
 async function tryStylelintFix(filePath: string, cwd: string): Promise<number> {
@@ -462,7 +516,7 @@ async function tryRustClippyFix(filePath: string): Promise<string[]> {
 	]);
 	if (!cargoDir) return [];
 
-	const before = snapshotProjectFiles(cargoDir);
+	const before = await snapshotProjectFiles(cargoDir);
 	const result = await safeSpawnAsync(
 		"cargo",
 		["clippy", "--fix", "--allow-dirty", "--allow-staged", "-q"],
@@ -482,7 +536,7 @@ async function tryDartFix(filePath: string): Promise<string[]> {
 	);
 	if (!pubspecDir) return [];
 
-	const before = snapshotProjectFiles(pubspecDir);
+	const before = await snapshotProjectFiles(pubspecDir);
 	const result = await safeSpawnAsync("dart", ["fix", "--apply"], {
 		timeout: 30000,
 		cwd: pubspecDir,
@@ -835,16 +889,70 @@ export async function resyncLspFile(
 			// the cache clear (no preserveDiagnostics) so the wait resolves on fresh,
 			// correctly-positioned diagnostics rather than stale pre-edit ones — the
 			// didChange triggers a server recompute regardless of cache preservation.
-			await lspService.touchFile(filePath, fileContent, {
-				diagnostics: "none",
-				source: "lsp_sync",
-				clientScope: "primary",
-				maxClientWaitMs: LSP_SPAWN_BUDGET_MS,
+			//
+			// The touch is client-wait-capped, but its didChange/didOpen *write* can
+			// backpressure forever on a wedged server (stdin not drained), which would
+			// hang the whole edit with no bound and — until this — no log. Race it
+			// against a hard budget + the turn's abort signal (Escape): whichever wins,
+			// the edit proceeds. A wedged server no longer parks the pipeline.
+			const budgetMs = lspSyncBudgetMs();
+			const abort = getAmbientAbortSignal();
+			if (abort?.aborted) return;
+			const bail = combineAbortSignals(abort, AbortSignal.timeout(budgetMs));
+			const startedAt = Date.now();
+			const touch = lspService
+				.touchFile(filePath, fileContent, {
+					diagnostics: "none",
+					source: "lsp_sync",
+					clientScope: "primary",
+					maxClientWaitMs: LSP_SPAWN_BUDGET_MS,
+				})
+				.then(() => "done" as const)
+				.catch((err) => {
+					dbg(`LSP resync after autofix error: ${err}`);
+					return "done" as const;
+				});
+			const bailed = new Promise<"bailed">((resolve) => {
+				if (!bail || bail.aborted) return resolve("bailed");
+				bail.addEventListener("abort", () => resolve("bailed"), { once: true });
 			});
+			const outcome = await Promise.race([touch, bailed]);
+			if (outcome === "bailed") {
+				// Abandon the still-pending write; the edit continues. Log it so this
+				// stall — previously an invisible hang — is queryable in latency.log.
+				logLatency({
+					type: "phase",
+					phase: "lsp_sync_abandoned",
+					filePath,
+					durationMs: Date.now() - startedAt,
+					metadata: {
+						source: "lsp_sync",
+						reason: abort?.aborted ? "aborted" : "timeout",
+						budgetMs,
+					},
+				});
+				dbg(
+					`LSP resync ${abort?.aborted ? "aborted (Escape)" : `timed out after ${budgetMs}ms`}; server slow/wedged for ${filePath}`,
+				);
+			}
 		}
 	} catch (err) {
 		dbg(`LSP resync after autofix error: ${err}`);
 	}
+}
+
+/** Maps a dispatch `Diagnostic` (clients/dispatch/types.ts) to the #502 bus payload shape. */
+function toPilensDiagnosticEntry(d: Diagnostic): PilensDiagnosticEntry {
+	const entry: PilensDiagnosticEntry = {
+		severity: d.severity,
+		message: d.message,
+		tool: d.tool,
+	};
+	if (d.rule !== undefined) entry.ruleId = d.rule;
+	if (d.line !== undefined) entry.line = d.line;
+	if (d.column !== undefined) entry.col = d.column;
+	if (d.fixable !== undefined) entry.fixable = d.fixable;
+	return entry;
 }
 
 type DispatchResult = Awaited<ReturnType<typeof dispatchLintWithResult>>;
@@ -988,60 +1096,7 @@ export async function runPipeline(
 	}
 	phase.end("read_file");
 
-	// --- 2. Secrets scan (blocking — early exit) ---
-	if (fileContent) {
-		const secretFindings = scanForSecrets(fileContent, filePath);
-		if (secretFindings.length > 0) {
-			const durationMs = Date.now() - pipelineStart;
-			logLatency({
-				type: "tool_result",
-				toolName,
-				filePath,
-				durationMs,
-				result: "blocked_secrets",
-				metadata: { secretsFound: secretFindings.length },
-			});
-			const secretDiagnostics: Diagnostic[] = secretFindings.map((finding) => ({
-				id: `secrets:${finding.line}`,
-				message: finding.message,
-				filePath,
-				line: finding.line,
-				column: 1,
-				severity: "error",
-				semantic: "blocking",
-				tool: "secrets-scanner",
-				rule: "secrets",
-				defectClass: "secrets",
-			}));
-			emitLensAnalysisComplete({
-				cwd,
-				filePath,
-				toolName,
-				model: ctx.telemetry?.model ?? "unknown",
-				sessionId: ctx.telemetry?.sessionId ?? "unknown",
-				turnIndex: ctx.telemetry?.turnIndex ?? 0,
-				writeIndex: ctx.telemetry?.writeIndex ?? 0,
-				diagnostics: secretDiagnostics,
-				blockers: secretDiagnostics,
-				warnings: [],
-				fixed: [],
-				resolvedCount: 0,
-				hasBlockers: true,
-				fileModified: false,
-				changedFiles: [],
-				durationMs,
-			});
-			return {
-				output: `\n\n${formatSecrets(secretFindings, filePath)}`,
-				hasBlockers: true,
-				isError: true,
-				fileModified: false,
-				changedFiles: [],
-			};
-		}
-	}
-
-	// --- 3. Auto-format ---
+	// --- 2. Auto-format ---
 	phase.start("format");
 	let formatChanged = false;
 	let formattersUsed: string[] = [];
@@ -1057,7 +1112,21 @@ export async function runPipeline(
 		formattersUsed = formatResult.formattersUsed;
 		formatFailures = formatResult.formatFailures;
 		fileContent = formatResult.fileContent;
-		if (formatChanged) piChangedFiles.add(path.resolve(filePath));
+		if (formatChanged) {
+			const absPath = path.resolve(filePath);
+			piChangedFiles.add(absPath);
+			publishFilesTouched({
+				reason: "format",
+				paths: [absPath],
+				cwd,
+				dbg,
+				fixes: formattersUsed.map((tool) => ({
+					path: absPath,
+					tool,
+					kind: "format",
+				})),
+			});
+		}
 	} else if (formatDeferred) {
 		dbg(`autoformat: deferred until agent_end for ${filePath}`);
 	}
@@ -1067,7 +1136,7 @@ export async function runPipeline(
 		deferred: formatDeferred,
 	});
 
-	// --- 4. Auto-fix ---
+	// --- 3. Auto-fix ---
 	phase.start("autofix");
 	const {
 		fixedCount,
@@ -1079,6 +1148,25 @@ export async function runPipeline(
 	} = await runAutofix(filePath, cwd, getFlag, dbg, deps);
 	for (const changedFile of autofixChangedFiles) {
 		piChangedFiles.add(path.resolve(changedFile));
+	}
+	if (autofixChangedFiles.length > 0) {
+		// autofixTools entries are "tool:count" (e.g. "ruff:3"); runAutofix runs
+		// against ONE target filePath per call, so every tool that fired in this
+		// batch applies to every file the batch changed — best-effort attribution
+		// (not per-file precision) since the underlying tool runners don't report
+		// per-changed-file breakdown. Good enough for the "was this hunk
+		// mechanical" use case the fix-provenance field exists for.
+		const absChangedFiles = autofixChangedFiles.map((f) => path.resolve(f));
+		const toolNames = autofixTools.map((t) => t.split(":")[0]);
+		publishFilesTouched({
+			reason: "autofix",
+			paths: absChangedFiles,
+			cwd,
+			dbg,
+			fixes: absChangedFiles.flatMap((p) =>
+				toolNames.map((tool) => ({ path: p, tool, kind: "autofix" as const })),
+			),
+		});
 	}
 	if (fixRefresh) {
 		try {
@@ -1094,7 +1182,7 @@ export async function runPipeline(
 		skipReason: autofixSkipReason,
 	});
 
-	// --- 5. LSP file sync ---
+	// --- 4. LSP file sync ---
 	// Sync once with final post-format/post-fix content so dispatch and cascade
 	// diagnostics do not observe stale pre-format text.
 	phase.start("lsp_sync");
@@ -1105,7 +1193,7 @@ export async function runPipeline(
 	}
 	phase.end("lsp_sync", { completed: lspSyncCompleted, finalContent: true });
 
-	// --- 6. Dispatch lint ---
+	// --- 5. Dispatch lint ---
 	phase.start("dispatch_lint");
 	dbg(`dispatch: running lint tools for ${filePath}`);
 
@@ -1124,7 +1212,35 @@ export async function runPipeline(
 			writeIndex: ctx.telemetry?.writeIndex ?? 0,
 		},
 	);
-	recordDiagnostics(filePath, dispatchResult.diagnostics);
+	recordDiagnostics(
+		filePath,
+		dispatchResult.diagnostics,
+		ctx.telemetry?.writeIndex,
+	);
+	// #502: emit the write batch's FINAL diagnostic state immediately after
+	// recordDiagnostics commits it — this call site runs after format,
+	// autofix, and dispatch have all completed for this batch (see the phase
+	// order above), so dispatchResult.diagnostics IS the latest post-batch
+	// picture, not an intermediate runner result. Full-replace semantics: we
+	// always pass the complete current set for this file, including an
+	// explicit `[]` on the transition from a previously-reported-dirty state
+	// to clean (see clients/diagnostics-publish.ts for the contract).
+	{
+		const absPath = path.resolve(filePath);
+		const wasDirty = wasPreviouslyReportedDirty(absPath);
+		if (dispatchResult.diagnostics.length > 0 || wasDirty) {
+			publishDiagnostics({
+				cwd,
+				files: [
+					{
+						path: absPath,
+						diagnostics: dispatchResult.diagnostics.map(toPilensDiagnosticEntry),
+					},
+				],
+				dbg,
+			});
+		}
+	}
 	const hasBlockers = dispatchResult.hasBlockers;
 	const actionableWarnings = dispatchResult.warnings
 		.map((diagnostic) => recordFromDispatchDiagnostic(diagnostic, cwd))
@@ -1216,17 +1332,35 @@ export async function runPipeline(
 		diagnosticCount: dispatchResult.diagnostics.length,
 	});
 
-	// --- 7. Cascade diagnostics (LSP only) ---
-	// Deferred: cascade errors in OTHER files are NOT shown inline — surfaced at
-	// turn_end so mid-refactor intermediate errors don't derail the agent.
-	const cascadeRun = getFlag("no-lsp")
+	// --- 6. Cascade diagnostics (LSP only) ---
+	// Kicked off UNAWAITED so the graph rebuild + neighbor LSP pulls run
+	// concurrently after the edit returns rather than blocking it (#450). The
+	// result is never shown inline — settled (bounded) and surfaced at turn_end.
+	// The stored promise must never reject: an unhandled rejection is fatal, so a
+	// failing compute resolves to an "error" skip-run instead.
+	const cascadePromise = getFlag("no-lsp")
 		? undefined
-		: await computeCascadeForFile(filePath, cwd, {
+		: computeCascadeForFile(filePath, cwd, {
 				hasBlockers,
 				dbg,
 				turnSeq: ctx.telemetry?.turnIndex,
 				writeSeq: ctx.telemetry?.writeIndex,
-			});
+				seqState: ctx.seqState,
+				fileContent,
+				wordIndex: ctx.wordIndex,
+				onWordIndexUpdated: ctx.onWordIndexUpdated,
+			}).catch(
+				(err): import("./cascade-types.js").CascadeRun => {
+					dbg(`cascade compute failed for ${filePath}: ${err}`);
+					return {
+						filePath,
+						result: undefined,
+						neighborCount: 0,
+						diagnosticCount: 0,
+						skipReason: "error",
+					};
+				},
+			);
 
 	// --- Final timing + all-clear ---
 	const elapsed = Date.now() - pipelineStart;
@@ -1260,7 +1394,7 @@ export async function runPipeline(
 	return {
 		output,
 		hasBlockers,
-		cascadeRun,
+		cascadePromise,
 		isError: false,
 		fileModified,
 		changedFiles,
@@ -1269,5 +1403,9 @@ export async function runPipeline(
 			: undefined,
 		actionableWarnings,
 		codeQualityWarnings,
+		diagnostics: dispatchResult.diagnostics,
+		formattersUsed,
+		fixedCount,
+		autofixTools,
 	};
 }

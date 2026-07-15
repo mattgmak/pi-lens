@@ -60,6 +60,14 @@ export interface MockCtx extends ExtensionCommandContext {
 	widgetCalls: CapturedWidget[];
 }
 
+/** A `pi.sendMessage(...)` call captured for assertions (#484). */
+export interface CapturedMessage {
+	customType: string;
+	content: unknown;
+	display: boolean;
+	details: unknown;
+}
+
 export interface PiMock {
 	// ── recordings ───────────────────────────────────────────────────────────
 	readonly flags: Map<string, RecordedFlag>;
@@ -67,6 +75,15 @@ export interface PiMock {
 	readonly tools: Map<string, unknown>;
 	readonly handlers: Map<string, Hook[]>;
 	readonly flagValues: Map<string, boolean | string>;
+	readonly messageRenderers: Map<string, unknown>;
+	readonly sentMessages: CapturedMessage[];
+	/**
+	 * #dynamic-tooling: tools registered via `registerTool` are active by
+	 * default (mirrors the real host — see docs' `getActiveTools`/
+	 * `setActiveTools` example, which starts from "all registered tools" and
+	 * filters DOWN). Only meaningful when `supportsActiveTools` is true.
+	 */
+	readonly activeTools: Set<string>;
 
 	// ── ExtensionAPI surface that index.ts uses ──────────────────────────────
 	registerFlag(name: string, options: RecordedFlag): void;
@@ -74,6 +91,15 @@ export interface PiMock {
 	registerTool(tool: { name: string } & Record<string, unknown>): void;
 	on(event: string, handler: Hook): void;
 	getFlag(name: string): boolean | string | undefined;
+	/** #484: registered message renderers, keyed by customType. */
+	registerMessageRenderer(customType: string, renderer: unknown): void;
+	/** #484: captures every `pi.sendMessage(...)` call into `sentMessages`. */
+	sendMessage(message: {
+		customType: string;
+		content: unknown;
+		display: boolean;
+		details?: unknown;
+	}): void;
 
 	// ── test helpers ─────────────────────────────────────────────────────────
 	/** Pre-set a flag value (read back via getFlag); call before `extension(pi)`. */
@@ -91,9 +117,22 @@ export interface PiMock {
 	asExtensionAPI(): ExtensionAPI;
 }
 
+export interface PiMockOptions {
+	/**
+	 * #dynamic-tooling: whether this mocked host exposes
+	 * `pi.getActiveTools`/`pi.setActiveTools`. Default true (current pi).
+	 * Set false to simulate an older host with no dynamic-tooling support —
+	 * `index.ts`'s feature-detection must fall back to leaving every tool
+	 * statically active rather than throwing.
+	 */
+	supportsActiveTools?: boolean;
+}
+
 export function createPiMock(
 	initialFlags: Record<string, boolean | string> = {},
+	options: PiMockOptions = {},
 ): PiMock {
+	const supportsActiveTools = options.supportsActiveTools ?? true;
 	const flags = new Map<string, RecordedFlag>();
 	const commands = new Map<string, RecordedCommand>();
 	const tools = new Map<string, unknown>();
@@ -101,6 +140,9 @@ export function createPiMock(
 	const flagValues = new Map<string, boolean | string>(
 		Object.entries(initialFlags),
 	);
+	const messageRenderers = new Map<string, unknown>();
+	const sentMessages: CapturedMessage[] = [];
+	const activeTools = new Set<string>();
 
 	const mock: PiMock = {
 		flags,
@@ -108,6 +150,9 @@ export function createPiMock(
 		tools,
 		handlers,
 		flagValues,
+		messageRenderers,
+		sentMessages,
+		activeTools,
 
 		registerFlag(name, options) {
 			flags.set(name, options);
@@ -126,6 +171,8 @@ export function createPiMock(
 				throw new Error(`tool already registered: ${tool.name}`);
 			}
 			tools.set(tool.name, tool);
+			// Mirror the real host: newly registered tools are active by default.
+			activeTools.add(tool.name);
 		},
 		on(event, handler) {
 			const list = handlers.get(event) ?? [];
@@ -134,6 +181,17 @@ export function createPiMock(
 		},
 		getFlag(name) {
 			return flagValues.get(name);
+		},
+		registerMessageRenderer(customType, renderer) {
+			messageRenderers.set(customType, renderer);
+		},
+		sendMessage(message) {
+			sentMessages.push({
+				customType: message.customType,
+				content: message.content,
+				display: message.display,
+				details: message.details,
+			});
 		},
 
 		setFlag(name, value) {
@@ -169,7 +227,15 @@ export function createPiMock(
 			await cmd.handler(args, ctx);
 		},
 		asExtensionAPI() {
-			return mock as unknown as ExtensionAPI;
+			const api: Record<string, unknown> = { ...mock };
+			if (supportsActiveTools) {
+				api.getActiveTools = () => Array.from(activeTools);
+				api.setActiveTools = (names: string[]) => {
+					activeTools.clear();
+					for (const name of names) activeTools.add(name);
+				};
+			}
+			return api as unknown as ExtensionAPI;
 		},
 	};
 

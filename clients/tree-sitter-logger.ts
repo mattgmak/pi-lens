@@ -1,16 +1,12 @@
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
+import { createNdjsonLogger } from "./ndjson-logger.js";
 
 const TREE_SITTER_LOG_DIR = getGlobalPiLensDir();
 const TREE_SITTER_LOG_FILE = path.join(TREE_SITTER_LOG_DIR, "tree-sitter.log");
 
-try {
-	if (!fs.existsSync(TREE_SITTER_LOG_DIR)) {
-		fs.mkdirSync(TREE_SITTER_LOG_DIR, { recursive: true });
-	}
-} catch {}
+const writer = createNdjsonLogger({ filePath: TREE_SITTER_LOG_FILE });
 
 export interface TreeSitterLogEntry {
 	ts?: string;
@@ -40,12 +36,14 @@ export function logTreeSitter(entry: TreeSitterLogEntry): void {
 	if (isTestMode()) {
 		return;
 	}
-	const line = `${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`;
-	try {
-		fs.appendFileSync(TREE_SITTER_LOG_FILE, line);
-	} catch {}
+	writer.log({ ts: new Date().toISOString(), ...entry });
 }
 
 export function getTreeSitterLogPath(): string {
 	return TREE_SITTER_LOG_FILE;
+}
+
+/** Resolve once all enqueued tree-sitter writes are on disk (tests/shutdown). */
+export function flushTreeSitterLog(): Promise<void> {
+	return writer.flush();
 }

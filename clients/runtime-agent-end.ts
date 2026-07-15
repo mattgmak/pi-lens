@@ -9,6 +9,7 @@ import type { CacheManager } from "./cache-manager.js";
 import type { FormatService } from "./format-service.js";
 import { logLatency } from "./latency-logger.js";
 import { resyncLspFile, runFormatPhase } from "./pipeline.js";
+import { publishFilesTouched } from "./bus-publish.js";
 import {
 	appendProjectChange,
 	type ProjectChangeSource,
@@ -79,6 +80,15 @@ export async function handleAgentEnd({
 		failed: [],
 		skipped: [],
 	};
+	// #502 fix provenance: per-path {tool, kind} entries accumulated across the
+	// deferred-format loop below, passed as `fixes` on the batch
+	// publishFilesTouched call so consumers can tell "pi-lens formatted this"
+	// from an agent edit.
+	const deferredFormatFixes: Array<{
+		path: string;
+		tool: string;
+		kind: "format";
+	}> = [];
 
 	dbg(`agent_end deferred_format: ${records.length} file(s)`);
 	logLatency({
@@ -160,6 +170,9 @@ export async function handleAgentEnd({
 
 			if (result.formatChanged) {
 				summary.changed.push(filePath);
+				for (const tool of result.formattersUsed) {
+					deferredFormatFixes.push({ path: filePath, tool, kind: "format" });
+				}
 				// turnStateCwd is required on DeferredFormatRecord (PR #114) — the
 				// previous fallback chain through ctxCwd / projectRoot / record.cwd
 				// could silently regress the monorepo cwd-mismatch fix from PR #105.
@@ -189,6 +202,16 @@ export async function handleAgentEnd({
 						`agent_end deferred_format modified-range tracking failed for ${filePath}: ${err}`,
 					);
 				}
+
+				// #484: opt-in per-turn summary — deferred format is the OTHER
+				// half of the format signal (immediate-mode is recorded at the
+				// runtime-tool-result.ts seam); same result.formattersUsed the
+				// latency phase below already logs, no new plumbing.
+				if (getFlag("lens-turn-summary")) {
+					for (const tool of result.formattersUsed) {
+						runtime.turnSummary.recordFormat(filePath, { tool });
+					}
+				}
 			}
 
 			if (result.fileContent) {
@@ -216,6 +239,16 @@ export async function handleAgentEnd({
 					formattersUsed: result.formattersUsed,
 					failureCount: result.formatFailures.length,
 				},
+			});
+		}
+
+		if (summary.changed.length > 0) {
+			publishFilesTouched({
+				reason: "format",
+				paths: summary.changed,
+				cwd: ctxCwd ?? runtime.projectRoot,
+				dbg,
+				fixes: deferredFormatFixes,
 			});
 		}
 	}
@@ -272,6 +305,26 @@ export async function handleAgentEnd({
 						);
 					}
 				}
+				if (fixSummary.changedFiles.length > 0) {
+					publishFilesTouched({
+						reason: "autofix",
+						paths: fixSummary.changedFiles,
+						cwd: ctxCwd ?? runtime.projectRoot,
+						dbg,
+						fixes: fixSummary.changedFiles.map((changedFile) => ({
+							path: changedFile,
+							tool: "lsp-quickfix",
+							kind: "autofix" as const,
+						})),
+					});
+					if (getFlag("lens-turn-summary")) {
+						for (const changedFile of fixSummary.changedFiles) {
+							runtime.turnSummary.recordAutofix(changedFile, {
+								tool: "lsp-quickfix",
+							});
+						}
+					}
+				}
 				logLatency({
 					type: "phase",
 					toolName: "agent_end",
@@ -318,7 +371,10 @@ export async function handleAgentEnd({
 			`pi-lens deferred format: ${summary.changed.length} changed, ${summary.failed.length} failed`,
 			"warning",
 		);
-	} else if (summary.changed.length > 0) {
+	} else if (summary.changed.length > 0 && !getFlag("lens-turn-summary")) {
+		// The info-level success toast is redundant once the turn-summary entry
+		// (#484) is opted in — it would repeat the same "N reformatted" fact the
+		// transcript entry already carries. Failures above stay untouched either way.
 		const names = summary.changed.map((f) => path.basename(f)).join(", ");
 		notify(
 			`pi-lens deferred format applied to ${summary.changed.length} file(s): ${names}`,

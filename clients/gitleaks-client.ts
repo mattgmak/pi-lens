@@ -17,6 +17,13 @@
  *   - `gitleaks` reference in `package.json` deps, OR
  *   - a git pre-commit hook (.husky/, .git/hooks/) referencing gitleaks
  *
+ * `lens_diagnostics mode=full`'s fresh-fetch path (`clients/project-diagnostics/
+ * fresh-fetch.ts`) uses a looser "smart-default" gate instead — any tracked
+ * git repo, via `hasGitRepo` — since that's an explicitly-requested
+ * comprehensive review where gitleaks's low cost and advisory-only findings
+ * make the stricter default needlessly conservative. session_start and
+ * per-edit dispatch keep the strict gate above unchanged.
+ *
  * If the gate trips, the runner auto-installs gitleaks from GitHub releases
  * (installer entry registered in clients/installer/index.ts) and runs
  * `gitleaks detect --no-git --report-format json` against the analysis root.
@@ -29,6 +36,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { mkdtempSync } from "node:fs";
 import { safeSpawnAsync } from "./safe-spawn.js";
+import { SecurityScanClient } from "./security-scan-client.js";
 
 // --- Types ---
 
@@ -123,19 +131,31 @@ export function hasGitleaksSignal(cwd: string): boolean {
 	return false;
 }
 
+/**
+ * "Smart-default" tier from #130's own considered-but-unshipped options:
+ * fire whenever the project is a tracked git repo, not only when an explicit
+ * gitleaks signal is present. gitleaks's own scan target is "a git repo's
+ * history/tree" — nearly every project qualifies, so this is meaningfully
+ * looser than {@link hasGitleaksSignal}. Used ONLY by `mode=full`'s
+ * fresh-fetch path (an explicitly-requested comprehensive review, where
+ * gitleaks's low cost — ~10MB binary, no external DB pull — and advisory-only
+ * findings make the stricter opt-in gate needlessly conservative); session_start
+ * and per-edit dispatch keep the strict {@link hasGitleaksSignal} gate
+ * unchanged, so day-to-day noise/cost stays exactly as conservative as before.
+ */
+export function hasGitRepo(cwd: string): boolean {
+	try {
+		return fs.existsSync(path.join(cwd, ".git"));
+	} catch {
+		return false;
+	}
+}
+
 // --- Client ---
 
-export class GitleaksClient {
-	private available: boolean | null = null;
-	private ensureInFlight: Promise<boolean> | null = null;
-	private inFlight = new Map<string, Promise<GitleaksResult>>();
-	private binaryPath: string | null = null;
-	private log: (msg: string) => void;
-
+export class GitleaksClient extends SecurityScanClient<GitleaksResult> {
 	constructor(verbose = false) {
-		this.log = verbose
-			? (msg: string) => console.error(`[gitleaks] ${msg}`)
-			: () => {};
+		super("gitleaks", verbose);
 	}
 
 	/**
@@ -146,67 +166,43 @@ export class GitleaksClient {
 		return hasGitleaksSignal(cwd);
 	}
 
-	/**
-	 * Check if gitleaks is available, auto-installing via the GitHub-release
-	 * path (registered in `clients/installer/index.ts`) when missing.
-	 *
-	 * Concurrent first-time callers share the same probe promise.
-	 */
-	async ensureAvailable(): Promise<boolean> {
-		if (this.available !== null) return this.available;
-		if (this.ensureInFlight) return this.ensureInFlight;
-		this.ensureInFlight = this.doEnsureAvailable();
-		try {
-			return await this.ensureInFlight;
-		} finally {
-			this.ensureInFlight = null;
-		}
+	/** Smart-default tier (#130) — see {@link hasGitRepo}'s doc comment. */
+	static hasGitRepo(cwd: string): boolean {
+		return hasGitRepo(cwd);
 	}
 
-	private async doEnsureAvailable(): Promise<boolean> {
-		// PATH probe first. gitleaks uses `version` (no leading dashes) as
-		// its CLI verb — quirky but stable.
-		const probe = await safeSpawnAsync("gitleaks", ["version"], {
-			timeout: 5000,
-		});
-		if (!probe.error && probe.status === 0) {
-			this.log(`gitleaks found: ${probe.stdout.trim().split("\n")[0]}`);
-			this.available = true;
-			return true;
-		}
-
-		// Auto-install via the pi-lens installer's gitleaks entry.
-		this.log("gitleaks not found, attempting auto-install");
-		const { ensureTool } = await import("./installer/index.js");
-		const installed = await ensureTool("gitleaks");
-		if (!installed) {
-			this.log("gitleaks auto-install failed");
-			this.available = false;
-			return false;
-		}
-
-		this.binaryPath = installed;
-		this.available = true;
-		this.log(`gitleaks auto-installed at ${installed}`);
-		return true;
+	/**
+	 * Auto-install via the GitHub-release path (registered in
+	 * `clients/installer/index.ts`) when gitleaks isn't already on PATH.
+	 * gitleaks uses `version` (no leading dashes) as its CLI verb.
+	 */
+	protected doEnsureAvailable(): Promise<boolean> {
+		return this.ensureViaInstaller(["version"]);
 	}
 
 	/**
 	 * Scan a directory tree for secrets.
 	 *
-	 * Skips early when the directory shows no gitleaks opt-in signal. When
-	 * gitleaks is unavailable, returns an empty result with an explanatory
-	 * summary rather than failing the session_start task.
+	 * Skips early when the directory shows no gitleaks opt-in signal — unless
+	 * `requireSignal: false` (the `mode=full` fresh-fetch path uses this to
+	 * apply the looser #130 "smart-default" gate, {@link hasGitRepo}, instead;
+	 * session_start and per-edit dispatch never pass this, so their behavior
+	 * is unchanged). When gitleaks is unavailable, returns an empty result
+	 * with an explanatory summary rather than failing the session_start task.
 	 *
 	 * Re-entrancy safe: concurrent calls against the same root share a
 	 * single gitleaks process (mirrors `KnipClient` / `JscpdClient` /
 	 * `GovulncheckClient`).
 	 */
-	async scan(cwd: string): Promise<GitleaksResult> {
+	async scan(
+		cwd: string,
+		options?: { requireSignal?: boolean },
+	): Promise<GitleaksResult> {
 		const targetDir = path.resolve(cwd);
 		const scannedAt = new Date().toISOString();
+		const requireSignal = options?.requireSignal ?? true;
 
-		if (!GitleaksClient.hasGitleaksSignal(targetDir)) {
+		if (requireSignal && !GitleaksClient.hasGitleaksSignal(targetDir)) {
 			return {
 				...EMPTY_RESULT,
 				success: true,
@@ -223,17 +219,7 @@ export class GitleaksClient {
 			};
 		}
 
-		const key = targetDir;
-		const existing = this.inFlight.get(key);
-		if (existing) {
-			this.log(`Scan already in flight for ${targetDir}; sharing result`);
-			return existing;
-		}
-		const promise = this.runScan(targetDir).finally(() => {
-			this.inFlight.delete(key);
-		});
-		this.inFlight.set(key, promise);
-		return promise;
+		return this.dedupeScan(targetDir, () => this.runScan(targetDir));
 	}
 
 	private async runScan(cwd: string): Promise<GitleaksResult> {

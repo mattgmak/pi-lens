@@ -35,12 +35,14 @@
 
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import https from "node:https";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
+const LOMBOK_DOWNLOAD_URL = "https://projectlombok.org/downloads/lombok.jar";
 
 /**
  * One minimal real project per language. `targets` are the runner ids whose
@@ -280,6 +282,34 @@ const LSP_FIXTURES = [
 		tools: ["typescript-language-server"],
 		clean: true,
 	},
+	// Native TypeScript 7 launch path (#524/#526, live-guarded by #530). The repo
+	// pins typescript 6.x, so the native `tsc --lsp --stdio` selection can't be
+	// exercised by a committed fixture — `setup` installs a real typescript@7
+	// into the COPIED temp workspace first. `expectLaunchVariant` fails the
+	// fixture if selection silently fell back to classic, even though the
+	// native and classic servers share the same "typescript" server id (so the
+	// diagnostic alone can't tell them apart).
+	{
+		lang: "typescript7",
+		dir: "tests/fixtures/tool-smoke/typescript7",
+		file: "bad.ts",
+		serverHint: "typescript native (tsc --lsp --stdio, TS7+)",
+		tools: [],
+		setup: "npm install typescript@7 --no-save --no-audit --no-fund",
+		expectLaunchVariant: "native-ts7",
+	},
+	// Clean counterpart — doubles as the future #529 clean-signal probe
+	// workspace for the native variant's publish-on-clean behavior.
+	{
+		lang: "typescript7-clean",
+		dir: "tests/fixtures/tool-smoke/typescript7-clean",
+		file: "clean.ts",
+		serverHint: "typescript native (clean file)",
+		tools: [],
+		setup: "npm install typescript@7 --no-save --no-audit --no-fund",
+		expectLaunchVariant: "native-ts7",
+		clean: true,
+	},
 	{
 		lang: "yaml",
 		dir: "tests/fixtures/tool-smoke/yaml",
@@ -337,6 +367,16 @@ const LSP_FIXTURES = [
 		tools: ["terraform-ls"],
 	},
 	{
+		// #274: marksman ships a bare per-platform binary (github single-binary).
+		// The fixture's bad.md carries a broken intra-repo link so a provisioned run
+		// also exercises marksman's cross-file check, not just the handshake.
+		lang: "markdown",
+		dir: "tests/fixtures/tool-smoke/markdown",
+		file: "bad.md",
+		serverHint: "marksman",
+		tools: ["marksman"],
+	},
+	{
 		lang: "prisma",
 		dir: "tests/fixtures/tool-smoke/prisma",
 		file: "schema.prisma",
@@ -357,6 +397,16 @@ const LSP_FIXTURES = [
 		serverHint: "rust-analyzer",
 		tools: ["rust-analyzer"],
 	},
+	{
+		// #278: PowerShell Editor Services — a pwsh-bootstrapped module bundle
+		// (archive tree bundle), not a binary. Needs pwsh on the runner (present on
+		// the nightly ubuntu image); installs the bundle via the archive strategy.
+		lang: "powershell",
+		dir: "tests/fixtures/tool-smoke/powershell",
+		file: "bad.ps1",
+		serverHint: "PowerShell Editor Services (pwsh Start-EditorServices.ps1 -Stdio)",
+		tools: ["powershell-editor-services"],
+	},
 	// Capability-matrix fixtures (#240): one fixture per remaining registered
 	// server so `characterize-lsp.mjs` can record each server's diagnostic mode
 	// (pull vs push). The mode comes from the server's advertised capabilities at
@@ -367,25 +417,160 @@ const LSP_FIXTURES = [
 	// New languages (no prior fixture) get a minimal clean source + root marker.
 	// Servers needing a toolchain report "unavailable" where it's absent; the
 	// fixture stays durable so a provisioned CI run completes the matrix.
-	{ lang: "go", dir: "tests/fixtures/tool-smoke/go", file: "bad.go", serverHint: "gopls", tools: ["gopls"] },
-	{ lang: "ruby", dir: "tests/fixtures/tool-smoke/ruby", file: "bad.rb", serverHint: "ruby-lsp", tools: ["ruby-lsp"] },
-	{ lang: "csharp", dir: "tests/fixtures/tool-smoke/csharp", file: "Program.cs", serverHint: "csharp-ls", tools: ["csharp-ls"] },
-	{ lang: "fsharp", dir: "tests/fixtures/tool-smoke/fsharp", file: "Program.fs", serverHint: "fsautocomplete", tools: ["fsautocomplete"] },
-	{ lang: "java", dir: "tests/fixtures/tool-smoke/java", file: "Bad.java", serverHint: "jdtls", tools: ["jdtls"] },
-	{ lang: "kotlin", dir: "tests/fixtures/tool-smoke/kotlin", file: "Bad.kt", serverHint: "kotlin-language-server", tools: ["kotlin-language-server"] },
-	{ lang: "swift", dir: "tests/fixtures/tool-smoke/swift", file: "main.swift", serverHint: "sourcekit-lsp", tools: ["sourcekit-lsp"] },
-	{ lang: "dart", dir: "tests/fixtures/tool-smoke/dart", file: "bad.dart", serverHint: "dart language-server", tools: ["dart"] },
-	{ lang: "lua", dir: "tests/fixtures/tool-smoke/lua", file: "main.lua", serverHint: "lua-language-server", tools: ["lua-language-server"] },
-	{ lang: "cpp", dir: "tests/fixtures/tool-smoke/cpp", file: "main.cpp", serverHint: "clangd", tools: ["clangd"] },
-	{ lang: "zig", dir: "tests/fixtures/tool-smoke/zig", file: "bad.zig", serverHint: "zls", tools: ["zls"] },
-	{ lang: "haskell", dir: "tests/fixtures/tool-smoke/haskell", file: "Main.hs", serverHint: "haskell-language-server", tools: ["haskell-language-server"] },
-	{ lang: "elixir", dir: "tests/fixtures/tool-smoke/elixir", file: "bad.ex", serverHint: "elixir-ls", tools: ["elixir-ls"] },
-	{ lang: "gleam", dir: "tests/fixtures/tool-smoke/gleam", file: "src/smoke.gleam", serverHint: "gleam lsp", tools: ["gleam"] },
-	{ lang: "ocaml", dir: "tests/fixtures/tool-smoke/ocaml", file: "main.ml", serverHint: "ocamllsp", tools: ["ocaml-lsp-server"] },
-	{ lang: "clojure", dir: "tests/fixtures/tool-smoke/clojure", file: "main.clj", serverHint: "clojure-lsp", tools: ["clojure-lsp"] },
-	{ lang: "nix", dir: "tests/fixtures/tool-smoke/nix", file: "flake.nix", serverHint: "nixd", tools: ["nixd"] },
-	{ lang: "vue", dir: "tests/fixtures/tool-smoke/vue", file: "App.vue", serverHint: "@vue/language-server", tools: ["@vue/language-server"] },
-	{ lang: "svelte", dir: "tests/fixtures/tool-smoke/svelte", file: "App.svelte", serverHint: "svelte-language-server", tools: ["svelte-language-server"] },
+	{
+		lang: "go",
+		dir: "tests/fixtures/tool-smoke/go",
+		file: "bad.go",
+		serverHint: "gopls",
+		tools: ["gopls"],
+	},
+	{
+		lang: "ruby",
+		dir: "tests/fixtures/tool-smoke/ruby",
+		file: "bad.rb",
+		serverHint: "ruby-lsp",
+		tools: ["ruby-lsp"],
+	},
+	{
+		lang: "csharp",
+		dir: "tests/fixtures/tool-smoke/csharp",
+		file: "Program.cs",
+		serverHint: "csharp-ls",
+		tools: ["csharp-ls"],
+	},
+	{
+		lang: "fsharp",
+		dir: "tests/fixtures/tool-smoke/fsharp",
+		file: "Program.fs",
+		serverHint: "fsautocomplete",
+		tools: ["fsautocomplete"],
+	},
+	{
+		lang: "java",
+		dir: "tests/fixtures/tool-smoke/java",
+		file: "Bad.java",
+		serverHint: "jdtls",
+		tools: ["jdtls"],
+	},
+	{
+		lang: "java-lombok",
+		dir: "tests/fixtures/tool-smoke/java-lombok",
+		file: "src/main/java/App.java",
+		serverHint: "jdtls + lombok javaagent",
+		tools: ["jdtls"],
+		lombokJar: true,
+		expectNoMessageMatch:
+			"getName|undefined|cannot be resolved|cannot find symbol",
+	},
+	{
+		lang: "kotlin",
+		dir: "tests/fixtures/tool-smoke/kotlin",
+		file: "Bad.kt",
+		serverHint: "kotlin-language-server",
+		tools: ["kotlin-language-server"],
+	},
+	{
+		lang: "swift",
+		dir: "tests/fixtures/tool-smoke/swift",
+		file: "main.swift",
+		serverHint: "sourcekit-lsp",
+		tools: ["sourcekit-lsp"],
+	},
+	{
+		lang: "dart",
+		dir: "tests/fixtures/tool-smoke/dart",
+		file: "bad.dart",
+		serverHint: "dart language-server",
+		tools: ["dart"],
+	},
+	{
+		lang: "lua",
+		dir: "tests/fixtures/tool-smoke/lua",
+		file: "main.lua",
+		serverHint: "lua-language-server",
+		tools: ["lua-language-server"],
+	},
+	{
+		lang: "cpp",
+		dir: "tests/fixtures/tool-smoke/cpp",
+		file: "main.cpp",
+		serverHint: "clangd",
+		tools: ["clangd"],
+	},
+	{
+		lang: "zig",
+		dir: "tests/fixtures/tool-smoke/zig",
+		file: "bad.zig",
+		serverHint: "zls",
+		tools: ["zls"],
+	},
+	{
+		lang: "haskell",
+		dir: "tests/fixtures/tool-smoke/haskell",
+		file: "Main.hs",
+		serverHint: "haskell-language-server",
+		tools: ["haskell-language-server"],
+	},
+	{
+		lang: "elixir",
+		dir: "tests/fixtures/tool-smoke/elixir",
+		file: "bad.ex",
+		serverHint: "elixir-ls",
+		tools: ["elixir-ls"],
+	},
+	{
+		// Expert is an alternate Elixir primary. Disabling ElixirLS makes this
+		// fixture exercise Expert's managed GitHub binary through initialize.
+		lang: "expert",
+		dir: "tests/fixtures/tool-smoke/elixir",
+		file: "bad.ex",
+		serverHint: "Expert (alternate of ElixirLS)",
+		tools: ["expert"],
+		disableServers: ["elixir"],
+		expectServerId: "expert",
+	},
+	{
+		lang: "gleam",
+		dir: "tests/fixtures/tool-smoke/gleam",
+		file: "src/smoke.gleam",
+		serverHint: "gleam lsp",
+		tools: ["gleam"],
+	},
+	{
+		lang: "ocaml",
+		dir: "tests/fixtures/tool-smoke/ocaml",
+		file: "main.ml",
+		serverHint: "ocamllsp",
+		tools: ["ocaml-lsp-server"],
+	},
+	{
+		lang: "clojure",
+		dir: "tests/fixtures/tool-smoke/clojure",
+		file: "main.clj",
+		serverHint: "clojure-lsp",
+		tools: ["clojure-lsp"],
+	},
+	{
+		lang: "nix",
+		dir: "tests/fixtures/tool-smoke/nix",
+		file: "flake.nix",
+		serverHint: "nixd",
+		tools: ["nixd"],
+	},
+	{
+		lang: "vue",
+		dir: "tests/fixtures/tool-smoke/vue",
+		file: "App.vue",
+		serverHint: "@vue/language-server",
+		tools: ["@vue/language-server"],
+	},
+	{
+		lang: "svelte",
+		dir: "tests/fixtures/tool-smoke/svelte",
+		file: "App.svelte",
+		serverHint: "svelte-language-server",
+		tools: ["svelte-language-server"],
+	},
 	// Auxiliary LSP (cross-cutting, diagnostic-only) — attaches alongside the
 	// primary language server. `auxiliaryServerIds` switches the touch to the
 	// with-auxiliary scope; `auxiliarySourceMatch` asserts the auxiliary actually
@@ -410,6 +595,50 @@ const LSP_FIXTURES = [
 		dir: "tests/fixtures/tool-smoke/ast-grep-aux",
 		file: "danger.js",
 		serverHint: "ast-grep (auxiliary)",
+		tools: ["ast-grep"],
+		auxiliaryServerIds: ["ast-grep"],
+		auxiliarySourceMatch: "ast[-_]?grep",
+		gitInit: true,
+	},
+	// zizmor GitHub Actions security scanner (auxiliary, #272). The fixture is a
+	// workflow that interpolates an attacker-controllable issue title into a `run:`
+	// step — zizmor's offline `template-injection` audit (no token needed) flags it.
+	// Proves install→spawn→scan→publish on the with-auxiliary path.
+	{
+		lang: "zizmor",
+		dir: "tests/fixtures/tool-smoke/zizmor-aux",
+		file: ".github/workflows/ci.yml",
+		serverHint: "zizmor (auxiliary)",
+		tools: ["zizmor"],
+		auxiliaryServerIds: ["zizmor"],
+		auxiliarySourceMatch: "zizmor",
+		gitInit: true,
+	},
+	// typos source-code spell checker (auxiliary, #283). The fixture is a markdown
+	// doc with several known misspellings — typos' compiled-in dictionary flags
+	// them with NO config (allow-list based). A markdown fixture deliberately
+	// exercises the option-B prose coverage (the novel scope vs the code-only
+	// auxiliaries). Proves install→spawn→scan→publish on the with-auxiliary path.
+	{
+		lang: "typos",
+		dir: "tests/fixtures/tool-smoke/typos-aux",
+		file: "notes.md",
+		serverHint: "typos (auxiliary)",
+		tools: ["typos-lsp"],
+		auxiliaryServerIds: ["typos"],
+		auxiliarySourceMatch: "typos",
+		gitInit: true,
+	},
+	// ast-grep no-sgconfig BASELINE (#239 Phase 2). NO sgconfig in the fixture, so
+	// the server must attach everywhere and launch with `lsp --config <shipped
+	// baseline>` to run pi-lens's bundled ruleset (`arr.sort()` → the shipped
+	// `no-sort-without-comparator`). Proves the baseline path, distinct from the
+	// sgconfig-gated team-rules path above.
+	{
+		lang: "ast-grep-baseline",
+		dir: "tests/fixtures/tool-smoke/ast-grep-baseline",
+		file: "bad.ts",
+		serverHint: "ast-grep (no-sgconfig baseline)",
 		tools: ["ast-grep"],
 		auxiliaryServerIds: ["ast-grep"],
 		auxiliarySourceMatch: "ast[-_]?grep",
@@ -836,6 +1065,33 @@ const AUTOFIX_FIXTURES = [
 const LSP_CLIENT_WAIT_MS = 30000;
 const LSP_DIAGNOSTICS_WAIT_MS = 8000;
 
+// Auxiliary scanners (opengrep, ast-grep, zizmor) compile their rules on the
+// FIRST scan of a session and may cache a late result that — by design —
+// "surfaces on the next edit" (see the opengrep strategy in
+// clients/lsp/server-strategies.ts: a cold scan that overruns aggregateWaitMs
+// isn't lost, it lands on the next touch). The smoke does a single touch, so a
+// cold rule-load that overran the deadline left this layer asserting 0
+// diagnostics and reddening the nightly (a flake, not a real break). We instead
+// touch up to AUX_TOUCH_ATTEMPTS times: the first touch warms the rule-load, and
+// each later touch re-syncs the auxiliary (reopenOnResync → didClose+didOpen) so
+// the now-warm scan re-runs and its diagnostic comes back. We stop early the
+// moment the expected finding appears. The per-server aggregateWaitMs still
+// bounds each attempt; this only adds attempts, it doesn't lengthen a passing one.
+const AUX_TOUCH_ATTEMPTS = 3;
+// Settle between retries so each re-touch actually re-opens the document. The LSP
+// service skips the didOpen (shouldSkipNotify) when an identical-content touch
+// lands within PI_LENS_LSP_TOUCH_DEBOUNCE_MS (default 1500ms) of the prior one;
+// without re-opening, the auxiliary never re-scans and the retry just re-reads the
+// same empty result. We can't disable the debounce from here — TOUCH_DEBOUNCE_MS
+// is captured when clients/lsp is imported, which (ESM hoisting) runs before this
+// module's body — so instead we wait just past the active debounce window. Read
+// the same env + default the LSP uses, then add a margin, so this stays correct if
+// the default changes.
+const AUX_RETRY_SETTLE_MS =
+	(Number.parseInt(process.env.PI_LENS_LSP_TOUCH_DEBOUNCE_MS ?? "1500", 10) ||
+		1500) + 250;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 const INFRA_FAILURES = new Set(["timeout", "exception", "server_error"]);
 
 function parseArgs(argv) {
@@ -867,7 +1123,12 @@ const TMP_PREFIX = "pi-lens-smoke-";
  */
 function safeRm(dir) {
 	try {
-		fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+		fs.rmSync(dir, {
+			recursive: true,
+			force: true,
+			maxRetries: 3,
+			retryDelay: 200,
+		});
 	} catch {
 		// leftover temp dir — swept on the next run (see sweepLeftovers)
 	}
@@ -906,10 +1167,97 @@ function copyDirToTemp(srcRel) {
 	return dest;
 }
 
+function downloadFile(url, dest) {
+	return new Promise((resolve, reject) => {
+		fs.mkdirSync(path.dirname(dest), { recursive: true });
+		const request = https.get(url, (response) => {
+			if (
+				response.statusCode >= 300 &&
+				response.statusCode < 400 &&
+				response.headers.location
+			) {
+				response.resume();
+				downloadFile(response.headers.location, dest).then(resolve, reject);
+				return;
+			}
+			if (response.statusCode !== 200) {
+				response.resume();
+				reject(new Error(`download failed ${response.statusCode}: ${url}`));
+				return;
+			}
+			const out = fs.createWriteStream(dest);
+			response.pipe(out);
+			out.on("finish", () => out.close(resolve));
+			out.on("error", reject);
+		});
+		request.on("error", reject);
+	});
+}
+
+// Bounded timeout for a fixture's `setup` step (#530): typescript7's `npm
+// install typescript@7` downloads a platform binary, so this is generous but
+// still bounded — a hung install must not hang the whole nightly run.
+const FIXTURE_SETUP_TIMEOUT_MS = 120000;
+
+/**
+ * Run a fixture's optional `setup` step (string command or argv array) in the
+ * COPIED temp workspace, before the touchFile. Used for fixtures whose
+ * workspace-local state (e.g. a real `node_modules/typescript@7` install)
+ * can't be a committed static fixture. Returns `{ ok: true }` on success, or
+ * `{ ok: false, detail }` on failure/timeout — callers must report a distinct
+ * `setup-failed` status and skip the rest of that fixture, never a false pass.
+ */
+function runFixtureSetup(setup, cwd, verbose) {
+	const [cmd, ...args] = Array.isArray(setup) ? setup : setup.split(/\s+/);
+	try {
+		// Windows resolves npm/npx/etc. via the .cmd shim, which `execFileSync`
+		// cannot spawn directly without a shell (EINVAL) — `shell: true` is the
+		// same convention the installer already uses for tool spawns (see
+		// `spawn(..., { shell: process.platform === "win32" })` in
+		// clients/installer/index.ts). Fixture `setup` strings are hand-authored
+		// in this file, not attacker-controlled, so shell interpretation is safe
+		// here.
+		const output = execFileSync(cmd, args, {
+			cwd,
+			timeout: FIXTURE_SETUP_TIMEOUT_MS,
+			stdio: verbose ? "inherit" : "pipe",
+			shell: process.platform === "win32",
+		});
+		if (verbose && output) {
+			console.error(output.toString());
+		}
+		return { ok: true };
+	} catch (err) {
+		const stderr = err?.stderr ? err.stderr.toString().slice(0, 500) : "";
+		const timedOut = err?.signal === "SIGTERM" || err?.killed === true;
+		const detail = timedOut
+			? `setup timed out after ${FIXTURE_SETUP_TIMEOUT_MS}ms: ${cmd} ${args.join(" ")}`
+			: `setup failed (${err?.status ?? err?.message ?? err}): ${cmd} ${args.join(" ")}${stderr ? ` — ${stderr}` : ""}`;
+		return { ok: false, detail };
+	}
+}
+
+async function ensureSmokeLombokJar(workspace, verbose) {
+	const cached = path.join(os.tmpdir(), "pi-lens-smoke-cache", "lombok.jar");
+	if (!fs.existsSync(cached) || fs.statSync(cached).size === 0) {
+		if (verbose)
+			console.error(`[java-lombok] downloading ${LOMBOK_DOWNLOAD_URL}`);
+		await downloadFile(LOMBOK_DOWNLOAD_URL, cached);
+	}
+	const dest = path.join(workspace, ".lombok", "lombok.jar");
+	fs.mkdirSync(path.dirname(dest), { recursive: true });
+	fs.copyFileSync(cached, dest);
+	return dest;
+}
+
 /** Classify one target runner's outcome against the Step-1 bar. */
 function classify(outcome) {
 	if (!outcome) {
-		return { state: "skip", detail: "not executed (filtered / when-skipped)", diags: 0 };
+		return {
+			state: "skip",
+			detail: "not executed (filtered / when-skipped)",
+			diags: 0,
+		};
 	}
 	const { status, failureKind, failureMessage, diagnostics } = outcome.result;
 	const diags = diagnostics.length;
@@ -921,7 +1269,11 @@ function classify(outcome) {
 		};
 	}
 	if (status === "skipped") {
-		return { state: "skip", detail: "runner skipped (tool/config unavailable)", diags };
+		return {
+			state: "skip",
+			detail: "runner skipped (tool/config unavailable)",
+			diags,
+		};
 	}
 	// succeeded, or failed with blocking_diagnostics → the tool ran and exited cleanly.
 	return {
@@ -931,26 +1283,32 @@ function classify(outcome) {
 	};
 }
 
-const ICON = { pass: "✓", fail: "✗", skip: "⚠" };
+// `setup-failed` (#530) is a distinct terminal state from `fail`: it means the
+// fixture's pre-touch setup step (e.g. `npm install typescript@7`) itself
+// broke — infrastructure, not the assertion under test — but it still counts
+// toward the failure exit code so it can't silently pass the nightly.
+const ICON = { pass: "✓", fail: "✗", skip: "⚠", "setup-failed": "✗" };
 
 function report(rows, title) {
 	const pad = (s, n) => String(s).padEnd(n);
 	console.log(`\nLive tool-smoke (#209) — ${title}\n`);
-	console.log(`${pad("", 2)} ${pad("LANG", 12)} ${pad("RUNNER/SERVER", 28)} ${pad("DIAG", 5)} DETAIL`);
+	console.log(
+		`${pad("", 2)} ${pad("LANG", 12)} ${pad("RUNNER/SERVER", 28)} ${pad("DIAG", 5)} DETAIL`,
+	);
 	for (const r of rows) {
 		console.log(
 			`${ICON[r.state]}  ${pad(r.lang, 12)} ${pad(r.runner, 28)} ${pad(r.diags, 5)} ${r.detail}`,
 		);
 	}
-	const counts = { pass: 0, fail: 0, skip: 0 };
+	const counts = { pass: 0, fail: 0, skip: 0, "setup-failed": 0 };
 	for (const r of rows) counts[r.state]++;
 	console.log(
-		`\n${counts.pass} passed · ${counts.fail} failed · ${counts.skip} skipped (tool/config unavailable)`,
+		`\n${counts.pass} passed · ${counts.fail} failed · ${counts["setup-failed"]} setup-failed · ${counts.skip} skipped (tool/config unavailable)`,
 	);
 	console.log(
-		"Legend: ✓ ok  ✗ failure  ⚠ unavailable (not a failure)\n",
+		"Legend: ✓ ok  ✗ failure/setup-failed  ⚠ unavailable (not a failure)\n",
 	);
-	return counts.fail;
+	return counts.fail + counts["setup-failed"];
 }
 
 /**
@@ -961,16 +1319,30 @@ function report(rows, title) {
 async function runLspHandshake({ langs, install, verbose }) {
 	const lspEntry = path.join(repoRoot, "dist", "clients", "lsp", "index.js");
 	if (!fs.existsSync(lspEntry)) {
-		console.error(`dist build missing: ${lspEntry}\nRun \`npm run build:dist\` first.`);
+		console.error(
+			`dist build missing: ${lspEntry}\nRun \`npm run build:dist\` first.`,
+		);
 		process.exit(2);
 	}
 	const { getLSPService } = await import(pathToFileURL(lspEntry).href);
-	const configEntry = path.join(repoRoot, "dist", "clients", "lsp", "config.js");
+	const configEntry = path.join(
+		repoRoot,
+		"dist",
+		"clients",
+		"lsp",
+		"config.js",
+	);
 	const { initLSPConfig } = await import(pathToFileURL(configEntry).href);
 
 	let ensureTool;
 	if (install) {
-		const installerEntry = path.join(repoRoot, "dist", "clients", "installer", "index.js");
+		const installerEntry = path.join(
+			repoRoot,
+			"dist",
+			"clients",
+			"installer",
+			"index.js",
+		);
 		({ ensureTool } = await import(pathToFileURL(installerEntry).href));
 	}
 
@@ -991,17 +1363,56 @@ async function runLspHandshake({ langs, install, verbose }) {
 				const resolved = await ensureTool(toolId);
 				if (!resolved) unavailableTools.add(toolId);
 				if (verbose) {
-					console.error(`[${fx.lang}] ensureTool(${toolId}) → ${resolved ?? "UNAVAILABLE"}`);
+					console.error(
+						`[${fx.lang}] ensureTool(${toolId}) → ${resolved ?? "UNAVAILABLE"}`,
+					);
 				}
 			}
 		}
 		const workspace = copyDirToTemp(fx.dir);
 		const absFile = path.join(workspace, fx.file);
+		if (fx.setup) {
+			if (verbose) {
+				const desc = Array.isArray(fx.setup) ? fx.setup.join(" ") : fx.setup;
+				console.error(`[${fx.lang}] setup: ${desc}`);
+			}
+			const setupResult = runFixtureSetup(fx.setup, workspace, verbose);
+			if (!setupResult.ok) {
+				rows.push({
+					lang: fx.lang,
+					runner: fx.serverHint,
+					state: "setup-failed",
+					detail: setupResult.detail,
+					diags: 0,
+				});
+				safeRm(workspace);
+				continue;
+			}
+		}
+		if (fx.lombokJar) {
+			try {
+				const jar = await ensureSmokeLombokJar(workspace, verbose);
+				if (verbose) console.error(`[${fx.lang}] lombok.jar → ${jar}`);
+			} catch (err) {
+				rows.push({
+					lang: fx.lang,
+					runner: fx.serverHint,
+					state: "skip",
+					detail: `lombok.jar unavailable: ${err?.message ?? err}`,
+					diags: 0,
+				});
+				safeRm(workspace);
+				continue;
+			}
+		}
 		// Some auxiliary servers (opengrep) root at the nearest .git — give the
 		// temp workspace one so the copied fixture is treated as in-workspace.
 		if (fx.gitInit) {
 			try {
-				execFileSync("git", ["init", "-q"], { cwd: workspace, stdio: "ignore" });
+				execFileSync("git", ["init", "-q"], {
+					cwd: workspace,
+					stdio: "ignore",
+				});
 			} catch {
 				// git unavailable — opengrep falls back to cwd; may not scan the temp file
 			}
@@ -1020,7 +1431,9 @@ async function runLspHandshake({ langs, install, verbose }) {
 			);
 			await initLSPConfig(workspace);
 			if (verbose) {
-				console.error(`[${fx.lang}] disabled [${fx.disableServers.join(",")}] via .pi-lens/lsp.json → expecting ${fx.expectServerId}`);
+				console.error(
+					`[${fx.lang}] disabled [${fx.disableServers.join(",")}] via .pi-lens/lsp.json → expecting ${fx.expectServerId}`,
+				);
 			}
 		}
 		try {
@@ -1031,25 +1444,58 @@ async function runLspHandshake({ langs, install, verbose }) {
 			const content = fs.readFileSync(absFile, "utf8");
 			let touched;
 			let threw;
-			try {
-				touched = await lsp.touchFile(absFile, content, {
-					diagnostics: "document",
-					collectDiagnostics: true,
-					clientScope: useAux ? "with-auxiliary" : "primary",
-					...(useAux ? { auxiliaryServerIds: auxIds } : {}),
-					maxClientWaitMs: LSP_CLIENT_WAIT_MS,
-					maxDiagnosticsWaitMs: LSP_DIAGNOSTICS_WAIT_MS,
-					source: "smoke-lsp",
-				});
-			} catch (err) {
-				threw = err?.message ?? String(err);
+			// Auxiliary fixtures get up to AUX_TOUCH_ATTEMPTS touches: the first warms
+			// the cold rule-load, later ones re-scan and pick up a finding that the
+			// first (overrun) scan only cached. Stop the moment the expected source
+			// appears. Non-aux fixtures resolve on the primary's first push, so one
+			// touch suffices.
+			const auxRe =
+				useAux && fx.auxiliarySourceMatch
+					? new RegExp(fx.auxiliarySourceMatch, "i")
+					: null;
+			// Don't burn retries on a tool that never installed — a zero result there
+			// is "unavailable" (⚠), classified below, not a flake worth re-touching.
+			// (Mirrors the `auxUnavailable` check in the assertion: known-unavailable
+			// only when every declared tool is missing.)
+			const auxToolList = fx.tools ?? [];
+			const auxToolUnavailable =
+				auxToolList.length > 0 &&
+				auxToolList.every((t) => unavailableTools.has(t));
+			const maxAttempts = auxRe && !auxToolUnavailable ? AUX_TOUCH_ATTEMPTS : 1;
+			for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+				try {
+					touched = await lsp.touchFile(absFile, content, {
+						diagnostics: "document",
+						collectDiagnostics: true,
+						clientScope: useAux ? "with-auxiliary" : "primary",
+						...(useAux ? { auxiliaryServerIds: auxIds } : {}),
+						maxClientWaitMs: LSP_CLIENT_WAIT_MS,
+						maxDiagnosticsWaitMs: LSP_DIAGNOSTICS_WAIT_MS,
+						source: "smoke-lsp",
+					});
+				} catch (err) {
+					threw = err?.message ?? String(err);
+					break;
+				}
+				if (!auxRe) break;
+				const hit = (Array.isArray(touched) ? touched : []).some((d) =>
+					auxRe.test(d.source || ""),
+				);
+				if (hit || attempt === maxAttempts) break;
+				if (verbose) {
+					console.error(
+						`[${fx.lang}] aux=${auxIds.join(",")} attempt ${attempt}/${maxAttempts} no ${fx.auxiliarySourceMatch} finding yet — re-touching after ${AUX_RETRY_SETTLE_MS}ms`,
+					);
+				}
+				// Wait past the touch-notify debounce so the next touch re-opens the
+				// document and forces a fresh auxiliary scan (not a deduped no-op).
+				await sleep(AUX_RETRY_SETTLE_MS);
 			}
 			// Auxiliary fixtures assert the cross-cutting server actually produced a
 			// finding (proves install→spawn→scan→publish), matched by LSP `source`.
-			if (useAux && fx.auxiliarySourceMatch && !threw) {
-				const re = new RegExp(fx.auxiliarySourceMatch, "i");
+			if (auxRe && !threw) {
 				const list = Array.isArray(touched) ? touched : [];
-				const auxDiags = list.filter((d) => re.test(d.source || ""));
+				const auxDiags = list.filter((d) => auxRe.test(d.source || ""));
 				if (verbose) {
 					console.error(
 						`[${fx.lang}] aux=${auxIds.join(",")} matched=${auxDiags.length}/${list.length} sources=${JSON.stringify([...new Set(list.map((d) => d.source))])}`,
@@ -1088,46 +1534,96 @@ async function runLspHandshake({ langs, install, verbose }) {
 					`[${fx.lang}] touched=${Array.isArray(touched) ? touched.length : touched} health=${JSON.stringify(lsp.getDiagnosticsHealth(absFile))}`,
 				);
 			}
-			// Alternate fixtures: the default is disabled for this workspace, so the
-			// only server that can serve is the alternate. Prove it spawned +
-			// handshook + diagnosed by fingerprinting the diagnostic `source`
-			// (deno → "deno-ts", jedi → "compile") — getDiagnosticsHealth isn't
-			// populated by touchFile, so source-match is the reliable signal.
+			// Alternate fixtures disable the default server in the workspace. Verify the
+			// actual warm client first, then optionally fingerprint its diagnostics when
+			// a server reliably reports a distinctive source.
 			if (fx.expectServerId && !threw) {
 				if (!Array.isArray(touched)) {
 					// No client became ready — the alternate isn't installed (and
 					// --install wasn't passed or its install failed). Skip, don't fail.
-					push("skip", `${fx.expectServerId} unavailable (no client ready; pass --install or install ${(fx.tools ?? []).join(",")})`);
+					push(
+						"skip",
+						`${fx.expectServerId} unavailable (no client ready; pass --install or install ${(fx.tools ?? []).join(",")})`,
+					);
 					continue;
 				}
-				const list = touched;
-				const sources = [...new Set(list.map((d) => d.source || "?"))];
-				const re = fx.expectSourceMatch
-					? new RegExp(fx.expectSourceMatch, "i")
-					: null;
-				const matched = re
-					? list.filter((d) => re.test(d.source || ""))
-					: list;
+				const active = await lsp.getWarmClientForFile(absFile);
+				if (active?.info.id !== fx.expectServerId) {
+					push(
+						"fail",
+						`expected alternate ${fx.expectServerId}, got ${active?.info.id ?? "no warm client"}`,
+						touched.length,
+					);
+					continue;
+				}
+				if (!fx.expectSourceMatch) {
+					push("pass", `alternate ${fx.expectServerId} handshook`, touched.length);
+					continue;
+				}
+				const sources = [...new Set(touched.map((d) => d.source || "?"))];
+				const re = new RegExp(fx.expectSourceMatch, "i");
+				const matched = touched.filter((d) => re.test(d.source || ""));
 				if (verbose) {
-					console.error(`[${fx.lang}] alternate sources=${JSON.stringify(sources)} matched=${matched.length}/${list.length}`);
+					console.error(
+						`[${fx.lang}] alternate sources=${JSON.stringify(sources)} matched=${matched.length}/${touched.length}`,
+					);
 				}
 				push(
 					matched.length > 0 ? "pass" : "fail",
 					matched.length > 0
 						? `alternate ${fx.expectServerId} served ${matched.length} diagnostic${matched.length === 1 ? "" : "s"} (source /${fx.expectSourceMatch}/; default [${fx.disableServers.join(",")}] disabled)`
-						: list.length
-							? `${fx.expectServerId}: ${list.length} diagnostic(s) but none matched source /${fx.expectSourceMatch}/ (got: ${sources.join(",")})`
+						: touched.length
+							? `${fx.expectServerId}: ${touched.length} diagnostic(s) but none matched source /${fx.expectSourceMatch}/ (got: ${sources.join(",")})`
 							: `expected ${fx.expectServerId} to serve a diagnostic, got none (server missing/slow?)`,
-					list.length,
+					touched.length,
 				);
 				continue;
 			}
 			if (threw) {
 				push("fail", `handshake/server error: ${threw}`, diags);
 			} else if (Array.isArray(touched)) {
+				// #530: assert the server that actually answered is the expected launch
+				// variant (e.g. "native-ts7") via the live capability snapshot. A silent
+				// fallback to classic must FAIL even though diagnostics arrived — the
+				// diagnostic alone can't distinguish which concrete server produced it
+				// (native-ts7 and classic share the same server id).
+				if (fx.expectLaunchVariant) {
+					const snapshots = await lsp.getCapabilitySnapshots(absFile);
+					const active = snapshots.find(
+						(s) => s.launchVariant === fx.expectLaunchVariant,
+					);
+					const gotVariants = [
+						...new Set(snapshots.map((s) => s.launchVariant ?? "(unset)")),
+					];
+					if (verbose) {
+						console.error(
+							`[${fx.lang}] capability snapshots launchVariant=${JSON.stringify(gotVariants)}`,
+						);
+					}
+					if (!active) {
+						push(
+							"fail",
+							`expected launchVariant '${fx.expectLaunchVariant}', got [${gotVariants.join(",") || "(no snapshot)"}] — silent fallback?`,
+							diags,
+						);
+						continue;
+					}
+				}
+				if (fx.expectNoMessageMatch) {
+					const re = new RegExp(fx.expectNoMessageMatch, "i");
+					const matched = touched.filter((d) => re.test(d.message || ""));
+					push(
+						matched.length === 0 ? "pass" : "fail",
+						matched.length === 0
+							? `handshook — Lombok-generated symbols resolved (${diags} diagnostic${diags === 1 ? "" : "s"})`
+							: `Lombok unresolved diagnostic(s): ${matched.map((d) => d.message).join("; ")}`,
+						diags,
+					);
+					continue;
+				}
 				push(
 					"pass",
-					`handshook — server replied${diags ? ` (${diags} diagnostic${diags === 1 ? "" : "s"})` : ""}`,
+					`handshook — server replied${diags ? ` (${diags} diagnostic${diags === 1 ? "" : "s"})` : ""}${fx.expectLaunchVariant ? ` [launchVariant=${fx.expectLaunchVariant}]` : ""}`,
 					diags,
 				);
 			} else {
@@ -1165,7 +1661,9 @@ async function runLspHandshake({ langs, install, verbose }) {
 async function runFormatSmoke({ langs, install, verbose }) {
 	const fmtEntry = path.join(repoRoot, "dist", "clients", "format-service.js");
 	if (!fs.existsSync(fmtEntry)) {
-		console.error(`dist build missing: ${fmtEntry}\nRun \`npm run build:dist\` first.`);
+		console.error(
+			`dist build missing: ${fmtEntry}\nRun \`npm run build:dist\` first.`,
+		);
 		process.exit(2);
 	}
 	const { getFormatService } = await import(pathToFileURL(fmtEntry).href);
@@ -1173,7 +1671,13 @@ async function runFormatSmoke({ langs, install, verbose }) {
 
 	let ensureTool;
 	if (install) {
-		const installerEntry = path.join(repoRoot, "dist", "clients", "installer", "index.js");
+		const installerEntry = path.join(
+			repoRoot,
+			"dist",
+			"clients",
+			"installer",
+			"index.js",
+		);
 		({ ensureTool } = await import(pathToFileURL(installerEntry).href));
 	}
 
@@ -1191,14 +1695,22 @@ async function runFormatSmoke({ langs, install, verbose }) {
 			for (const toolId of fx.tools ?? []) {
 				const resolved = await ensureTool(toolId);
 				if (verbose) {
-					console.error(`[${fx.lang}] ensureTool(${toolId}) → ${resolved ?? "UNAVAILABLE"}`);
+					console.error(
+						`[${fx.lang}] ensureTool(${toolId}) → ${resolved ?? "UNAVAILABLE"}`,
+					);
 				}
 			}
 		}
 		const workspace = copyDirToTemp(fx.dir);
 		const absFile = path.join(workspace, fx.file);
 		const push = (state, detail) =>
-			rows.push({ lang: fx.lang, runner: fx.formatter, state, detail, diags: 0 });
+			rows.push({
+				lang: fx.lang,
+				runner: fx.formatter,
+				state,
+				detail,
+				diags: 0,
+			});
 		try {
 			// Mirror runFormatPhase: establish the fileTime baseline (recordRead)
 			// before formatting so the external-modification guard doesn't skip.
@@ -1260,7 +1772,9 @@ async function runAutofixSmoke({ langs, install, verbose }) {
 	const ruffEntry = path.join(repoRoot, "dist", "clients", "ruff-client.js");
 	for (const e of [pipelineEntry, biomeEntry, ruffEntry]) {
 		if (!fs.existsSync(e)) {
-			console.error(`dist build missing: ${e}\nRun \`npm run build:dist\` first.`);
+			console.error(
+				`dist build missing: ${e}\nRun \`npm run build:dist\` first.`,
+			);
 			process.exit(2);
 		}
 	}
@@ -1270,7 +1784,13 @@ async function runAutofixSmoke({ langs, install, verbose }) {
 
 	let ensureTool;
 	if (install) {
-		const installerEntry = path.join(repoRoot, "dist", "clients", "installer", "index.js");
+		const installerEntry = path.join(
+			repoRoot,
+			"dist",
+			"clients",
+			"installer",
+			"index.js",
+		);
 		({ ensureTool } = await import(pathToFileURL(installerEntry).href));
 	}
 
@@ -1290,7 +1810,9 @@ async function runAutofixSmoke({ langs, install, verbose }) {
 			for (const toolId of fx.tools ?? []) {
 				const resolved = await ensureTool(toolId);
 				if (verbose) {
-					console.error(`[${fx.lang}] ensureTool(${toolId}) → ${resolved ?? "UNAVAILABLE"}`);
+					console.error(
+						`[${fx.lang}] ensureTool(${toolId}) → ${resolved ?? "UNAVAILABLE"}`,
+					);
 				}
 			}
 		}
@@ -1329,9 +1851,15 @@ async function runAutofixSmoke({ langs, install, verbose }) {
 						: `no safe-autofix tool selected${result.skipReason ? ` (${result.skipReason})` : ""}`,
 				);
 			} else if (result.fixedCount > 0 && before !== after) {
-				push("pass", `${fx.tool} applied a safe fix (${result.autofixTools.join(",")})`);
+				push(
+					"pass",
+					`${fx.tool} applied a safe fix (${result.autofixTools.join(",")})`,
+				);
 			} else {
-				push("fail", `${fx.tool} attempted but applied no fix / file unchanged`);
+				push(
+					"fail",
+					`${fx.tool} attempted but applied no fix / file unchanged`,
+				);
 			}
 		} catch (err) {
 			push("fail", `error: ${err?.message ?? err}`);
@@ -1344,34 +1872,57 @@ async function runAutofixSmoke({ langs, install, verbose }) {
 }
 
 async function main() {
-	const { langs, step2, verbose, install, lsp, format, autofix } = parseArgs(process.argv.slice(2));
+	const { langs, step2, verbose, install, lsp, format, autofix } = parseArgs(
+		process.argv.slice(2),
+	);
 
 	// Clean leftovers from prior runs (their file locks are released now).
 	const swept = sweepLeftovers();
-	if (verbose && swept > 0) console.error(`swept ${swept} leftover temp workspace(s)`);
+	if (verbose && swept > 0)
+		console.error(`swept ${swept} leftover temp workspace(s)`);
 
 	if (lsp) {
-		process.exit((await runLspHandshake({ langs, install, verbose })) > 0 ? 1 : 0);
+		process.exit(
+			(await runLspHandshake({ langs, install, verbose })) > 0 ? 1 : 0,
+		);
 	}
 
 	if (format) {
-		process.exit((await runFormatSmoke({ langs, install, verbose })) > 0 ? 1 : 0);
+		process.exit(
+			(await runFormatSmoke({ langs, install, verbose })) > 0 ? 1 : 0,
+		);
 	}
 
 	if (autofix) {
-		process.exit((await runAutofixSmoke({ langs, install, verbose })) > 0 ? 1 : 0);
+		process.exit(
+			(await runAutofixSmoke({ langs, install, verbose })) > 0 ? 1 : 0,
+		);
 	}
 
-	const distEntry = path.join(repoRoot, "dist", "clients", "dispatch", "integration.js");
+	const distEntry = path.join(
+		repoRoot,
+		"dist",
+		"clients",
+		"dispatch",
+		"integration.js",
+	);
 	if (!fs.existsSync(distEntry)) {
-		console.error(`dist build missing: ${distEntry}\nRun \`npm run build:dist\` first.`);
+		console.error(
+			`dist build missing: ${distEntry}\nRun \`npm run build:dist\` first.`,
+		);
 		process.exit(2);
 	}
 	const { dispatchLintDetailed } = await import(pathToFileURL(distEntry).href);
 
 	let ensureTool;
 	if (install) {
-		const installerEntry = path.join(repoRoot, "dist", "clients", "installer", "index.js");
+		const installerEntry = path.join(
+			repoRoot,
+			"dist",
+			"clients",
+			"installer",
+			"index.js",
+		);
 		({ ensureTool } = await import(pathToFileURL(installerEntry).href));
 	}
 
@@ -1415,7 +1966,9 @@ async function main() {
 						return `${r.runnerId}:${status}${why}`;
 					})
 					.join(", ");
-				console.error(`[${fixture.lang}] executed runners: ${desc || "(none)"}`);
+				console.error(
+					`[${fixture.lang}] executed runners: ${desc || "(none)"}`,
+				);
 			}
 			for (const target of fixture.targets) {
 				const outcome = runners.find((r) => r.runnerId === target);
@@ -1428,7 +1981,8 @@ async function main() {
 					verdict.diags === 0
 				) {
 					verdict.state = "fail";
-					verdict.detail = "ran clean but produced no diagnostic on known defect";
+					verdict.detail =
+						"ran clean but produced no diagnostic on known defect";
 				}
 				rows.push({ lang: fixture.lang, runner: target, ...verdict });
 			}

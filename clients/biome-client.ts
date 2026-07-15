@@ -9,9 +9,10 @@
  */
 
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { isFileKind } from "./file-kinds.js";
+import { getGlobalPiLensDir } from "./file-utils.js";
+import { findGlobalBinary } from "./package-manager.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
 
 // --- Types ---
@@ -60,7 +61,9 @@ export class BiomeClient {
 	 * falls back to `process.cwd()`, which is wrong when pi is invoked from
 	 * a different directory than the file being edited.
 	 */
-	private getBiomeBinary(cwd?: string): { cmd: string; args: string[] } {
+	private async getBiomeBinary(
+		cwd?: string,
+	): Promise<{ cmd: string; args: string[] }> {
 		const resolveCwd = cwd ?? process.cwd();
 		const cached = this.localBinaryByCwd.get(resolveCwd);
 		if (cached) return { cmd: cached, args: [] };
@@ -75,8 +78,7 @@ export class BiomeClient {
 		// On Windows prefer .cmd (native batch) over the sh wrapper — 2x faster.
 		const isWin = process.platform === "win32";
 		const piLensBin = path.join(
-			os.homedir(),
-			".pi-lens",
+			getGlobalPiLensDir(),
 			"tools",
 			"node_modules",
 			".bin",
@@ -99,6 +101,13 @@ export class BiomeClient {
 				return { cmd: p, args: [] };
 			}
 		}
+		// Any package manager's global bin dir (npm/pnpm/yarn/bun) before npx —
+		// catches `pnpm add -g @biomejs/biome` installs that PATH misses (#375).
+		const global = await findGlobalBinary("biome");
+		if (global) {
+			this.localBinaryByCwd.set(resolveCwd, global);
+			return { cmd: global, args: [] };
+		}
 		// Fallback: npx (slower but works anywhere)
 		return { cmd: "npx", args: ["@biomejs/biome"] };
 	}
@@ -108,7 +117,7 @@ export class BiomeClient {
 		timeout = 15000,
 		cwd?: string,
 	) {
-		const { cmd, args: prefix } = this.getBiomeBinary(cwd);
+		const { cmd, args: prefix } = await this.getBiomeBinary(cwd);
 		return safeSpawnAsync(cmd, [...prefix, ...args], { timeout });
 	}
 

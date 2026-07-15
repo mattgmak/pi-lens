@@ -43,4 +43,16 @@ export interface ProjectDiagnosticsScanOptions {
 	cwd: string;
 	tier: ProjectDiagnosticsTier;
 	maxFiles?: number;
+	/**
+	 * Cancellation for a long full-mode scan (#341). When aborted mid-scan the
+	 * scanner returns a partial snapshot and does NOT persist it, so an
+	 * interrupted run can't poison the cross-session cache.
+	 */
+	signal?: AbortSignal;
+	/**
+	 * Explicit file list (#461): scan exactly these files instead of walking the
+	 * project. Used by lens_diagnostics' `paths` scope restrictor. Caller has
+	 * already resolved/deduped/filtered these against the ignore matcher.
+	 */
+	files?: string[];
 }

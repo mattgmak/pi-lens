@@ -34,13 +34,25 @@ interface CredoOutput {
 	issues: CredoIssue[];
 }
 
-function parseCredoJson(raw: string, filePath: string): Diagnostic[] {
+// `mix credo <file>` is single-file-scoped today, so blanket attribution would
+// be correct — but map issue.filename (resolved against cwd) for robustness so
+// this stays correct if the invocation ever widens to a directory (#265 A4).
+export function parseCredoJson(
+	raw: string,
+	fallbackPath: string,
+	cwd: string,
+): Diagnostic[] {
 	try {
 		const output: CredoOutput = JSON.parse(raw);
 		return (output.issues ?? []).map((issue) => ({
 			id: `credo:${issue.check}:${issue.line_no}`,
 			message: `[${issue.check}] ${issue.message}`,
-			filePath,
+			filePath:
+				issue.filename && issue.filename.trim()
+					? path.isAbsolute(issue.filename)
+						? issue.filename
+						: path.resolve(cwd, issue.filename)
+					: fallbackPath,
 			line: issue.line_no,
 			column: issue.column ?? 1,
 			severity: issue.priority <= 10 ? ("error" as const) : ("warning" as const),
@@ -89,7 +101,7 @@ const credoRunner: RunnerDefinition = {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
-		const diagnostics = parseCredoJson(result.stdout ?? "", ctx.filePath);
+		const diagnostics = parseCredoJson(result.stdout ?? "", ctx.filePath, cwd);
 		if (diagnostics.length === 0) {
 			return { status: "succeeded", diagnostics: [], semantic: "none" };
 		}

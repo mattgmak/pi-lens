@@ -8,7 +8,7 @@
  * - Rust (rust-analyzer)
  * - Ruby, PHP, C#, Java, Kotlin, Swift, Dart, etc.
  *
- * Replaces language-specific runners (ts-lsp, pyright) with a single
+ * Replaces language-specific runners (pyright, etc.) with a single
  * unified runner that delegates to the LSP service.
  */
 
@@ -26,6 +26,7 @@ import { convertLspDiagnostics } from "../utils/lsp-diagnostics.js";
 import {
 	enabledAuxiliaryLspServerIds,
 	findAuxiliaryProfileForSource,
+	isAuxiliaryDiagnosticSuppressed,
 } from "../auxiliary-lsp.js";
 import { readFileContent } from "./utils.js";
 
@@ -130,6 +131,11 @@ const lspRunner: RunnerDefinition = {
 		// spawn that didn't complete in the budget, or LSP unavailable for this
 		// file) — distinct from `[]`, which means the server replied with zero.
 		let lspClientReady = true;
+		// True when touchFile ran but couldn't confirm its result within
+		// budget (notify write and/or diagnostics wait timed out on at least
+		// one spawned server) — an empty `lspDiags` in that case is NOT a
+		// confirmed clean result and must not be reported as one (#570).
+		let diagnosticsInconclusive = false;
 		let failureReason = "";
 		const content = readFileContent(ctx.filePath);
 		if (!content) {
@@ -162,6 +168,7 @@ const lspRunner: RunnerDefinition = {
 				lspClientReady = false;
 			} else {
 				lspDiags = touched;
+				diagnosticsInconclusive = touched.inconclusive === true;
 			}
 		} catch (err) {
 			serverFailed = true;
@@ -208,6 +215,19 @@ const lspRunner: RunnerDefinition = {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
+		if (diagnosticsInconclusive) {
+			// The touch ran and a client was ready, but the notify write and/or
+			// diagnostics wait hit their deadline before the server confirmed
+			// completion — `lspDiags` (even if non-empty) is not a trustworthy
+			// merged result. Same treatment as `!lspClientReady`: report
+			// "skipped" rather than "succeeded" with a possibly-incomplete
+			// diagnostics list, so the coverage notice flags the gap instead of
+			// the footer reading this as a confirmed clean/partial result (#570).
+			// Diagnostics that do arrive late still land in the client cache and
+			// surface on the next edit.
+			return { status: "skipped", diagnostics: [], semantic: "none" };
+		}
+
 		if (lspDiags.length === 0) {
 			return {
 				status: "succeeded",
@@ -229,25 +249,27 @@ const lspRunner: RunnerDefinition = {
 			.filter(({ d }) => d.severity === 1)
 			.slice(0, MAX_CODE_ACTION_LOOKUPS);
 
-		for (const { d, idx } of blockingDiagIndexes) {
-			try {
-				const start = d.range.start;
-				const end = d.range.end ?? d.range.start;
-				const actions = await lspService.codeAction(
-					ctx.filePath,
-					start.line,
-					start.character,
-					end.line,
-					end.character,
-				);
-				const suggestion = buildCodeActionSuggestion(actions);
-				if (suggestion) {
-					fixSuggestionByIndex.set(idx, suggestion);
+		await Promise.all(
+			blockingDiagIndexes.map(async ({ d, idx }) => {
+				try {
+					const start = d.range.start;
+					const end = d.range.end ?? d.range.start;
+					const actions = await lspService.codeAction(
+						ctx.filePath,
+						start.line,
+						start.character,
+						end.line,
+						end.character,
+					);
+					const suggestion = buildCodeActionSuggestion(actions);
+					if (suggestion) {
+						fixSuggestionByIndex.set(idx, suggestion);
+					}
+				} catch {
+					// Best-effort enrichment only; base diagnostics remain authoritative.
 				}
-			} catch {
-				// Best-effort enrichment only; base diagnostics remain authoritative.
-			}
-		}
+			}),
+		);
 
 		const diagnostics: Diagnostic[] = convertLspDiagnostics(
 			validLspDiags,
@@ -260,9 +282,16 @@ const lspRunner: RunnerDefinition = {
 		// their tool id + semantic policy — language-server diagnostics keep "lsp".
 		// blockingAllowed is per-workspace (e.g. curated repo rules), computed once.
 		const blockingAllowedByProfile = new Map<unknown, boolean>();
+		// Diagnostics dropped by the tool's NATIVE inline suppression (e.g. opengrep
+		// `# nosemgrep`, #441). Reuses `content` from the sync read above.
+		const suppressedIndices = new Set<number>();
 		for (let i = 0; i < diagnostics.length; i++) {
 			const profile = findAuxiliaryProfileForSource(validLspDiags[i]?.source);
 			if (!profile) continue;
+			if (isAuxiliaryDiagnosticSuppressed(validLspDiags[i], content)) {
+				suppressedIndices.add(i);
+				continue;
+			}
 			let blockingAllowed = blockingAllowedByProfile.get(profile);
 			if (blockingAllowed === undefined) {
 				blockingAllowed = profile.allowBlocking?.(ctx.cwd) ?? false;
@@ -277,11 +306,14 @@ const lspRunner: RunnerDefinition = {
 			const defectClass = profile.defectClass?.(validLspDiags[i]);
 			if (defectClass) d.defectClass = defectClass;
 		}
+		const keptDiagnostics = suppressedIndices.size
+			? diagnostics.filter((_, i) => !suppressedIndices.has(i))
+			: diagnostics;
 
-		const hasErrors = diagnostics.some((d) => d.semantic === "blocking");
+		const hasErrors = keptDiagnostics.some((d) => d.semantic === "blocking");
 		const resultSemantic = hasErrors
 			? "blocking"
-			: diagnostics.length > 0
+			: keptDiagnostics.length > 0
 				? "warning"
 				: "none";
 
@@ -290,7 +322,7 @@ const lspRunner: RunnerDefinition = {
 			// "failed" here means the file has blocking type errors — the check ran
 			// fine. Tag it so the smell analyzer doesn't read it as a runner crash.
 			failureKind: hasErrors ? "blocking_diagnostics" : undefined,
-			diagnostics,
+			diagnostics: keptDiagnostics,
 			semantic: resultSemantic,
 		};
 	},

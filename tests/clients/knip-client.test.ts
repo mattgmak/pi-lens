@@ -2,10 +2,58 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import { getProjectDataDir } from "../../clients/file-utils.js";
 import { KnipClient } from "../../clients/knip-client.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
+vi.mock("../../clients/safe-spawn.js", () => ({
+	safeSpawnAsync: vi.fn(async () => ({
+		error: null,
+		status: 0,
+		stdout: "",
+		stderr: "",
+	})),
+}));
+
 describe("knip-client", () => {
+	it("runAnalyze() passes --cache and a --cache-location under getProjectDataDir", async () => {
+		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-knip-cache-");
+		try {
+			fs.writeFileSync(path.join(tmpDir, "package.json"), '{"name":"demo"}');
+
+			const safeSpawnMod = await import("../../clients/safe-spawn.js");
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockClear();
+
+			const client = new KnipClient(false) as unknown as {
+				runAnalyze: (d: string) => Promise<unknown>;
+			};
+
+			await client.runAnalyze(tmpDir);
+
+			expect(safeSpawnMod.safeSpawnAsync).toHaveBeenCalled();
+			const [, args] = vi.mocked(safeSpawnMod.safeSpawnAsync).mock.calls[0] ?? [];
+			expect(args).toContain("--cache");
+
+			const cacheLocationIndex = (args as string[]).indexOf("--cache-location");
+			expect(cacheLocationIndex).toBeGreaterThan(-1);
+
+			const expectedCacheLocation = path.join(
+				getProjectDataDir(tmpDir),
+				"cache",
+				"knip",
+			);
+			expect((args as string[])[cacheLocationIndex + 1]).toBe(
+				expectedCacheLocation,
+			);
+
+			// Pre-created eagerly (knip's own auto-mkdir for --cache-location is
+			// unreliable on Windows — see comment in runAnalyze()).
+			expect(fs.existsSync(expectedCacheLocation)).toBe(true);
+		} finally {
+			cleanup();
+		}
+	});
+
 	it("resolves project root from nested directory", () => {
 		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-knip-");
 		try {
@@ -20,6 +68,52 @@ describe("knip-client", () => {
 			expect(client.resolveProjectRoot(nested)).toBe(tmpDir);
 		} finally {
 			cleanup();
+		}
+	});
+
+	it("does not resolve package markers at or above home", () => {
+		const tmpRoot = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-knip-home-ceiling-"),
+		);
+		try {
+			const ancestor = path.join(tmpRoot, "ancestor");
+			const home = path.join(ancestor, "home");
+			const nested = path.join(home, "empty-folder");
+			fs.mkdirSync(nested, { recursive: true });
+			fs.writeFileSync(path.join(ancestor, "package.json"), '{"name":"parent"}');
+
+			const client = new KnipClient(false) as unknown as {
+				resolveProjectRoot: (
+					startDir: string,
+					homeDir?: string,
+				) => string | null;
+			};
+
+			expect(client.resolveProjectRoot(nested, home)).toBeNull();
+		} finally {
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("does not resolve a package marker at the home dir itself", () => {
+		const tmpRoot = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-knip-home-marker-"),
+		);
+		try {
+			const home = path.join(tmpRoot, "home");
+			fs.mkdirSync(home, { recursive: true });
+			fs.writeFileSync(path.join(home, "package.json"), '{"name":"home"}');
+
+			const client = new KnipClient(false) as unknown as {
+				resolveProjectRoot: (
+					startDir: string,
+					homeDir?: string,
+				) => string | null;
+			};
+
+			expect(client.resolveProjectRoot(home, home)).toBeNull();
+		} finally {
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
 		}
 	});
 
@@ -251,5 +345,34 @@ describe("knip-client", () => {
 		expect(result.issues).toHaveLength(1);
 		expect(result.unlistedDeps).toHaveLength(1);
 		expect(result.unlistedDeps[0].name).toBe("@acme/pkg");
+	});
+
+	it("routes enumMembers into unusedExports (grouped format)", () => {
+		// NOTE: knip 6.x has no `classMembers` issue type (requesting it makes knip
+		// exit 2), so the only member-level type we include/parse is enumMembers.
+		const client = new KnipClient(false) as unknown as {
+			parseOutput: (output: string) => {
+				success: boolean;
+				unusedExports: Array<{ type: string; name: string }>;
+			};
+		};
+
+		const result = client.parseOutput(
+			JSON.stringify({
+				issues: [
+					{
+						file: "src/widget.ts",
+						exports: [{ name: "OldHelper" }],
+						enumMembers: [{ name: "Color.Mauve" }],
+					},
+				],
+			}),
+		);
+
+		expect(result.success).toBe(true);
+		const byName = new Map(result.unusedExports.map((e) => [e.name, e.type]));
+		expect(byName.get("OldHelper")).toBe("export");
+		expect(byName.get("Color.Mauve")).toBe("enumMember");
+		expect(result.unusedExports).toHaveLength(2);
 	});
 });

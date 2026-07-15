@@ -1,5 +1,9 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createLensDiagnosticsTool } from "../../tools/lens-diagnostics.js";
+import { resetProjectLensConfigCache } from "../../clients/project-lens-config.js";
 
 const projectDiagnosticsMocks = vi.hoisted(() => ({
 	scanProjectDiagnostics: vi.fn(),
@@ -7,15 +11,40 @@ const projectDiagnosticsMocks = vi.hoisted(() => ({
 	loadProjectDiagnosticsDeltaReport: vi.fn(),
 }));
 
+// #585: mode=full now fetches the heavyweight analyzers (knip/jscpd/madge/
+// gitleaks/govulncheck/trivy/dead-code) FRESH via `fetchFreshProjectDiagnostics`
+// instead of reading `cacheManager` directly — mock that seam (and the
+// `loadBootstrapClients()` singleton it's handed) so these tests never
+// construct real analyzer clients / spawn real external tools. Defaults to
+// "nothing extra" so tests that don't care about this path are unaffected;
+// individual tests below override the resolved value to exercise it.
+const freshFetchMocks = vi.hoisted(() => ({
+	fetchFreshProjectDiagnostics: vi.fn(),
+}));
+
+vi.mock("../../clients/project-diagnostics/fresh-fetch.js", () => ({
+	fetchFreshProjectDiagnostics: freshFetchMocks.fetchFreshProjectDiagnostics,
+}));
+
+vi.mock("../../clients/bootstrap.js", () => ({
+	loadBootstrapClients: vi.fn().mockResolvedValue({}),
+}));
+
 vi.mock("../../clients/project-diagnostics/scanner.js", () => ({
 	scanProjectDiagnostics: projectDiagnosticsMocks.scanProjectDiagnostics,
 }));
 
 vi.mock("../../clients/project-diagnostics/cache.js", () => ({
+	PROJECT_DIAGNOSTICS_CACHE_VERSION: 2,
 	loadProjectDiagnosticsSnapshot:
 		projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot,
 	loadProjectDiagnosticsDeltaReport:
 		projectDiagnosticsMocks.loadProjectDiagnosticsDeltaReport,
+	// Identity passthrough — these tests exercise ignore-filtering, not on-disk
+	// staleness (covered in project-diagnostics.test.ts).
+	reconcileProjectDiagnosticsSnapshot: (
+		snapshot: import("../../clients/project-diagnostics/types.js").ProjectDiagnosticsSnapshot,
+	) => ({ snapshot, staleDropped: 0 }),
 }));
 
 // ── Mock widget state ─────────────────────────────────────────────────────────
@@ -26,17 +55,30 @@ const mockSummaries: ReturnType<
 
 let mockStaleDropped = 0;
 
+const reconcileScanDiagnosticsMock = vi.fn();
+
 vi.mock("../../clients/widget-state.js", () => ({
 	getFileDiagnosticSummaries: () => mockSummaries,
 	reconcileStaleWidgetFiles: async () => mockStaleDropped,
+	reconcileScanDiagnostics: (...args: unknown[]) =>
+		reconcileScanDiagnosticsMock(...args),
 }));
 
 beforeEach(() => {
 	projectDiagnosticsMocks.scanProjectDiagnostics.mockReset();
 	projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot.mockReset();
 	projectDiagnosticsMocks.loadProjectDiagnosticsDeltaReport.mockReset();
+	freshFetchMocks.fetchFreshProjectDiagnostics.mockReset();
+	freshFetchMocks.fetchFreshProjectDiagnostics.mockResolvedValue({
+		diagnostics: [],
+		runners: [],
+		cold: [],
+		timings: {},
+	});
 	mockSummaries.length = 0;
 	mockStaleDropped = 0;
+	reconcileScanDiagnosticsMock.mockReset();
+	resetProjectLensConfigCache();
 });
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -62,12 +104,26 @@ function makeTool(
 	);
 }
 
-async function run(
+function run(
 	tool: ReturnType<typeof makeTool>,
 	params: Record<string, unknown> = {},
+	cwd = "/proj",
 ) {
-	return tool.execute("1", params, new AbortController().signal, null, {
-		cwd: "/proj",
+	return tool.execute("1", params, new AbortController().signal, null, { cwd });
+}
+
+function withIgnoredFixture<T>(fn: (cwd: string) => Promise<T>): Promise<T> {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-diag-ignore-"));
+	fs.writeFileSync(
+		path.join(cwd, ".pi-lens.json"),
+		JSON.stringify({
+			ignore: ["**/.history/**", "pi-session-*.html", "ignored/**"],
+		}),
+	);
+	resetProjectLensConfigCache();
+	return fn(cwd).finally(() => {
+		fs.rmSync(cwd, { recursive: true, force: true });
+		resetProjectLensConfigCache();
 	});
 }
 
@@ -277,6 +333,92 @@ describe("lens_diagnostics mode=delta", () => {
 		expect(text).toContain("Unlisted dependency lodash");
 		expect(result.details).toMatchObject({ projectDiagnostics: 1 });
 	});
+
+	it("filters ignored actionable, quality, and project-delta entries (#279)", async () =>
+		withIgnoredFixture(async (cwd) => {
+			const ignored = path.join(cwd, ".history", "old.ts");
+			const kept = path.join(cwd, "src", "keep.ts");
+			const tool = makeTool({
+				"actionable-warnings": {
+					files: [
+						{
+							filePath: ignored,
+							warnings: [
+								{
+									line: 1,
+									rule: "ignored-a",
+									tool: "t",
+									message: "ignored actionable",
+								},
+							],
+						},
+						{
+							filePath: kept,
+							warnings: [
+								{
+									line: 2,
+									rule: "kept-a",
+									tool: "t",
+									message: "kept actionable",
+								},
+							],
+						},
+					],
+					summary: { warnings: 2 },
+				},
+				"code-quality-warnings": {
+					files: [
+						{
+							filePath: ignored,
+							warnings: [
+								{
+									line: 3,
+									rule: "ignored-q",
+									tool: "t",
+									message: "ignored quality",
+								},
+							],
+						},
+					],
+					summary: { warnings: 1 },
+				},
+			});
+			projectDiagnosticsMocks.loadProjectDiagnosticsDeltaReport.mockReturnValue(
+				{
+					version: 1,
+					cwd,
+					generatedAt: "2026-01-01T00:00:00.000Z",
+					sessionId: "session-1",
+					turnIndex: 3,
+					diagnostics: [
+						{
+							filePath: ignored,
+							line: 4,
+							severity: "warning",
+							semantic: "warning",
+							tool: "fact-rules",
+							runner: "fact-rules",
+							rule: "ignored-project",
+							message: "ignored project delta",
+							source: "project-scan",
+						},
+					],
+					sources: ["fact-rules"],
+				},
+			);
+
+			const result = await run(tool, { mode: "delta" }, cwd);
+			const text = String(result.content[0].text);
+			expect(text).toContain("kept actionable");
+			expect(text).not.toContain("ignored actionable");
+			expect(text).not.toContain("ignored quality");
+			expect(text).not.toContain("ignored project delta");
+			expect(result.details).toMatchObject({
+				actionableWarnings: 1,
+				qualityIssues: 0,
+				projectDiagnostics: 0,
+			});
+		}));
 });
 
 // ── all mode ──────────────────────────────────────────────────────────────────
@@ -342,7 +484,10 @@ describe("lens_diagnostics mode=full", () => {
 
 		const result = await run(makeTool({}, lspService), { mode: "full" });
 		const text = String(result.content[0].text);
-		expect(lspService.runWorkspaceDiagnostics).toHaveBeenCalledWith("/proj");
+		expect(lspService.runWorkspaceDiagnostics).toHaveBeenCalledWith(
+			"/proj",
+			expect.objectContaining({ signal: expect.anything() }),
+		);
 		expect(text).toContain("edited.ts");
 		expect(text).toContain("cached runner warning");
 		expect(text).toContain("unedited.ts");
@@ -356,6 +501,389 @@ describe("lens_diagnostics mode=full", () => {
 		});
 	});
 
+	it("reconciles a confirmed per-file LSP result into the footer via reconcileScanDiagnostics (#571)", async () => {
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([
+				{
+					filePath: "/proj/src/unedited.ts",
+					diagnostics: [
+						{
+							severity: 1,
+							message: "project-wide type error",
+							range: {
+								start: { line: 9, character: 4 },
+								end: { line: 9, character: 8 },
+							},
+							source: "ts",
+							code: 2322,
+						},
+					],
+					count: 1,
+					// Not timed out — completed within budget.
+				},
+			]),
+		};
+		let drawn = 0;
+		const tool = createLensDiagnosticsTool(
+			makeCacheManager({}) as any,
+			() => "/proj",
+			() => lspService as any,
+			undefined,
+			() => (drawn += 1),
+		);
+		await run(tool, { mode: "full" });
+
+		expect(reconcileScanDiagnosticsMock).toHaveBeenCalledTimes(1);
+		const [filePath, diags, confirmed, writeIndex] =
+			reconcileScanDiagnosticsMock.mock.calls[0];
+		expect(filePath).toBe("/proj/src/unedited.ts");
+		expect(confirmed).toBe(true);
+		expect(writeIndex).toBe(1);
+		expect(diags).toEqual([
+			expect.objectContaining({ message: "project-wide type error" }),
+		]);
+	});
+
+	it("does NOT reconcile a timed-out per-file result into the footer (#571 / #570 dependency)", async () => {
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([
+				{
+					filePath: "/proj/src/timed-out.ts",
+					diagnostics: [],
+					count: 0,
+					timedOut: true,
+				},
+			]),
+		};
+		const tool = createLensDiagnosticsTool(
+			makeCacheManager({}) as any,
+			() => "/proj",
+			() => lspService as any,
+			undefined,
+			() => 1,
+		);
+		await run(tool, { mode: "full" });
+
+		expect(reconcileScanDiagnosticsMock).not.toHaveBeenCalled();
+	});
+
+	it("does NOT reconcile an errored per-file result into the footer", async () => {
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([
+				{
+					filePath: "/proj/src/errored.ts",
+					diagnostics: [],
+					count: 0,
+					error: "spawn failed",
+				},
+			]),
+		};
+		const tool = createLensDiagnosticsTool(
+			makeCacheManager({}) as any,
+			() => "/proj",
+			() => lspService as any,
+			undefined,
+			() => 1,
+		);
+		await run(tool, { mode: "full" });
+
+		expect(reconcileScanDiagnosticsMock).not.toHaveBeenCalled();
+	});
+
+	// #630: a timed-out (or errored) per-file LSP result must never read as
+	// "confirmed clean" in the MERGED summary the agent actually sees — the
+	// tests above only covered the footer-write exclusion; these cover the
+	// merge/render/details path that #630 found unprotected.
+	it("does not render a timed-out LSP file as clean, and lists it as unconfirmed (#630)", async () => {
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([
+				{
+					filePath: "/proj/src/clean.ts",
+					diagnostics: [],
+					count: 0,
+					// Confirmed clean — genuinely completed with no findings.
+				},
+				{
+					filePath: "/proj/src/has-issue.ts",
+					diagnostics: [
+						{
+							severity: 1,
+							message: "real type error",
+							range: {
+								start: { line: 1, character: 0 },
+								end: { line: 1, character: 5 },
+							},
+							source: "ts",
+							code: 2322,
+						},
+					],
+					count: 1,
+				},
+				{
+					filePath: "/proj/src/timed-out.ts",
+					diagnostics: [],
+					count: 0,
+					timedOut: true,
+				},
+			]),
+		};
+		const result = await run(makeTool({}, lspService), { mode: "full" });
+		const text = String(result.content[0].text);
+
+		expect(text).toContain("real type error");
+		expect(text).toContain("timed-out.ts");
+		expect(text).toMatch(/unconfirmed/i);
+		expect(text).toContain("NOT the same as 0 diagnostics");
+		// The unconfirmed file must not be described/counted as clean, and its
+		// path must not silently drop out of the report.
+		expect(result.details).toMatchObject({
+			mode: "full",
+			lspFilesConfirmed: 2,
+			lspFilesUnconfirmed: 1,
+			unconfirmedLspFiles: ["/proj/src/timed-out.ts"],
+		});
+
+		// The footer-cache write behavior (#571) must be unaffected by this fix.
+		expect(reconcileScanDiagnosticsMock).toHaveBeenCalledTimes(2);
+		const reconciledFiles = reconcileScanDiagnosticsMock.mock.calls.map(
+			(call) => call[0],
+		);
+		expect(reconciledFiles).not.toContain("/proj/src/timed-out.ts");
+	});
+
+	it("does not render an errored LSP file as clean, and distinguishes error from timeout in the note (#630)", async () => {
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([
+				{
+					filePath: "/proj/src/errored.ts",
+					diagnostics: [],
+					count: 0,
+					error: "spawn failed",
+				},
+			]),
+		};
+		const result = await run(makeTool({}, lspService), { mode: "full" });
+		const text = String(result.content[0].text);
+
+		expect(text).toContain("errored.ts");
+		expect(text).toContain("check errored");
+		expect(result.details).toMatchObject({
+			lspFilesConfirmed: 0,
+			lspFilesUnconfirmed: 1,
+			unconfirmedLspFiles: ["/proj/src/errored.ts"],
+		});
+	});
+
+	it("does not surface an unconfirmed note when every LSP result is confirmed (#630)", async () => {
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([
+				{ filePath: "/proj/src/clean.ts", diagnostics: [], count: 0 },
+			]),
+		};
+		const result = await run(makeTool({}, lspService), { mode: "full" });
+		const text = String(result.content[0].text);
+
+		expect(text).not.toMatch(/unconfirmed/i);
+		expect(result.details).toMatchObject({
+			lspFilesConfirmed: 1,
+			lspFilesUnconfirmed: 0,
+			unconfirmedLspFiles: [],
+		});
+	});
+
+	it("breaks the confirmed/unconfirmed LSP tally down per primary server (#646)", async () => {
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([
+				// typescript-served files: both confirmed.
+				{ filePath: "/proj/src/a.ts", diagnostics: [], count: 0 },
+				{ filePath: "/proj/src/b.ts", diagnostics: [], count: 0 },
+				// marksman-served files: both unconfirmed (push-only, timed out) —
+				// mirrors #646's motivating dogfooding case (34/155 unconfirmed
+				// files were 100% one push-only server, marksman).
+				{
+					filePath: "/proj/docs/a.md",
+					diagnostics: [],
+					count: 0,
+					timedOut: true,
+				},
+				{
+					filePath: "/proj/docs/b.md",
+					diagnostics: [],
+					count: 0,
+					timedOut: true,
+				},
+			]),
+		};
+		const result = await run(makeTool({}, lspService), { mode: "full" });
+		const text = String(result.content[0].text);
+
+		expect(result.details).toMatchObject({
+			lspFilesConfirmed: 2,
+			lspFilesUnconfirmed: 2,
+			lspServerBreakdown: {
+				typescript: { confirmed: 2, total: 2 },
+				marksman: { confirmed: 0, total: 2 },
+			},
+		});
+		// Rendered note calls out which server is responsible for the
+		// unconfirmed files, sorted worst-confirmed first.
+		expect(text).toContain("by server: marksman: 0/2, typescript: 2/2");
+	});
+
+	it("does not render a per-server breakdown clause when only one primary server is involved (#646)", async () => {
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([
+				{ filePath: "/proj/src/a.ts", diagnostics: [], count: 0 },
+				{
+					filePath: "/proj/src/b.ts",
+					diagnostics: [],
+					count: 0,
+					timedOut: true,
+				},
+			]),
+		};
+		const result = await run(makeTool({}, lspService), { mode: "full" });
+		const text = String(result.content[0].text);
+
+		expect(result.details).toMatchObject({
+			lspServerBreakdown: { typescript: { confirmed: 1, total: 2 } },
+		});
+		expect(text).not.toContain("by server:");
+	});
+
+	it("splits raw LSP-sweep findings into primary vs auxiliary counts (#646)", async () => {
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([
+				{
+					filePath: "/proj/src/a.ts",
+					diagnostics: [
+						{
+							severity: 1,
+							message: "real type error",
+							range: {
+								start: { line: 1, character: 0 },
+								end: { line: 1, character: 5 },
+							},
+							source: "typescript",
+							code: 2322,
+						},
+						{
+							severity: 2,
+							message: "ast-grep rule hit",
+							range: {
+								start: { line: 2, character: 0 },
+								end: { line: 2, character: 5 },
+							},
+							source: "ast-grep",
+						},
+					],
+					count: 2,
+				},
+			]),
+		};
+		const result = await run(makeTool({}, lspService), { mode: "full" });
+		const text = String(result.content[0].text);
+
+		expect(result.details).toMatchObject({
+			lspPrimaryDiagnosticsCount: 1,
+			lspAuxiliaryDiagnosticsCount: 1,
+		});
+		expect(text).toContain("LSP sweep findings: 1 primary");
+		expect(text).toContain("1 auxiliary");
+	});
+
+	it("honors inline `# pi-lens-ignore` like mode=all (#442)", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-diag-suppress-"));
+		resetProjectLensConfigCache();
+		try {
+			const file = path.join(cwd, "app.py");
+			fs.writeFileSync(
+				file,
+				"value = eval(userInput)  # pi-lens-ignore: no-eval\n",
+			);
+			mockSummaries.length = 0;
+			mockSummaries.push(
+				sum(
+					file,
+					{ blocking: 1 },
+					{
+						diagnostics: [
+							{
+								severity: "error",
+								semantic: "blocking",
+								message: "eval of untrusted input",
+								line: 1,
+								rule: "no-eval",
+								tool: "ast-grep",
+							},
+						],
+					},
+				),
+			);
+			const lspService = {
+				runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+			};
+			const tool = createLensDiagnosticsTool(
+				makeCacheManager({}) as any,
+				() => cwd,
+				() => lspService as any,
+			);
+			const result = await tool.execute(
+				"1",
+				{ mode: "full" },
+				new AbortController().signal,
+				null,
+				{ cwd },
+			);
+			const text = String(result.content[0].text);
+			// The suppressed finding must NOT appear and must NOT count as blocking
+			// (a fully-suppressed run reports clean, so totalBlocking is 0/absent).
+			expect(text).not.toContain("eval of untrusted input");
+			expect(
+				(result.details as { totalBlocking?: number }).totalBlocking ?? 0,
+			).toBe(0);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+			resetProjectLensConfigCache();
+		}
+	});
+
+	it("forwards maxLspFiles to the LSP workspace sweep as maxFiles (#341)", async () => {
+		mockSummaries.length = 0;
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+		};
+		await run(makeTool({}, lspService), { mode: "full", maxLspFiles: 200 });
+		expect(lspService.runWorkspaceDiagnostics).toHaveBeenCalledWith(
+			"/proj",
+			expect.objectContaining({ maxFiles: 200 }),
+		);
+	});
+
+	it("threads the abort signal to the LSP sweep and flags partial results (#341)", async () => {
+		mockSummaries.length = 0;
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+		};
+		const controller = new AbortController();
+		controller.abort();
+		const tool = makeTool({}, lspService);
+		const result = await tool.execute(
+			"1",
+			{ mode: "full", maxLspFiles: 50 },
+			controller.signal,
+			null,
+			{ cwd: "/proj" },
+		);
+		const passed = lspService.runWorkspaceDiagnostics.mock.calls[0][1];
+		// The sweep receives a COMBINED signal now (tool-call + ctx + wall-clock
+		// ceiling), so assert its aborted state, not object identity.
+		expect(passed.signal.aborted).toBe(true);
+		const text = String(result.content[0].text);
+		expect(text).toContain("Scan cancelled before completion");
+		expect(result.details).toMatchObject({ mode: "full", partial: true });
+	});
+
 	it("refreshRunners=cheap scans cheap project runners and merges their cached snapshot", async () => {
 		mockSummaries.length = 0;
 		const lspService = {
@@ -367,7 +895,7 @@ describe("lens_diagnostics mode=full", () => {
 			tier: "cheap",
 			scannedAt: "2026-01-01T00:00:00.000Z",
 			filesScanned: 2,
-			runners: ["tree-sitter", "fact-rules"],
+			runners: ["tree-sitter", "fact-rules", "ast-grep-napi"],
 			diagnostics: [
 				{
 					filePath: "/proj/src/project.ts",
@@ -391,11 +919,11 @@ describe("lens_diagnostics mode=full", () => {
 		});
 		const text = String(result.content[0].text);
 		expect(projectDiagnosticsMocks.scanProjectDiagnostics).toHaveBeenCalledWith(
-			{
+			expect.objectContaining({
 				cwd: "/proj",
 				tier: "cheap",
 				maxFiles: 2,
-			},
+			}),
 		);
 		expect(text).toContain("project.ts");
 		expect(text).toContain("project runner warning");
@@ -451,6 +979,270 @@ describe("lens_diagnostics mode=full", () => {
 		expect(result.details).toMatchObject({ totalBlocking: 1 });
 	});
 
+	it("folds fresh-fetched jscpd findings into full mode (#585)", async () => {
+		mockSummaries.length = 0;
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+		};
+		// No scanned snapshot — jscpd must synthesize one from its own findings.
+		projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot.mockReturnValue(
+			undefined,
+		);
+		freshFetchMocks.fetchFreshProjectDiagnostics.mockResolvedValue({
+			diagnostics: [
+				{
+					filePath: "/proj/src/a.ts",
+					line: 42,
+					severity: "warning",
+					semantic: "warning",
+					tool: "jscpd",
+					runner: "jscpd",
+					rule: "duplicate-code",
+					message: "Duplicate code (18 lines)",
+					source: "project-scan",
+				},
+			],
+			runners: ["jscpd"],
+			cold: [],
+			timings: { jscpd: 42 },
+		});
+
+		const result = await run(makeTool({}, lspService), {
+			mode: "full",
+			refreshRunners: "cached",
+		});
+
+		const text = String(result.content[0].text);
+		expect(text).toContain("Duplicate code (18 lines)");
+		expect(text).toContain("fetched fresh this call");
+		expect(text).toContain("jscpd (42ms)");
+		expect(
+			projectDiagnosticsMocks.scanProjectDiagnostics,
+		).not.toHaveBeenCalled();
+	});
+
+	it("does not read jscpd cache when refreshRunners is not set (LSP-only full mode)", async () => {
+		mockSummaries.length = 0;
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+		};
+		const cm = makeCacheManager({
+			"jscpd-ts": {
+				success: true,
+				duplicatedLines: 1,
+				totalLines: 1,
+				percentage: 1,
+				clones: [
+					{ fileA: "src/a.ts", startA: 1, fileB: "src/b.ts", startB: 2, lines: 5, tokens: 9 },
+				],
+			},
+		});
+		const tool = createLensDiagnosticsTool(
+			cm as any,
+			() => "/proj",
+			() => lspService as any,
+		);
+
+		const result = await tool.execute("1", { mode: "full" }, new AbortController().signal, null, {
+			cwd: "/proj",
+		});
+
+		expect(String(result.content[0].text)).not.toContain("Duplicate code");
+		expect(cm.readCache).not.toHaveBeenCalledWith("jscpd-ts", "/proj");
+	});
+
+	// #533: a cache-only extractor with NO cache entry yet must render as cold,
+	// never as a clean "no issues found" — that would misrepresent an analyzer
+	// that has simply never run this session as having confirmed no findings.
+	it("mode=full refreshRunners=cached: analyzers the fresh-fetch reports cold say COLD, not clean", async () => {
+		mockSummaries.length = 0;
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+		};
+		projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot.mockReturnValue(
+			undefined,
+		);
+		// Every analyzer gated out this run (no go.mod, no gitleaks signal, …) —
+		// fetchFreshProjectDiagnostics reports them all cold.
+		freshFetchMocks.fetchFreshProjectDiagnostics.mockResolvedValue({
+			diagnostics: [],
+			runners: [],
+			cold: ["knip", "jscpd", "madge", "gitleaks"],
+			timings: {},
+		});
+
+		const result = await run(makeTool({}, lspService), {
+			mode: "full",
+			refreshRunners: "cached",
+		});
+
+		const text = String(result.content[0].text);
+		expect(text).toContain("cold");
+		expect(text).toContain("knip");
+		expect(text).toContain("jscpd");
+		expect(text).toContain("madge");
+		expect(text).toContain("gitleaks");
+		expect((result.details as { coldRunners?: string[] }).coldRunners).toEqual(
+			expect.arrayContaining(["knip", "jscpd", "madge", "gitleaks"]),
+		);
+	});
+
+	it("mode=full refreshRunners=cached: an analyzer the fresh-fetch actually ran is not listed as cold", async () => {
+		mockSummaries.length = 0;
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+		};
+		projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot.mockReturnValue(
+			undefined,
+		);
+		freshFetchMocks.fetchFreshProjectDiagnostics.mockResolvedValue({
+			diagnostics: [],
+			runners: [],
+			// jscpd ran fresh and found nothing (success, empty) — that's a
+			// confirmed clean, not cold. knip stayed cold (e.g. no project marker).
+			cold: ["knip"],
+			timings: { jscpd: 5 },
+		});
+
+		const result = await run(makeTool({}, lspService), {
+			mode: "full",
+			refreshRunners: "cached",
+		});
+
+		expect(
+			(result.details as { coldRunners?: string[] }).coldRunners,
+		).not.toContain("jscpd");
+		expect(
+			(result.details as { coldRunners?: string[] }).coldRunners,
+		).toContain("knip");
+	});
+
+	it("mode=full without refreshRunners never reports cold extractors (they weren't requested)", async () => {
+		mockSummaries.length = 0;
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+		};
+		const result = await run(makeTool({}, lspService), { mode: "full" });
+		expect(String(result.content[0].text)).not.toContain("cold");
+		expect((result.details as { coldRunners?: string[] }).coldRunners).toEqual(
+			[],
+		);
+		// #585: without refreshRunners opting in, the (expensive) fresh-fetch of
+		// the heavyweight analyzers must not run at all.
+		expect(
+			freshFetchMocks.fetchFreshProjectDiagnostics,
+		).not.toHaveBeenCalled();
+	});
+
+	it("mode=full refreshRunners=cached triggers the analyzer fresh-fetch for the resolved cwd (#585)", async () => {
+		mockSummaries.length = 0;
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+		};
+		await run(makeTool({}, lspService), {
+			mode: "full",
+			refreshRunners: "cached",
+		});
+		expect(freshFetchMocks.fetchFreshProjectDiagnostics).toHaveBeenCalledWith(
+			expect.anything(),
+			"/proj",
+			expect.anything(),
+			expect.anything(),
+		);
+	});
+
+	it("mode=full refreshRunners=cached threads the SAME combined abort signal into the analyzer fresh-fetch that the LSP sweep gets (#585 follow-up)", async () => {
+		mockSummaries.length = 0;
+		let capturedLspSignal: AbortSignal | undefined;
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockImplementation(
+				async (_cwd: string, opts: { signal?: AbortSignal }) => {
+					capturedLspSignal = opts.signal;
+					return [];
+				},
+			),
+		};
+		await run(makeTool({}, lspService), {
+			mode: "full",
+			refreshRunners: "cached",
+		});
+		const freshFetchSignal =
+			freshFetchMocks.fetchFreshProjectDiagnostics.mock.calls[0]?.[3];
+		expect(freshFetchSignal).toBeInstanceOf(AbortSignal);
+		expect(freshFetchSignal).toBe(capturedLspSignal);
+	});
+
+	it("mode=full: an aborted fresh-fetch is reported as a distinct 'stopped mid-scan' note, not folded into the generic cold note (#585 follow-up)", async () => {
+		mockSummaries.length = 0;
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+		};
+		freshFetchMocks.fetchFreshProjectDiagnostics.mockResolvedValue({
+			diagnostics: [],
+			runners: [],
+			cold: ["trivy"],
+			timings: {},
+			aborted: true,
+			abortedIds: ["trivy"],
+		});
+
+		const result = await run(makeTool({}, lspService), {
+			mode: "full",
+			refreshRunners: "cached",
+		});
+
+		const text = String(result.content[0].text);
+		expect(text).toContain("stopped mid-scan");
+		expect(text).toContain("trivy");
+		// The generic "not applicable / unavailable" cold note should NOT also
+		// claim trivy — it has its own, more accurate reason.
+		expect(text).not.toContain("not applicable / unavailable this run): trivy");
+		expect(
+			(result.details as { analyzersAborted?: boolean }).analyzersAborted,
+		).toBe(true);
+		expect(
+			(result.details as { analyzersAbortedIds?: string[] }).analyzersAbortedIds,
+		).toEqual(["trivy"]);
+	});
+
+	// #613: fetchFreshProjectDiagnostics used to be `await`ed only AFTER the LSP
+	// sweep's own Promise.all had already resolved — sequentially eating into
+	// the SAME wall-clock ceiling the sweep already spent, instead of sharing it
+	// concurrently. A slow LSP sweep left the analyzer fetch almost no budget,
+	// so on a real project all 7 heavyweight analyzers could get aborted before
+	// any completed. Prove the fetch is now invoked (not just resolved) BEFORE
+	// the slow LSP sweep finishes.
+	it("mode=full starts the analyzer fresh-fetch CONCURRENTLY with the LSP sweep, not after it resolves (#613)", async () => {
+		mockSummaries.length = 0;
+		let lspSweepResolve: (() => void) | undefined;
+		let lspSweepStarted = false;
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockImplementation(
+				() =>
+					new Promise<unknown[]>((resolve) => {
+						lspSweepStarted = true;
+						lspSweepResolve = () => resolve([]);
+					}),
+			),
+		};
+
+		const runPromise = run(makeTool({}, lspService), {
+			mode: "full",
+			refreshRunners: "cached",
+		});
+
+		// Give the microtask queue a few turns for the sweep to start and, if the
+		// analyzer fetch were STILL sequential (the #613 bug), for it to be
+		// skipped since the sweep's own promise is deliberately never resolved
+		// in this test until after this assertion.
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+		expect(lspSweepStarted).toBe(true);
+		expect(freshFetchMocks.fetchFreshProjectDiagnostics).toHaveBeenCalled();
+
+		lspSweepResolve?.();
+		await runPromise;
+	});
+
 	it("deduplicates LSP diagnostics already present in widget state by file line and rule", async () => {
 		mockSummaries.length = 0;
 		mockSummaries.push(
@@ -498,6 +1290,141 @@ describe("lens_diagnostics mode=full", () => {
 		expect(text).not.toContain("same diagnostic from workspace scan");
 		expect(result.details).toMatchObject({ totalBlocking: 1, totalErrors: 1 });
 	});
+
+	it("dedups the napi project scan against ast-grep LSP findings despite the source prefix (#308)", async () => {
+		// The ast-grep LSP keys its findings `ast-grep:<id>`; the napi scan (#308)
+		// uses the bare `<id>`. Same violation, same line — must collapse to ONE in
+		// mode=full, not double-report once the binary is present.
+		mockSummaries.length = 0;
+		mockSummaries.push(
+			sum(
+				"/proj/src/ui.ts",
+				{ warnings: 1 },
+				{
+					diagnostics: [
+						{
+							severity: "warning",
+							message: "Avoid alert()",
+							line: 5,
+							rule: "ast-grep:no-alert",
+							tool: "ast-grep",
+						},
+					],
+				},
+			),
+		);
+		projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot.mockReturnValue({
+			// cache.js is mocked in this file, so the version constant isn't in scope;
+			// the tool path doesn't validate it (loader is mocked, reconcile is identity).
+			version: 2,
+			cwd: "/proj",
+			tier: "cheap",
+			scannedAt: "2026-01-01T00:00:00.000Z",
+			filesScanned: 1,
+			runners: ["tree-sitter", "fact-rules", "ast-grep-napi"],
+			diagnostics: [
+				{
+					filePath: "/proj/src/ui.ts",
+					line: 5,
+					severity: "warning",
+					semantic: "warning",
+					tool: "ast-grep-napi",
+					runner: "ast-grep-napi",
+					rule: "no-alert",
+					message: "Avoid alert()",
+					source: "project-scan",
+				},
+			],
+		});
+		const lspService = { runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]) };
+
+		const result = await run(makeTool({}, lspService), {
+			mode: "full",
+			refreshRunners: "cached",
+		});
+		// One warning, not two — the napi scan finding deduped against the LSP one.
+		expect(result.details).toMatchObject({ totalWarnings: 1 });
+	});
+
+	it("filters ignored cached/widget/project diagnostics when merging full mode (#279)", async () =>
+		withIgnoredFixture(async (cwd) => {
+			const keep = path.join(cwd, "src", "keep.ts");
+			const ignoredWidget = path.join(cwd, ".history", "old.ts");
+			const ignoredLsp = path.join(cwd, "pi-session-2026.html");
+			const ignoredProject = path.join(cwd, "ignored", "project.ts");
+			mockSummaries.push(
+				sum(
+					keep,
+					{ warnings: 1 },
+					{ diagnostics: [{ severity: "warning", message: "keep", line: 1 }] },
+				),
+				sum(
+					ignoredWidget,
+					{ blocking: 1, errors: 1 },
+					{
+						diagnostics: [
+							{
+								severity: "error",
+								semantic: "blocking",
+								message: "old history",
+								line: 2,
+							},
+						],
+					},
+				),
+			);
+			const lspService = {
+				runWorkspaceDiagnostics: vi.fn().mockResolvedValue([
+					{
+						filePath: ignoredLsp,
+						diagnostics: [
+							{
+								severity: 1,
+								message: "ignored html parse error",
+								range: {
+									start: { line: 0, character: 0 },
+									end: { line: 0, character: 1 },
+								},
+								source: "html",
+							},
+						],
+					},
+				]),
+			};
+			projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot.mockReturnValue({
+				version: 1,
+				cwd,
+				tier: "cheap",
+				scannedAt: "2026-01-01T00:00:00.000Z",
+				filesScanned: 1,
+				runners: ["fact-rules"],
+				diagnostics: [
+					{
+						filePath: ignoredProject,
+						line: 3,
+						severity: "error",
+						semantic: "blocking",
+						tool: "fact-rules",
+						runner: "fact-rules",
+						rule: "ignored-project",
+						message: "ignored project blocker",
+						source: "project-scan",
+					},
+				],
+			});
+
+			const result = await run(
+				makeTool({}, lspService),
+				{ mode: "full", refreshRunners: "cached" },
+				cwd,
+			);
+			const text = String(result.content[0].text);
+			expect(text).toContain("keep");
+			expect(text).not.toContain("old history");
+			expect(text).not.toContain("ignored html parse error");
+			expect(text).not.toContain("ignored project blocker");
+			expect(result.details).toMatchObject({ totalWarnings: 1 });
+		}));
 });
 
 describe("lens_diagnostics mode=all", () => {
@@ -515,9 +1442,15 @@ describe("lens_diagnostics mode=all", () => {
 			undefined,
 			flush,
 		);
-		await tool.execute("1", { mode: "all" }, new AbortController().signal, null, {
-			cwd: "/proj",
-		});
+		await tool.execute(
+			"1",
+			{ mode: "all" },
+			new AbortController().signal,
+			null,
+			{
+				cwd: "/proj",
+			},
+		);
 		expect(flush).toHaveBeenCalledOnce();
 	});
 
@@ -537,6 +1470,47 @@ describe("lens_diagnostics mode=all", () => {
 		const result = await run(makeTool(), { mode: "all" });
 		expect(String(result.content[0].text)).toContain("✓");
 	});
+
+	it("filters ignored widget summaries in all mode (#279)", async () =>
+		withIgnoredFixture(async (cwd) => {
+			mockSummaries.push(
+				sum(
+					path.join(cwd, "src", "keep.ts"),
+					{ warnings: 1 },
+					{
+						diagnostics: [
+							{ severity: "warning", message: "keep warning", line: 1 },
+						],
+					},
+				),
+				sum(
+					path.join(cwd, ".history", "old.ts"),
+					{
+						blocking: 1,
+						errors: 1,
+					},
+					{
+						diagnostics: [
+							{
+								severity: "error",
+								semantic: "blocking",
+								message: "ignored history blocker",
+								line: 2,
+							},
+						],
+					},
+				),
+			);
+
+			const result = await run(makeTool(), { mode: "all" }, cwd);
+			const text = String(result.content[0].text);
+			expect(text).toContain("keep warning");
+			expect(text).not.toContain("ignored history blocker");
+			expect(result.details).toMatchObject({
+				filesWithIssues: 1,
+				totalWarnings: 1,
+			});
+		}));
 
 	it("lists files with blocking errors first", async () => {
 		mockSummaries.length = 0;
@@ -738,5 +1712,401 @@ describe("lens_diagnostics mode=all", () => {
 		const text = String(result.content[0].text);
 		expect(text).toContain("BOOM error here");
 		expect(text).not.toContain("minor warning here");
+	});
+});
+
+// ── paths scope restrictor (#461) ───────────────────────────────────────────────
+
+describe("lens_diagnostics paths", () => {
+	it("exposes paths in the schema", () => {
+		const tool = makeTool();
+		const props = (tool.parameters as { properties: Record<string, unknown> })
+			.properties;
+		expect(props.paths).toBeDefined();
+	});
+
+	it("mode=all: paths filter shows only listed files, excluding unrelated cached findings", async () => {
+		mockSummaries.length = 0;
+		mockSummaries.push(sum("/proj/src/keep.ts", { warnings: 1 }));
+		mockSummaries.push(sum("/proj/src/other.ts", { blocking: 1 }));
+		const result = await run(makeTool(), {
+			mode: "all",
+			paths: ["/proj/src/keep.ts"],
+		});
+		const text = String(result.content[0].text);
+		expect(text).toContain("keep.ts");
+		expect(text).not.toContain("other.ts");
+	});
+
+	it("mode=delta: paths filter shows only listed files' findings", async () => {
+		const tool = makeTool({
+			"actionable-warnings": {
+				files: [
+					{
+						filePath: "/proj/src/keep.ts",
+						warnings: [
+							{ line: 1, rule: "r1", tool: "t", message: "keep this" },
+						],
+					},
+					{
+						filePath: "/proj/src/other.ts",
+						warnings: [
+							{ line: 1, rule: "r2", tool: "t", message: "exclude this" },
+						],
+					},
+				],
+				summary: { warnings: 2 },
+			},
+		});
+		const result = await run(tool, {
+			mode: "delta",
+			paths: ["/proj/src/keep.ts"],
+		});
+		const text = String(result.content[0].text);
+		expect(text).toContain("keep this");
+		expect(text).not.toContain("exclude this");
+	});
+
+	it("mode=all with paths hitting no cached files includes the cached-only/use-mode=full note", async () => {
+		mockSummaries.length = 0;
+		mockSummaries.push(sum("/proj/src/unrelated.ts", { warnings: 1 }));
+		const result = await run(makeTool(), {
+			mode: "all",
+			paths: ["/proj/src/never-dispatched.ts"],
+		});
+		const text = String(result.content[0].text);
+		expect(text).toContain("mode=full");
+		expect(text).toContain("cached findings");
+	});
+
+	it("mode=delta with paths hitting no cached files includes the cached-only/use-mode=full note", async () => {
+		const result = await run(makeTool(), {
+			mode: "delta",
+			paths: ["/proj/src/never-dispatched.ts"],
+		});
+		const text = String(result.content[0].text);
+		expect(text).toContain("mode=full");
+	});
+
+	it("mode=full: LSP sweep and cheap scanner receive exactly the listed (existing) files", async () => {
+		mockSummaries.length = 0;
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-diag-paths-"));
+		try {
+			const fileA = path.join(cwd, "a.ts");
+			const fileB = path.join(cwd, "b.ts");
+			fs.writeFileSync(fileA, "export const a = 1;\n");
+			fs.writeFileSync(fileB, "export const b = 2;\n");
+			const lspService = {
+				runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+			};
+			projectDiagnosticsMocks.scanProjectDiagnostics.mockResolvedValue({
+				version: 1,
+				cwd,
+				tier: "cheap",
+				scannedAt: "2026-01-01T00:00:00.000Z",
+				filesScanned: 2,
+				runners: ["tree-sitter", "fact-rules", "ast-grep-napi"],
+				diagnostics: [],
+			});
+			const tool = createLensDiagnosticsTool(
+				makeCacheManager({}) as any,
+				() => cwd,
+				() => lspService as any,
+			);
+			await tool.execute(
+				"1",
+				{ mode: "full", refreshRunners: "cheap", paths: [fileA, fileB] },
+				new AbortController().signal,
+				null,
+				{ cwd },
+			);
+			expect(lspService.runWorkspaceDiagnostics).toHaveBeenCalledWith(
+				cwd,
+				expect.objectContaining({ files: [fileA, fileB] }),
+			);
+			expect(
+				projectDiagnosticsMocks.scanProjectDiagnostics,
+			).toHaveBeenCalledWith(
+				expect.objectContaining({ files: [fileA, fileB] }),
+			);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("mode=full: a mixed dir+file list falls back to the walk (no silent under-scan of the directory)", async () => {
+		mockSummaries.length = 0;
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-diag-mixed-"));
+		try {
+			const dir = path.join(cwd, "src");
+			fs.mkdirSync(dir);
+			const inDir = path.join(dir, "in-dir.ts");
+			const fileA = path.join(cwd, "a.ts");
+			fs.writeFileSync(inDir, "export const d = 1;\n");
+			fs.writeFileSync(fileA, "export const a = 1;\n");
+			const lspService = {
+				runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+			};
+			const tool = createLensDiagnosticsTool(
+				makeCacheManager({}) as any,
+				() => cwd,
+				() => lspService as any,
+			);
+			await tool.execute(
+				"1",
+				{ mode: "full", paths: [dir, fileA] },
+				new AbortController().signal,
+				null,
+				{ cwd },
+			);
+			// Passing only [fileA] as the explicit list would skip everything under
+			// src/ while claiming a full-mode result for the whole scope — the walk
+			// (files: undefined) is the correct fallback, narrowed by includeFile.
+			const passed = lspService.runWorkspaceDiagnostics.mock.calls[0][1];
+			expect(passed.files).toBeUndefined();
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("mode=full: an all-missing paths list scans nothing instead of walking the whole project", async () => {
+		mockSummaries.length = 0;
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-diag-missing-"));
+		try {
+			const lspService = {
+				runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+			};
+			const tool = createLensDiagnosticsTool(
+				makeCacheManager({}) as any,
+				() => cwd,
+				() => lspService as any,
+			);
+			const result = await tool.execute(
+				"1",
+				{ mode: "full", paths: [path.join(cwd, "deleted.ts")] },
+				new AbortController().signal,
+				null,
+				{ cwd },
+			);
+			// files: [] means "scan nothing" at both seams; undefined would trigger
+			// a full project walk that includeFile then filters to nothing.
+			const passed = lspService.runWorkspaceDiagnostics.mock.calls[0][1];
+			expect(passed.files).toEqual([]);
+			expect(String(result.content[0].text)).toContain("deleted.ts");
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("mode=full: cached extractor findings outside paths are filtered out", async () => {
+		mockSummaries.length = 0;
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-diag-paths2-"));
+		try {
+			const kept = path.join(cwd, "keep.ts");
+			fs.writeFileSync(kept, "export const x = 1;\n");
+			const lspService = {
+				runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+			};
+			projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot.mockReturnValue({
+				version: 1,
+				cwd,
+				tier: "cheap",
+				scannedAt: "2026-01-01T00:00:00.000Z",
+				filesScanned: 2,
+				runners: ["fact-rules"],
+				diagnostics: [
+					{
+						filePath: kept,
+						line: 1,
+						severity: "warning",
+						semantic: "warning",
+						tool: "fact-rules",
+						runner: "fact-rules",
+						rule: "kept-rule",
+						message: "kept finding",
+						source: "project-scan",
+					},
+					{
+						filePath: path.join(cwd, "excluded.ts"),
+						line: 1,
+						severity: "warning",
+						semantic: "warning",
+						tool: "fact-rules",
+						runner: "fact-rules",
+						rule: "excluded-rule",
+						message: "excluded finding",
+						source: "project-scan",
+					},
+				],
+			});
+			const tool = createLensDiagnosticsTool(
+				makeCacheManager({}) as any,
+				() => cwd,
+				() => lspService as any,
+			);
+			const result = await tool.execute(
+				"1",
+				{ mode: "full", refreshRunners: "cached", paths: [kept] },
+				new AbortController().signal,
+				null,
+				{ cwd },
+			);
+			const text = String(result.content[0].text);
+			expect(text).toContain("kept finding");
+			expect(text).not.toContain("excluded finding");
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("normalizes relative and absolute path entries to the same result", async () => {
+		mockSummaries.length = 0;
+		mockSummaries.push(sum("/proj/src/keep.ts", { warnings: 1 }));
+		const relResult = await run(makeTool(), {
+			mode: "all",
+			paths: ["src/keep.ts"],
+		});
+		const absResult = await run(makeTool(), {
+			mode: "all",
+			paths: ["/proj/src/keep.ts"],
+		});
+		expect(String(relResult.content[0].text)).toContain("keep.ts");
+		expect(String(absResult.content[0].text)).toContain("keep.ts");
+		expect(relResult.details).toMatchObject(
+			absResult.details as Record<string, unknown>,
+		);
+	});
+
+	it("cross-form path separators normalize to the same result (Windows path-key discipline)", async () => {
+		mockSummaries.length = 0;
+		mockSummaries.push(sum("/proj/src/keep.ts", { warnings: 1 }));
+		const forwardResult = await run(makeTool(), {
+			mode: "all",
+			paths: ["/proj/src/keep.ts"],
+		});
+		const backslashResult = await run(makeTool(), {
+			mode: "all",
+			paths: ["/proj\\src\\keep.ts"],
+		});
+		expect(String(forwardResult.content[0].text)).toContain("keep.ts");
+		expect(String(backslashResult.content[0].text)).toContain("keep.ts");
+	});
+
+	it("a directory entry matches files beneath it", async () => {
+		mockSummaries.length = 0;
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-diag-dir-"));
+		try {
+			const subdir = path.join(cwd, "src");
+			fs.mkdirSync(subdir);
+			const inside = path.join(subdir, "keep.ts");
+			const outside = path.join(cwd, "outside.ts");
+			mockSummaries.push(sum(inside, { warnings: 1 }));
+			mockSummaries.push(sum(outside, { blocking: 1 }));
+			const result = await run(makeTool(), { mode: "all", paths: [subdir] }, cwd);
+			const text = String(result.content[0].text);
+			expect(text).toContain("keep.ts");
+			expect(text).not.toContain("outside.ts");
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("errors clearly when paths exceeds the 200-entry cap", async () => {
+		const many = Array.from({ length: 201 }, (_, i) => `/proj/src/f${i}.ts`);
+		const result = (await run(makeTool(), { mode: "all", paths: many })) as {
+			content: [{ type: "text"; text: string }];
+			isError?: boolean;
+		};
+		expect(result.isError).toBe(true);
+		const text = String(result.content[0].text);
+		expect(text).toContain("200");
+	});
+
+	it("mode=full: a nonexistent path produces the skipped-note without throwing", async () => {
+		mockSummaries.length = 0;
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-diag-missing-"));
+		try {
+			const missing = path.join(cwd, "deleted-but-staged.ts");
+			const lspService = {
+				runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+			};
+			const tool = createLensDiagnosticsTool(
+				makeCacheManager({}) as any,
+				() => cwd,
+				() => lspService as any,
+			);
+			const result = await tool.execute(
+				"1",
+				{ mode: "full", paths: [missing] },
+				new AbortController().signal,
+				null,
+				{ cwd },
+			);
+			const text = String(result.content[0].text);
+			expect(text).toContain("Skipped");
+			expect(text).toContain("not found");
+			expect(text).toContain("deleted-but-staged.ts");
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+});
+
+// ── cancellation via ctx.signal (Escape / turn abort) ──────────────────────────
+describe("lens_diagnostics honors the turn abort (ctx.signal)", () => {
+	it("aborts a mode=full scan when ctx.signal (Escape) fires, even if the positional signal is live", async () => {
+		mockSummaries.length = 0;
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+		};
+		// Positional tool-call signal is live (not aborted); the TURN signal is the
+		// one Escape fires. Before the fix the tool only read the positional signal,
+		// so Escape did nothing.
+		const liveCall = new AbortController();
+		const turn = new AbortController();
+		turn.abort();
+		const tool = makeTool({}, lspService);
+		const result = await tool.execute(
+			"1",
+			{ mode: "full", maxLspFiles: 50 },
+			liveCall.signal,
+			null,
+			{ cwd: "/proj", signal: turn.signal },
+		);
+		const passed = lspService.runWorkspaceDiagnostics.mock.calls[0][1];
+		expect(passed.signal.aborted).toBe(true);
+		expect(String(result.content[0].text)).toContain(
+			"Scan cancelled before completion",
+		);
+		expect(result.details).toMatchObject({ mode: "full", partial: true });
+	});
+});
+
+
+describe("lens_diagnostics wall-clock ceiling (never-hang guarantee)", () => {
+	it("stops mode=full and marks timedOut when the wall-clock budget is exceeded", async () => {
+		vi.resetModules();
+		process.env.PI_LENS_LENS_DIAGNOSTICS_FULL_TIMEOUT_MS = "1";
+		const { createLensDiagnosticsTool: freshCreate } = await import(
+			"../../tools/lens-diagnostics.js"
+		);
+		const lspService = {
+			// Outlast the 1ms ceiling so it fires before the sweep returns.
+			runWorkspaceDiagnostics: vi.fn(async () => {
+				await new Promise((r) => setTimeout(r, 30));
+				return [];
+			}),
+		};
+		const tool = freshCreate(
+			makeCacheManager({}) as any,
+			() => "/proj",
+			() => lspService as any,
+		);
+		const result = await tool.execute("1", { mode: "full" }, undefined, null, {
+			cwd: "/proj",
+		});
+		expect(String(result.content[0].text)).toContain("time budget");
+		expect(result.details).toMatchObject({ mode: "full", timedOut: true });
+		delete process.env.PI_LENS_LENS_DIAGNOSTICS_FULL_TIMEOUT_MS;
 	});
 });

@@ -10,28 +10,67 @@
 
 import { spawn as nodeSpawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { access } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
+import * as os from "node:os";
 import { pathToFileURL } from "node:url";
-import type { MessageConnection } from "vscode-jsonrpc";
+import { withTimeout } from "../deadline-utils.js";
+import type { MessageConnection } from "../deps/vscode-jsonrpc.js";
 import { logLatency } from "../latency-logger.js";
 // vscode-jsonrpc v9 ships an `exports` map exposing the Node entry as the
 // `./node` subpath (no `.js`); the old `/node.js` file path no longer resolves.
 import {
+	CancellationTokenSource,
 	createMessageConnection,
 	StreamMessageReader,
 	StreamMessageWriter,
-} from "vscode-jsonrpc/node";
+} from "../deps/vscode-jsonrpc.js";
+import { getAmbientAbortSignal } from "../safe-spawn.js";
 
 import { applyWorkspaceEdit } from "./edits.js";
+import { recordLspChild, removeLspChild } from "../instance-registry.js";
 import type { LSPProcess } from "./launch.js";
 import { normalizeMapKey, uriToPath } from "./path-utils.js";
+import {
+	ADVERTISED_POSITION_ENCODINGS,
+	convertCharacterOffset,
+	lineTextAt,
+	negotiatePositionEncoding,
+	type PositionEncoding,
+} from "./position-encoding.js";
 import { getStrategy } from "./server-strategies.js";
+import { WatchedFilesQueue } from "./watch-queue.js";
 
 // Opt-in publishDiagnostics trace (PILENS_PUB_DEBUG=1) — read once, negligible
 // hot-path cost. Surfaces each server's publish behavior (version + count) to
 // diagnose the clean-file affirmative-signal question (#240): which servers
 // publish an empty-with-version set on a clean scan vs go silent.
 const PUB_DEBUG = Boolean(process.env.PILENS_PUB_DEBUG);
+
+/**
+ * #472/#449: extract a per-spawn-unique "marker" from an LSP server's resolved
+ * args, for the instance registry's command-line re-identification fallback
+ * (used when a recorded child's pid is dead/recycled but its process tree
+ * grandchild — e.g. ast-grep's native exe behind a dead node wrapper — is
+ * still alive under a different pid).
+ *
+ * Generalized, NOT ast-grep-specific (uniformity requirement — no per-server
+ * special casing): the value immediately following a `--config`/`-c` flag, if
+ * that value looks like a path under a temp directory (`os.tmpdir()`). This
+ * covers ast-grep's `lsp --config <tmp sgconfig path>` (clients/sgconfig.ts)
+ * today, and any other server later launched with a temp-file `--config`/`-c`
+ * argument, without new server-specific code.
+ */
+function extractSpawnMarker(args: readonly string[]): string | undefined {
+	const tmpDir = os.tmpdir();
+	for (let i = 0; i < args.length - 1; i++) {
+		const flag = args[i];
+		if (flag === "--config" || flag === "-c") {
+			const value = args[i + 1];
+			if (value?.startsWith(tmpDir)) return value;
+		}
+	}
+	return undefined;
+}
 
 // --- Types ---
 
@@ -95,6 +134,12 @@ export interface LSPWorkspaceEdit {
 export interface LSPWorkspaceDiagnosticsSupport {
 	advertised: boolean;
 	mode: "pull" | "push-only";
+	/**
+	 * The server advertises `workspace/diagnostic` (a single project-wide pull),
+	 * distinct from `mode: "pull"` which only reflects per-document
+	 * `textDocument/diagnostic` support.
+	 */
+	workspaceDiagnostics: boolean;
 	diagnosticProviderKind: string;
 }
 
@@ -212,6 +257,13 @@ export interface LSPClientInfo {
 	getTrackedDiagnosticPaths(): string[];
 	/** Capability snapshot for workspace diagnostics support */
 	getWorkspaceDiagnosticsSupport(): LSPWorkspaceDiagnosticsSupport;
+	/**
+	 * Issue one project-wide `workspace/diagnostic` pull. Resolves per-file
+	 * reports, or `undefined` when unsupported/dead/timed-out/malformed.
+	 */
+	requestWorkspaceDiagnostics(
+		budgetMs: number,
+	): Promise<Array<{ filePath: string; diagnostics: LSPDiagnostic[] }> | undefined>;
 	/** Capability snapshot for navigation/edit operations */
 	getOperationSupport(): LSPOperationSupport;
 	/** Commands the server advertised for workspace/executeCommand (the allowlist) */
@@ -219,6 +271,11 @@ export interface LSPClientInfo {
 	/** Top-level keys of the raw ServerCapabilities advertised at initialize —
 	 *  the full advertised surface (incl. providers pi-lens does not parse). */
 	getRawCapabilityKeys(): string[];
+	/** See `LSPServerInfo.spawn`'s `launchVariant` (server.ts) — which concrete
+	 *  binary/protocol variant this client instance is actually running.
+	 *  Undefined = single-variant server or not yet reported (fail-safe:
+	 *  consumers must treat that as classic/default behavior). */
+	getLaunchVariant(): "classic" | "native-ts7" | undefined;
 	/**
 	 * Run a server command via workspace/executeCommand. Hardened: the command
 	 * MUST be in the server's advertised list or this rejects without sending.
@@ -321,6 +378,53 @@ const INITIALIZE_TIMEOUT_MS = positiveIntFromEnv(
 	"PI_LENS_LSP_INIT_TIMEOUT_MS",
 	15_000,
 ); // 15s — npx downloads are handled by ensureTool, not here
+
+/**
+ * The client capabilities advertised in every `initialize`. The textDocument set
+ * is intentionally COMPLETE and spec-compliant: servers built on
+ * OmniSharp.Extensions.LanguageServer (PowerShell Editor Services, #278)
+ * dereference these sub-capabilities while handling `initialize` and throw a
+ * NullReferenceException when an expected one is absent, hanging the handshake. A
+ * partial textDocument object (the old `synchronization: {didOpen, didChange}` —
+ * not even valid TextDocumentSyncClientCapabilities fields) triggered exactly
+ * that. Declaring the full set is harmless to other servers (they act only on the
+ * requests we actually send), so this is the single, server-agnostic shape.
+ * Exported for the regression guard in client-internals tests.
+ */
+export const CLIENT_CAPABILITIES = {
+	general: { positionEncodings: ADVERTISED_POSITION_ENCODINGS },
+	window: { workDoneProgress: true },
+	workspace: {
+		workspaceFolders: true,
+		configuration: true,
+		didChangeWatchedFiles: { dynamicRegistration: true },
+	},
+	textDocument: {
+		synchronization: {
+			dynamicRegistration: false,
+			willSave: false,
+			willSaveWaitUntil: false,
+			didSave: true,
+		},
+		completion: {
+			dynamicRegistration: false,
+			completionItem: { snippetSupport: false },
+		},
+		hover: { dynamicRegistration: false },
+		signatureHelp: { dynamicRegistration: false },
+		definition: { dynamicRegistration: false },
+		typeDefinition: { dynamicRegistration: false },
+		implementation: { dynamicRegistration: false },
+		references: { dynamicRegistration: false },
+		documentSymbol: { dynamicRegistration: false },
+		codeAction: { dynamicRegistration: false },
+		rename: { dynamicRegistration: false },
+		publishDiagnostics: {
+			relatedInformation: true,
+			versionSupport: true,
+		},
+	},
+} as const;
 const NAV_REQUEST_TIMEOUT_MS = positiveIntFromEnv(
 	"PI_LENS_LSP_NAV_REQUEST_TIMEOUT_MS",
 	10_000,
@@ -333,9 +437,28 @@ const PULL_DIAGNOSTICS_RETRY_INTERVAL_MS = positiveIntFromEnv(
 	"PI_LENS_LSP_PULL_RETRY_INTERVAL_MS",
 	250,
 );
+// Per-request ceiling for pull diagnostics (textDocument/diagnostic), mirroring
+// NAV_REQUEST_TIMEOUT_MS. safeSendRequest only settles on a reply or a *destroyed*
+// stream, so a pull-mode server that is alive but hung (accepts the request, never
+// replies) would await forever — hanging clientWaitForDiagnostics and, upstream,
+// the diagnostics flush. On timeout the request is treated as `unavailable`, which
+// (per #240) is NOT read as clean and falls through to the bounded push backstop.
+const PULL_REQUEST_TIMEOUT_MS = positiveIntFromEnv(
+	"PI_LENS_LSP_PULL_REQUEST_TIMEOUT_MS",
+	10_000,
+);
 const SHUTDOWN_REQUEST_TIMEOUT_MS = positiveIntFromEnv(
 	"PI_LENS_LSP_SHUTDOWN_TIMEOUT_MS",
 	1000,
+);
+// Anti-deadlock backstop for workspace/executeCommand. Deliberately generous
+// (30s): the command is mutating and legitimately long-running (a real server
+// refactor / organize-imports), so this must not truncate valid work — it only
+// stops a hung server from blocking the caller forever. On timeout the command
+// may still be applying server-side; we surface that rather than pretend it ran.
+const EXECUTE_COMMAND_TIMEOUT_MS = positiveIntFromEnv(
+	"PI_LENS_LSP_EXECUTE_COMMAND_TIMEOUT_MS",
+	30_000,
 );
 
 const LSP_CRASH_CODES = new Set([
@@ -384,6 +507,12 @@ function installCrashGuard(): void {
 export interface LSPClientState {
 	isConnected: boolean;
 	isDestroyed: boolean;
+	/** Set only by clientShutdown() — distinguishes an intentional kill from a
+	 *  genuine crash so the exit handler below logs the latter even when the
+	 *  JSON-RPC connection's onClose/onError already flipped isConnected false
+	 *  before the process 'exit' event fires (the ordering that previously
+	 *  made every crash silently look "expected"). */
+	shutdownRequested: boolean;
 	connectionDisposed: boolean;
 	lastError: Error | undefined;
 	readonly connection: MessageConnection;
@@ -409,6 +538,10 @@ export interface LSPClientState {
 	/** Top-level keys of the raw ServerCapabilities from initialize (sorted) —
 	 *  captured once; the full advertised surface for diagnostics/documentation. */
 	rawCapabilityKeys?: string[];
+	/** Position encoding the server negotiated at initialize (#269). UTF-16 unless
+	 *  the server advertised otherwise; drives character-offset translation on
+	 *  outgoing navigation requests. */
+	positionEncoding: PositionEncoding;
 	/** Baseline mode from static initResult — used to revert on unregister */
 	staticDiagnosticsMode: "pull" | "push-only";
 	/** Live dynamic registrations from client/registerCapability: id → method */
@@ -428,8 +561,17 @@ export interface LSPClientState {
 	 */
 	serverEditsAllowed: number;
 	readonly serverId: string;
+	/** See `LSPServerInfo.spawn`'s `launchVariant` (server.ts). Undefined =
+	 *  single-variant server or not yet reported. */
+	readonly launchVariant?: "classic" | "native-ts7";
 	readonly root: string;
 	readonly lspProcess: LSPProcess;
+	/**
+	 * Per-client debounced `workspace/didChangeWatchedFiles` batcher (#271).
+	 * Two-phase init (needs `state` for its flush closure) — assigned right after
+	 * the state literal, like `workspaceDiagnosticsSupport`.
+	 */
+	watchQueue: WatchedFilesQueue;
 }
 
 function isClientAlive(state: LSPClientState): boolean {
@@ -452,16 +594,47 @@ export async function killProcessTree(
 	proc: {
 		kill(signal?: NodeJS.Signals | number): boolean;
 		unref?: () => void;
+		exitCode?: number | null;
+		signalCode?: NodeJS.Signals | null;
 	},
 	pid: number,
 	options: LSPShutdownOptions = {},
 ): Promise<void> {
+	// If our child has already exited, its PID is dead and the OS may have
+	// RECYCLED it. The Windows `taskkill /F /T` below force-kills the PID's whole
+	// tree, so on a recycled PID it would kill an unrelated process (in the test
+	// suite this occasionally nuked a vitest worker fork → "Worker exited
+	// unexpectedly" with no fatal dump). There is nothing left for us to kill, and
+	// the handle-based proc.kill() below is moot, so return early.
+	if (
+		(proc.exitCode != null || proc.signalCode != null) &&
+		!options.processExiting
+	) {
+		proc.unref?.();
+		return;
+	}
 	if (process.platform === "win32" && pid > 0) {
 		// Host process is exiting (loop already closing): never spawn a child here —
 		// the spawn's uv_async_send on the closing loop-wakeup handle hard-aborts
 		// (src\win\async.c). Kill the direct child via the handle we already hold
-		// (TerminateProcess; synchronous, no async handle). Orphaned grandchildren
-		// are reaped by the OS as the host exits.
+		// (TerminateProcess; synchronous, no async handle).
+		//
+		// #472 CORRECTION of a prior false claim here ("orphaned grandchildren are
+		// reaped by the OS as the host exits"): Windows does NOT kill children when
+		// a parent dies. For shell/.cmd-wrapped servers the direct child is
+		// cmd.exe, so this path only ever kills the wrapper — the actual server
+		// (its grandchild) survives by design whenever it doesn't independently
+		// exit. It relies entirely on best-effort backstops instead: (1) the
+		// server observing stdin EOF once the wrapper's pipes close, (2) LSP
+		// `initialize.processId: process.pid` (some servers self-watchdog on that
+		// pid dying — typescript-language-server does, ast-grep's native binary
+		// does not, an upstream spec violation), and (3) the #449/#472
+		// cross-process instance registry's orphan reaper, which is the only
+		// mechanism that works regardless of why a pipe write-end stayed open
+		// (e.g. Windows handle-inheritance capture by a long-lived process). This
+		// is why registering every LSP child at spawn matters uniformly — do NOT
+		// weaken this direct-child-only kill to try to chase grandchildren here;
+		// spawning taskkill in this branch is exactly the libuv hazard above.
 		if (options.processExiting) {
 			try {
 				proc.kill();
@@ -495,16 +668,33 @@ export async function killProcessTree(
 		return;
 	}
 
+	const killPosixProcessGroup = (signal: NodeJS.Signals): boolean => {
+		if (pid <= 0) return false;
+		try {
+			process.kill(-pid, signal);
+			return true;
+		} catch {
+			return false;
+		}
+	};
+	const killDirectChild = (signal: NodeJS.Signals): void => {
+		try {
+			proc.kill(signal);
+		} catch {
+			// best-effort
+		}
+	};
+
 	try {
-		proc.kill("SIGTERM");
+		if (!killPosixProcessGroup("SIGTERM")) {
+			killDirectChild("SIGTERM");
+		}
 		if (options.fast) {
 			const timer = setTimeout(() => {
-				try {
-					if (!(proc as { killed?: boolean }).killed) {
-						proc.kill("SIGKILL");
+				if (!(proc as { killed?: boolean }).killed) {
+					if (!killPosixProcessGroup("SIGKILL")) {
+						killDirectChild("SIGKILL");
 					}
-				} catch {
-					// best-effort
 				}
 			}, 1500);
 			timer.unref?.();
@@ -514,12 +704,10 @@ export async function killProcessTree(
 		// SIGTERM → 1.5s → SIGKILL escalation.
 		// SIGTERM alone can leave zombie processes if the server hangs.
 		await new Promise<void>((resolve) => setTimeout(resolve, 1500));
-		try {
-			if (!(proc as { killed?: boolean }).killed) {
-				proc.kill("SIGKILL");
+		if (!(proc as { killed?: boolean }).killed) {
+			if (!killPosixProcessGroup("SIGKILL")) {
+				killDirectChild("SIGKILL");
 			}
-		} catch {
-			// best-effort
 		}
 	} catch {
 		// ignore
@@ -635,6 +823,7 @@ export function applyDynamicCapabilities(state: LSPClientState): void {
 		state.workspaceDiagnosticsSupport = {
 			advertised: true,
 			mode: "pull",
+			workspaceDiagnostics: registeredMethods.has("workspace/diagnostic"),
 			diagnosticProviderKind: "dynamic",
 		};
 	} else if (
@@ -645,6 +834,7 @@ export function applyDynamicCapabilities(state: LSPClientState): void {
 		state.workspaceDiagnosticsSupport = {
 			advertised: false,
 			mode: "push-only",
+			workspaceDiagnostics: false,
 			diagnosticProviderKind: "none",
 		};
 	}
@@ -656,7 +846,10 @@ export function applyDynamicCapabilities(state: LSPClientState): void {
 	}
 }
 
-function setupIncomingHandlers(
+// Exported (only) so tests can invoke the publishDiagnostics notification
+// handler directly against a mock LSPClientState/connection without spawning
+// a real language server. Not part of the public client API surface.
+export function setupIncomingHandlers(
 	state: LSPClientState,
 	initialization: Record<string, unknown> | undefined,
 ): void {
@@ -682,12 +875,39 @@ function setupIncomingHandlers(
 				}
 			};
 
+			// Late/superseded-push guard: if the server stamped this push with a
+			// version and that version already lags the latest didChange we sent,
+			// this is analysis for an edit that's since been overtaken — caching it
+			// would let getDiagnostics()/getAllDiagnostics()/pruneDiagnostics() (none
+			// of which consult isVersionStale — that check only gates the *wait*
+			// helper below) serve stale results as current until the next genuinely
+			// fresh push overwrites them. Drop it before it reaches the cache instead.
+			// Checked at write time (not at notification-receipt time) so a push that
+			// arrives fresh but whose debounce timer fires after a later didChange is
+			// still caught. Version-less servers (docVersion undefined) are
+			// unaffected — that's an intentional, separate tradeoff (see
+			// isVersionStale below), not something this guard touches.
+			//
+			// Known, deliberately out-of-scope gaps: the pull-diagnostics path
+			// (clientRequestPullDiagnostics/clientRequestWorkspaceDiagnostics) has no
+			// version stamp to compare against in this codebase's current handling,
+			// so nothing analogous is applied there. And diagnosticsVersion is a
+			// single global counter rather than per-path, so an unrelated path's
+			// fresh push can still satisfy a wait for this path's version bump —
+			// both are separate, larger changes.
+			const isSupersededPush = (): boolean => {
+				if (docVersion === undefined) return false;
+				const currentVersion = state.documentVersions.get(normalizedPath);
+				return currentVersion !== undefined && docVersion < currentVersion;
+			};
+
 			// Seed on first push for servers whose first push is known complete.
 			// Bypasses the debounce timer entirely — resolves waiting promises immediately.
 			if (
 				strategy.seedFirstPush &&
 				!state.pushDiagnostics.has(normalizedPath)
 			) {
+				if (isSupersededPush()) return;
 				state.pushDiagnostics.set(normalizedPath, newDiags);
 				state.pushDiagnosticTimestamps.set(normalizedPath, Date.now());
 				recordDocVersion();
@@ -700,10 +920,11 @@ function setupIncomingHandlers(
 			if (existingTimer) clearTimeout(existingTimer);
 
 			const timer = setTimeout(() => {
+				state.pendingDiagnostics.delete(normalizedPath);
+				if (isSupersededPush()) return;
 				state.pushDiagnostics.set(normalizedPath, newDiags);
 				state.pushDiagnosticTimestamps.set(normalizedPath, Date.now());
 				recordDocVersion();
-				state.pendingDiagnostics.delete(normalizedPath);
 				state.diagnosticsVersion += 1;
 				state.diagnosticEmitter.emit("diagnostics", normalizedPath);
 			}, strategy.debounceMs);
@@ -784,7 +1005,10 @@ function setupIncomingHandlers(
 	state.connection.onRequest("window/workDoneProgress/create", async () => {});
 }
 
-function setupConnectionLifecycle(state: LSPClientState): void {
+function setupConnectionLifecycle(
+	state: LSPClientState,
+	recentStderr: (lines?: number) => string,
+): void {
 	state.connection.onError(([error]: [Error, ...unknown[]]) => {
 		state.lastError = error instanceof Error ? error : new Error(String(error));
 		state.isConnected = false;
@@ -798,12 +1022,20 @@ function setupConnectionLifecycle(state: LSPClientState): void {
 		disposeClientConnection(state);
 	});
 
-	state.lspProcess.process.on("exit", (code) => {
-		const wasConnected = state.isConnected;
+	state.lspProcess.process.on("exit", (code, signal) => {
+		// Gate on shutdownRequested (our own clientShutdown() call), not
+		// isConnected: a genuine crash's connection.onClose/onError handler above
+		// can fire and flip isConnected false BEFORE this 'exit' event arrives,
+		// which used to make the old `wasConnected` check silently swallow every
+		// crash whose transport died before the process itself reported exiting
+		// (previously: 5 ast-grep deaths during a dogfooding sweep logged only
+		// "respawn, uptime=Xms" — no exit code, no signal, no stderr — because
+		// none of them tripped this log).
+		const wasIntentional = state.shutdownRequested;
 		state.isConnected = false;
 		state.isDestroyed = true;
 		disposeClientConnection(state);
-		if (wasConnected) {
+		if (!wasIntentional) {
 			logLatency({
 				type: "phase",
 				phase: "lsp_server_unexpected_exit",
@@ -813,6 +1045,8 @@ function setupConnectionLifecycle(state: LSPClientState): void {
 					serverId: state.serverId,
 					pid: state.lspProcess.pid,
 					exitCode: code ?? null,
+					exitSignal: signal ?? null,
+					stderrTail: recentStderr(20),
 				},
 			});
 		}
@@ -834,15 +1068,24 @@ type PullDiagnosticsOutcome =
 async function clientRequestPullDiagnostics(
 	state: LSPClientState,
 	filePath: string,
+	budgetMs: number = PULL_REQUEST_TIMEOUT_MS,
 ): Promise<PullDiagnosticsOutcome> {
 	if (!isClientAlive(state)) return { status: "unavailable" };
 	const uri = pathToFileURL(filePath).href;
 	try {
-		const report = await safeSendRequest<{
-			kind?: string;
-			items?: LSPDiagnostic[];
-			relatedDocuments?: Record<string, { items?: LSPDiagnostic[] }>;
-		}>(state.connection, "textDocument/diagnostic", { textDocument: { uri } });
+		// withTimeout is the backstop against a hung pull-mode server: without it
+		// this await never settles unless the stream is destroyed. Bounded by the
+		// smaller of the absolute ceiling and the caller's remaining wait budget.
+		// On timeout the caught error yields `unavailable` below (never a false
+		// `clean`), so it falls through to the push-wait/timeout backstop.
+		const report = await withTimeout(
+			safeSendRequest<{
+				kind?: string;
+				items?: LSPDiagnostic[];
+				relatedDocuments?: Record<string, { items?: LSPDiagnostic[] }>;
+			}>(state.connection, "textDocument/diagnostic", { textDocument: { uri } }),
+			Math.max(1, Math.min(PULL_REQUEST_TIMEOUT_MS, budgetMs)),
+		);
 
 		if (!report) return { status: "unavailable" };
 
@@ -881,6 +1124,47 @@ async function clientRequestPullDiagnostics(
 	}
 }
 
+/**
+ * One project-wide `workspace/diagnostic` pull — a single request that returns
+ * diagnostics for every document the server knows, instead of opening N files.
+ * Returns per-file reports, or `undefined` on unsupported/dead/timeout/malformed
+ * (caller falls back to the per-file path). `unchanged`-kind items carry no
+ * diagnostics and are skipped, so a file absent from the result is "clean".
+ */
+export async function clientRequestWorkspaceDiagnostics(
+	state: LSPClientState,
+	budgetMs: number,
+): Promise<Array<{ filePath: string; diagnostics: LSPDiagnostic[] }> | undefined> {
+	if (!isClientAlive(state)) return undefined;
+	if (!state.workspaceDiagnosticsSupport.workspaceDiagnostics) return undefined;
+	try {
+		const report = await withTimeout(
+			safeSendRequest<{
+				items?: Array<{
+					uri?: string;
+					kind?: string;
+					items?: LSPDiagnostic[];
+				}>;
+			}>(state.connection, "workspace/diagnostic", { previousResultIds: [] }),
+			Math.max(1, budgetMs),
+		);
+		if (!report || !Array.isArray(report.items)) return undefined;
+		const out: Array<{ filePath: string; diagnostics: LSPDiagnostic[] }> = [];
+		for (const item of report.items) {
+			// Only "full" reports carry items; "unchanged" means "same as last pull"
+			// (none, since previousResultIds is empty on this one-shot request).
+			if (!item?.uri || item.kind !== "full") continue;
+			out.push({
+				filePath: uriToPath(item.uri),
+				diagnostics: normalizeLspDiagnostics(item.items ?? []),
+			});
+		}
+		return out;
+	} catch {
+		return undefined;
+	}
+}
+
 export async function clientWaitForDiagnostics(
 	state: LSPClientState,
 	filePath: string,
@@ -915,7 +1199,7 @@ export async function clientWaitForDiagnostics(
 		// `hasFreshDiagnostics()`, which is unconditionally true when there is no
 		// version baseline (`minVersion === undefined`), so a failed pull returned
 		// 0 and was read as a fresh clean.
-		let outcome = await clientRequestPullDiagnostics(state, filePath);
+		let outcome = await clientRequestPullDiagnostics(state, filePath, timeoutMs);
 		if (outcome.status === "found") return;
 		let sawClean = outcome.status === "clean";
 
@@ -933,7 +1217,11 @@ export async function clientWaitForDiagnostics(
 			await new Promise((resolve) =>
 				setTimeout(resolve, PULL_DIAGNOSTICS_RETRY_INTERVAL_MS),
 			);
-			outcome = await clientRequestPullDiagnostics(state, filePath);
+			outcome = await clientRequestPullDiagnostics(
+				state,
+				filePath,
+				Math.max(0, retryBudgetMs - (Date.now() - startedAt)),
+			);
 			if (outcome.status === "clean") sawClean = true;
 		}
 		if (outcome.status === "found" || sawClean) return;
@@ -1045,11 +1333,12 @@ export async function handleNotifyOpen(
 		} catch {
 			fileExists = false;
 		}
-		await safeSendNotification(
-			state.connection,
-			"workspace/didChangeWatchedFiles",
-			{ changes: [{ uri, type: fileExists ? 2 : 1 }] },
-		);
+		// #271: enqueue instead of sending now — the per-client queue coalesces a
+		// turn's file opens into a single notification, so push-diagnostics servers
+		// re-analyze the project once per burst rather than once per file. didOpen
+		// (below) still carries this file's content immediately, so the open
+		// document is analyzed without waiting on the batched watcher notify.
+		state.watchQueue.enqueue(uri, fileExists ? 2 : 1);
 	}
 
 	if (!isClientAlive(state)) return;
@@ -1096,6 +1385,7 @@ export async function clientShutdown(
 	state: LSPClientState,
 	options: LSPShutdownOptions = {},
 ): Promise<void> {
+	state.shutdownRequested = true;
 	state.isConnected = false;
 	state.isDestroyed = true;
 	for (const timer of state.pendingDiagnostics.values()) {
@@ -1104,6 +1394,9 @@ export async function clientShutdown(
 	state.pendingDiagnostics.clear();
 	state.pendingOpens.clear();
 	state.openDocuments.clear();
+	// #271: drop any pending watched-files batch + its timer (a dying client's
+	// queued FS changes are moot, and the timer must not outlive the connection).
+	state.watchQueue?.cancel();
 	state.diagnosticEmitter.removeAllListeners();
 	if (!options.fast) {
 		try {
@@ -1122,26 +1415,154 @@ export async function clientShutdown(
 	}
 	disposeClientConnection(state);
 	const pid = state.lspProcess.pid;
+	// #449/#472: deregister this LSP child from the instance registry. Fire-
+	// and-forget (async fs, no spawn) — must not add latency/risk to shutdown,
+	// including the `processExiting` path where the event loop is closing
+	// (#234 forbids spawning here, but a plain fs write/rename is fine; even
+	// so, we don't await it to keep this teardown path as fast as before).
+	void removeLspChild(pid).catch(() => {
+		// best-effort — a stale entry is caught dead-pid by the reaper later
+	});
 	// On Windows, killing the direct child first can orphan grandchildren before
 	// taskkill can traverse the tree. Kill the full tree first and wait briefly.
 	await killProcessTree(state.lspProcess.process, pid, options);
 }
 
-async function navRequest<T>(
+/**
+ * Translate a caller-supplied (UTF-16) `(line, character)` into the position the
+ * server expects under its negotiated encoding (#269). UTF-16 is the identity —
+ * the common case pays nothing (no I/O). For UTF-8/UTF-32 we read the target
+ * line from disk (pi edits files on disk before navigating, so disk == the
+ * server's content) and re-measure the character offset; a read failure falls
+ * back to the raw offset rather than dropping the request.
+ */
+async function toWirePosition(
+	state: LSPClientState,
+	filePath: string,
+	line: number,
+	character: number,
+): Promise<{ line: number; character: number }> {
+	if (state.positionEncoding === "utf-16") return { line, character };
+	try {
+		const content = await readFile(filePath, "utf8");
+		return {
+			line,
+			character: convertCharacterOffset(
+				state.positionEncoding,
+				lineTextAt(content, line),
+				character,
+			),
+		};
+	} catch {
+		return { line, character };
+	}
+}
+
+// #276: drop a navigation result whose document was edited while the request was
+// in flight. Mirrors the diagnostics-path staleness check (isVersionStale) which
+// compares the version computed-against to the latest didChange. Default on;
+// PI_LENS_LSP_NAV_STALE_DROP=0 disables it if it ever over-drops.
+function navStaleDropEnabled(): boolean {
+	return process.env.PI_LENS_LSP_NAV_STALE_DROP !== "0";
+}
+
+// Exported for the timeout regression tests (#365). `timeoutMs` overrides the
+// per-request ceiling so a test can bound a hung server quickly.
+export async function navRequest<T>(
 	state: LSPClientState,
 	method: string,
 	params: Record<string, unknown>,
+	// When provided, the request is dropped if the document's version advances
+	// (an edit landed) between send and response. Omit for non-single-file
+	// requests (workspaceSymbol, call-hierarchy follow-ups) that have no version.
+	staleCheckPath?: string,
+	timeoutMs: number = NAV_REQUEST_TIMEOUT_MS,
+	// Cancels the in-flight request (LSP `$/cancelRequest`) when the turn is
+	// abandoned. Defaults to the ambient abort signal set around dispatch/tool
+	// handling, so callers get cancellation for free without a signature change
+	// (#238 Item 1). Pass explicitly in tests.
+	signal: AbortSignal | undefined = getAmbientAbortSignal(),
 ): Promise<T | null | undefined> {
 	if (!isClientAlive(state)) return null;
-	return withTimeout(
-		safeSendRequest<T>(state.connection, method, params),
-		NAV_REQUEST_TIMEOUT_MS,
+	const normalizedPath =
+		staleCheckPath !== undefined ? normalizeMapKey(staleCheckPath) : undefined;
+	const requestVersion =
+		normalizedPath !== undefined
+			? state.documentVersions.get(normalizedPath)
+			: undefined;
+	const result = (await withTimeout(
+		safeSendRequest<T>(state.connection, method, params, signal),
+		timeoutMs,
 	).catch((err: unknown) => {
 		if (err instanceof Error && err.message.startsWith("Timeout after")) {
 			return undefined;
 		}
 		throw err;
-	}) as Promise<T | undefined>;
+	})) as T | undefined;
+	// requestVersion === undefined (never opened, or version-less) → unaffected,
+	// matching the diagnostics path; the request timeout remains the backstop.
+	if (
+		normalizedPath !== undefined &&
+		requestVersion !== undefined &&
+		navStaleDropEnabled()
+	) {
+		const currentVersion = state.documentVersions.get(normalizedPath);
+		if (currentVersion !== undefined && currentVersion > requestVersion) {
+			return undefined;
+		}
+	}
+	return result;
+}
+
+// Run an advertised server command via workspace/executeCommand, with the
+// generous EXECUTE_COMMAND_TIMEOUT_MS anti-deadlock backstop. Preserves the
+// hardening invariants: allowlist-by-advertisement (only commands the server
+// declared) and the serverEditsAllowed window that gates server-driven
+// applyEdit to the duration of an explicit call. Exported with an overridable
+// `timeoutMs` for the #365 regression tests.
+export async function runServerCommand(
+	state: LSPClientState,
+	command: string,
+	args: unknown[] | undefined,
+	timeoutMs: number = EXECUTE_COMMAND_TIMEOUT_MS,
+): Promise<{ executed: boolean; result?: unknown; reason?: string }> {
+	if (!isClientAlive(state)) {
+		return { executed: false, reason: "lsp client not alive" };
+	}
+	if (!state.advertisedCommands.has(command)) {
+		return {
+			executed: false,
+			reason: `command "${command}" is not advertised by the ${state.serverId} server`,
+		};
+	}
+	state.serverEditsAllowed += 1;
+	try {
+		let result: unknown;
+		try {
+			result = await withTimeout(
+				safeSendRequest<unknown>(state.connection, "workspace/executeCommand", {
+					command,
+					arguments: args ?? [],
+				}),
+				timeoutMs,
+			);
+		} catch (err) {
+			// Generous backstop only: a timeout means the server is hung (or the
+			// command is running longer than the ceiling). Surface it honestly — the
+			// command may still be applying — instead of hanging the caller. Real
+			// (non-timeout) errors still propagate.
+			if (err instanceof Error && err.message.startsWith("Timeout after")) {
+				return {
+					executed: false,
+					reason: `workspace/executeCommand timed out after ${timeoutMs}ms — the command may still be applying server-side`,
+				};
+			}
+			throw err;
+		}
+		return { executed: true, result };
+	} finally {
+		state.serverEditsAllowed -= 1;
+	}
 }
 
 async function resolveCodeActionBestEffort(
@@ -1175,6 +1596,11 @@ export async function createLSPClient(options: {
 	root: string;
 	initialization?: Record<string, unknown>;
 	initializeTimeoutMs?: number;
+	/** See `LSPServerInfo.spawn`'s `launchVariant` (server.ts) — which concrete
+	 *  binary/protocol variant was launched for this server id. Undefined =
+	 *  single-variant server or not yet reported; consumers must treat that as
+	 *  the classic/default behavior (fail-safe). */
+	launchVariant?: "classic" | "native-ts7";
 }): Promise<LSPClientInfo> {
 	installCrashGuard();
 
@@ -1184,7 +1610,24 @@ export async function createLSPClient(options: {
 		root,
 		initialization,
 		initializeTimeoutMs = INITIALIZE_TIMEOUT_MS,
+		launchVariant,
 	} = options;
+
+	// #449/#472: register this LSP child in the cross-process instance registry
+	// as soon as we have a live pid — BEFORE `initialize` completes, not after.
+	// Registering early means a child that dies/hangs during initialize (the
+	// catch block below kills it) is still deregistered by that same path via
+	// removeLspChild, and a process that crashes mid-initialize is still
+	// visible to the orphan reaper rather than silently untracked. Fire-and-
+	// forget: registry I/O must never block or fail LSP startup.
+	void recordLspChild({
+		pid: lspProcess.pid,
+		serverId,
+		command: lspProcess.command,
+		marker: extractSpawnMarker(lspProcess.args),
+	}).catch(() => {
+		// best-effort observability — never fail LSP startup over this
+	});
 
 	const startupState: {
 		exitCode: number | null;
@@ -1294,6 +1737,7 @@ export async function createLSPClient(options: {
 	const state: LSPClientState = {
 		isConnected: true,
 		isDestroyed: false,
+		shutdownRequested: false,
 		connectionDisposed: false,
 		lastError: undefined,
 		connection,
@@ -1313,17 +1757,32 @@ export async function createLSPClient(options: {
 			undefined as unknown as LSPWorkspaceDiagnosticsSupport,
 		operationSupport: undefined as unknown as LSPOperationSupport,
 		staticDiagnosticsMode: "push-only",
+		positionEncoding: "utf-16",
 		dynamicRegistrations: new Map(),
 		advertisedCommands: new Set(),
 		serverEditsAllowed: 0,
 		serverId,
+		launchVariant,
 		root,
 		lspProcess,
+		// two-phase: the flush closure needs `state` (below)
+		watchQueue: undefined as unknown as WatchedFilesQueue,
 	};
+
+	// #271: batch per-file workspace/didChangeWatchedFiles into one notification
+	// per debounce window, so an N-file turn re-indexes the server once, not N×.
+	state.watchQueue = new WatchedFilesQueue((changes) => {
+		if (!isClientAlive(state)) return;
+		void safeSendNotification(
+			state.connection,
+			"workspace/didChangeWatchedFiles",
+			{ changes },
+		);
+	});
 
 	setupIncomingHandlers(state, initialization);
 	connection.listen();
-	setupConnectionLifecycle(state);
+	setupConnectionLifecycle(state, recentStderr);
 
 	let initResult: Awaited<ReturnType<typeof safeSendRequest>>;
 	try {
@@ -1334,18 +1793,7 @@ export async function createLSPClient(options: {
 				workspaceFolders: [
 					{ name: "workspace", uri: pathToFileURL(root).href },
 				],
-				capabilities: {
-					window: { workDoneProgress: true },
-					workspace: {
-						workspaceFolders: true,
-						configuration: true,
-						didChangeWatchedFiles: { dynamicRegistration: true },
-					},
-					textDocument: {
-						synchronization: { didOpen: true, didChange: true },
-						publishDiagnostics: { versionSupport: true },
-					},
-				},
+				capabilities: CLIENT_CAPABILITIES,
 				initializationOptions: initialization,
 			}),
 			initializeTimeoutMs,
@@ -1355,6 +1803,13 @@ export async function createLSPClient(options: {
 		// SIGTERM alone is unreliable on Windows for cmd.exe/PowerShell trees.
 		const pid = lspProcess.pid;
 		void killProcessTree(lspProcess.process, pid);
+		// A child registered above (recordLspChild) but never reaching a healthy
+		// createLSPClient return must still be deregistered here — otherwise the
+		// registry keeps a stale entry for a process we just killed.
+		void removeLspChild(pid).catch(() => {
+			// best-effort — a stale registry entry is harmless (the reaper's
+			// liveness check will find it dead on the next sweep regardless)
+		});
 		setTimeout(() => {
 			if (!lspProcess.process.killed && process.platform !== "win32") {
 				lspProcess.process.kill("SIGKILL");
@@ -1393,6 +1848,9 @@ export async function createLSPClient(options: {
 	state.workspaceDiagnosticsSupport =
 		detectWorkspaceDiagnosticsSupport(initResult);
 	state.operationSupport = detectOperationSupport(initResult);
+	state.positionEncoding = negotiatePositionEncoding(
+		(initResult as { capabilities?: unknown })?.capabilities,
+	);
 	state.rawCapabilityKeys = Object.keys(
 		(initResult as { capabilities?: Record<string, unknown> })?.capabilities ??
 			{},
@@ -1496,6 +1954,10 @@ export async function createLSPClient(options: {
 			return state.workspaceDiagnosticsSupport;
 		},
 
+		requestWorkspaceDiagnostics(budgetMs: number) {
+			return clientRequestWorkspaceDiagnostics(state, budgetMs);
+		},
+
 		getOperationSupport() {
 			return state.operationSupport;
 		},
@@ -1508,29 +1970,12 @@ export async function createLSPClient(options: {
 			return state.rawCapabilityKeys ?? [];
 		},
 
+		getLaunchVariant() {
+			return state.launchVariant;
+		},
+
 		async executeCommand(command, args) {
-			if (!isClientAlive(state)) {
-				return { executed: false, reason: "lsp client not alive" };
-			}
-			// Hardening: allowlist-by-advertisement. Only commands the server
-			// itself declared (static or dynamic) may run — no arbitrary strings.
-			if (!state.advertisedCommands.has(command)) {
-				return {
-					executed: false,
-					reason: `command "${command}" is not advertised by the ${state.serverId} server`,
-				};
-			}
-			state.serverEditsAllowed += 1;
-			try {
-				const result = await safeSendRequest<unknown>(
-					state.connection,
-					"workspace/executeCommand",
-					{ command, arguments: args ?? [] },
-				);
-				return { executed: true, result };
-			} finally {
-				state.serverEditsAllowed -= 1;
-			}
+			return runServerCommand(state, command, args);
 		},
 
 		get diagnosticsVersion() {
@@ -1551,8 +1996,9 @@ export async function createLSPClient(options: {
 				"textDocument/definition",
 				{
 					textDocument: { uri: pathToFileURL(filePath).href },
-					position: { line, character },
+					position: await toWirePosition(state, filePath, line, character),
 				},
+				filePath,
 			);
 			if (!result) return [];
 			return Array.isArray(result) ? result : [result];
@@ -1564,8 +2010,9 @@ export async function createLSPClient(options: {
 				"textDocument/typeDefinition",
 				{
 					textDocument: { uri: pathToFileURL(filePath).href },
-					position: { line, character },
+					position: await toWirePosition(state, filePath, line, character),
 				},
+				filePath,
 			);
 			if (!result) return [];
 			return Array.isArray(result) ? result : [result];
@@ -1577,8 +2024,9 @@ export async function createLSPClient(options: {
 				"textDocument/declaration",
 				{
 					textDocument: { uri: pathToFileURL(filePath).href },
-					position: { line, character },
+					position: await toWirePosition(state, filePath, line, character),
 				},
+				filePath,
 			);
 			if (!result) return [];
 			return Array.isArray(result) ? result : [result];
@@ -1590,18 +2038,24 @@ export async function createLSPClient(options: {
 				"textDocument/references",
 				{
 					textDocument: { uri: pathToFileURL(filePath).href },
-					position: { line, character },
+					position: await toWirePosition(state, filePath, line, character),
 					context: { includeDeclaration },
 				},
+				filePath,
 			);
 			return result ?? [];
 		},
 
 		async hover(filePath, line, character) {
-			const result = await navRequest<LSPHover>(state, "textDocument/hover", {
-				textDocument: { uri: pathToFileURL(filePath).href },
-				position: { line, character },
-			});
+			const result = await navRequest<LSPHover>(
+				state,
+				"textDocument/hover",
+				{
+					textDocument: { uri: pathToFileURL(filePath).href },
+					position: await toWirePosition(state, filePath, line, character),
+				},
+				filePath,
+			);
 			return result ?? null;
 		},
 
@@ -1611,8 +2065,9 @@ export async function createLSPClient(options: {
 				"textDocument/signatureHelp",
 				{
 					textDocument: { uri: pathToFileURL(filePath).href },
-					position: { line, character },
+					position: await toWirePosition(state, filePath, line, character),
 				},
+				filePath,
 			);
 			return result ?? null;
 		},
@@ -1622,31 +2077,36 @@ export async function createLSPClient(options: {
 				state,
 				"textDocument/documentSymbol",
 				{ textDocument: { uri: pathToFileURL(filePath).href } },
+				filePath,
 			);
 			return result ?? [];
 		},
 
 		async workspaceSymbol(query) {
 			if (!isClientAlive(state)) return [];
-			const result = await safeSendRequest<LSPSymbol[]>(
-				connection,
-				"workspace/symbol",
-				{ query },
-			);
+			// Route through navRequest for the shared withTimeout ceiling — a hung
+			// server would otherwise await forever (safeSendRequest only settles on
+			// a reply or a destroyed stream). No staleCheckPath: not single-file.
+			const result = await navRequest<LSPSymbol[]>(state, "workspace/symbol", {
+				query,
+			});
 			return result ?? [];
 		},
 
 		async codeAction(filePath, line, character, endLine, endCharacter) {
 			if (!isClientAlive(state)) return [];
 			const uri = pathToFileURL(filePath).href;
-			const result = await safeSendRequest<unknown[]>(
-				connection,
+			// navRequest adds the shared withTimeout ceiling + single-file
+			// stale-drop (matches documentSymbol); a hung server no longer awaits
+			// forever, and code actions computed against superseded content drop.
+			const result = await navRequest<unknown[]>(
+				state,
 				"textDocument/codeAction",
 				{
 					textDocument: { uri },
 					range: {
-						start: { line, character },
-						end: { line: endLine, character: endCharacter },
+						start: await toWirePosition(state, filePath, line, character),
+						end: await toWirePosition(state, filePath, endLine, endCharacter),
 					},
 					context: {
 						diagnostics: getMergedDiagnosticsForPath(
@@ -1655,6 +2115,7 @@ export async function createLSPClient(options: {
 						),
 					},
 				},
+				filePath,
 			);
 			if (!result || !Array.isArray(result)) return [];
 			const actions = result.filter(
@@ -1672,9 +2133,10 @@ export async function createLSPClient(options: {
 				"textDocument/rename",
 				{
 					textDocument: { uri: pathToFileURL(filePath).href },
-					position: { line, character },
+					position: await toWirePosition(state, filePath, line, character),
 					newName,
 				},
+				filePath,
 			);
 			return result ?? null;
 		},
@@ -1713,8 +2175,9 @@ export async function createLSPClient(options: {
 				"textDocument/implementation",
 				{
 					textDocument: { uri: pathToFileURL(filePath).href },
-					position: { line, character },
+					position: await toWirePosition(state, filePath, line, character),
 				},
+				filePath,
 			);
 			if (!result) return [];
 			return Array.isArray(result) ? result : [result];
@@ -1723,10 +2186,15 @@ export async function createLSPClient(options: {
 		async prepareCallHierarchy(filePath, line, character) {
 			const result = await navRequest<
 				LSPCallHierarchyItem | LSPCallHierarchyItem[]
-			>(state, "textDocument/prepareCallHierarchy", {
-				textDocument: { uri: pathToFileURL(filePath).href },
-				position: { line, character },
-			});
+			>(
+				state,
+				"textDocument/prepareCallHierarchy",
+				{
+					textDocument: { uri: pathToFileURL(filePath).href },
+					position: await toWirePosition(state, filePath, line, character),
+				},
+				filePath,
+			);
 			if (!result) return [];
 			return Array.isArray(result) ? result : [result];
 		},
@@ -1777,19 +2245,79 @@ async function safeSendRequest<T>(
 	connection: MessageConnection,
 	method: string,
 	params: unknown,
+	// When provided, aborting the signal cancels the in-flight request via
+	// vscode-jsonrpc's CancellationToken → an LSP `$/cancelRequest` notification,
+	// so a server stops computing a result the agent has already abandoned (#238
+	// Item 1). The rejection that follows is swallowed (treated as `undefined`).
+	signal?: AbortSignal,
 ): Promise<T | undefined> {
-	try {
-		return (await connection.sendRequest(
-			method as never,
-			params as never,
-		)) as T;
-	} catch (err) {
-		if (isStreamError(err)) {
-			// Silently ignore - stream was destroyed
-			return undefined;
-		}
-		throw err;
+	// Already abandoned before we even sent — don't bother the server.
+	if (signal?.aborted) return undefined;
+
+	let tokenSource: InstanceType<typeof CancellationTokenSource> | undefined;
+	let onAbort: (() => void) | undefined;
+	if (signal) {
+		tokenSource = new CancellationTokenSource();
+		onAbort = () => tokenSource?.cancel();
+		signal.addEventListener("abort", onAbort, { once: true });
 	}
+
+	// Only pass a token when cancellation is wired, so the call shape is unchanged
+	// for the (many) requests without a signal.
+	const send = () =>
+		tokenSource
+			? connection.sendRequest(
+					method as never,
+					params as never,
+					tokenSource.token as never,
+				)
+			: connection.sendRequest(method as never, params as never);
+
+	try {
+		// One safe retry on ContentModified (-32801): the document changed under
+		// us, so the server discarded the request. A single retry beats returning
+		// empty — correctness-under-edit is pi-lens's whole hot path (#238 Item 2).
+		const MAX_ATTEMPTS = 2;
+		for (let attempt = 1; ; attempt++) {
+			try {
+				return (await send()) as T;
+			} catch (err) {
+				if (isStreamError(err) || isCancellationError(err)) {
+					// Stream destroyed, or we cancelled the request on abort — either
+					// way there is no result to return.
+					return undefined;
+				}
+				if (isContentModifiedError(err)) {
+					// Retry once (unless we've since been aborted); if it's still
+					// ContentModified after that, return empty rather than throwing a
+					// code callers don't understand. RequestFailed (-32803) and other
+					// codes are permanent and fall through to the rethrow below.
+					if (attempt < MAX_ATTEMPTS && !signal?.aborted) continue;
+					return undefined;
+				}
+				throw err;
+			}
+		}
+	} finally {
+		if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+		tokenSource?.dispose();
+	}
+}
+
+// vscode-jsonrpc rejects a token-cancelled request with a `ResponseError` whose
+// code is `RequestCancelled` (-32800) or `ServerCancelled` (-32802). Treat both
+// as "no result" rather than a failure. (isStreamError also matches the
+// "cancelled" message text; this adds the structured error-code path.)
+function isCancellationError(err: unknown): boolean {
+	const code = (err as { code?: unknown } | null)?.code;
+	return code === -32800 || code === -32802;
+}
+
+// `ContentModified` (-32801): the document changed while the request was in
+// flight, so the server couldn't answer against a consistent state. Retryable —
+// the only LSP error code worth a second attempt on the edit hot path (#238).
+function isContentModifiedError(err: unknown): boolean {
+	return (err as { code?: unknown } | null)?.code === -32801;
 }
 
 // Helper to detect stream destruction / connection disposal errors.
@@ -1816,29 +2344,6 @@ function isStreamError(err: unknown): boolean {
 
 // Using shared path utilities from path-utils.ts
 
-async function withTimeout<T>(
-	promise: Promise<T>,
-	timeoutMs: number,
-): Promise<T> {
-	let timeout: ReturnType<typeof setTimeout> | undefined;
-	// Suppress unhandled rejection if `promise` rejects AFTER the timeout
-	// wins the race — Promise.race settles on the first result but the
-	// losing promises still run, and any later rejection would be uncaught.
-	promise.catch(() => {});
-	try {
-		return await Promise.race([
-			promise,
-			new Promise<T>((_, reject) => {
-				timeout = setTimeout(
-					() => reject(new Error(`Timeout after ${timeoutMs}ms`)),
-					timeoutMs,
-				);
-			}),
-		]);
-	} finally {
-		if (timeout) clearTimeout(timeout);
-	}
-}
 
 function positiveIntFromEnv(name: string, fallback: number): number {
 	const raw = process.env[name];
@@ -1860,6 +2365,7 @@ function detectWorkspaceDiagnosticsSupport(
 		return {
 			advertised: false,
 			mode: "push-only",
+			workspaceDiagnostics: false,
 			diagnosticProviderKind: "none",
 		};
 	}
@@ -1868,6 +2374,8 @@ function detectWorkspaceDiagnosticsSupport(
 		return {
 			advertised: diagnosticProvider,
 			mode: diagnosticProvider ? "pull" : "push-only",
+			// The boolean form of diagnosticProvider only signals document pull.
+			workspaceDiagnostics: false,
 			diagnosticProviderKind: "boolean",
 		};
 	}
@@ -1876,6 +2384,9 @@ function detectWorkspaceDiagnosticsSupport(
 		return {
 			advertised: true,
 			mode: "pull",
+			workspaceDiagnostics:
+				(diagnosticProvider as { workspaceDiagnostics?: unknown })
+					.workspaceDiagnostics === true,
 			diagnosticProviderKind: "object",
 		};
 	}
@@ -1883,6 +2394,7 @@ function detectWorkspaceDiagnosticsSupport(
 	return {
 		advertised: false,
 		mode: "push-only",
+		workspaceDiagnostics: false,
 		diagnosticProviderKind: typeof diagnosticProvider,
 	};
 }

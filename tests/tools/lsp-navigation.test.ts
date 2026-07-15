@@ -16,6 +16,20 @@ import { createLspNavigationTool } from "../../tools/lsp-navigation.js";
 
 const tmpPath = (name: string): string => path.join(os.tmpdir(), name);
 const tmpFileUrl = (name: string): string => pathToFileURL(tmpPath(name)).href;
+const parseToolJson = (result: {
+	content: Array<{ text?: string }>;
+}): Record<string, unknown> => {
+	try {
+		return JSON.parse(String(result.content[0]?.text)) as Record<
+			string,
+			unknown
+		>;
+	} catch (error) {
+		throw new Error(
+			`Expected parseable lsp_navigation JSON: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+};
 
 describe("lsp_navigation tool", () => {
 	beforeEach(() => {
@@ -77,7 +91,7 @@ describe("lsp_navigation tool", () => {
 		};
 	});
 
-	it("reports cached LSP capabilities without requiring filePath", async () => {
+	it("reports cached LSP capabilities without requiring path", async () => {
 		const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
 		(
 			mocked.service as { getCapabilitySnapshots: ReturnType<typeof vi.fn> }
@@ -113,17 +127,21 @@ describe("lsp_navigation tool", () => {
 		);
 
 		expect(result.isError).toBeUndefined();
+		const envelope = parseToolJson(result);
+		expect(envelope).toMatchObject({
+			tool: "lsp_navigation",
+			operation: "capabilities",
+			ok: true,
+			status: "success",
+			resultCount: 1,
+		});
 		expect(String(result.content[0]?.text)).toContain(
 			"typescript (/workspace)",
 		);
+		expect(String(result.content[0]?.text)).toContain("definition ✓");
+		expect(String(result.content[0]?.text)).toContain("signatureHelp ✗");
 		expect(String(result.content[0]?.text)).toContain(
-			"definition             ✓",
-		);
-		expect(String(result.content[0]?.text)).toContain(
-			"signatureHelp          ✗",
-		);
-		expect(String(result.content[0]?.text)).toContain(
-			"rename_file            ✓  (willRenameFiles/didRenameFiles helper available)",
+			"rename_file ✓ (willRenameFiles/didRenameFiles helper available)",
 		);
 		expect(result.details?.servers).toEqual(["typescript"]);
 	});
@@ -132,7 +150,7 @@ describe("lsp_navigation tool", () => {
 		const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
 		const result = await tool.execute(
 			"capabilities-empty",
-			{ operation: "capabilities", filePath: "missing.ts" },
+			{ operation: "capabilities", path: "missing.ts" },
 			new AbortController().signal,
 			null,
 			{ cwd: "." },
@@ -143,7 +161,27 @@ describe("lsp_navigation tool", () => {
 		expect(result.details?.resultCount).toBe(0);
 	});
 
-	it("allows incomingCalls without filePath when callHierarchyItem exists", async () => {
+	it("returns structured JSON for LSP-disabled errors", async () => {
+		const tool = createLspNavigationTool((flag) => flag === "no-lsp");
+		const result = await tool.execute(
+			"disabled",
+			{ operation: "definition", path: "x.ts", line: 1, character: 1 },
+			new AbortController().signal,
+			null,
+			{ cwd: "." },
+		);
+
+		expect(result.isError).toBe(true);
+		expect(parseToolJson(result)).toMatchObject({
+			tool: "lsp_navigation",
+			operation: "precheck",
+			ok: false,
+			status: "lsp_disabled",
+			resultCount: 0,
+		});
+	});
+
+	it("allows incomingCalls without path when callHierarchyItem exists", async () => {
 		const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
 		const callHierarchyItem = {
 			name: "foo",
@@ -175,7 +213,7 @@ describe("lsp_navigation tool", () => {
 		expect(result.details?.operation).toBe("incomingCalls");
 	});
 
-	it("adds workspaceSymbol hint when filePath is omitted and empty", async () => {
+	it("adds workspaceSymbol hint when path is omitted and empty", async () => {
 		const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
 
 		const result = await tool.execute(
@@ -187,8 +225,13 @@ describe("lsp_navigation tool", () => {
 		);
 
 		expect(result.isError).toBeUndefined();
+		const envelope = parseToolJson(result);
+		expect(envelope.status).toBe("empty");
+		expect(envelope.hints).toEqual([
+			"provide path to scope workspaceSymbol to the active language server/root.",
+		]);
 		expect(String(result.content[0]?.text)).toContain(
-			"Hint: provide filePath to scope workspaceSymbol",
+			"provide path to scope workspaceSymbol",
 		);
 		expect(
 			(mocked.service as { workspaceSymbol: ReturnType<typeof vi.fn> })
@@ -268,7 +311,7 @@ describe("lsp_navigation tool", () => {
 			"type-definition",
 			{
 				operation: "typeDefinition",
-				filePath: path.resolve("tests/tools/lsp-navigation.test.ts"),
+				path: path.resolve("tests/tools/lsp-navigation.test.ts"),
 				line: 1,
 				character: 1,
 			},
@@ -279,6 +322,16 @@ describe("lsp_navigation tool", () => {
 
 		expect(result.isError).toBeUndefined();
 		expect(result.details?.operation).toBe("typeDefinition");
+		expect(parseToolJson(result).locations).toEqual([
+			{
+				uri: tmpFileUrl("types.ts"),
+				filePath: tmpPath("types.ts"),
+				range: {
+					start: { line: 10, character: 1 },
+					end: { line: 10, character: 5 },
+				},
+			},
+		]);
 		expect(
 			(mocked.service as { typeDefinition: ReturnType<typeof vi.fn> })
 				.typeDefinition,
@@ -295,7 +348,7 @@ describe("lsp_navigation tool", () => {
 			"declaration-empty",
 			{
 				operation: "declaration",
-				filePath: path.resolve("tests/tools/lsp-navigation.test.ts"),
+				path: path.resolve("tests/tools/lsp-navigation.test.ts"),
 				line: 1,
 				character: 1,
 			},
@@ -319,7 +372,7 @@ describe("lsp_navigation tool", () => {
 			"references-search-reads",
 			{
 				operation: "references",
-				filePath: path.resolve("tests/tools/lsp-navigation.test.ts"),
+				path: path.resolve("tests/tools/lsp-navigation.test.ts"),
 				line: 1,
 				character: 1,
 			},
@@ -533,7 +586,7 @@ describe("lsp_navigation tool", () => {
 		try {
 			const result = await tool.execute(
 				"3",
-				{ operation: "workspaceSymbol", filePath, query: "normalizeMapKey" },
+				{ operation: "workspaceSymbol", path: filePath, query: "normalizeMapKey" },
 				new AbortController().signal,
 				null,
 				{ cwd: "." },
@@ -573,7 +626,7 @@ describe("lsp_navigation tool", () => {
 		try {
 			const result = await tool.execute(
 				"4",
-				{ operation: "workspaceSymbol", filePath, query: "projected" },
+				{ operation: "workspaceSymbol", path: filePath, query: "projected" },
 				new AbortController().signal,
 				null,
 				{ cwd: "." },
@@ -626,7 +679,7 @@ describe("lsp_navigation tool", () => {
 				"find-symbol",
 				{
 					operation: "findSymbol",
-					filePath,
+					path: filePath,
 					query: "normalize",
 					kinds: ["method"],
 				},
@@ -638,7 +691,7 @@ describe("lsp_navigation tool", () => {
 			expect(result.isError).toBeUndefined();
 			expect(result.details?.resultCount).toBe(1);
 			expect(String(result.content[0]?.text)).toContain("normalizeReport");
-			expect(String(result.content[0]?.text)).toContain('"kind": "method"');
+			expect(String(result.content[0]?.text)).toContain('"kind":"method"');
 		} finally {
 			fs.rmSync(tmpDir, { recursive: true, force: true });
 		}
@@ -653,7 +706,7 @@ describe("lsp_navigation tool", () => {
 		try {
 			const result = await tool.execute(
 				"symbol-column",
-				{ operation: "references", filePath, line: 1, symbol: "myFunc" },
+				{ operation: "references", path: filePath, line: 1, symbol: "myFunc" },
 				new AbortController().signal,
 				null,
 				{ cwd: "." },
@@ -681,7 +734,7 @@ describe("lsp_navigation tool", () => {
 		try {
 			await tool.execute(
 				"symbol-occurrence",
-				{ operation: "references", filePath, line: 1, symbol: "myFunc#2" },
+				{ operation: "references", path: filePath, line: 1, symbol: "myFunc#2" },
 				new AbortController().signal,
 				null,
 				{ cwd: "." },
@@ -704,7 +757,7 @@ describe("lsp_navigation tool", () => {
 		try {
 			const result = await tool.execute(
 				"symbol-case",
-				{ operation: "references", filePath, line: 1, symbol: "myfunc" },
+				{ operation: "references", path: filePath, line: 1, symbol: "myfunc" },
 				new AbortController().signal,
 				null,
 				{ cwd: "." },
@@ -731,7 +784,7 @@ describe("lsp_navigation tool", () => {
 		try {
 			await tool.execute(
 				"symbol-boundary",
-				{ operation: "references", filePath, line: 1, symbol: "myFunc" },
+				{ operation: "references", path: filePath, line: 1, symbol: "myFunc" },
 				new AbortController().signal,
 				null,
 				{ cwd: "." },
@@ -755,7 +808,7 @@ describe("lsp_navigation tool", () => {
 		try {
 			const result = await tool.execute(
 				"symbol-missing",
-				{ operation: "references", filePath, line: 1, symbol: "myFunc" },
+				{ operation: "references", path: filePath, line: 1, symbol: "myFunc" },
 				new AbortController().signal,
 				null,
 				{ cwd: "." },
@@ -784,7 +837,7 @@ describe("lsp_navigation tool", () => {
 				"symbol-explicit",
 				{
 					operation: "references",
-					filePath,
+					path: filePath,
 					line: 1,
 					character: 3,
 					symbol: "myFunc",
@@ -812,7 +865,7 @@ describe("lsp_navigation tool", () => {
 		try {
 			const result = await tool.execute(
 				"5",
-				{ operation: "references", filePath, line: 1, character: 12 },
+				{ operation: "references", path: filePath, line: 1, character: 12 },
 				new AbortController().signal,
 				null,
 				{ cwd: "." },
@@ -838,7 +891,7 @@ describe("lsp_navigation tool", () => {
 				"6",
 				{
 					operation: "codeAction",
-					filePath,
+					path: filePath,
 					line: 1,
 					character: 1,
 					endLine: 1,
@@ -863,7 +916,7 @@ describe("lsp_navigation tool", () => {
 		}
 	});
 
-	it("collects file diagnostics when workspaceDiagnostics gets filePath", async () => {
+	it("collects file diagnostics when workspaceDiagnostics gets path", async () => {
 		const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
 		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-nav-"));
 		const filePath = path.join(tmpDir, "diag.rs");
@@ -894,13 +947,18 @@ describe("lsp_navigation tool", () => {
 		try {
 			const result = await tool.execute(
 				"7",
-				{ operation: "workspaceDiagnostics", filePath },
+				{ operation: "workspaceDiagnostics", path: filePath },
 				new AbortController().signal,
 				null,
 				{ cwd: "." },
 			);
 
 			expect(result.isError).toBeUndefined();
+			const envelope = parseToolJson(result);
+			expect(envelope.status).toBe("success");
+			expect(envelope.notes).toEqual([
+				"path mode requests pull diagnostics for this file and returns the aggregated result",
+			]);
 			expect(result.details?.coverage).toBe("requested-file");
 			expect(result.details?.resultCount).toBe(1);
 			expect(
@@ -935,7 +993,7 @@ describe("lsp_navigation tool", () => {
 				"rename-file-preview",
 				{
 					operation: "rename_file",
-					filePath,
+					path: filePath,
 					newFilePath,
 					apply: false,
 				},
@@ -993,7 +1051,7 @@ describe("lsp_navigation tool", () => {
 				"rename-apply",
 				{
 					operation: "rename",
-					filePath,
+					path: filePath,
 					line: 1,
 					character: 8,
 					newName: "newName",
@@ -1006,7 +1064,7 @@ describe("lsp_navigation tool", () => {
 
 			expect(result.isError).toBeUndefined();
 			expect(result.details?.resultCount).toBe(1);
-			expect(String(result.content[0]?.text)).toContain('"applied": true');
+			expect(String(result.content[0]?.text)).toContain('"applied":true');
 			expect(fs.readFileSync(filePath, "utf-8")).toBe(
 				"const newName = 1;\nconsole.log(newName);\n",
 			);

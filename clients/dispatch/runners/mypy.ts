@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { hasMypyConfig } from "../../tool-policy.js";
 import { PRIORITY } from "../priorities.js";
@@ -15,16 +16,32 @@ import {
 const mypy = createAvailabilityChecker("mypy", "");
 
 // mypy output: file.py:10: error: Incompatible types [assignment]
-function parseMypyOutput(raw: string, filePath: string): Diagnostic[] {
+//
+// mypy follows imports and reports errors in OTHER modules, not just the file
+// it was invoked on. Attribute each diagnostic to the file mypy names (group 1,
+// resolved against cwd) rather than blanket-stamping ctx.filePath — otherwise a
+// cross-file regression is mis-located onto the edited file (#265 A2). We do NOT
+// filter to the edited file: surfacing the cross-file impact is the point.
+export function parseMypyOutput(
+	raw: string,
+	fallbackPath: string,
+	cwd: string,
+): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
 	const linePattern =
 		/^(.+?):(\d+)(?::(\d+))?:\s*(error|warning|note):\s*(.+?)(?:\s+\[([^\]]+)\])?$/gm;
 	for (const match of raw.matchAll(linePattern)) {
-		const [, , lineNum, col, level, message, errorCode] = match;
+		const [, file, lineNum, col, level, message, errorCode] = match;
 		if (!lineNum || !level || !message) continue;
 		if (level === "note") continue; // skip contextual notes
 		const severity = level === "error" ? "error" : "warning";
 		const rule = errorCode ?? "mypy";
+		const filePath =
+			file && file.trim()
+				? path.isAbsolute(file)
+					? file
+					: path.resolve(cwd, file)
+				: fallbackPath;
 		diagnostics.push({
 			id: `mypy-${lineNum}-${rule}`,
 			message: errorCode ? `[${errorCode}] ${message}` : message,
@@ -72,7 +89,7 @@ const mypyRunner: RunnerDefinition = {
 		);
 
 		const raw = `${result.stdout ?? ""}${result.stderr ?? ""}`;
-		const diagnostics = parseMypyOutput(raw, ctx.filePath);
+		const diagnostics = parseMypyOutput(raw, ctx.filePath, cwd);
 		if (diagnostics.length === 0) {
 			return { status: "succeeded", diagnostics: [], semantic: "none" };
 		}

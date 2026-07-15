@@ -12,6 +12,7 @@
  */
 
 import { existsSync, realpathSync } from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { dirname, win32 } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -134,6 +135,32 @@ export function normalizeMapKey(filePath: string): string {
 }
 
 /**
+ * Cheap, syntactic-only Map key normalization: slash-fold + (on Windows)
+ * lowercase. No `realpathSync` / filesystem I/O.
+ *
+ * `normalizeMapKey` (via `normalizeFilePath`) calls `realpathSync.native()` to
+ * get canonical on-disk casing — correct for maps that key long-lived state
+ * shared across call sites (e.g. LSP/read-guard caches), but expensive when
+ * the *point* of the cache is to avoid filesystem calls in the first place:
+ * for a candidate path that does NOT exist (the common case for sibling-probe
+ * memos), `normalizeFilePath` walks up the directory tree doing its own
+ * `existsSync` calls to resolve the nearest existing ancestor — measured at
+ * ~11x slower than the single `existsSync` probe such a cache is trying to
+ * save (refs #191).
+ *
+ * Safe to use ONLY for ephemeral, single-process, single-walk caches whose
+ * keys are produced by this process's own `path.join`/`path.resolve` calls
+ * within the same run (so separators and casing are already consistent
+ * modulo simple slash direction) — never for state shared across processes,
+ * persisted, or compared against externally-supplied paths where symlink /
+ * real-casing resolution actually matters.
+ */
+export function normalizeEphemeralMapKey(filePath: string): string {
+	const slashed = filePath.replace(/\\/g, "/");
+	return process.platform === "win32" ? slashed.toLowerCase() : slashed;
+}
+
+/**
  * Compare two file paths for equality, handling Windows case-insensitivity
  * and mixed separators (backslash vs forward slash).
  */
@@ -183,6 +210,84 @@ export function findNearestContaining(
 		}
 	}
 	return undefined;
+}
+
+export interface FindNearestMarkerRootOptions {
+	/**
+	 * Directory names/files that, if found BEFORE any of `markers`, stop the
+	 * walk and make it return `null` — e.g. `.git`/`.hg`/`.svn` so a search
+	 * starting inside a repo without its own project marker doesn't escape
+	 * past that repo's VCS boundary to pick up an unrelated parent's marker.
+	 * Omit for callers with no such boundary (default: none).
+	 */
+	boundaries?: readonly string[];
+	/** Override for `os.homedir()`, primarily for tests. */
+	homeDir?: string;
+}
+
+/**
+ * Walk up from `startDir` looking for a directory containing any of
+ * `markers`, the same containment-aware climb `knip-client.ts` and
+ * `dead-code-client.ts` each used to hand-roll independently (refs #625):
+ *
+ *   - Never resolves at or above `$HOME` (via `isAtOrAboveHomeDir`) — a
+ *     marker found there has escaped the user's workspace.
+ *   - If `options.boundaries` is given and one is found before any `marker`,
+ *     stops and returns `null` rather than continuing past it.
+ *   - Depth-capped at 64 climbs, matching the callers' existing safety bound
+ *     (guards a pathological symlink loop; real depths are ~10).
+ *   - Returns `null` — never `startDir` — when nothing is found. Callers
+ *     must treat `null` as "no project here", not fall back to the start
+ *     directory (a `null`-swallowing fallback was the #250/#296 bug class:
+ *     scanning $HOME wholesale from a bare cwd).
+ *
+ * For a plain "find nearest containing directory" with no boundary concept,
+ * use `findNearestContaining` instead. Distinct from `startup-scan.ts`'s
+ * `findNearestProjectRoot` (fixed marker list, no boundaries, no home-check —
+ * that caller applies `isAtOrAboveHomeDir` itself afterward); named
+ * differently here to avoid confusion between the two.
+ */
+export function findNearestMarkerRoot(
+	startDir: string,
+	markers: readonly string[],
+	options: FindNearestMarkerRootOptions = {},
+): string | null {
+	const boundaries = options.boundaries ?? [];
+	const homeDir = path.resolve(options.homeDir ?? os.homedir());
+	let current = path.resolve(startDir);
+	for (let depth = 0; depth < 64; depth++) {
+		if (isAtOrAboveHomeDir(current, homeDir)) return null;
+		if (markers.some((m) => existsSync(path.join(current, m)))) return current;
+		if (boundaries.some((m) => existsSync(path.join(current, m)))) return null;
+		const parent = path.dirname(current);
+		if (parent === current) return null;
+		current = parent;
+	}
+	return null;
+}
+
+/**
+ * True when `dir` is the home directory OR an ancestor of it (`/home`,
+ * `C:\Users`, the filesystem root, …). A project-root search that climbs to
+ * such a directory has escaped the user's workspace — walking down from it
+ * scans unrelated trees (the #250 runaway). Use this as the single shared
+ * ceiling on any upward project-root resolution, instead of an exact
+ * `=== os.homedir()` check (which a marker found *above* `$HOME` slips past).
+ * A normal project *under* home (e.g. `~/code/app`) is NOT at-or-above home,
+ * so it still resolves fine. Refs #253.
+ */
+export function isAtOrAboveHomeDir(
+	dir: string,
+	homeDir: string = os.homedir(),
+): boolean {
+	const resolvedDir = path.resolve(dir);
+	const resolvedHome = path.resolve(homeDir);
+	if (resolvedDir === resolvedHome) return true;
+	// `dir` is an ancestor of home ⇢ home lies inside dir ⇢ the relative path
+	// from dir to home has no leading `..` and is not absolute (cross-drive on
+	// Windows yields an absolute rel, correctly treated as "not above").
+	const rel = path.relative(resolvedDir, resolvedHome);
+	return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
 }
 
 export function isUnderDir(child: string, parent: string): boolean {

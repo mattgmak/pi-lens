@@ -21,6 +21,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { mergeServerCapabilitiesDoc } from "./lib/md-matrix.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const argv = process.argv.slice(2);
@@ -145,15 +146,17 @@ lines.push("");
 lines.push("## Diagnostic mode + navigation/edit operations");
 lines.push("");
 lines.push(
-	`Legend: ✓ advertised, · not. ${OPS.map(([k, a]) => `**${a}**=${k}`).join(", ")}; **cmds** = executeCommand allowlist size.`,
+	`Legend: ✓ advertised, · not. **mode** = document diagnostics (\`pull\` = \`textDocument/diagnostic\`, else push-only); **ws-pull** = advertises \`workspace/diagnostic\` (one project-wide pull — the #387 Item 2 fast path). ${OPS.map(([k, a]) => `**${a}**=${k}`).join(", ")}; **cmds** = executeCommand allowlist size.`,
 );
 lines.push("");
-lines.push(`| server | mode | ${OPS.map(([, a]) => a).join(" | ")} | cmds |`);
-lines.push(`|---|---|${OPS.map(() => "---").join("|")}|---|`);
+lines.push(
+	`| server | mode | ws-pull | ${OPS.map(([, a]) => a).join(" | ")} | cmds |`,
+);
+lines.push(`|---|---|---|${OPS.map(() => "---").join("|")}|---|`);
 for (const s of rows) {
 	const ops = OPS.map(([k]) => yn(s.operationSupport?.[k])).join(" | ");
 	lines.push(
-		`| ${s.serverId} | ${s.workspaceDiagnosticsSupport?.mode ?? "?"} | ${ops} | ${s.advertisedCommands?.length ?? 0} |`,
+		`| ${s.serverId} | ${s.workspaceDiagnosticsSupport?.mode ?? "?"} | ${yn(s.workspaceDiagnosticsSupport?.workspaceDiagnostics)} | ${ops} | ${s.advertisedCommands?.length ?? 0} |`,
 	);
 }
 lines.push("");
@@ -193,12 +196,36 @@ if (unavailable.size) {
 }
 lines.push("");
 
-fs.writeFileSync(
-	path.join(repoRoot, "docs", "servercapabilities.md"),
-	lines.join("\n"),
-);
+const docPath = path.join(repoRoot, "docs", "servercapabilities.md");
+const fresh = lines.join("\n");
+
+// #390/#469 partial-doc merge guard: this host (esp. the ubuntu nightly) lacks
+// many toolchains, so servers it couldn't spawn are absent from `rows` and
+// would DROP from the doc on a naive overwrite. mergeServerCapabilitiesDoc
+// (pure, tested in tests/scripts/server-capabilities-merge.test.ts) merges the
+// prior doc's rows/bullets for servers this run didn't capture into the fresh
+// doc — schema-tolerant (a column added this run, like ws-pull, no longer
+// silently disables the whole guard — #469) and also carries over the two
+// bullet sections, which the original guard didn't touch at all.
+let output = fresh;
+try {
+	if (fs.existsSync(docPath)) {
+		const prior = fs.readFileSync(docPath, "utf8");
+		const { text: merged, preservedCount } = mergeServerCapabilitiesDoc(prior, fresh);
+		output = merged;
+		if (preservedCount > 0) {
+			console.error(
+				`merge guard: preserved ${preservedCount} prior server row(s)/bullet(s) not captured this run.`,
+			);
+		}
+	}
+} catch (e) {
+	console.error(`servercapabilities merge guard skipped: ${e?.message ?? e}`);
+}
+
+fs.writeFileSync(docPath, output);
 console.error(
-	`\nWrote docs/servercapabilities.md (${rows.length} servers, ${unavailable.size} unavailable).`,
+	`\nWrote docs/servercapabilities.md (${rows.length} servers captured this run, ${unavailable.size} unavailable).`,
 );
 
 try {

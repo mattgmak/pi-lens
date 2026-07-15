@@ -3,7 +3,10 @@ import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
 	findNearestContaining,
+	findNearestMarkerRoot,
+	isAtOrAboveHomeDir,
 	isExternalOrVendorFile,
+	normalizeEphemeralMapKey,
 	pathToUri,
 	uriToPath,
 	walkUpDirs,
@@ -33,6 +36,34 @@ describe("path-utils", () => {
 		} finally {
 			cleanup();
 		}
+	});
+});
+
+describe("normalizeEphemeralMapKey (refs #191)", () => {
+	it("folds backslash and forward-slash forms to the same key", () => {
+		const forward = "C:/Users/foo/src/plan.js";
+		const back = "C:\\Users\\foo\\src\\plan.js";
+
+		expect(normalizeEphemeralMapKey(forward)).toBe(
+			normalizeEphemeralMapKey(back),
+		);
+	});
+
+	it("does not touch the filesystem (never throws for a nonexistent path, no realpath resolution)", () => {
+		const nonExistent = "C:\\definitely\\not\\a\\real\\path\\file.ts";
+		expect(() => normalizeEphemeralMapKey(nonExistent)).not.toThrow();
+		// Purely syntactic: slash-folded (+ lowercased on win32), not
+		// realpath-resolved, so it must not depend on the path existing.
+		expect(normalizeEphemeralMapKey(nonExistent)).toContain(
+			"/definitely/not/a/real/path/file.ts",
+		);
+	});
+
+	it("is case-insensitive on win32 semantics (matches this suite's Windows CI target)", () => {
+		if (process.platform !== "win32") return;
+		expect(normalizeEphemeralMapKey("C:\\Foo\\BAR.TS")).toBe(
+			normalizeEphemeralMapKey("c:\\foo\\bar.ts"),
+		);
 	});
 });
 
@@ -106,6 +137,140 @@ describe("walkUpDirs / findNearestContaining (#122)", () => {
 		} finally {
 			env.cleanup();
 		}
+	});
+});
+
+describe("findNearestMarkerRoot (refs #625)", () => {
+	it("resolves the nearest directory containing a marker", () => {
+		const env = setupTestEnvironment("pi-lens-marker-root-");
+		try {
+			fs.writeFileSync(path.join(env.tmpDir, "package.json"), "{}");
+			const nested = path.join(env.tmpDir, "src", "pkg");
+			fs.mkdirSync(nested, { recursive: true });
+
+			expect(findNearestMarkerRoot(nested, ["package.json"])).toBe(
+				path.resolve(env.tmpDir),
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("never resolves at or above the given home dir", () => {
+		const env = setupTestEnvironment("pi-lens-marker-root-home-");
+		try {
+			const ancestor = path.join(env.tmpDir, "ancestor");
+			const home = path.join(ancestor, "home");
+			const nested = path.join(home, "empty-folder");
+			fs.mkdirSync(nested, { recursive: true });
+			fs.writeFileSync(path.join(ancestor, "package.json"), "{}");
+
+			expect(
+				findNearestMarkerRoot(nested, ["package.json"], { homeDir: home }),
+			).toBeNull();
+			// The home dir itself is also at-or-above home.
+			fs.writeFileSync(path.join(home, "package.json"), "{}");
+			expect(
+				findNearestMarkerRoot(home, ["package.json"], { homeDir: home }),
+			).toBeNull();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("stops at a boundary marker found before any project marker", () => {
+		const env = setupTestEnvironment("pi-lens-marker-root-boundary-");
+		try {
+			fs.writeFileSync(path.join(env.tmpDir, "package.json"), "{}");
+			const repoRoot = path.join(env.tmpDir, "sub-repo");
+			const nested = path.join(repoRoot, "src");
+			fs.mkdirSync(path.join(repoRoot, ".git"), { recursive: true });
+			fs.mkdirSync(nested, { recursive: true });
+
+			expect(
+				findNearestMarkerRoot(nested, ["package.json"], {
+					boundaries: [".git", ".hg", ".svn"],
+				}),
+			).toBeNull();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not stop at a boundary that coincides with the marker directory itself", () => {
+		const env = setupTestEnvironment("pi-lens-marker-root-boundary-same-");
+		try {
+			const repoRoot = path.join(env.tmpDir, "repo");
+			const nested = path.join(repoRoot, "src");
+			fs.mkdirSync(path.join(repoRoot, ".git"), { recursive: true });
+			fs.writeFileSync(path.join(repoRoot, "package.json"), "{}");
+			fs.mkdirSync(nested, { recursive: true });
+
+			// Marker check happens before the boundary check at each directory, so
+			// a marker co-located with the boundary still resolves.
+			expect(
+				findNearestMarkerRoot(nested, ["package.json"], {
+					boundaries: [".git"],
+				}),
+			).toBe(path.resolve(repoRoot));
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("returns null (never startDir) when nothing matches up to the filesystem root", () => {
+		const env = setupTestEnvironment("pi-lens-marker-root-none-");
+		try {
+			const nested = path.join(env.tmpDir, "deep", "nowhere");
+			fs.mkdirSync(nested, { recursive: true });
+
+			const found = findNearestMarkerRoot(nested, [
+				"this-marker-will-not-collide-XYZZY-pi-lens",
+			]);
+			expect(found).not.toBe(nested);
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+describe("isAtOrAboveHomeDir (#253)", () => {
+	// Use a synthetic home so the assertions are platform-stable.
+	const home = path.resolve(path.join("tmp-home", "user"));
+
+	it("treats the home directory itself as at-or-above home", () => {
+		expect(isAtOrAboveHomeDir(home, home)).toBe(true);
+	});
+
+	it("treats an ancestor of home as at-or-above home (the #253 escape)", () => {
+		const ancestor = path.dirname(home); // …/tmp-home
+		const grandAncestor = path.dirname(ancestor);
+		expect(isAtOrAboveHomeDir(ancestor, home)).toBe(true);
+		expect(isAtOrAboveHomeDir(grandAncestor, home)).toBe(true);
+	});
+
+	it("treats the filesystem root as at-or-above home", () => {
+		const { root } = path.parse(home);
+		expect(isAtOrAboveHomeDir(root, home)).toBe(true);
+	});
+
+	it("treats a project UNDER home as not at-or-above home", () => {
+		expect(isAtOrAboveHomeDir(path.join(home, "code", "app"), home)).toBe(
+			false,
+		);
+		expect(isAtOrAboveHomeDir(path.join(home, "proj"), home)).toBe(false);
+	});
+
+	it("treats a sibling/unrelated tree as not at-or-above home", () => {
+		const sibling = path.join(path.dirname(home), "someone-else", "proj");
+		expect(isAtOrAboveHomeDir(sibling, home)).toBe(false);
+	});
+
+	it("normalizes unresolved paths before comparing", () => {
+		expect(isAtOrAboveHomeDir(path.join(home, "x", ".."), home)).toBe(true);
+		expect(isAtOrAboveHomeDir(path.join(home, "a", "..", "b"), home)).toBe(
+			false,
+		);
 	});
 });
 

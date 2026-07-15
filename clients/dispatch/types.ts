@@ -2,7 +2,7 @@
  * Redesigned Dispatch Types for pi-lens
  *
  * Key insight: Different clients have different OUTPUT SEMANTICS:
- * - BLOCKING: Errors that stop the agent (architect, ts-lsp errors)
+ * - BLOCKING: Errors that stop the agent (architect, lsp errors)
  * - WARNING: Non-blocking issues (biome warnings, type-safety)
  * - FIXABLE: Issues with auto-fix available
  * - SILENT: Metrics tracked but not shown (complexity)
@@ -13,6 +13,7 @@
 
 import type { FileKind } from "../file-kinds.js";
 import type { FileRole } from "../file-role.js";
+import type { PiLensProjectConfig } from "../project-lens-config.js";
 
 export type DefectClass =
 	| "silent-error"
@@ -155,6 +156,8 @@ export interface RunnerResult {
 
 export interface DispatchContext {
 	readonly filePath: string;
+	/** Workspace/project root before language-specific root resolution. */
+	readonly projectRoot?: string;
 	readonly cwd: string;
 	readonly kind: FileKind | undefined;
 	readonly fileRole: FileRole;
@@ -162,6 +165,8 @@ export interface DispatchContext {
 	readonly autofix: boolean;
 	readonly deltaMode: boolean;
 	readonly facts: import("./fact-store.js").FactStore;
+	/** Project-local .pi-lens.json config captured for this dispatch. */
+	readonly projectConfig?: PiLensProjectConfig;
 	/** Only run blocking rules (severity: error) - used for fast feedback on file write */
 	readonly blockingOnly?: boolean;
 	readonly modifiedRanges?: ModifiedRange[];

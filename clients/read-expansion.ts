@@ -8,6 +8,7 @@
  */
 
 import * as fs from "node:fs";
+import { withBudget } from "./deadline-utils.js";
 import type { TreeSitterClient } from "./tree-sitter-client.js";
 
 /** Only expand reads smaller than this (lines). Larger reads don't benefit. */
@@ -59,6 +60,14 @@ const EXT_TO_LANG: Record<string, string> = {
 	".sh": "bash",
 	".bash": "bash",
 };
+
+/**
+ * Canonical set of source-code file extensions pi-lens understands, derived
+ * from the same {@link EXT_TO_LANG} map the read-coverage path uses. Exported as
+ * the single source of truth so language-spanning scanners cover every
+ * supported language instead of a hardcoded subset (#262).
+ */
+export const CODE_FILE_EXTENSIONS: readonly string[] = Object.keys(EXT_TO_LANG);
 
 /** AST node types considered "enclosing symbols" for coverage purposes. */
 const ENCLOSING_TYPES: Record<string, string[]> = {
@@ -196,21 +205,6 @@ function buildAncestryChain(node: any, types: string[]): AncestorSymbol[] {
 	return chain.reverse(); // outermost first
 }
 
-function withBudget<T>(
-	promise: Promise<T>,
-	budgetMs: number,
-): Promise<T | undefined> {
-	if (budgetMs <= 0) return Promise.resolve(undefined);
-	let t: ReturnType<typeof setTimeout> | undefined;
-	return Promise.race([
-		promise,
-		new Promise<undefined>((resolve) => {
-			t = setTimeout(() => resolve(undefined), budgetMs);
-		}),
-	]).finally(() => {
-		if (t) clearTimeout(t);
-	});
-}
 
 function tryExpandMarkdownSection(
 	content: string,

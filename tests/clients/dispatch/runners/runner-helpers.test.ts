@@ -3,13 +3,17 @@ import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	createAvailabilityChecker,
+	lspPrimaryCoversFile,
 	resolveCommandArgsWithInstallFallback,
 	resolveCommandWithInstallFallback,
+	resolveLocalFirstAsync,
 	resolveNodeToolCommand,
 	resolveToolCommand,
 	resolveToolCommandWithInstallFallback,
 	resolveVendorToolCommand,
 } from "../../../../clients/dispatch/runners/utils/runner-helpers.ts";
+import type { DispatchContext } from "../../../../clients/dispatch/types.ts";
+import { findGlobalBinary } from "../../../../clients/package-manager.js";
 import { setupTestEnvironment } from "../../test-utils.js";
 
 vi.mock("../../../../clients/safe-spawn.js", () => ({
@@ -21,6 +25,13 @@ vi.mock("../../../../clients/installer/index.js", () => ({
 	ensureTool: vi.fn(async () => null),
 }));
 
+vi.mock("../../../../clients/package-manager.js", async (importOriginal) => ({
+	...(await importOriginal<
+		typeof import("../../../../clients/package-manager.js")
+	>()),
+	findGlobalBinary: vi.fn(async () => undefined),
+}));
+
 describe("runner-helpers availability checker", () => {
 	beforeEach(async () => {
 		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
@@ -28,6 +39,8 @@ describe("runner-helpers availability checker", () => {
 		vi.mocked(safeSpawnMod.safeSpawn).mockReset();
 		vi.mocked(safeSpawnMod.safeSpawnAsync).mockReset();
 		vi.mocked(installerMod.ensureTool).mockReset();
+		vi.mocked(findGlobalBinary).mockReset();
+		vi.mocked(findGlobalBinary).mockResolvedValue(undefined);
 	});
 
 	it("resolves local node_modules/.bin commands before global fallback", () => {
@@ -171,6 +184,107 @@ describe("runner-helpers availability checker", () => {
 		const checker = createAvailabilityChecker("sometool");
 		expect(await checker.isAvailableAsync(process.cwd())).toBe(true);
 		expect(probedArgs).toEqual(["--version"]);
+	});
+
+	it("lspPrimaryCoversFile: true when the named server is the file's primary (#233)", () => {
+		const ctx = {
+			filePath: "/proj/config.toml",
+			pi: { getFlag: () => false },
+		} as unknown as DispatchContext;
+		// the `toml` LSP server (taplo lsp) is the sole primary for .toml
+		expect(lspPrimaryCoversFile(ctx, "toml")).toBe(true);
+		const sh = {
+			filePath: "/proj/deploy.sh",
+			pi: { getFlag: () => false },
+		} as unknown as DispatchContext;
+		expect(lspPrimaryCoversFile(sh, "bash")).toBe(true);
+	});
+
+	it("lspPrimaryCoversFile: false when no-lsp kills the runner (#233)", () => {
+		const ctx = {
+			filePath: "/proj/config.toml",
+			pi: { getFlag: (f: string) => f === "no-lsp" },
+		} as unknown as DispatchContext;
+		expect(lspPrimaryCoversFile(ctx, "toml")).toBe(false);
+	});
+
+	it("lspPrimaryCoversFile: false when the server is not this file's primary (#233)", () => {
+		// a .py file's primary is the python server, not toml — so the taplo CLI
+		// must NOT self-skip on it.
+		const ctx = {
+			filePath: "/proj/main.py",
+			pi: { getFlag: () => false },
+		} as unknown as DispatchContext;
+		expect(lspPrimaryCoversFile(ctx, "toml")).toBe(false);
+	});
+
+	it("resolveLocalFirstAsync: local node_modules/.bin wins without any probe", async () => {
+		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
+		const env = setupTestEnvironment("pi-lens-local-first-");
+		try {
+			const isWin = process.platform === "win32";
+			const binName = isWin ? "prisma.cmd" : "prisma";
+			const local = path.join(env.tmpDir, "node_modules", ".bin", binName);
+			fs.mkdirSync(path.dirname(local), { recursive: true });
+			fs.writeFileSync(local, isWin ? "@echo off\n" : "#!/bin/sh\n");
+
+			const resolved = await resolveLocalFirstAsync("prisma", env.tmpDir);
+			expect(resolved).toEqual({ cmd: local, args: [] });
+			// Local hit short-circuits — no global-bin lookup, no PATH spawn.
+			expect(findGlobalBinary).not.toHaveBeenCalled();
+			expect(safeSpawnMod.safeSpawnAsync).not.toHaveBeenCalled();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("resolveLocalFirstAsync: falls to a manager's global bin dir before PATH", async () => {
+		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
+		const env = setupTestEnvironment("pi-lens-global-bin-");
+		try {
+			const globalPath = path.join("/opt/pnpm/bin", "prisma");
+			vi.mocked(findGlobalBinary).mockResolvedValueOnce(globalPath);
+
+			const resolved = await resolveLocalFirstAsync("prisma", env.tmpDir);
+			expect(resolved).toEqual({ cmd: globalPath, args: [] });
+			expect(findGlobalBinary).toHaveBeenCalledWith("prisma", ".cmd");
+			// Found via direct file lookup — the PATH `--version` spawn is skipped.
+			expect(safeSpawnMod.safeSpawnAsync).not.toHaveBeenCalled();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("resolveLocalFirstAsync: PATH probe when no local/global bin, else npx --no", async () => {
+		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
+		const env = setupTestEnvironment("pi-lens-path-probe-");
+		try {
+			vi.mocked(findGlobalBinary).mockResolvedValue(undefined);
+
+			// On PATH: `<tool> --version` exits 0 → run it bare.
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockResolvedValueOnce({
+				stdout: "5.0.0",
+				stderr: "",
+				status: 0,
+			});
+			expect(await resolveLocalFirstAsync("prisma", env.tmpDir)).toEqual({
+				cmd: "prisma",
+				args: [],
+			});
+
+			// Not on PATH → universal cache-only `npx --no` fallback (no dlx fetch).
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockResolvedValueOnce({
+				stdout: "",
+				stderr: "not found",
+				status: 1,
+			});
+			expect(await resolveLocalFirstAsync("prisma", env.tmpDir)).toEqual({
+				cmd: "npx",
+				args: ["--no", "prisma"],
+			});
+		} finally {
+			env.cleanup();
+		}
 	});
 
 	it("caches availability per cwd (does not leak false across projects)", async () => {

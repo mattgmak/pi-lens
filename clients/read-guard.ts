@@ -342,6 +342,46 @@ export class ReadGuard {
 	}
 
 	/**
+	 * Record a structured symbol read (the `readSymbol` engine capability / its
+	 * MCP mirror) as a genuine read of that symbol's line range — the
+	 * read-substitute tie-in for #245. `readSymbol` returns the verbatim body, so
+	 * an edit within [startLine, endLine] is legitimately covered, exactly like a
+	 * TS/LSP-expanded read that delivered the whole enclosing symbol. Line hashes
+	 * for the range are captured by recordRead, so the edit is also
+	 * snapshot-verified (drift since the symbol read still blocks).
+	 *
+	 * Intentionally NOT offered for module *outlines*: an outline shows a symbol's
+	 * shape (name/signature/range), not its body, so granting edit coverage from
+	 * it would let the agent edit lines it never saw. Only a body-delivering read
+	 * (readSymbol / raw Read) records coverage.
+	 */
+	recordSymbolRead(
+		filePath: string,
+		symbol: { name: string; kind: string; startLine: number; endLine: number },
+		turnIndex: number,
+		writeIndex: number,
+	): void {
+		const span = Math.max(1, symbol.endLine - symbol.startLine + 1);
+		this.recordRead({
+			filePath,
+			requestedOffset: symbol.startLine,
+			requestedLimit: span,
+			effectiveOffset: symbol.startLine,
+			effectiveLimit: span,
+			expandedByLsp: false,
+			enclosingSymbol: {
+				name: symbol.name,
+				kind: symbol.kind,
+				startLine: symbol.startLine,
+				endLine: symbol.endLine,
+			},
+			turnIndex,
+			writeIndex,
+			timestamp: Date.now(),
+		});
+	}
+
+	/**
 	 * Check if an edit should be allowed.
 	 * Returns verdict with action and optional reason for blocking.
 	 */

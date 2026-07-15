@@ -47,14 +47,23 @@
  */
 
 import { spawn } from "node:child_process";
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import fs from "node:fs/promises";
 import https from "node:https";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+
+const _installerRequire = createRequire(import.meta.url);
 import { createGunzip } from "node:zlib";
 import { isTestMode } from "../env-utils.js";
 import { getGlobalPiLensDir } from "../file-utils.js";
+import {
+	allAvailableGlobalBinDirs,
+	installArgs,
+	pmBinary,
+	resolveNodePackageManager,
+} from "../package-manager.js";
 
 // Global installation directory for pi-lens tools
 const TOOLS_DIR = path.join(getGlobalPiLensDir(), "tools");
@@ -134,16 +143,43 @@ export interface MavenJarSpec {
 }
 
 export interface ArchiveSpec {
-	/** Download URL for the distribution archive (.tgz/.zip). */
-	url: string;
+	/**
+	 * Download URL for the distribution archive (.tgz/.zip). Either a single
+	 * platform-agnostic string (e.g. PowerShell Editor Services, a .NET bundle) or
+	 * a resolver `(platform, arch) => url | undefined` for servers that ship a
+	 * per-platform (and sometimes per-arch) archive — clangd, lua-language-server,
+	 * etc. Returning `undefined` marks the current platform/arch unsupported, and
+	 * the install degrades to "unavailable" (never a hard failure).
+	 *   platform: "linux" | "darwin" | "win32"
+	 *   arch:     "x64" | "arm64" | ...
+	 */
+	url: string | ((platform: string, arch: string) => string | undefined);
 	/** Archive kind — both extracted via `tar` (Windows bsdtar handles zip too). */
 	kind: "tgz" | "zip";
 	/**
 	 * Launcher path relative to the archive's top-level dir (which is stripped on
 	 * extraction), e.g. "bin/spotbugs". On win32 the installer resolves the
-	 * sibling `.bat`.
+	 * sibling `.bat`. OMIT for a TREE BUNDLE (a multi-folder module distribution
+	 * with no single launcher binary, e.g. PowerShellEditorServices) — the whole
+	 * extracted tree is the artifact and the install resolves to the extract dir
+	 * (`~/.pi-lens/tools/<id>`) rather than a shim. The consuming server then
+	 * launches a runtime (pwsh/java/node) against a bootstrap inside the tree.
 	 */
-	launcher: string;
+	launcher?: string;
+	/**
+	 * Components to strip on extraction. Default 1: drops a single versioned
+	 * top-level dir so launcher paths are stable (spotbugs-X.Y.Z/bin → bin). Set 0
+	 * for a multi-folder bundle that has NO wrapping dir (PSES extracts several
+	 * sibling module folders at the root — stripping would flatten/merge them).
+	 */
+	stripComponents?: number;
+	/**
+	 * For a tree bundle (no launcher), a path relative to the extract dir that must
+	 * exist after extraction to confirm success, e.g.
+	 * "PowerShellEditorServices/Start-EditorServices.ps1". Used in place of the
+	 * launcher-existence check.
+	 */
+	treeMarker?: string;
 }
 
 export interface ToolDefinition {
@@ -157,6 +193,43 @@ export interface ToolDefinition {
 	github?: GitHubAssetSpec;
 	maven?: MavenJarSpec;
 	archive?: ArchiveSpec;
+	/**
+	 * For npm tools whose runnable binary ships in a per-platform
+	 * optional-dependency package (e.g. `@ast-grep/cli-<platform>`,
+	 * `@biomejs/cli-<platform>`). Under pnpm/bun the main package's JS launcher
+	 * frequently can't locate that binary (symlink store / skipped postinstall),
+	 * but the binary itself IS installed — so resolve it directly. The general
+	 * mechanism for any npm/pnpm/bun-distributed platform-CLI tool.
+	 */
+	platformPackage?: PlatformPackageSpec;
+}
+
+export interface PlatformPackageSpec {
+	/** Base name; the platform package is `${base}-${suffix}`. Defaults to `packageName`. */
+	base?: string;
+	/** node `${platform}-${arch}` → npm package-name suffix. */
+	suffixes: Record<string, string>;
+	/** Candidate binary filenames at the platform package root (first existing wins). */
+	binaries: string[];
+}
+
+/**
+ * Build a GitHub-release `assetMatch` from a small per-platform table, replacing
+ * the copy-pasted `if (platform === "linux") return arch === "arm64" ? … : …`
+ * ladder that several release entries repeat verbatim. Each platform maps to its
+ * `x64` (default) and optional `arm64` asset substring; a missing platform or
+ * arch ⇒ unsupported (`undefined`), exactly as the hand-written ladders behaved.
+ */
+function archAssetMatch(table: {
+	linux?: { x64?: string; arm64?: string };
+	darwin?: { x64?: string; arm64?: string };
+	win32?: { x64?: string; arm64?: string };
+}): (platform: string, arch: string) => string | undefined {
+	return (platform, arch) => {
+		const entry = table[platform as "linux" | "darwin" | "win32"];
+		if (!entry) return undefined;
+		return arch === "arm64" ? entry.arm64 : entry.x64;
+	};
 }
 
 export const TOOLS: ToolDefinition[] = [
@@ -226,6 +299,18 @@ export const TOOLS: ToolDefinition[] = [
 		installStrategy: "npm",
 		packageName: "@biomejs/biome",
 		binaryName: "biome",
+		platformPackage: {
+			base: "@biomejs/cli",
+			suffixes: {
+				"linux-x64": "linux-x64",
+				"linux-arm64": "linux-arm64",
+				"darwin-x64": "darwin-x64",
+				"darwin-arm64": "darwin-arm64",
+				"win32-x64": "win32-x64",
+				"win32-arm64": "win32-arm64",
+			},
+			binaries: ["biome"],
+		},
 	},
 	// Analysis tools (run at session start / turn end)
 	{
@@ -243,7 +328,7 @@ export const TOOLS: ToolDefinition[] = [
 		checkCommand: "jscpd",
 		checkArgs: ["--version"],
 		installStrategy: "npm",
-		packageName: "jscpd@3.5.10", // jscpd v4 introduced reprism dep whose lib/languages/ dir is missing from the published package — v3.5.x is the last stable release
+		packageName: "jscpd@5.0.12", // v4's packaging bug (reprism dep missing lib/languages/) is gone in v5's ground-up Rust rewrite — verified: real per-platform native binary (jscpd-windows-x64-msvc etc. via optionalDependencies, no missing-dir regression), --min-lines/--min-tokens/--reporters/--output/--ignore all unchanged, JSON schema fields read by clients/jscpd-client.ts's parseReport() (statistics.total.*, duplicates[].firstFile/secondFile.name+start, .lines, .tokens) are identical, and it's ~50x faster on this repo (4.1s -> 76ms detection time) — closes #582
 		binaryName: "jscpd",
 	},
 	// Structural search and dead code detection
@@ -255,6 +340,18 @@ export const TOOLS: ToolDefinition[] = [
 		installStrategy: "npm",
 		packageName: "@ast-grep/cli",
 		binaryName: "ast-grep",
+		platformPackage: {
+			suffixes: {
+				"linux-x64": "linux-x64-gnu",
+				"linux-arm64": "linux-arm64-gnu",
+				"darwin-x64": "darwin-x64",
+				"darwin-arm64": "darwin-arm64",
+				"win32-x64": "win32-x64-msvc",
+				"win32-arm64": "win32-arm64-msvc",
+				"win32-ia32": "win32-ia32-msvc",
+			},
+			binaries: ["ast-grep", "sg"],
+		},
 	},
 	{
 		id: "knip",
@@ -648,6 +745,101 @@ export const TOOLS: ToolDefinition[] = [
 		},
 	},
 	{
+		// PowerShell Editor Services (#278). NOT a single binary — a multi-folder
+		// PowerShell MODULE BUNDLE launched via `pwsh Start-EditorServices.ps1
+		// -Stdio` (see PowerShellServer.spawn). archive TREE BUNDLE: the release zip
+		// extracts sibling module dirs (PowerShellEditorServices/, PSReadLine/,
+		// PSScriptAnalyzer/) at the root with no wrapping dir, so stripComponents:0
+		// + no launcher — the whole tree is kept and resolved to its extract dir.
+		// checkCommand "pwsh" documents the runtime but is unused for resolution
+		// (tree bundles resolve only via the extract dir + treeMarker).
+		id: "powershell-editor-services",
+		name: "PowerShell Editor Services",
+		checkCommand: "pwsh",
+		checkArgs: ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"],
+		installStrategy: "archive",
+		binaryName: "powershell-editor-services",
+		archive: {
+			url: "https://github.com/PowerShell/PowerShellEditorServices/releases/download/v4.6.0/PowerShellEditorServices.zip",
+			kind: "zip",
+			stripComponents: 0,
+			treeMarker: "PowerShellEditorServices/Start-EditorServices.ps1",
+		},
+	},
+	{
+		// clangd (C/C++/Obj-C LSP, #241) — a self-contained native TREE BUNDLE: the
+		// release zip wraps `clangd_<ver>/{bin,lib}` (bin/clangd[.exe] + the bundled
+		// libclang headers under lib/), so stripComponents:1 drops the version dir and
+		// the whole tree is kept (no launcher). Unlike PSES there is no external
+		// runtime — CppServer launches `<bundle>/bin/clangd` directly. checkCommand
+		// documents the binary but is unused for resolution (tree bundles resolve only
+		// via the extract dir + treeMarker). Platform-matched url: clangd ships x64
+		// prebuilts; arm runs the x64 build under Rosetta/emulation (darwin/win32),
+		// while linux/arm64 has no official build → undefined (graceful unavailable).
+		id: "clangd",
+		name: "clangd",
+		checkCommand: "clangd",
+		checkArgs: ["--version"],
+		installStrategy: "archive",
+		binaryName: "clangd",
+		archive: {
+			url: (platform, arch) => {
+				const version = "22.1.0";
+				const base = `https://github.com/clangd/clangd/releases/download/${version}`;
+				if (platform === "linux")
+					return arch === "x64" ? `${base}/clangd-linux-${version}.zip` : undefined;
+				if (platform === "darwin") return `${base}/clangd-mac-${version}.zip`;
+				if (platform === "win32") return `${base}/clangd-windows-${version}.zip`;
+				return undefined;
+			},
+			kind: "zip",
+			stripComponents: 1,
+			treeMarker: "bin",
+		},
+	},
+	{
+		// lua-language-server (#564, split from #241) — same self-contained native
+		// TREE BUNDLE shape as clangd: bin/lua-language-server[.exe] + bundled
+		// locale/meta files, no external runtime. UNLIKE clangd, the release
+		// archive has NO wrapping version dir (verified by inspecting the actual
+		// 3.18.2 linux-x64 .tar.gz and win32-x64 .zip contents: `bin/`, `LICENSE`,
+		// `locale/`, … sit at archive root) — so stripComponents:0, not 1.
+		// LuaServer launches `<bundle>/bin/lua-language-server` directly.
+		// checkCommand documents the binary but is unused for resolution (tree
+		// bundles resolve only via the extract dir + treeMarker). Platform-matched
+		// url: LuaLS publishes darwin/linux x64+arm64 and win32 x64 (no win32/arm64
+		// build as of 3.18.2 → undefined, graceful unavailable); asset naming
+		// verified against the live GitHub release listing, not guessed.
+		id: "lua-language-server",
+		name: "lua-language-server",
+		checkCommand: "lua-language-server",
+		checkArgs: ["--version"],
+		installStrategy: "archive",
+		binaryName: "lua-language-server",
+		archive: {
+			url: (platform, arch) => {
+				const version = "3.18.2";
+				const base = `https://github.com/LuaLS/lua-language-server/releases/download/${version}`;
+				if (platform === "linux")
+					return arch === "arm64"
+						? `${base}/lua-language-server-${version}-linux-arm64.tar.gz`
+						: `${base}/lua-language-server-${version}-linux-x64.tar.gz`;
+				if (platform === "darwin")
+					return arch === "arm64"
+						? `${base}/lua-language-server-${version}-darwin-arm64.tar.gz`
+						: `${base}/lua-language-server-${version}-darwin-x64.tar.gz`;
+				if (platform === "win32")
+					return arch === "arm64"
+						? undefined
+						: `${base}/lua-language-server-${version}-win32-x64.zip`;
+				return undefined;
+			},
+			kind: "zip",
+			stripComponents: 0,
+			treeMarker: "bin",
+		},
+	},
+	{
 		id: "actionlint",
 		name: "actionlint",
 		checkCommand: "actionlint",
@@ -668,6 +860,70 @@ export const TOOLS: ToolDefinition[] = [
 				return undefined;
 			},
 			binaryInArchive: "actionlint",
+		},
+	},
+	{
+		// zizmor: GitHub Actions workflow security scanner that speaks LSP (#272).
+		// cargo-dist release archives, one per target triple, each holding a single
+		// `zizmor` binary (extracted via the recursive binary find). Online audits
+		// (known-vulnerable-actions, unpinned-uses, …) need a GitHub token — the LSP
+		// spawn forwards one via resolveZizmorGitHubToken (clients/zizmor-config.ts).
+		id: "zizmor",
+		name: "zizmor",
+		checkCommand: "zizmor",
+		checkArgs: ["--version"],
+		installStrategy: "github",
+		binaryName: "zizmor",
+		github: {
+			repo: "zizmorcore/zizmor",
+			assetMatch: (platform, arch) => {
+				if (platform === "linux")
+					return arch === "arm64"
+						? "aarch64-unknown-linux-gnu.tar.gz"
+						: "x86_64-unknown-linux-gnu.tar.gz";
+				if (platform === "darwin")
+					return arch === "arm64"
+						? "aarch64-apple-darwin.tar.gz"
+						: "x86_64-apple-darwin.tar.gz";
+				// One x86 Windows build; arm64 Windows runs it under emulation.
+				if (platform === "win32") return "x86_64-pc-windows-msvc.zip";
+				return undefined;
+			},
+			binaryInArchive: "zizmor",
+		},
+	},
+	{
+		// typos-lsp: source-code spell checker that speaks LSP (#283). cargo-dist
+		// release archives, one per target triple, each holding a single `typos-lsp`
+		// binary (extracted via the recursive binary find). NO token / network — the
+		// dictionary is compiled in. The binary takes no `--version` (it ignores args
+		// and serves the LSP on stdin/stdout); the PATH probe ignores checkArgs and
+		// verifyToolBinary runs with stdin:ignore so the server gets EOF and exits.
+		id: "typos-lsp",
+		name: "typos-lsp",
+		checkCommand: "typos-lsp",
+		checkArgs: ["--version"],
+		installStrategy: "github",
+		binaryName: "typos-lsp",
+		github: {
+			repo: "tekumara/typos-lsp",
+			assetMatch: (platform, arch) => {
+				if (platform === "linux")
+					return arch === "arm64"
+						? "aarch64-unknown-linux-gnu.tar.gz"
+						: "x86_64-unknown-linux-gnu.tar.gz";
+				if (platform === "darwin")
+					return arch === "arm64"
+						? "aarch64-apple-darwin.tar.gz"
+						: "x86_64-apple-darwin.tar.gz";
+				if (platform === "win32")
+					// Native win-arm64 build (one better than zizmor, which emulates).
+					return arch === "arm64"
+						? "aarch64-pc-windows-msvc.zip"
+						: "x86_64-pc-windows-msvc.zip";
+				return undefined;
+			},
+			binaryInArchive: "typos-lsp",
 		},
 	},
 	{
@@ -703,16 +959,35 @@ export const TOOLS: ToolDefinition[] = [
 			// gitleaks asset naming uses `x64` not `amd64` (unlike most Go-built
 			// tools). Substring match is exact-enough — release assets are
 			// named e.g. `gitleaks_8.18.4_linux_x64.tar.gz`.
-			assetMatch: (platform, arch) => {
-				if (platform === "linux")
-					return arch === "arm64" ? "linux_arm64.tar.gz" : "linux_x64.tar.gz";
-				if (platform === "darwin")
-					return arch === "arm64" ? "darwin_arm64.tar.gz" : "darwin_x64.tar.gz";
-				if (platform === "win32")
-					return arch === "arm64" ? "windows_arm64.zip" : "windows_x64.zip";
-				return undefined;
-			},
+			assetMatch: archAssetMatch({
+				linux: { x64: "linux_x64.tar.gz", arm64: "linux_arm64.tar.gz" },
+				darwin: { x64: "darwin_x64.tar.gz", arm64: "darwin_arm64.tar.gz" },
+				win32: { x64: "windows_x64.zip", arm64: "windows_arm64.zip" },
+			}),
 			binaryInArchive: "gitleaks",
+		},
+	},
+	{
+		id: "trivy",
+		name: "Trivy",
+		checkCommand: "trivy",
+		checkArgs: ["--version"],
+		installStrategy: "github",
+		binaryName: "trivy",
+		github: {
+			repo: "aquasecurity/trivy",
+			// Trivy asset naming is `trivy_<ver>_<OS>-<bits>.{tar.gz,zip}` with a
+			// capitalized OS and `64bit`/`ARM64` arch tokens — e.g.
+			// `trivy_0.71.2_Linux-64bit.tar.gz`, `trivy_0.71.2_macOS-ARM64.tar.gz`.
+			// No windows-arm64 asset exists (win32.arm64 omitted), so (like
+			// swiftlint) trivy is absent from GITHUB_TOOLS and covered by the
+			// weaker "at least one platform" guard.
+			assetMatch: archAssetMatch({
+				linux: { x64: "Linux-64bit.tar.gz", arm64: "Linux-ARM64.tar.gz" },
+				darwin: { x64: "macOS-64bit.tar.gz", arm64: "macOS-ARM64.tar.gz" },
+				win32: { x64: "windows-64bit.zip" },
+			}),
+			binaryInArchive: "trivy",
 		},
 	},
 	{
@@ -891,6 +1166,61 @@ export const TOOLS: ToolDefinition[] = [
 			binaryInArchive: "gleam",
 		},
 	},
+	{
+		// marksman ships a single BARE (uncompressed) binary per platform on GitHub
+		// releases — no archive, so it lands via the bare-binary branch of
+		// installGitHubTool (the `else` that writes the asset directly, like shfmt).
+		// Used as managedToolId by MarksmanServer; LSP entrypoint is `marksman
+		// server` (stdio). macOS ships a universal binary; Windows has only x64
+		// (runs on arm64 via emulation) — so all six platform/arch combos resolve.
+		id: "marksman",
+		name: "Marksman",
+		checkCommand: "marksman",
+		checkArgs: ["--version"],
+		installStrategy: "github",
+		binaryName: "marksman",
+		github: {
+			repo: "artempyanykh/marksman",
+			assetMatch: (platform, arch) => {
+				if (platform === "linux")
+					return arch === "arm64"
+						? "marksman-linux-arm64"
+						: "marksman-linux-x64";
+				if (platform === "darwin") return "marksman-macos";
+				if (platform === "win32") return "marksman.exe";
+				return undefined;
+			},
+			// bare binary — no binaryInArchive
+		},
+	},
+	{
+		// Expert ships a bare native binary per platform on GitHub releases. Its
+		// `--stdio` flag is required to start the LSP transport. Windows arm64 uses
+		// the x64 binary through Windows' built-in x64 emulation.
+		id: "expert",
+		name: "Expert",
+		checkCommand: "expert",
+		checkArgs: ["--version"],
+		installStrategy: "github",
+		binaryName: "expert",
+		github: {
+			repo: "expert-lsp/expert",
+			assetMatch: (platform, arch) => {
+				if (arch !== "x64" && arch !== "arm64") return undefined;
+				if (platform === "linux")
+					return arch === "arm64"
+						? "expert_linux_arm64"
+						: "expert_linux_amd64";
+				if (platform === "darwin")
+					return arch === "arm64"
+						? "expert_darwin_arm64"
+						: "expert_darwin_amd64";
+				if (platform === "win32") return "expert_windows_amd64.exe";
+				return undefined;
+			},
+			// bare binary — no binaryInArchive
+		},
+	},
 ];
 
 const ensureInFlight = new Map<string, Promise<string | undefined>>();
@@ -908,11 +1238,7 @@ interface ProbeCacheEntry {
 
 type ProbeCache = Record<string, ProbeCacheEntry>;
 
-const PROBE_CACHE_PATH = path.join(
-	os.homedir(),
-	".pi-lens",
-	"probe-cache.json",
-);
+const PROBE_CACHE_PATH = path.join(getGlobalPiLensDir(), "probe-cache.json");
 const PROBE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 let _probeCache: ProbeCache | null = null;
@@ -1037,6 +1363,9 @@ export async function updateProbeCache(
 export function resetProbeCacheStateForTesting(): void {
 	_probeCache = null;
 	_probeCacheDirty = false;
+	resolvedPathCache.clear();
+	ensureInFlight.clear();
+	lastManagedInstallVersion.clear();
 	if (_probeCacheFlushTimer !== null) {
 		clearTimeout(_probeCacheFlushTimer);
 		_probeCacheFlushTimer = null;
@@ -1105,10 +1434,48 @@ export function isLspTransportRequiredError(output: string): boolean {
 }
 
 /**
- * Verify a tool binary actually works by running --version
- * This catches broken symlinks, partial installs, and corrupted binaries
+ * Parse the exact version pinned in a TOOLS `packageName` spec, e.g.
+ * `"jscpd@3.5.10"` -> `"3.5.10"`. Scoped packages (`"@ast-grep/cli"`) have no
+ * pin unless a version is appended after the package name
+ * (`"@scope/pkg@1.2.3"`) — `lastIndexOf("@")` on a bare scope marker (index 0)
+ * correctly reports "no pin" rather than mistaking the scope for a version.
+ * Returns undefined when packageName has no explicit `@version` suffix.
  */
-async function verifyToolBinary(binPath: string): Promise<boolean> {
+function parsePinnedVersion(packageName: string): string | undefined {
+	const at = packageName.lastIndexOf("@");
+	if (at <= 0) return undefined;
+	return packageName.slice(at + 1) || undefined;
+}
+
+/** Extract the first semver-ish token (e.g. "3.5.10") from `--version` output. */
+function extractVersionToken(output: string): string | undefined {
+	return output.match(/\d+\.\d+\.\d+(?:[-+][\w.]+)?/)?.[0];
+}
+
+/**
+ * Version reported by the last successful `--version` probe of a pi-lens
+ * managed local npm install, keyed by toolId. Populated only inside
+ * getToolPath()'s managed-local-install checks below — i.e. only when that
+ * code path already spawns verifyToolBinary anyway (cache hits in
+ * ensureTool()'s fast paths never reach getToolPath, so this never adds a new
+ * spawn). Consumed by ensureTool() to detect drift against the tool's current
+ * `packageName` pin (#589) — deliberately scoped to installStrategy "npm"
+ * with an explicit version pin; unpinned tools and non-npm strategies (github/
+ * maven/archive) never populate or read this map.
+ */
+const lastManagedInstallVersion = new Map<string, string>();
+
+/**
+ * Verify a tool binary actually works by running --version
+ * This catches broken symlinks, partial installs, and corrupted binaries.
+ * `onVersionOutput`, when provided, receives the raw stdout on a successful
+ * (exit 0) probe — used to piggyback version-pin drift detection onto this
+ * already-happening spawn instead of adding a new one (#589).
+ */
+async function verifyToolBinary(
+	binPath: string,
+	onVersionOutput?: (output: string) => void,
+): Promise<boolean> {
 	return new Promise((resolve) => {
 		const isWindows = process.platform === "win32";
 		const hasKnownWindowsExt = /\.(cmd|exe|ps1)$/i.test(binPath);
@@ -1149,6 +1516,7 @@ async function verifyToolBinary(binPath: string): Promise<boolean> {
 		proc.on("exit", (code) => {
 			if (code === 0) {
 				debugLog(`Verified: ${binPath} (version: ${stdout.trim()})`);
+				onVersionOutput?.(stdout);
 				resolve(true);
 			} else if (isLspTransportRequiredError(`${stdout}\n${stderr}`)) {
 				// Valid stdio LSP server that rejects `--version` (#208) — the
@@ -1207,6 +1575,19 @@ export async function getAllToolStatuses(): Promise<ToolStatus[]> {
 			source: "not-installed",
 			strategy: tool.installStrategy,
 		};
+
+		// 0. Tree-bundle archives resolve ONLY to their extract dir — never via a
+		// PATH/global probe (the runtime may be present while the bundle is absent).
+		if (tool.installStrategy === "archive" && !tool.archive?.launcher) {
+			const bundleDir = await getArchiveTreeBundlePath(tool);
+			if (bundleDir) {
+				status.installed = true;
+				status.source = "archive-dist";
+				status.path = bundleDir;
+			}
+			statuses.push(status);
+			continue;
+		}
 
 		// 1. Check if in PATH (global)
 		if (await isCommandAvailable(tool.checkCommand, tool.checkArgs)) {
@@ -1319,11 +1700,104 @@ export async function isToolInstalled(toolId: string): Promise<boolean> {
 }
 
 /**
+ * Resolve an installed archive TREE BUNDLE (an `archive` tool with no launcher)
+ * to its extract dir, confirmed via the tree marker. Returns undefined when the
+ * tool isn't a tree bundle or isn't extracted yet.
+ */
+async function getArchiveTreeBundlePath(
+	tool: ToolDefinition,
+): Promise<string | undefined> {
+	if (tool.installStrategy !== "archive" || tool.archive?.launcher) {
+		return undefined;
+	}
+	const extractDir = path.join(TOOLS_DIR, tool.id);
+	const marker = tool.archive?.treeMarker
+		? path.join(extractDir, ...tool.archive.treeMarker.split("/"))
+		: extractDir;
+	try {
+		await fs.access(marker);
+		return extractDir;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * Get the path to a tool (global or local)
  */
+/**
+ * Resolve a tool's native binary from its per-platform optional-dependency
+ * package (e.g. `@ast-grep/cli-linux-x64-gnu`), following pnpm/bun symlinks via
+ * the MAIN package's resolver. This is the reliable path for npm/pnpm/bun
+ * installs: the JS launcher in the main package frequently can't locate the
+ * binary under a symlink/isolated store (or after a skipped postinstall), but
+ * the binary is installed — find it directly. Returns undefined if the tool
+ * has no platformPackage spec, the platform is unsupported, or it isn't found.
+ */
+export function resolvePlatformPackageBinary(
+	tool: ToolDefinition,
+): string | undefined {
+	const spec = tool.platformPackage;
+	if (!spec || !tool.packageName) return undefined;
+	const suffix = spec.suffixes[`${process.platform}-${process.arch}`];
+	if (!suffix) return undefined;
+	const platformPkg = `${spec.base ?? tool.packageName}-${suffix}`;
+	try {
+		// Resolve the platform package FROM the main package, which owns it as an
+		// optional dependency (pnpm exposes it there, not to arbitrary roots).
+		const mainPkgJson = _installerRequire.resolve(
+			`${tool.packageName}/package.json`,
+		);
+		const fromMain = createRequire(mainPkgJson);
+		let pkgDir: string;
+		try {
+			pkgDir = path.dirname(fromMain.resolve(`${platformPkg}/package.json`));
+		} catch {
+			pkgDir = path.dirname(
+				_installerRequire.resolve(`${platformPkg}/package.json`),
+			);
+		}
+		const isWin = process.platform === "win32";
+		for (const bin of spec.binaries) {
+			for (const name of isWin ? [`${bin}.exe`, bin] : [bin]) {
+				const candidate = path.join(pkgDir, name);
+				if (existsSync(candidate)) return candidate;
+			}
+		}
+	} catch {
+		// not installed / not resolvable for this layout
+	}
+	return undefined;
+}
+
 export async function getToolPath(toolId: string): Promise<string | undefined> {
 	const tool = TOOLS.find((t) => t.id === toolId);
 	if (!tool) return undefined;
+
+	// Tree-bundle archives (no launcher) are "installed" ONLY when extracted — the
+	// extract dir is authoritative. No PATH/global/npm fallback: the runtime that
+	// drives the bundle (e.g. pwsh) may be on PATH while the bundle itself is
+	// absent, which must NOT read as installed (else the bundle never downloads).
+	if (tool.installStrategy === "archive" && !tool.archive?.launcher) {
+		return getArchiveTreeBundlePath(tool);
+	}
+
+	// Version-pin drift detection (#589) is scoped to npm-strategy tools with an
+	// explicit `@version` pin — everything else (unpinned npm entries, pip/gem,
+	// github/maven/archive) has no drift signal to piggyback on here. Clear any
+	// stale entry up front so a miss on the checks below never leaves a prior
+	// call's version lingering for ensureTool() to misread.
+	const pinnedVersion =
+		tool.installStrategy === "npm" && tool.packageName
+			? parsePinnedVersion(tool.packageName)
+			: undefined;
+	if (pinnedVersion) lastManagedInstallVersion.delete(toolId);
+	const recordVersion = pinnedVersion
+		? (output: string): void => {
+				const seen = extractVersionToken(output);
+				if (seen) lastManagedInstallVersion.set(toolId, seen);
+			}
+		: undefined;
 
 	// Fast path: check local npm install first (where auto-install places tools).
 	// This avoids the ~2-5s overhead of spawning npm global probes and PATH
@@ -1339,7 +1813,7 @@ export async function getToolPath(toolId: string): Promise<string | undefined> {
 		const cmdPath = `${localBase}.cmd`;
 		try {
 			await fs.access(cmdPath);
-			if (await verifyToolBinary(cmdPath)) {
+			if (await verifyToolBinary(cmdPath, recordVersion)) {
 				return cmdPath;
 			}
 			logSessionStart(
@@ -1353,7 +1827,7 @@ export async function getToolPath(toolId: string): Promise<string | undefined> {
 		const exePath = `${localBase}.exe`;
 		try {
 			await fs.access(exePath);
-			if (await verifyToolBinary(exePath)) {
+			if (await verifyToolBinary(exePath, recordVersion)) {
 				return exePath;
 			}
 			logSessionStart(
@@ -1365,7 +1839,7 @@ export async function getToolPath(toolId: string): Promise<string | undefined> {
 	}
 	try {
 		await fs.access(localBase);
-		if (await verifyToolBinary(localBase)) {
+		if (await verifyToolBinary(localBase, recordVersion)) {
 			return localBase;
 		}
 		logSessionStart(
@@ -1373,6 +1847,23 @@ export async function getToolPath(toolId: string): Promise<string | undefined> {
 		);
 	} catch {
 		// fall through to global checks
+	}
+
+	// npm/pnpm/bun: prefer the native per-platform binary directly. The main
+	// package's launcher often can't find it under a symlink store / after a
+	// skipped postinstall, but the binary IS installed — resolve + verify it
+	// before falling back to PATH or a (re)install.
+	if (tool.platformPackage) {
+		const platformBin = resolvePlatformPackageBinary(tool);
+		if (platformBin && (await verifyToolBinary(platformBin))) {
+			logSessionStart(
+				`auto-install ${toolId}: resolved platform-package binary at ${platformBin}`,
+			);
+			return platformBin;
+		}
+		logSessionStart(
+			`auto-install ${toolId}: platform-package binary not resolved (${process.platform}-${process.arch}, base=${tool.platformPackage.base ?? tool.packageName}) — falling back to PATH/managed install`,
+		);
 	}
 
 	// For github/maven tools, prefer the managed install (~/.pi-lens/bin/) over
@@ -1517,21 +2008,10 @@ async function getNpmGlobalBinCandidates(): Promise<string[]> {
 		add(path.join(os.homedir(), ".npm-global", "bin"));
 	}
 
-	const pm = process.platform === "win32" ? "npm.cmd" : "npm";
-	const prefix = await new Promise<string>((resolve) => {
-		const proc = spawn(pm, ["config", "get", "prefix"], {
-			stdio: ["ignore", "pipe", "pipe"],
-			shell: process.platform === "win32",
-		});
-
-		let stdout = "";
-		proc.stdout?.on("data", (data: Buffer | string) => (stdout += data));
-		proc.on("exit", (code) => resolve(code === 0 ? stdout.trim() : ""));
-		proc.on("error", () => resolve(""));
-	});
-
-	if (prefix) {
-		add(process.platform === "win32" ? prefix : path.join(prefix, "bin"));
+	// Global bin dirs for every installed manager (npm/pnpm/yarn/bun) — a tool
+	// may have been installed globally via any of them.
+	for (const dir of await allAvailableGlobalBinDirs()) {
+		add(dir);
 	}
 
 	return dirs;
@@ -2082,6 +2562,20 @@ async function installMavenTool(
  * so the tool resolves like any other via findGitHubToolPath. Extraction uses
  * `tar` (present on Windows 10+ as bsdtar, which also reads .zip).
  */
+/**
+ * Resolve an {@link ArchiveSpec} download URL for the current platform/arch.
+ * A string URL is platform-agnostic; a function resolves per platform/arch and
+ * may return `undefined` (unsupported → caller degrades to "unavailable").
+ * Exported for the tool-registry contract test.
+ */
+export function resolveArchiveUrl(
+	spec: ArchiveSpec,
+	platform: string = process.platform,
+	arch: string = process.arch,
+): string | undefined {
+	return typeof spec.url === "function" ? spec.url(platform, arch) : spec.url;
+}
+
 async function installArchiveTool(
 	tool: ToolDefinition,
 ): Promise<string | undefined> {
@@ -2090,10 +2584,18 @@ async function installArchiveTool(
 	const binaryName = tool.binaryName ?? tool.id;
 	const isWindows = process.platform === "win32";
 
-	logSessionStart(`archive-install ${tool.id}: downloading ${spec.url}`);
+	const url = resolveArchiveUrl(spec);
+	if (!url) {
+		logSessionStart(
+			`archive-install ${tool.id}: no archive for ${process.platform}/${process.arch} — unsupported, skipping`,
+		);
+		return undefined;
+	}
+
+	logSessionStart(`archive-install ${tool.id}: downloading ${url}`);
 	let archiveBuffer: Buffer;
 	try {
-		archiveBuffer = await httpsGet(spec.url);
+		archiveBuffer = await httpsGet(url);
 	} catch (err) {
 		logSessionStart(
 			`archive-install ${tool.id}: download failed: ${(err as Error).message}`,
@@ -2117,15 +2619,20 @@ async function installArchiveTool(
 		await fs.mkdir(extractDir, { recursive: true });
 		await fs.writeFile(tmpArchive, archiveBuffer);
 
-		// `--strip-components=1` drops the versioned top-level dir so the launcher
-		// path is stable (bin/… not spotbugs-X.Y.Z/bin/…). bsdtar handles both
-		// .tgz and .zip with -xf.
+		// `--strip-components=N` drops N leading path components. Default 1 drops a
+		// versioned top-level dir so a launcher path stays stable (bin/… not
+		// spotbugs-X.Y.Z/bin/…). A TREE BUNDLE (stripComponents:0) has no wrapping
+		// dir — stripping would flatten/merge its sibling module folders — so the
+		// flag is omitted. bsdtar handles both .tgz and .zip with -xf.
+		const stripComponents = spec.stripComponents ?? 1;
 		const tarArgs = [
 			spec.kind === "tgz" ? "-xzf" : "-xf",
 			archiveName,
 			"-C",
 			extractName,
-			"--strip-components=1",
+			...(stripComponents > 0
+				? [`--strip-components=${stripComponents}`]
+				: []),
 		];
 		// Resolve `tar` to an absolute path on Windows (System32\tar.exe is the
 		// bsdtar shipped with Windows 10+) so extraction can't be hijacked via a
@@ -2160,6 +2667,28 @@ async function installArchiveTool(
 				`archive-install ${tool.id}: extraction failed: ${extracted.stderr}`,
 			);
 			return undefined;
+		}
+
+		// Tree bundle (no launcher): the whole extracted tree IS the artifact. Verify
+		// the marker exists and resolve to the extract dir — the consuming server
+		// launches a runtime against a bootstrap inside it (e.g. PSES via pwsh).
+		if (!spec.launcher) {
+			const marker = spec.treeMarker
+				? path.join(extractDir, ...spec.treeMarker.split("/"))
+				: extractDir;
+			try {
+				await fs.access(marker);
+			} catch {
+				logSessionStart(
+					`archive-install ${tool.id}: tree marker not found at ${marker} after extraction`,
+				);
+				return undefined;
+			}
+			logSessionStart(
+				`archive-install ${tool.id}: installed tree bundle → ${extractDir} (extracted ${archiveBuffer.length} bytes)`,
+			);
+			debugLog(`[archive] installed ${tool.name} bundle → ${extractDir}`);
+			return extractDir;
 		}
 
 		// The launcher inside the extracted tree (e.g. bin/spotbugs[.bat]).
@@ -2229,25 +2758,23 @@ async function installNpmTool(
 			);
 		}
 
-		// Install via npm or bun (use .cmd on Windows)
+		// Resolve the package manager for the tools dir and build install args.
 		const isWindows = process.platform === "win32";
-		let pm = isWindows ? "npm.cmd" : "npm";
-		if (process.env.BUN_INSTALL) {
-			pm = isWindows ? "bun.exe" : "bun";
-		}
+		const pm = await resolveNodePackageManager(TOOLS_DIR);
+		const pmCommand = pmBinary(pm);
 		// Use --ignore-scripts unless the package explicitly needs postinstall
 		// (e.g. biome downloads a platform-specific native binary via postinstall).
 		const needsScripts = NEEDS_POSTINSTALL.has(packageName);
-		const baseInstallArgs = needsScripts
-			? ["install", packageName]
-			: ["install", "--ignore-scripts", packageName];
+		const baseInstallArgs = installArgs(pm, packageName, {
+			ignoreScripts: !needsScripts,
+		});
 
 		const INSTALL_TIMEOUT_MS = 120_000;
 		const runInstallAttempt = async (
 			args: string[],
 		): Promise<{ ok: boolean; stderr: string }> =>
 			new Promise((resolve) => {
-				const proc = spawn(pm, args, {
+				const proc = spawn(pmCommand, args, {
 					cwd: TOOLS_DIR,
 					stdio: ["ignore", "pipe", "pipe"],
 					shell: isWindows, // Required for .cmd files on Windows
@@ -2276,17 +2803,18 @@ async function installNpmTool(
 
 		let outcome = await runInstallAttempt(baseInstallArgs);
 
-		const isNpm = pm === "npm" || pm === "npm.cmd";
+		// --legacy-peer-deps is npm-only; retry just npm's ERESOLVE failures.
 		const erResolve =
 			outcome.ok === false &&
 			/npm\s+error\s+ERESOLVE|\bERESOLVE\b|could not resolve/i.test(
 				outcome.stderr,
 			);
 
-		if (isNpm && erResolve) {
-			const retryArgs = needsScripts
-				? ["install", "--legacy-peer-deps", packageName]
-				: ["install", "--ignore-scripts", "--legacy-peer-deps", packageName];
+		if (pm === "npm" && erResolve) {
+			const retryArgs = installArgs(pm, packageName, {
+				ignoreScripts: !needsScripts,
+				legacyPeerDeps: true,
+			});
 			logSessionStart(
 				`auto-install npm ${packageName}: retry with --legacy-peer-deps after ERESOLVE`,
 			);
@@ -2637,10 +3165,20 @@ export async function installTool(toolId: string): Promise<boolean> {
  */
 export async function ensureTool(
 	toolId: string,
-	opts?: { forceReinstall?: boolean },
+	opts?: { forceReinstall?: boolean; allowInstall?: boolean },
 ): Promise<string | undefined> {
+	const cacheResolvedPath = (result: string | undefined): string | undefined => {
+		if (result) {
+			resolvedPathCache.set(toolId, result);
+			void updateProbeCache(toolId, result);
+		}
+		return result;
+	};
+
 	// forceReinstall: nuke caches, download from managed source, skip PATH entirely.
 	// Used when a PATH-resolved tool proves broken at launch (e.g. broken symlink).
+	// allowInstall:false wins over forceReinstall: caches are still cleared, but
+	// the function falls back to discovery-only and never downloads.
 	if (opts?.forceReinstall) {
 		const ensureStartMs = Date.now();
 		logSessionStart(
@@ -2660,6 +3198,13 @@ export async function ensureTool(
 			// best-effort
 		}
 
+		if (opts.allowInstall === false) {
+			logSessionStart(
+				`auto-install ensure ${toolId}: force reinstall blocked — install disabled, discovery only (${Date.now() - ensureStartMs}ms)`,
+			);
+			return cacheResolvedPath(await getToolPath(toolId));
+		}
+
 		// Force download
 		const installed = await installTool(toolId);
 		if (!installed) {
@@ -2670,10 +3215,8 @@ export async function ensureTool(
 		}
 
 		// Find the newly installed binary (github-local check now comes before PATH)
-		const result = await getToolPath(toolId);
+		const result = cacheResolvedPath(await getToolPath(toolId));
 		if (result) {
-			resolvedPathCache.set(toolId, result);
-			void updateProbeCache(toolId, result);
 			logSessionStart(
 				`auto-install ensure ${toolId}: force reinstall success at ${result} (${Date.now() - ensureStartMs}ms)`,
 			);
@@ -2697,11 +3240,15 @@ export async function ensureTool(
 
 	// Coalesce the whole ensure operation, not just installation. Most startup
 	// duplicates race while checking already-installed tools, before installTool()
-	// would ever run.
-	const inFlight = ensureInFlight.get(toolId);
+	// would ever run. The key includes the install policy so a discovery-only
+	// caller cannot accidentally inherit an install-allowed caller's download (or
+	// vice versa).
+	const inFlightKey =
+		opts?.allowInstall === false ? `${toolId}:discovery-only` : toolId;
+	const inFlight = ensureInFlight.get(inFlightKey);
 	if (inFlight) {
 		logSessionStart(
-			`auto-install ensure ${toolId}: waiting for in-flight ensure`,
+			`auto-install ensure ${toolId}: waiting for in-flight ensure (${inFlightKey})`,
 		);
 		return inFlight;
 	}
@@ -2713,12 +3260,50 @@ export async function ensureTool(
 		// Check if already installed.
 		const existingPath = await getToolPath(toolId);
 		if (existingPath) {
+			// Version-pin drift (#589): getToolPath() above just spawned
+			// verifyToolBinary on the managed local install anyway (this is the
+			// slow path — fast paths 1/2 above already returned before reaching
+			// here), so lastManagedInstallVersion was populated for free if this
+			// is a pinned npm tool. Compare it to the current pin and, on
+			// mismatch, route through the EXISTING forceReinstall codepath rather
+			// than resolving to a known-stale binary. Piggybacks entirely on the
+			// probe-cache's ~once-per-24h/once-per-session cadence — no new spawn.
+			const tool = TOOLS.find((t) => t.id === toolId);
+			const pinnedVersion =
+				tool?.installStrategy === "npm" && tool.packageName
+					? parsePinnedVersion(tool.packageName)
+					: undefined;
+			if (pinnedVersion) {
+				const seenVersion = lastManagedInstallVersion.get(toolId);
+				if (seenVersion && seenVersion !== pinnedVersion) {
+					lastManagedInstallVersion.delete(toolId);
+					logSessionStart(
+						`auto-install ensure ${toolId}: version drift (installed ${seenVersion} != pinned ${pinnedVersion}) — forcing reinstall (${Date.now() - ensureStartMs}ms)`,
+					);
+					return ensureTool(toolId, {
+						forceReinstall: true,
+						allowInstall: opts?.allowInstall,
+					});
+				}
+			}
+
 			resolvedPathCache.set(toolId, existingPath);
 			void updateProbeCache(toolId, existingPath);
 			logSessionStart(
 				`auto-install ensure ${toolId}: already available at ${existingPath} (${Date.now() - ensureStartMs}ms)`,
 			);
 			return existingPath;
+		}
+
+		// Discovery and install are SEPARATE concerns. getToolPath() above already
+		// probed PATH / npm-global / managed bin — offline-safe, no download. When the
+		// caller forbids installs (allowInstall:false, e.g. PI_LENS_DISABLE_LSP_INSTALL=1)
+		// we must still return a discovered binary and only skip the actual install.
+		if (opts?.allowInstall === false) {
+			logSessionStart(
+				`auto-install ensure ${toolId}: install disabled — discovery only, not found (${Date.now() - ensureStartMs}ms)`,
+			);
+			return undefined;
 		}
 
 		const installed = await installTool(toolId);
@@ -2744,11 +3329,11 @@ export async function ensureTool(
 		return result;
 	})();
 
-	ensureInFlight.set(toolId, ensurePromise);
+	ensureInFlight.set(inFlightKey, ensurePromise);
 	try {
 		return await ensurePromise;
 	} finally {
-		ensureInFlight.delete(toolId);
+		ensureInFlight.delete(inFlightKey);
 	}
 }
 
@@ -2824,6 +3409,8 @@ export const GITHUB_TOOLS = [
 	"golangci-lint",
 	"ktlint",
 	"actionlint",
+	"zizmor",
+	"typos-lsp",
 	"tflint",
 	"terraform-ls",
 	"zls",
@@ -2835,6 +3422,8 @@ export const GITHUB_TOOLS = [
 	"deno",
 	"clojure-lsp",
 	"gleam",
+	"marksman",
+	"expert",
 ] as const;
 export type GitHubToolId = (typeof GITHUB_TOOLS)[number];
 

@@ -1,4 +1,3 @@
-import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { GITHUB_TOOLS, GitHubToolId } from "../../../clients/installer/index.ts";
@@ -195,21 +194,93 @@ describe("GitHub release asset selection", () => {
 			expect(resolveGitHubAsset("zls", platform, arch)).toBe(expected);
 		});
 	});
+
+	// #274: marksman ships BARE (uncompressed) per-platform binaries. macOS is a
+	// universal binary (same asset for x64/arm64); Windows ships only x64.
+	describe("marksman asset patterns", () => {
+		it.each([
+			["linux", "x64", "marksman-linux-x64"],
+			["linux", "arm64", "marksman-linux-arm64"],
+			["darwin", "x64", "marksman-macos"],
+			["darwin", "arm64", "marksman-macos"],
+			["win32", "x64", "marksman.exe"],
+			["win32", "arm64", "marksman.exe"],
+		] as const)("%s/%s → %s", async (platform, arch, expected) => {
+			const { resolveGitHubAsset } = await import(
+				"../../../clients/installer/index.ts"
+			);
+			expect(resolveGitHubAsset("marksman", platform, arch)).toBe(expected);
+		});
+
+		it("installs as marksman.exe on Windows (bare binary, no archive)", async () => {
+			const { resolveGitHubInstalledBinaryName } = await import(
+				"../../../clients/installer/index.ts"
+			);
+			expect(
+				resolveGitHubInstalledBinaryName("marksman", "win32", "marksman.exe"),
+			).toBe("marksman.exe");
+			expect(
+				resolveGitHubInstalledBinaryName("marksman", "linux", "marksman-linux-x64"),
+			).toBe("marksman");
+		});
+	});
+
+	describe("Expert asset patterns", () => {
+		it.each([
+			["linux", "x64", "expert_linux_amd64"],
+			["linux", "arm64", "expert_linux_arm64"],
+			["darwin", "x64", "expert_darwin_amd64"],
+			["darwin", "arm64", "expert_darwin_arm64"],
+			["win32", "x64", "expert_windows_amd64.exe"],
+			["win32", "arm64", "expert_windows_amd64.exe"],
+		] as const)("%s/%s → %s", async (platform, arch, expected) => {
+			const { resolveGitHubAsset } = await import(
+				"../../../clients/installer/index.ts"
+			);
+			expect(resolveGitHubAsset("expert", platform, arch)).toBe(expected);
+		});
+
+		it("installs as expert.exe on Windows (bare binary, no archive)", async () => {
+			const { resolveGitHubInstalledBinaryName } = await import(
+				"../../../clients/installer/index.ts"
+			);
+			expect(
+				resolveGitHubInstalledBinaryName("expert", "win32", "expert_windows_amd64.exe"),
+			).toBe("expert.exe");
+			expect(
+				resolveGitHubInstalledBinaryName("expert", "linux", "expert_linux_amd64"),
+			).toBe("expert");
+		});
+
+		it("does not select an incompatible release binary", async () => {
+			const { resolveGitHubAsset } = await import(
+				"../../../clients/installer/index.ts"
+			);
+			expect(resolveGitHubAsset("expert", "linux", "ppc64"))
+				.toBeUndefined();
+			expect(resolveGitHubAsset("expert", "win32", "ia32"))
+				.toBeUndefined();
+		});
+	});
 });
 
 describe("getToolEnvironment PATH", () => {
-	it("prepends ~/.pi-lens/bin to PATH", async () => {
+	it("prepends the managed pi-lens bin dir (~/.pi-lens/bin by default) to PATH", async () => {
 		const { getToolEnvironment } = await import("../../../clients/installer/index.ts");
+		const { getGlobalPiLensDir } = await import("../../../clients/file-utils.js");
 		const env = await getToolEnvironment();
-		const githubBin = path.join(os.homedir(), ".pi-lens", "bin");
+		// Asserts against the actual machine-global root (respects #525's
+		// PI_LENS_HOME test override) rather than hardcoding os.homedir().
+		const githubBin = path.join(getGlobalPiLensDir(), "bin");
 		const separator = process.platform === "win32" ? ";" : ":";
 		expect(env.PATH?.startsWith(githubBin + separator)).toBe(true);
 	});
 
 	it("also includes local npm tools dir in PATH", async () => {
 		const { getToolEnvironment } = await import("../../../clients/installer/index.ts");
+		const { getGlobalPiLensDir } = await import("../../../clients/file-utils.js");
 		const env = await getToolEnvironment();
-		const localBin = path.join(os.homedir(), ".pi-lens", "tools", "node_modules", ".bin");
+		const localBin = path.join(getGlobalPiLensDir(), "tools", "node_modules", ".bin");
 		expect(env.PATH).toContain(localBin);
 	});
 

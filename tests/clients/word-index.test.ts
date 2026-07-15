@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import * as path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	buildWordIndex,
 	centralityFromReverseDeps,
@@ -7,7 +8,11 @@ import {
 	serializeWordIndex,
 	splitIdentifier,
 	tokenizeLine,
+	_resetWordIndexBuildGuardForTests,
+	triggerBackgroundWordIndexBuild,
 } from "../../clients/word-index.ts";
+import { loadProjectSnapshot } from "../../clients/project-snapshot.ts";
+import { createTempFile, setupTestEnvironment } from "./test-utils.ts";
 
 describe("splitIdentifier", () => {
 	it("splits camelCase and keeps the whole identifier", () => {
@@ -206,4 +211,97 @@ describe("serializeWordIndex / deserializeWordIndex", () => {
 		expect(deserializeWordIndex(null)).toBeNull();
 		expect(deserializeWordIndex({} as never)).toBeNull();
 	});
+});
+
+describe("triggerBackgroundWordIndexBuild (#348 cold-query stampede guard)", () => {
+	afterEach(() => {
+		_resetWordIndexBuildGuardForTests();
+	});
+
+	it("builds and persists a word index for a cwd with no prior snapshot", async () => {
+		const env = setupTestEnvironment("pi-lens-wordindex-cold-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"src/auth.ts",
+				"export function authenticateUser(id) { return id; }",
+			);
+			triggerBackgroundWordIndexBuild(env.tmpDir);
+			await vi.waitFor(
+				() => {
+					const snapshot = loadProjectSnapshot(env.tmpDir);
+					expect(snapshot?.wordIndex).toBeDefined();
+				},
+				{ timeout: 5000 },
+			);
+			const snapshot = loadProjectSnapshot(env.tmpDir);
+			const index = deserializeWordIndex(snapshot!.wordIndex);
+			expect(index).not.toBeNull();
+			const results = searchWordIndex(index!, "authenticate user");
+			expect(results.length).toBeGreaterThan(0);
+			expect(path.basename(results[0].file)).toBe("auth.ts");
+		} finally {
+			env.cleanup();
+		}
+	}, 10_000);
+
+	it("dedupes concurrent triggers for the same cwd (stampede guard)", async () => {
+		const env = setupTestEnvironment("pi-lens-wordindex-stampede-");
+		try {
+			createTempFile(env.tmpDir, "src/a.ts", "export function helperA() {}");
+			// Fire several times back-to-back — only one build should actually run;
+			// the guard is a Set keyed by resolved cwd, so a second call while the
+			// first is still in flight is a no-op (fire-and-forget, no error either
+			// way — this just asserts it doesn't throw / double-schedule visibly).
+			triggerBackgroundWordIndexBuild(env.tmpDir);
+			triggerBackgroundWordIndexBuild(env.tmpDir);
+			triggerBackgroundWordIndexBuild(env.tmpDir);
+			await vi.waitFor(
+				() => {
+					const snapshot = loadProjectSnapshot(env.tmpDir);
+					expect(snapshot?.wordIndex).toBeDefined();
+				},
+				{ timeout: 5000 },
+			);
+		} finally {
+			env.cleanup();
+		}
+	}, 10_000);
+
+	it("preserves other snapshot fields when persisting the built index", async () => {
+		const env = setupTestEnvironment("pi-lens-wordindex-preserve-");
+		try {
+			createTempFile(env.tmpDir, "src/a.ts", "export function helperA() {}");
+			// Seed a snapshot (as a real session would) with unrelated data.
+			const { saveProjectSnapshot, PROJECT_SNAPSHOT_VERSION } = await import(
+				"../../clients/project-snapshot.ts"
+			);
+			saveProjectSnapshot(env.tmpDir, {
+				version: PROJECT_SNAPSHOT_VERSION,
+				projectRoot: env.tmpDir,
+				generatedAt: new Date().toISOString(),
+				seq: 7,
+				files: {},
+				symbols: {},
+				reverseDeps: { "some/file.ts": ["some/importer.ts"] },
+				cachedExports: [["helperA", "src/a.ts"]],
+			});
+			triggerBackgroundWordIndexBuild(env.tmpDir);
+			await vi.waitFor(
+				() => {
+					const snapshot = loadProjectSnapshot(env.tmpDir);
+					expect(snapshot?.wordIndex).toBeDefined();
+				},
+				{ timeout: 5000 },
+			);
+			const snapshot = loadProjectSnapshot(env.tmpDir);
+			expect(snapshot?.seq).toBe(7);
+			expect(snapshot?.cachedExports).toEqual([["helperA", "src/a.ts"]]);
+			expect(snapshot?.reverseDeps).toEqual({
+				"some/file.ts": ["some/importer.ts"],
+			});
+		} finally {
+			env.cleanup();
+		}
+	}, 10_000);
 });

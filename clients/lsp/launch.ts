@@ -10,7 +10,6 @@
 import {
 	type ChildProcess,
 	execFileSync,
-	execSync,
 	spawn as nodeSpawn,
 	type SpawnOptions,
 } from "node:child_process";
@@ -19,6 +18,7 @@ import os from "node:os";
 import path from "node:path";
 import { isTestMode } from "../env-utils.js";
 import { getGlobalPiLensDir } from "../file-utils.js";
+import { findGlobalBinary } from "../package-manager.js";
 
 export interface LSPProcess {
 	process: ChildProcess;
@@ -26,9 +26,30 @@ export interface LSPProcess {
 	stdout: NodeJS.ReadableStream;
 	stderr: NodeJS.ReadableStream;
 	pid: number;
+	/** The actual resolved command that was spawned (post shim/global-bin/ps1
+	 *  resolution) — used by the #449/#472 instance registry to identify and
+	 *  re-find this LSP child process. */
+	command: string;
+	/** The actual resolved args passed to `command` above. */
+	args: string[];
 }
 
 const isWindows = process.platform === "win32";
+
+/**
+ * Whether a resolved command must be spawned through a shell on Windows.
+ * `.cmd`/`.bat` are scripts cmd.exe must interpret; extensionless or spaced-path
+ * commands also go through the shell so cmd resolves/quotes them.
+ */
+function computeNeedsShell(resolvedCommand: string): boolean {
+	return (
+		isWindows &&
+		(resolvedCommand.includes(" ") ||
+			/\.(cmd|bat)$/i.test(resolvedCommand) ||
+			!/\.(exe|cmd|bat)$/i.test(resolvedCommand))
+	);
+}
+
 const DEFAULT_STARTUP_FAILURE_WINDOW_MS = 50;
 const WINDOWS_NAV_STARTUP_FAILURE_WINDOW_MS = 500;
 const SESSIONSTART_LOG_DIR = getGlobalPiLensDir();
@@ -189,39 +210,6 @@ function buildAugmentedPath(basePath?: string): string {
 }
 
 /**
- * Find binary in npm global directory
- * Works around PATH caching issue after npm install -g
- */
-function _findBinaryInNpmGlobal(command: string): string | undefined {
-	try {
-		// Get npm global prefix
-		const prefix = execSync("npm prefix -g", { encoding: "utf-8" }).trim();
-
-		// On Windows, binaries are directly in the prefix dir
-		// On Unix, they're in prefix/bin
-		const binDir = isWindows ? prefix : path.join(prefix, "bin");
-
-		// Check for Windows variants
-		const candidates = isWindows
-			? [
-					path.join(binDir, `${command}.cmd`),
-					path.join(binDir, `${command}.exe`),
-					path.join(binDir, command),
-				]
-			: [path.join(binDir, command)];
-
-		for (const candidate of candidates) {
-			if (fs.existsSync(candidate)) {
-				return candidate;
-			}
-		}
-		return undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-/**
  * Validate that a .cmd shim's target JS/script exists before attempting to
  * spawn it. npm-generated .cmd files reference the actual script via a path
  * like `"%~dp0\..\yaml-language-server\bin\yaml-language-server"`. If that
@@ -343,7 +331,7 @@ function trySpawn(
 			cwd,
 			env,
 			stdio: ["pipe", "pipe", "pipe"],
-			detached: false,
+			detached: !isWindows,
 			windowsHide: true,
 			shell: true,
 		});
@@ -353,7 +341,7 @@ function trySpawn(
 			cwd,
 			env,
 			stdio: ["pipe", "pipe", "pipe"],
-			detached: false,
+			detached: !isWindows,
 			windowsHide: isWindows,
 		});
 	}
@@ -531,12 +519,7 @@ export async function launchLSP(
 	// Compute needsShell based on command
 	// On Windows, shell: true is needed for .cmd/.bat files and extensionless binaries
 	// .exe files can be spawned directly, but .cmd/.bat require shell interpretation
-	const hasScriptExtension = /\.(cmd|bat)$/i.test(resolvedCommand);
-	let needsShell =
-		isWindows &&
-		(resolvedCommand.includes(" ") ||
-			hasScriptExtension ||
-			!/\.(exe|cmd|bat)$/i.test(resolvedCommand));
+	let needsShell = computeNeedsShell(resolvedCommand);
 
 	// Try to spawn the process
 	// If command not found, try npm global as fallback (handles PATH caching after install)
@@ -548,15 +531,11 @@ export async function launchLSP(
 		!command.includes(path.sep) &&
 		!command.includes("/")
 	) {
-		const npmGlobalPath = _findBinaryInNpmGlobal(command);
-		if (npmGlobalPath) {
-			spawnCommand = npmGlobalPath;
-			// Recompute needsShell for npm global path
-			needsShell =
-				isWindows &&
-				(spawnCommand.includes(" ") ||
-					/\.(cmd|bat)$/i.test(spawnCommand) ||
-					!/\.(exe|cmd|bat)$/i.test(spawnCommand));
+		const globalBinPath = await findGlobalBinary(command);
+		if (globalBinPath) {
+			spawnCommand = globalBinPath;
+			// Recompute needsShell for the resolved global path
+			needsShell = computeNeedsShell(spawnCommand);
 		}
 	}
 
@@ -604,15 +583,11 @@ export async function launchLSP(
 			!command.includes(path.sep) &&
 			!command.includes("/")
 		) {
-			const npmGlobalPath = _findBinaryInNpmGlobal(command);
-			if (npmGlobalPath && npmGlobalPath !== spawnCommand) {
-				// Recompute needsShell for npm global path
-				const needsShellGlobal =
-					isWindows &&
-					(npmGlobalPath.includes(" ") ||
-						/\.(cmd|bat)$/i.test(npmGlobalPath) ||
-						!/\.(exe|cmd|bat)$/i.test(npmGlobalPath));
-				proc = trySpawn(npmGlobalPath, args, cwd, env, needsShellGlobal);
+			const globalBinPath = await findGlobalBinary(command);
+			if (globalBinPath && globalBinPath !== spawnCommand) {
+				// Recompute needsShell for the resolved global path
+				const needsShellGlobal = computeNeedsShell(globalBinPath);
+				proc = trySpawn(globalBinPath, args, cwd, env, needsShellGlobal);
 			} else {
 				throw err;
 			}
@@ -726,107 +701,9 @@ export async function launchLSP(
 		stdout: proc.stdout,
 		stderr: proc.stderr,
 		pid: proc.pid ?? 0,
+		command: spawnCommand,
+		args,
 	};
-}
-
-/**
- * Spawn via package manager (npx/bun)
- */
-export async function launchViaPackageManager(
-	packageName: string,
-	args: string[] = [],
-	options: SpawnOptions = {},
-): Promise<LSPProcess> {
-	// Prefer bun if available, fall back to npx (use .cmd on Windows)
-	const isWin = process.platform === "win32";
-
-	if (process.env.BUN_INSTALL) {
-		return launchLSP(
-			isWin ? "bun.exe" : "bun",
-			["x", packageName, ...args],
-			options,
-		);
-	}
-
-	// shell:true justified: npx on Windows is npx.cmd — requires shell to execute.
-	if (isWin) {
-		const argsStr = args.map((a) => (a.includes(" ") ? `"${a}"` : a)).join(" ");
-		// --no prevents silent download of uncached packages
-		const shellCommand = `npx --no ${packageName}${argsStr ? ` ${argsStr}` : ""}`;
-
-		const cwd = String(options.cwd ?? process.cwd());
-		const mergedEnv = { ...process.env, ...options.env };
-		const augmentedPath = buildAugmentedPath(resolvePathValue(mergedEnv));
-		const env: NodeJS.ProcessEnv = {
-			...mergedEnv,
-			PATH: augmentedPath,
-			...(isWindows ? { Path: augmentedPath } : {}),
-		};
-
-		const proc = nodeSpawn(shellCommand, [], {
-			cwd,
-			env,
-			stdio: ["pipe", "pipe", "pipe"],
-			detached: false,
-			windowsHide: true,
-			shell: true,
-		});
-
-		if (!proc.stdin || !proc.stdout || !proc.stderr) {
-			throw new Error(`Failed to spawn package manager for: ${packageName}`);
-		}
-
-		// Check for immediate spawn failure on Windows
-		await new Promise<void>((resolve, reject) => {
-			let settled = false;
-
-			proc.on("error", (err: Error & { code?: string }) => {
-				if (!settled && (err.code === "ENOENT" || err.code === "EINVAL")) {
-					settled = true;
-					reject(
-						new Error(
-							`Package manager not found for: ${packageName}. ` +
-								`Install Node.js or check your PATH.`,
-						),
-					);
-				}
-			});
-
-			proc.on("exit", (code: number | null) => {
-				if (!settled && code !== null) {
-					settled = true;
-					reject(
-						new Error(
-							`Package manager exited immediately for: ${packageName} (code: ${code})`,
-						),
-					);
-				}
-			});
-
-			setTimeout(() => {
-				if (!settled) {
-					settled = true;
-					resolve();
-				}
-			}, 50);
-		});
-
-		// Attach permanent error handler
-		_attachErrorHandler(proc, packageName);
-		unrefLspProcessHandles(proc);
-
-		return {
-			process: proc,
-			stdin: proc.stdin,
-			stdout: proc.stdout,
-			stderr: proc.stderr,
-			pid: proc.pid ?? 0,
-		};
-	}
-
-	// --no prevents silent download of uncached packages; user must have
-	// already installed the LSP server via the interactive-install flow.
-	return launchLSP("npx", ["--no", packageName, ...args], options);
 }
 
 /**
@@ -881,6 +758,17 @@ export async function stopLSP(handle: LSPProcess): Promise<void> {
 
 		const killWindowsTree = (): boolean => {
 			if (!isWindows || handle.pid <= 0) return false;
+			// If our child has already exited, its PID is dead and the OS may have
+			// RECYCLED it to an unrelated process. `taskkill /F /T` on a recycled PID
+			// force-kills that process AND its whole tree — in the test suite this
+			// occasionally nuked a vitest worker fork ("Worker exited unexpectedly",
+			// no fatal dump, e.g. via the "stopLSP after the process already exited"
+			// path); in production it could kill an unrelated user process. Never
+			// tree-kill a PID we no longer own — fall back to handle.process.kill(),
+			// which on Windows signals via the retained process HANDLE (not the raw
+			// PID), so it's a safe no-op on an already-exited child.
+			if (handle.process.exitCode !== null || handle.process.signalCode !== null)
+				return false;
 			try {
 				// Absolute path avoids PATH-resolution substitution on Windows.
 				const taskkill = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\taskkill.exe`;

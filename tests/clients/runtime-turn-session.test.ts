@@ -9,7 +9,11 @@ import {
 } from "../../clients/runtime-context.js";
 import { loadProjectDiagnosticsDeltaReport } from "../../clients/project-diagnostics/cache.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
-import { handleTurnEnd } from "../../clients/runtime-turn.js";
+import { SESSION_START_GUIDANCE } from "../../clients/runtime-session.js";
+import {
+	cancelLSPIdleReset,
+	handleTurnEnd,
+} from "../../clients/runtime-turn.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
 const EMPTY_KNIP_RESULT = {
@@ -45,6 +49,110 @@ function makeTurnEndDeps(
 		...overrides,
 	} as any;
 }
+
+// ── LSP idle reset ─────────────────────────────────────────────────────────────
+
+describe("LSP idle reset", () => {
+	it("skips a pending idle reset after the session generation changes", async () => {
+		const env = setupTestEnvironment("pi-lens-idle-generation-");
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		const resetLSPService = vi.fn();
+
+		vi.useFakeTimers();
+		try {
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, {
+					ctxCwd: env.tmpDir,
+					resetLSPService,
+				}),
+			);
+
+			runtime.resetForSession();
+			await vi.advanceTimersByTimeAsync(240_000);
+
+			expect(resetLSPService).not.toHaveBeenCalled();
+		} finally {
+			cancelLSPIdleReset();
+			vi.useRealTimers();
+			env.cleanup();
+		}
+	});
+
+	it("logs and swallows errors from a detached idle reset", async () => {
+		const env = setupTestEnvironment("pi-lens-idle-error-");
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		const dbg = vi.fn();
+		const resetError = new Error("stale ctx");
+		const resetLSPService = vi.fn(() => {
+			throw resetError;
+		});
+
+		vi.useFakeTimers();
+		try {
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, {
+					ctxCwd: env.tmpDir,
+					dbg,
+					resetLSPService,
+				}),
+			);
+
+			await vi.advanceTimersByTimeAsync(240_000);
+
+			expect(resetLSPService).toHaveBeenCalledTimes(1);
+			expect(dbg).toHaveBeenCalledWith(`lsp idle reset failed: ${resetError}`);
+		} finally {
+			cancelLSPIdleReset();
+			vi.useRealTimers();
+			env.cleanup();
+		}
+	});
+
+	it("falls back to process warnings when idle reset logging fails", async () => {
+		const env = setupTestEnvironment("pi-lens-idle-error-reporter-");
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		const resetError = new Error("stale ctx");
+		const logError = new Error("logger unavailable");
+		const dbg = vi.fn((msg: string) => {
+			if (msg.startsWith("lsp idle reset failed")) {
+				throw logError;
+			}
+		});
+		const resetLSPService = vi.fn(() => {
+			throw resetError;
+		});
+		const emitWarning = vi
+			.spyOn(process, "emitWarning")
+			.mockImplementation(() => undefined as never);
+
+		vi.useFakeTimers();
+		try {
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, {
+					ctxCwd: env.tmpDir,
+					dbg,
+					resetLSPService,
+				}),
+			);
+
+			await vi.advanceTimersByTimeAsync(240_000);
+
+			expect(resetLSPService).toHaveBeenCalledTimes(1);
+			expect(emitWarning).toHaveBeenCalledWith(
+				`pi-lens LSP idle reset error reporter failed: ${logError}`,
+				{ code: "PI_LENS_LSP_IDLE_RESET_REPORTER_FAILED" },
+			);
+		} finally {
+			cancelLSPIdleReset();
+			vi.useRealTimers();
+			emitWarning.mockRestore();
+			env.cleanup();
+		}
+	});
+});
 
 // ── Dedup suppression ──────────────────────────────────────────────────────────
 
@@ -472,6 +580,33 @@ describe("context injection framing", () => {
 
 		env.cleanup();
 	});
+
+	it("SESSION_START_GUIDANCE advertises the read-substitute tools and only registered pi tools", () => {
+		const text = SESSION_START_GUIDANCE.join("\n");
+
+		// The #245 gap this guards: module_report + read_symbol were registered as
+		// pi tools but never surfaced in the session-start orientation, so the agent
+		// never reached for them. Keep them (and the other key tools) advertised.
+		for (const tool of [
+			"lens_diagnostics",
+			// #348: symbol_search is now a registered pi tool (the discovery
+			// funnel's entry point) — advertise it alongside module_report/
+			// read_symbol like the other read-substitute tools.
+			"symbol_search",
+			"module_report",
+			"read_symbol",
+			"lsp_navigation",
+			"lsp_diagnostics",
+			"ast_grep_search",
+			"ast_grep_replace",
+			"ast_grep_dump",
+		]) {
+			expect(text).toContain(tool);
+		}
+
+		// Stay lean: the orientation is a nudge, not re-documentation of every arg.
+		expect(text.length).toBeLessThan(750);
+	});
 });
 
 // ── Unresolved inline blocker re-surfacing ────────────────────────────────────
@@ -569,5 +704,394 @@ describe("unresolved inline blocker re-surfacing", () => {
 		runtime.beginTurn();
 		const entries = runtime.consumeInlineBlockers();
 		expect(entries).toHaveLength(0);
+	});
+});
+
+// ── Unified secret surfacing (#131 Mode 3) ────────────────────────────────────
+
+describe("turn_end unified secret surfacing", () => {
+	it("collapses the SAME secret from gitleaks + trivy + ast-grep into ONE blocker", async () => {
+		const env = setupTestEnvironment("pi-lens-secret-collapse-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "sec-session" });
+			const cacheManager = new CacheManager(false);
+
+			const secretFile = path.join(env.tmpDir, "src/config.ts");
+			fs.mkdirSync(path.dirname(secretFile), { recursive: true });
+			fs.writeFileSync(secretFile, "const k = 'AKIA...';\n");
+			cacheManager.addModifiedRange(
+				secretFile,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+				"sec-session",
+			);
+
+			// Three independent sources flag the SAME line with DIFFERENT rule ids.
+			cacheManager.writeCache(
+				"gitleaks",
+				{
+					success: true,
+					scannedAt: "",
+					findings: [
+						{
+							ruleId: "aws-access-token",
+							file: secretFile,
+							startLine: 42,
+							description: "AWS key",
+						},
+					],
+				},
+				env.tmpDir,
+			);
+			cacheManager.writeCache(
+				"trivy",
+				{
+					success: true,
+					scannedAt: "",
+					findings: [],
+					secrets: [
+						{ ruleId: "aws-access-key-id", file: secretFile, line: 42 },
+					],
+				},
+				env.tmpDir,
+			);
+			runtime.recordActionableWarnings([
+				{
+					id: "ag:1",
+					filePath: secretFile,
+					displayPath: "src/config.ts",
+					line: 42,
+					severity: "warning",
+					tool: "ast-grep",
+					rule: "no-hardcoded-secret-js",
+					message: "hardcoded secret",
+					actions: [],
+					suppressed: false,
+					origin: "dispatch",
+				},
+			]);
+
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, { ctxCwd: env.tmpDir }),
+			);
+
+			const result = consumeTurnEndFindings(cacheManager, env.tmpDir);
+			const content = result?.messages?.[0]?.content ?? "";
+
+			// The location is surfaced exactly ONCE, not three times.
+			expect(content.split("src/config.ts:42").length - 1).toBe(1);
+			// Combined provenance from all three scanners is shown.
+			expect(content).toContain("gitleaks + trivy + ast-grep");
+			// gitleaks (highest priority) owns the displayed rule.
+			expect(content).toContain("aws-access-token");
+			// Exactly one secrets blocker header.
+			expect(content.split("hardcoded secrets detected").length - 1).toBe(1);
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+// ── License-risk advisory (#131 Mode 4) ───────────────────────────────────────
+
+describe("turn_end license-risk surfacing", () => {
+	it("surfaces cached trivy license findings as an advisory", async () => {
+		const env = setupTestEnvironment("pi-lens-license-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "lic-session" });
+			const cacheManager = new CacheManager(false);
+
+			const file = path.join(env.tmpDir, "src/a.ts");
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			fs.writeFileSync(file, "export const x = 1;\n");
+			cacheManager.addModifiedRange(
+				file,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+				"lic-session",
+			);
+
+			cacheManager.writeCache(
+				"trivy",
+				{
+					success: true,
+					scannedAt: "",
+					findings: [],
+					secrets: [],
+					licenses: [
+						{
+							license: "GPL-3.0",
+							pkgName: "leftpad",
+							severity: "HIGH",
+							category: "restricted",
+						},
+					],
+				},
+				env.tmpDir,
+			);
+
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, { ctxCwd: env.tmpDir }),
+			);
+
+			const content =
+				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages?.[0]
+					?.content ?? "";
+			expect(content).toContain("Dependency license risk");
+			expect(content).toContain("leftpad — GPL-3.0 (HIGH, restricted)");
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+// ── #628: stale test results are cached, not discarded ────────────────────────
+
+describe("turn_end test runner — stale results are cached, not discarded", () => {
+	it("caches a real failure even when the turn advances before the async run resolves", async () => {
+		const env = setupTestEnvironment("pi-lens-test-stale-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "stale-session" });
+			const cacheManager = new CacheManager(false);
+
+			const srcFile = path.join(env.tmpDir, "src/foo.ts");
+			fs.mkdirSync(path.dirname(srcFile), { recursive: true });
+			fs.writeFileSync(srcFile, "export const x = 1;\n");
+			cacheManager.addModifiedRange(
+				srcFile,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+				"stale-session",
+			);
+
+			let resolveRun!: (v: {
+				file: string;
+				sourceFile: string;
+				runner: string;
+				passed: number;
+				failed: number;
+				skipped: number;
+				failures: unknown[];
+				duration: number;
+			}) => void;
+			const runPromise = new Promise((resolve) => {
+				resolveRun = resolve;
+			});
+
+			const testFile = path.join(env.tmpDir, "src/foo.test.ts");
+			const testRunnerClient = {
+				getTestRunTarget: () => ({
+					testFile,
+					runner: "vitest",
+					config: {} as any,
+					strategy: "related" as const,
+				}),
+				runTestFileAsync: () => runPromise,
+				formatResult: (r: { failed: number }) =>
+					r.failed > 0 ? "[Tests] ✗ 0/1 passed — vitest" : "",
+			};
+
+			const done = handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, {
+					ctxCwd: env.tmpDir,
+					testRunnerClient,
+				}),
+			);
+			await done;
+
+			// Simulate the turn advancing (another edit landed) before the fired
+			// test subprocess resolves — this is the routine, non-rare case from
+			// the real dogfooding logs.
+			runtime.beginTurn();
+			resolveRun({
+				file: testFile,
+				sourceFile: srcFile,
+				runner: "vitest",
+				passed: 0,
+				failed: 1,
+				skipped: 0,
+				failures: [],
+				duration: 5,
+			});
+			// Flush the now-resolved Promise.allSettled(...).then(...) chain.
+			await new Promise((r) => setImmediate(r));
+
+			const cached = cacheManager.readCache<{
+				content: string;
+				stale?: boolean;
+			}>("test-runner-findings", env.tmpDir);
+
+			// The old behavior discarded this entirely (no cache entry at all).
+			expect(cached?.data?.content).toContain("[Tests] ✗ 0/1 passed");
+			expect(cached?.data?.stale).toBe(true);
+			expect(cached?.data?.content).toContain("prior turn");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not tag the result stale when the turn has not advanced", async () => {
+		const env = setupTestEnvironment("pi-lens-test-nonstale-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "nonstale-session" });
+			const cacheManager = new CacheManager(false);
+
+			const srcFile = path.join(env.tmpDir, "src/foo.ts");
+			fs.mkdirSync(path.dirname(srcFile), { recursive: true });
+			fs.writeFileSync(srcFile, "export const x = 1;\n");
+			cacheManager.addModifiedRange(
+				srcFile,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+				"nonstale-session",
+			);
+
+			const testFile = path.join(env.tmpDir, "src/foo.test.ts");
+			const testRunnerClient = {
+				getTestRunTarget: () => ({
+					testFile,
+					runner: "vitest",
+					config: {} as any,
+					strategy: "related" as const,
+				}),
+				runTestFileAsync: async () => ({
+					file: testFile,
+					sourceFile: srcFile,
+					runner: "vitest",
+					passed: 0,
+					failed: 1,
+					skipped: 0,
+					failures: [],
+					duration: 5,
+				}),
+				formatResult: () => "[Tests] ✗ 0/1 passed — vitest",
+			};
+
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, {
+					ctxCwd: env.tmpDir,
+					testRunnerClient,
+				}),
+			);
+			await new Promise((r) => setImmediate(r));
+
+			const cached = cacheManager.readCache<{
+				content: string;
+				stale?: boolean;
+			}>("test-runner-findings", env.tmpDir);
+
+			expect(cached?.data?.content).toContain("[Tests] ✗ 0/1 passed");
+			expect(cached?.data?.stale).toBe(false);
+			expect(cached?.data?.content).not.toContain("prior turn");
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+// ── #628: cascade-neighbor test companions are also fired ─────────────────────
+
+describe("turn_end test runner — cascade neighbors get their own test companion run", () => {
+	it("fires the test companion for a cascade neighbor, not just the edited file", async () => {
+		const env = setupTestEnvironment("pi-lens-test-neighbor-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "neighbor-session" });
+			const cacheManager = new CacheManager(false);
+
+			const editedFile = path.join(env.tmpDir, "src/foo.ts");
+			const neighborFile = path.join(env.tmpDir, "src/bar.ts");
+			fs.mkdirSync(path.dirname(editedFile), { recursive: true });
+			fs.writeFileSync(editedFile, "export const x = 1;\n");
+			fs.writeFileSync(neighborFile, "import { x } from './foo'; export const y = x;\n");
+
+			cacheManager.addModifiedRange(
+				editedFile,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+				"neighbor-session",
+			);
+
+			// Seed this turn's already-computed cascade result (as the #450
+			// deferred-cascade drain would have produced it) — bar.ts imports
+			// foo.ts, so it's a neighbor of the edited file.
+			runtime.appendCascadeRun({
+				filePath: editedFile,
+				result: {
+					filePath: editedFile,
+					impact: {} as any,
+					neighbors: [
+						{
+							filePath: neighborFile,
+							reason: "imports",
+							diagnostics: [],
+							lspTouched: false,
+						},
+					],
+					formatted: "",
+				},
+				neighborCount: 1,
+				diagnosticCount: 0,
+			});
+
+			const fooTestFile = path.join(env.tmpDir, "src/foo.test.ts");
+			const barTestFile = path.join(env.tmpDir, "src/bar.test.ts");
+			const getTestRunTarget = vi.fn((absPath: string) => {
+				if (path.basename(absPath) === path.basename(editedFile)) {
+					return {
+						testFile: fooTestFile,
+						runner: "vitest",
+						config: {} as any,
+						strategy: "related" as const,
+					};
+				}
+				if (path.basename(absPath) === path.basename(neighborFile)) {
+					return {
+						testFile: barTestFile,
+						runner: "vitest",
+						config: {} as any,
+						strategy: "related" as const,
+					};
+				}
+				return null;
+			});
+			const runTestFileAsync = vi.fn(async (testFile: string) => ({
+				file: testFile,
+				sourceFile: "",
+				runner: "vitest",
+				passed: 1,
+				failed: 0,
+				skipped: 0,
+				failures: [],
+				duration: 1,
+			}));
+
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, {
+					ctxCwd: env.tmpDir,
+					testRunnerClient: {
+						getTestRunTarget,
+						runTestFileAsync,
+						formatResult: () => "",
+					},
+				}),
+			);
+			await new Promise((r) => setImmediate(r));
+
+			const firedTestFiles = runTestFileAsync.mock.calls.map((c) => c[0]);
+			expect(firedTestFiles).toContain(fooTestFile);
+			expect(firedTestFiles).toContain(barTestFile);
+		} finally {
+			env.cleanup();
+		}
 	});
 });

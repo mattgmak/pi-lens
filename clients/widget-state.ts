@@ -1,7 +1,9 @@
 import { stat } from "node:fs/promises";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth } from "./deps/pi-tui.js";
+import { fitLine } from "./tui-fit.js";
+import { WriteOrderingGuard } from "./write-ordering-guard.js";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -64,6 +66,17 @@ const lspServers = new Map<string, LspRecord>();
 let sessionLanguages: string[] = [];
 let requestRenderFn: (() => void) | null = null;
 
+/**
+ * Guards `recordDiagnostics` writes against the same race class fixed for
+ * `clients/lsp/client.ts` in #555: pi-lens allows concurrent pipeline runs
+ * for the same file across different same-turn edits, so an older edit's
+ * (slower) pipeline can finish its `recordDiagnostics` call AFTER a newer
+ * edit's (faster) pipeline already recorded fresher diagnostics for that
+ * path. Keyed by `filePath`, tokened by `writeIndex` (see
+ * `clients/runtime-tool-result.ts:nextWriteIndex`).
+ */
+const diagnosticsWriteGuard = new WriteOrderingGuard<string, number>();
+
 const MAX_STORED_DIAGNOSTICS_PER_FILE = 12;
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -77,6 +90,7 @@ export function clearWidgetState(): void {
 	lspServers.clear();
 	sessionLanguages = [];
 	requestRenderFn = null;
+	diagnosticsWriteGuard.clear();
 }
 
 const WIDGET_STATE_VERSION = 1;
@@ -129,6 +143,12 @@ export function exportWidgetState(): PersistedWidgetState {
 export function importWidgetState(state: PersistedWidgetState | undefined): boolean {
 	if (!state || state.version !== WIDGET_STATE_VERSION) return false;
 	files.clear();
+	// A resumed session's writeIndex counter starts fresh (#190 rehydration is
+	// process-bound like lspServers, see the export above) — any ordering
+	// tokens tracked before the restore no longer correspond to anything, so
+	// drop them rather than risk a legitimate post-resume write being read as
+	// "superseded" against a stale token.
+	diagnosticsWriteGuard.clear();
 	for (const f of state.files ?? []) {
 		files.set(f.filePath, {
 			filePath: f.filePath,
@@ -153,6 +173,27 @@ export function importWidgetState(state: PersistedWidgetState | undefined): bool
 export function setSessionLanguages(langs: string[]): void {
 	sessionLanguages = langs;
 	requestRender();
+}
+
+/** File-kinds detected in use this session (#170 staleness scope). */
+export function getSessionLanguages(): string[] {
+	return [...sessionLanguages];
+}
+
+/**
+ * Distinct serverIds with a failed spawn record (#170). Raw — the per-language
+ * coverage check (a live sibling) and the in-use staleness filter live in
+ * `selectLspStatus`, which joins this against the alive set and session kinds.
+ */
+export function getFailedLspServerIds(): string[] {
+	const ids: string[] = [];
+	const seen = new Set<string>();
+	for (const rec of lspServers.values()) {
+		if (rec.status !== "failed" || seen.has(rec.serverId)) continue;
+		seen.add(rec.serverId);
+		ids.push(rec.serverId);
+	}
+	return ids;
 }
 
 export function recordFormatter(
@@ -206,7 +247,17 @@ export function recordDiagnostics(
 		severity?: string;
 		semantic?: string;
 	}>,
+	writeIndex?: number,
 ): void {
+	// Drop a write that's superseded by a later same-turn edit to this file
+	// whose pipeline finished first (same race class as #555). No cache write,
+	// no count/timestamp update, no render trigger — the recorded state must
+	// stay exactly as the fresher write left it. `writeIndex` omitted (e.g.
+	// the `clients/mcp/analyze.ts` on-demand call site, which has no per-edit
+	// ordering token) always proceeds, same as version-less LSP servers in the
+	// #555 guard.
+	if (!diagnosticsWriteGuard.shouldWrite(filePath, writeIndex)) return;
+
 	const rec = getOrCreate(filePath);
 	const base = pathToFileURL(filePath).href;
 	const normalized = diagnostics.map((d) => {
@@ -243,6 +294,53 @@ export function recordDiagnostics(
 	rec.touchedAt = Date.now();
 	files.set(filePath, rec);
 	requestRender();
+}
+
+/**
+ * Reconcile a diagnostics result obtained OUTSIDE the per-edit dispatch
+ * pipeline — a `lens_diagnostics` mode=full workspace scan, or a standalone
+ * `lsp_diagnostics` on-demand check — into the footer cache (#571).
+ *
+ * `recordDiagnostics` is otherwise only reachable from `pipeline.ts`'s
+ * per-edit dispatch, so a file that becomes stale/fresh purely because of a
+ * change to some OTHER file it depends on (and is never itself re-edited
+ * through pi-lens) has no path to correct the footer — a full scan proves
+ * the fresher truth but had nowhere to put it. This is that path, shared by
+ * both call sites so there's exactly one place that decides whether a scan
+ * result is trustworthy enough to write.
+ *
+ * `confirmed` MUST be false for any result the caller can't vouch for — a
+ * timed-out/inconclusive LSP check (see #570) must never present as
+ * "confirmed clean" in the footer, and must not clobber a real prior
+ * confirmed-dirty entry either. Non-confirmed results are silently skipped,
+ * leaving whatever the footer already had (stale-but-real beats
+ * fresh-but-fabricated).
+ *
+ * `writeIndex` should be a freshly-drawn token from the same monotonic
+ * source the per-edit pipeline uses (`RuntimeCoordinator.nextWriteIndex()`)
+ * so `recordDiagnostics`'s existing `WriteOrderingGuard` (#555) can tell a
+ * scan-originated write apart from a concurrent, genuinely newer per-edit
+ * write for the same file — an omitted `writeIndex` always proceeds (same
+ * version-less fallback `recordDiagnostics` already documents), which is
+ * only safe for callers with no ordering token to give (e.g. tests).
+ */
+export function reconcileScanDiagnostics(
+	filePath: string,
+	diagnostics: Array<{
+		tool?: string;
+		rule?: string;
+		id?: string;
+		message?: string;
+		line?: number;
+		column?: number;
+		severity?: string;
+		semantic?: string;
+	}>,
+	confirmed: boolean,
+	writeIndex?: number,
+): void {
+	if (!confirmed) return;
+	recordDiagnostics(filePath, diagnostics, writeIndex);
 }
 
 /**
@@ -310,6 +408,28 @@ export function getFileDiagnosticSummaries(): FileDiagnosticSummary[] {
 		hasFinalSnapshot: rec.hasFinalDiagnosticsSnapshot,
 		diagnostics: rec.allDiagnostics.map((d) => ({ ...d })),
 	}));
+}
+
+/**
+ * Return the current FULL (uncapped) diagnostic set for a single file, as
+ * last recorded by {@link recordDiagnostics} — the same `allDiagnostics`
+ * store `getFileDiagnosticSummaries` exposes per-file, without paying for a
+ * whole-session snapshot. Used by the #502 `pilens:diagnostics` bus producer
+ * (`clients/bus-publish.ts`), which reads this immediately after
+ * `recordDiagnostics` writes it so the emitted event reflects the write
+ * batch's FINAL diagnostic state (post-format, post-autofix, post-dispatch —
+ * see pipeline.ts call order). Returns `undefined` when the file has never
+ * been recorded (caller must not confuse "never seen" with "seen and clean";
+ * an explicit `[]` from `recordDiagnostics` is a real empty array here).
+ *
+ * NOTE: `filePath` must be the exact string used to record the file — the
+ * `files` map key is NOT normalized (pre-existing; see `getOrCreate`), so
+ * callers should pass through the same value they gave `recordDiagnostics`.
+ */
+export function getFileDiagnostics(filePath: string): WidgetDiagnostic[] | undefined {
+	const rec = files.get(filePath);
+	if (!rec) return undefined;
+	return rec.allDiagnostics.map((d) => ({ ...d }));
 }
 
 /** @internal Test-only helpers. Do not use in production code. */
@@ -701,9 +821,9 @@ function osc8(uri: string, label: string): string {
 	return `\x1b]8;;${uri}\x1b\\${label}\x1b]8;;\x1b\\`;
 }
 
-function fitLine(s: string, maxWidth: number, ellipsis = "..."): string {
-	return truncateToWidth(s, Math.max(0, maxWidth), ellipsis);
-}
+// Dual-signature truncateToWidth handling lives in tui-fit.ts (shared with the
+// turn-summary message renderer, which learned the hard way that pi-tui crashes
+// the host on over-width lines — #513).
 
 function dedupeByBasename(recs: FileRecord[]): FileRecord[] {
 	const seen = new Map<string, FileRecord>();

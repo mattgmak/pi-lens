@@ -28,6 +28,7 @@ import {
 } from "./project-changes.js";
 import type { RuffClient } from "./ruff-client.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
+import { scheduleWordIndexPersist } from "./word-index.js";
 
 interface ToolResultEvent {
 	toolName: string;
@@ -574,6 +575,26 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			},
 			getFlag,
 			dbg,
+			// #451: hand the deferred cascade live sequence accessors so the
+			// review-graph builder can skip its per-build O(project) sweep when
+			// only pi-observed edits happened. projectSeq is a function because the
+			// cascade runs after this returns (#450) — read current, not captured.
+			seqState: {
+				projectSeq: () => runtime.projectSeq,
+				getFilesChangedSince: (seq: number) =>
+					runtime.getFilesChangedSince(seq),
+			},
+			// #348 phase 2: live reference so the deferred cascade can update the
+			// warm word index in place at the same seam as the graph rebuild.
+			// `runtime.wordIndex` is read fresh (not captured) via this closure-free
+			// property access being re-evaluated at object-literal construction
+			// time here — that's fine because runPipeline reads `ctx.wordIndex`
+			// synchronously into computeCascadeForFile's options before returning
+			// (the deferred part is the cascade's OWN execution, not this handoff).
+			wordIndex: runtime.wordIndex,
+			onWordIndexUpdated: (index) => {
+				scheduleWordIndexPersist(dispatchCwd, index, dbg);
+			},
 		},
 		{
 			biomeClient,
@@ -682,8 +703,8 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		}
 	}
 
-	if (result.cascadeRun) {
-		runtime.appendCascadeRun(result.cascadeRun);
+	if (result.cascadePromise) {
+		runtime.appendCascadePromise(result.cascadePromise);
 	}
 
 	if (result.actionableWarnings?.length) {
@@ -691,6 +712,42 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	}
 	if (result.codeQualityWarnings?.length) {
 		runtime.recordCodeQualityWarnings(result.codeQualityWarnings);
+	}
+
+	// #484: opt-in per-turn summary collection. Same signals the pipeline
+	// already computed above (diagnostics, autofix count/tools, formatters
+	// used) — no new collection plumbing, just fed into the collector when
+	// the feature is on.
+	if (getFlag("lens-turn-summary")) {
+		if (result.diagnostics?.length) {
+			for (const d of result.diagnostics) {
+				runtime.turnSummary.recordDiagnostic(d.filePath || filePath, {
+					tool: d.tool,
+					ruleId: d.rule ?? d.code,
+					severity: d.severity,
+					line: d.line,
+					description: d.message,
+				});
+			}
+		}
+		if (result.fixedCount && result.fixedCount > 0) {
+			for (const label of result.autofixTools ?? []) {
+				const [tool, countStr] = label.split(":");
+				const count = Number.parseInt(countStr ?? "", 10);
+				runtime.turnSummary.recordAutofix(filePath, {
+					tool: tool || label,
+					description:
+						Number.isFinite(count) && count > 0
+							? `${count} issue(s) fixed`
+							: undefined,
+				});
+			}
+		}
+		if (result.formattersUsed?.length) {
+			for (const tool of result.formattersUsed) {
+				runtime.turnSummary.recordFormat(filePath, { tool });
+			}
+		}
 	}
 
 	if (result.inlineBlockerSummary) {

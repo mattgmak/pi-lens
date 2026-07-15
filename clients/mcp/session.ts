@@ -102,9 +102,11 @@ export async function runSessionStart(
 		ruffClient: ctx.clients.ruffClient,
 		knipClient: ctx.clients.knipClient,
 		jscpdClient: ctx.clients.jscpdClient,
+		deadCodeClients: ctx.clients.deadCodeClients,
 		govulncheckClient: ctx.clients.govulncheckClient,
 		gitleaksClient: ctx.clients.gitleaksClient,
-		typeCoverageClient: ctx.clients.typeCoverageClient,
+		trivyClient: ctx.clients.trivyClient,
+		opengrepClient: ctx.clients.opengrepClient,
 		depChecker: ctx.clients.depChecker,
 		testRunnerClient: ctx.clients.testRunnerClient,
 		goClient: ctx.clients.goClient,
@@ -112,7 +114,8 @@ export async function runSessionStart(
 		ensureTool: async (name: string) =>
 			(await import("../installer/index.js")).ensureTool(name),
 		cleanStaleTsBuildInfo: () => [],
-		resetDispatchBaselines,
+		resetDispatchBaselines: (cwdArg?: string) =>
+			resetDispatchBaselines(cwdArg ?? cwd),
 		resetLSPService,
 	});
 
@@ -170,6 +173,7 @@ export async function runTurnEnd(
 		runtime: ctx.runtime,
 		cacheManager: ctx.cacheManager,
 		knipClient: ctx.clients.knipClient,
+		deadCodeClients: ctx.clients.deadCodeClients,
 		depChecker: ctx.clients.depChecker,
 		testRunnerClient: ctx.clients.testRunnerClient,
 		resetLSPService,

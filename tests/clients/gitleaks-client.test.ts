@@ -1,8 +1,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
+	GitleaksClient,
 	hasGitleaksSignal,
+	hasGitRepo,
 	parseGitleaksReport,
 } from "../../clients/gitleaks-client.js";
 import { setupTestEnvironment } from "./test-utils.js";
@@ -228,5 +230,162 @@ describe("parseGitleaksReport (#130)", () => {
 		const findings = parseGitleaksReport(raw);
 		expect(findings).toHaveLength(1);
 		expect(findings[0].startLine).toBe(42);
+	});
+});
+
+describe("GitleaksClient.scan requireSignal option (#608)", () => {
+	it("defaults to the strict gate: no signal -> no scan attempted", async () => {
+		const env = setupTestEnvironment("pi-lens-gitleaks-strict-default-");
+		try {
+			const client = new GitleaksClient(false) as unknown as {
+				ensureAvailable: () => Promise<boolean>;
+				scan: (
+					cwd: string,
+					options?: { requireSignal?: boolean },
+				) => Promise<{ success: boolean; summary?: string }>;
+			};
+			const ensureSpy = vi
+				.spyOn(client, "ensureAvailable")
+				.mockResolvedValue(true);
+
+			const result = await client.scan(env.tmpDir);
+			expect(result.summary).toBe("no gitleaks opt-in signal at project root");
+			expect(ensureSpy).not.toHaveBeenCalled();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("requireSignal:false skips the strict gate and attempts a scan on a bare git repo", async () => {
+		const env = setupTestEnvironment("pi-lens-gitleaks-loose-gate-");
+		try {
+			fs.mkdirSync(path.join(env.tmpDir, ".git"));
+			const client = new GitleaksClient(false) as unknown as {
+				ensureAvailable: () => Promise<boolean>;
+				runScan: (cwd: string) => Promise<{
+					success: boolean;
+					findings: unknown[];
+					scannedAt: string;
+				}>;
+				scan: (
+					cwd: string,
+					options?: { requireSignal?: boolean },
+				) => Promise<{ success: boolean; summary?: string }>;
+			};
+			vi.spyOn(client, "ensureAvailable").mockResolvedValue(true);
+			const runSpy = vi.spyOn(client, "runScan").mockResolvedValue({
+				success: true,
+				findings: [],
+				scannedAt: "now",
+			});
+
+			const result = await client.scan(env.tmpDir, { requireSignal: false });
+			expect(runSpy).toHaveBeenCalledTimes(1);
+			expect(result.success).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+describe("hasGitRepo (#608 mode=full smart-default gate)", () => {
+	it("returns false for a project with no .git", () => {
+		const env = setupTestEnvironment("pi-lens-gitleaks-nogit-");
+		try {
+			expect(hasGitRepo(env.tmpDir)).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("returns true when .git is a directory (normal clone)", () => {
+		const env = setupTestEnvironment("pi-lens-gitleaks-gitdir-");
+		try {
+			fs.mkdirSync(path.join(env.tmpDir, ".git"));
+			expect(hasGitRepo(env.tmpDir)).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("returns true when .git is a file (worktree gitdir pointer)", () => {
+		const env = setupTestEnvironment("pi-lens-gitleaks-gitfile-");
+		try {
+			fs.writeFileSync(
+				path.join(env.tmpDir, ".git"),
+				"gitdir: ../main/.git/worktrees/wt\n",
+			);
+			expect(hasGitRepo(env.tmpDir)).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("is true even without any explicit gitleaks opt-in signal, unlike hasGitleaksSignal", () => {
+		const env = setupTestEnvironment("pi-lens-gitleaks-smartdefault-");
+		try {
+			fs.mkdirSync(path.join(env.tmpDir, ".git"));
+			expect(hasGitleaksSignal(env.tmpDir)).toBe(false);
+			expect(hasGitRepo(env.tmpDir)).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+describe("GitleaksClient de-dupe guard (#585 prerequisite)", () => {
+	it("de-dupes concurrent scan() calls for the same project root (SecurityScanClient.dedupeScan)", async () => {
+		// #585: mode=full can now trigger a fresh gitleaks scan while a
+		// session_start scan of the same root may still be in flight. Without
+		// this guard (added via the shared SecurityScanClient base, #313) that
+		// would double-spawn gitleaks — the same CPU-contention pathology
+		// KnipClient.inFlight's docstring documents for knip.
+		const env = setupTestEnvironment("pi-lens-gitleaks-dedupe-");
+		try {
+			fs.writeFileSync(path.join(env.tmpDir, ".gitleaksignore"), "");
+
+			const client = new GitleaksClient(false) as unknown as {
+				ensureAvailable: () => Promise<boolean>;
+				runScan: (cwd: string) => Promise<{
+					success: boolean;
+					findings: unknown[];
+					scannedAt: string;
+				}>;
+				scan: (cwd: string) => Promise<unknown>;
+			};
+			vi.spyOn(client, "ensureAvailable").mockResolvedValue(true);
+
+			type Resolver = (v: {
+				success: boolean;
+				findings: unknown[];
+				scannedAt: string;
+			}) => void;
+			let resolveRun: Resolver | null = null;
+			let runCalls = 0;
+			const runSpy = vi.spyOn(client, "runScan").mockImplementation(
+				() =>
+					new Promise((res) => {
+						runCalls++;
+						resolveRun = res as unknown as Resolver;
+					}),
+			);
+
+			const first = client.scan(env.tmpDir);
+			const second = client.scan(env.tmpDir);
+
+			await Promise.resolve();
+			await Promise.resolve();
+
+			expect(runCalls).toBe(1);
+			expect(runSpy).toHaveBeenCalledTimes(1);
+
+			const payload = { success: true, findings: [], scannedAt: "now" };
+			(resolveRun as Resolver | null)?.(payload);
+
+			const [a, b] = await Promise.all([first, second]);
+			expect(a).toBe(b);
+		} finally {
+			env.cleanup();
+		}
 	});
 });

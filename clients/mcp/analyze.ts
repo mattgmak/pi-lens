@@ -16,14 +16,78 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { CacheManager } from "../cache-manager.js";
 import {
+	CASCADE_GRAPH_KINDS,
 	dispatchLintWithResult,
 	getLatencyReports,
 } from "../dispatch/integration.js";
+import { FactStore } from "../dispatch/fact-store.js";
 import type { Diagnostic } from "../dispatch/types.js";
+import { detectFileKind } from "../file-kinds.js";
 import { getDiagnosticTracker } from "../diagnostic-tracker.js";
 import { getLSPService } from "../lsp/index.js";
+import { loadProjectSnapshot } from "../project-snapshot.js";
+import { buildOrUpdateGraph } from "../review-graph/service.js";
 import { recordDiagnostics } from "../widget-state.js";
+import {
+	deserializeWordIndex,
+	removeWordIndexDocument,
+	scheduleWordIndexPersist,
+	updateWordIndexDocument,
+	WORD_INDEX_MAX_BYTES,
+	type WordIndex,
+} from "../word-index.js";
 import { createMcpHost } from "./host-shim.js";
+
+// #536: module-scoped FactStore for the warm-analyze graph seam, mirroring the
+// per-edit cascade path's own module-level `sessionFacts` singleton
+// (clients/dispatch/integration.ts) — buildOrUpdateGraph's incremental/cached
+// tiers key off a stable FactStore instance across calls, so a fresh FactStore
+// per call would defeat that reuse. Scoped separately from integration.ts's
+// singleton since this file has no dependency on that module's internal state.
+const warmGraphFacts = new FactStore();
+
+// #536 rider (issue body: "when #348 phase 2 lands, the word-index per-edit
+// update should ride the SAME seam so both indexes stay warm together"):
+// MCP has no RuntimeCoordinator/`runtime.wordIndex` to hold a live index the
+// way pi's per-edit seam does (clients/dispatch/integration.ts's
+// `updateWordIndexForCascade`, called from clients/runtime-tool-result.ts with
+// `runtime.wordIndex`) — this process-scoped Map is the MCP-side equivalent: a
+// per-cwd live WordIndex, loaded once from the persisted snapshot and mutated
+// in place thereafter, mirroring `runtime.wordIndex`'s lifecycle for a process
+// that has no other place to hold it. `undefined` cached value = "checked,
+// nothing usable" (index missing or pre-phase-2/no-forward-map), distinct from
+// "never checked" (key absent) — avoids re-attempting a snapshot load with no
+// forward index on every single analyze call.
+const warmWordIndexes = new Map<string, WordIndex | undefined>();
+
+/**
+ * Look up (loading from the persisted snapshot on first use per cwd) the warm
+ * in-memory word index this analyze facade keeps mutated in place. Exported so
+ * `symbolSearch()` (clients/lens-engine.ts) can prefer this live copy over a
+ * fresh disk read when one exists for the cwd — otherwise a query immediately
+ * following a warm `pilens_analyze` call in the SAME process would read a
+ * stale on-disk snapshot until the debounced persist (default 1500ms) flushes.
+ */
+export function getOrLoadWarmWordIndex(cwd: string): WordIndex | undefined {
+	const key = path.resolve(cwd);
+	if (warmWordIndexes.has(key)) return warmWordIndexes.get(key);
+	const snapshot = loadProjectSnapshot(key);
+	const index = deserializeWordIndex(snapshot?.wordIndex) ?? undefined;
+	// Same phase-2 rule as updateWordIndexForCascade: no forward index ⇒ no
+	// incremental primitive available, so don't cache it as "usable" — this
+	// call site's whole point is the incremental single-doc update.
+	const usable = index?.forward ? index : undefined;
+	warmWordIndexes.set(key, usable);
+	return usable;
+}
+
+/**
+ * Test-only reset — the module-level warm cache otherwise survives across
+ * unrelated test cases in the same vitest worker.
+ */
+export function _resetWarmWordIndexCacheForTests(): void {
+	warmWordIndexes.clear();
+}
 
 // Generous warm-up budgets: a cold language server needs to spawn AND publish
 // diagnostics. The per-edit dispatch runner caps these tightly (spawn budget +
@@ -121,6 +185,25 @@ export interface AnalyzeFileOptions {
 	 * benchmarking doesn't pollute the real turn-state.
 	 */
 	registerTurnState?: boolean;
+	/**
+	 * Maintain the review graph for this file after a successful dispatch — the
+	 * SAME `buildOrUpdateGraph` call pi's per-edit cascade path makes
+	 * (`computeCascadeForFile`, clients/dispatch/integration.ts), so
+	 * `pilens_module_report`'s usedBy/blastRadius and `pilens_symbol_search`'s
+	 * centrality reflect files analyzed via MCP, not just session-start state.
+	 * Default false — this is a DELIBERATE opt-in gate (#536), not a
+	 * per-call-site inference from cwd/process, because `analyzeFile` is the
+	 * shared facade for BOTH the warm in-process path (mcp/server.ts) and the
+	 * `fresh` worker (mcp/worker.ts, forked per-call, always cold, exits after
+	 * one result) — the fresh worker's process-lifetime is too short for the
+	 * persist debounce to ever flush, and building/persisting a graph from a
+	 * one-shot throwaway process on every fresh analysis would be pure waste
+	 * plus a needless disk write. Only mcp/server.ts's two warm call sites (the
+	 * IPC handler and the direct tool dispatch) set this true. This retires the
+	 * #256 "read-only facade" contract for warm mode specifically; `fresh`
+	 * stays read-only.
+	 */
+	updateGraph?: boolean;
 }
 
 function toMcpDiagnostic(diagnostic: Diagnostic): McpAnalyzeDiagnostic {
@@ -229,6 +312,61 @@ export async function analyzeFile(
 			);
 		} catch {
 			// unreadable — skip turn-state registration
+		}
+	}
+
+	if (options.updateGraph && !result.hasBlockers) {
+		// #536: maintain the review graph on a successful warm analysis — the same
+		// call pi's per-edit cascade path makes (computeCascadeForFile), gated the
+		// same way (CASCADE_GRAPH_KINDS: only languages the graph actually models,
+		// and skipped when the file has blockers, matching the cascade path's own
+		// "primary_has_blockers" skip). buildOrUpdateGraph owns its own debounced
+		// persist + seq machinery internally — this is the ONLY call needed; no
+		// separate persist/flush step. Best-effort: a graph build failure must
+		// never fail the analysis itself (the diagnostics are already computed).
+		const fileKind = detectFileKind(absPath);
+		if (fileKind && CASCADE_GRAPH_KINDS.has(fileKind)) {
+			try {
+				await buildOrUpdateGraph(cwd, [absPath], warmGraphFacts);
+			} catch {
+				// Best-effort — the graph update is additive; a failure here must not
+				// surface as an analyze failure.
+			}
+		}
+
+		// #536 rider: ride the SAME seam for the word index (#348 phase 2's
+		// per-edit primitive), mirroring pi's `updateWordIndexForCascade`
+		// (clients/dispatch/integration.ts) rule-for-rule rather than reusing it
+		// directly — that function is module-private and reads its file-content
+		// argument from the pipeline's already-read buffer, whereas this seam
+		// reads the file itself (no pipeline hook here). Same rules: a cached
+		// index with no `forward` map (or none loaded) ⇒ no-op (no incremental
+		// primitive available — the eventual full rebuild covers it); an
+		// oversized file is REMOVED, never partially indexed; the update is
+		// synchronous (no interleaving hazard — MCP is single-process, same as
+		// pi); a successful update schedules the SAME debounced persist
+		// (`scheduleWordIndexPersist`, `PI_LENS_WORD_INDEX_PERSIST_DEBOUNCE_MS`)
+		// pi's path uses — no second persist mechanism.
+		//
+		// Key shape: `path.resolve(absPath)`, matching the build path's own keys
+		// (collectWordIndexDocs → collectSourceFilesAsync), NOT normalizeMapKey —
+		// see updateWordIndexForCascade's doc comment for why a mismatched key
+		// silently orphans a duplicate entry instead of replacing it.
+		const warmIndex = getOrLoadWarmWordIndex(cwd);
+		if (warmIndex) {
+			try {
+				const content = fs.readFileSync(absPath, "utf8");
+				const byteLength = Buffer.byteLength(content, "utf-8");
+				if (byteLength > WORD_INDEX_MAX_BYTES) {
+					removeWordIndexDocument(warmIndex, absPath);
+				} else {
+					updateWordIndexDocument(warmIndex, { path: absPath, content });
+				}
+				scheduleWordIndexPersist(cwd, warmIndex);
+			} catch {
+				// unreadable/deleted, or an update failure — best-effort, same as the
+				// graph update above.
+			}
 		}
 	}
 

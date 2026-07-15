@@ -5,8 +5,16 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { minimatch } from "minimatch";
+import { minimatch } from "./deps/minimatch.js";
+import {
+	getGlobalIgnorePatterns,
+	getPiLensGlobalConfigPath,
+} from "./lens-config.js";
 import { normalizeFilePath } from "./path-utils.js";
+import {
+	findPiLensProjectConfig,
+	loadPiLensProjectConfig,
+} from "./project-lens-config.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
 
 /**
@@ -30,8 +38,7 @@ export function getProjectDataDir(cwd: string): string {
 	if (!configuredBase && fs.existsSync(legacyProjectDir)) {
 		return legacyProjectDir;
 	}
-	const base =
-		configuredBase || path.join(os.homedir(), ".pi-lens", "projects");
+	const base = configuredBase || path.join(getGlobalPiLensDir(), "projects");
 	const normalized = normalizeFilePath(path.resolve(cwd));
 	const slug = normalized
 		.replace(/^[a-z]:/i, "") // strip Windows drive letter
@@ -43,18 +50,30 @@ export function getProjectDataDir(cwd: string): string {
 }
 
 /**
- * Machine-global pi-lens directory: `~/.pi-lens/`.
+ * Machine-global pi-lens directory: `~/.pi-lens/` by default.
  *
  * Used for logs (latency, cascade, read-guard, tree-sitter, actionable-warnings,
- * sessionstart), tool binaries (`~/.pi-lens/tools/`, `~/.pi-lens/bin/`), LSP
- * server storage, and other state that is intentionally NOT project-scoped
- * — it spans every project pi-lens has touched.
+ * sessionstart), tool binaries (`~/.pi-lens/tools/`, `~/.pi-lens/bin/`), the
+ * cross-process instance registry (`instances.json`, #449/#525), the
+ * auto-install probe cache, and other state that is intentionally NOT
+ * project-scoped — it spans every project pi-lens has touched.
+ *
+ * Override: set `PI_LENS_HOME=/some/path` to relocate this ENTIRE root (every
+ * caller below routes through this one function, so one env var covers all of
+ * them — see #525). Tests MUST set this to a per-worker temp dir in
+ * `tests/support/vitest-setup.ts` rather than mocking each caller separately;
+ * otherwise a test that exercises `registerInstance`/`sweepOrphans` or any
+ * logger writes into the developer's REAL `~/.pi-lens` (dogfooded live: a
+ * test-fixture instance survived in the real `instances.json` for 17h).
  *
  * Distinct from `getProjectDataDir(cwd)`, which respects `PILENS_DATA_DIR`
- * and produces per-project subdirectories. Callers writing project caches,
- * snapshots, or worklogs should use `getProjectDataDir(cwd)` instead.
+ * (project-scoped) and produces per-project subdirectories. Callers writing
+ * project caches, snapshots, or worklogs should use `getProjectDataDir(cwd)`
+ * instead — `PI_LENS_HOME` is the MACHINE-scoped sibling of that override.
  */
 export function getGlobalPiLensDir(): string {
+	const override = process.env.PI_LENS_HOME?.trim();
+	if (override) return path.resolve(override);
 	return path.join(os.homedir(), ".pi-lens");
 }
 
@@ -330,9 +349,14 @@ function buildProjectIgnoreMatcher(
 export function createProjectIgnoreMatcher(
 	rootDir: string,
 	extraPatterns: string[] = [],
+	globalPatterns: string[] = [],
 ): ProjectIgnoreMatcher {
 	const resolvedRoot = resolveGitIgnoreRoot(rootDir);
+	// Precedence is gitignore order: LATER patterns override earlier ones. So
+	// global (lowest) → project .gitignore → project .pi-lens.json (highest),
+	// which lets a project `!negation` re-include a globally-ignored path (#252).
 	const patterns = [
+		...parseGitignoreContent(globalPatterns.join("\n")),
 		...readGitignorePatterns(resolvedRoot),
 		...parseGitignoreContent(extraPatterns.join("\n")),
 	];
@@ -341,8 +365,27 @@ export function createProjectIgnoreMatcher(
 
 const projectIgnoreMatcherCache = new Map<
 	string,
-	{ gitignoreMtimeMs: number; matcher: ProjectIgnoreMatcher }
+	{
+		gitignoreMtimeMs: number;
+		lensConfigPath: string | undefined;
+		lensConfigMtimeMs: number;
+		globalConfigMtimeMs: number;
+		matcher: ProjectIgnoreMatcher;
+	}
 >();
+
+/**
+ * mtime of the global `~/.pi-lens/config.json` (or the PI_LENS_CONFIG_PATH
+ * override). Part of the ignore-matcher cache key so editing global ignore
+ * patterns takes effect without a restart (#252). -1 when absent.
+ */
+function globalConfigMtimeMs(): number {
+	try {
+		return fs.statSync(getPiLensGlobalConfigPath()).mtimeMs;
+	} catch {
+		return -1;
+	}
+}
 
 function gitignoreMtimeMs(rootDir: string): number {
 	try {
@@ -352,15 +395,53 @@ function gitignoreMtimeMs(rootDir: string): number {
 	}
 }
 
+/**
+ * The project config file found by the same upward walk as the loader. Cache
+ * invalidation must track the actual file found, not only a file directly under
+ * the git root: nested worktrees/submodules can legitimately inherit a
+ * `.pi-lens.json` from a parent directory.
+ */
+function lensConfigInfo(rootDir: string): {
+	info: ReturnType<typeof findPiLensProjectConfig>;
+	path: string | undefined;
+	mtimeMs: number;
+} {
+	const info = findPiLensProjectConfig(rootDir);
+	return info
+		? { info, path: info.path, mtimeMs: info.mtimeMs }
+		: { info, path: undefined, mtimeMs: -1 };
+}
+
 export function getProjectIgnoreMatcher(rootDir: string): ProjectIgnoreMatcher {
 	const resolvedRoot = resolveGitIgnoreRoot(rootDir);
 	const gitignoreMtime = gitignoreMtimeMs(resolvedRoot);
+	const lensConfig = lensConfigInfo(resolvedRoot);
+	const globalMtime = globalConfigMtimeMs();
 	const cached = projectIgnoreMatcherCache.get(resolvedRoot);
-	if (cached?.gitignoreMtimeMs === gitignoreMtime) return cached.matcher;
+	if (
+		cached?.gitignoreMtimeMs === gitignoreMtime &&
+		cached?.lensConfigPath === lensConfig.path &&
+		cached?.lensConfigMtimeMs === lensConfig.mtimeMs &&
+		cached?.globalConfigMtimeMs === globalMtime
+	) {
+		return cached.matcher;
+	}
 
-	const matcher = createProjectIgnoreMatcher(resolvedRoot);
+	// Load both configs fresh on cache miss. On a cache HIT (the common case)
+	// none of this runs — the only per-call cost is the mtime stats above. The
+	// project loader is itself mtime-cached; the global loader re-parses, but
+	// only here on miss (when some tracked mtime changed).
+	const projectConfig = loadPiLensProjectConfig(resolvedRoot, lensConfig.info);
+	const matcher = createProjectIgnoreMatcher(
+		resolvedRoot,
+		projectConfig.ignore,
+		getGlobalIgnorePatterns(),
+	);
 	projectIgnoreMatcherCache.set(resolvedRoot, {
 		gitignoreMtimeMs: gitignoreMtime,
+		lensConfigPath: lensConfig.path,
+		lensConfigMtimeMs: lensConfig.mtimeMs,
+		globalConfigMtimeMs: globalMtime,
 		matcher,
 	});
 	return matcher;

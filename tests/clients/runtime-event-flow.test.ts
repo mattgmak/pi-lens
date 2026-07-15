@@ -25,7 +25,7 @@ vi.mock("../../clients/pipeline.js", () => ({
 		hasBlockers: false,
 		isError: false,
 		fileModified: false,
-		cascadeRun: undefined,
+		cascadePromise: undefined,
 	})),
 }));
 
@@ -73,7 +73,6 @@ describe("runtime event flow", () => {
 					isAvailable: () => false,
 					ensureAvailable: async () => false,
 				},
-				typeCoverageClient: { isAvailable: () => false },
 				depChecker: {
 					isAvailable: () => false,
 					ensureAvailable: async () => false,

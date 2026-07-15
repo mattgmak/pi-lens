@@ -5,11 +5,11 @@ name: Tool smoke (nightly)
 # path against per-language fixtures — so it's slow and network-dependent, hence
 # nightly + manual only, never a per-PR gate.
 #
-# The harness exits nonzero only on genuine infra failures (timeout / exception /
-# server_error). A tool that's merely unavailable (couldn't install on the
+# The harness exits nonzero only on genuine infra failures (timeout / exception
+# / server_error). A tool that's merely unavailable (couldn't install on the
 # runner) reports ⚠ and does NOT fail the run, so transient install/network
-# flakiness doesn't produce false alarms — the printed report still shows the ⚠
-# counts for review.
+# flakiness doesn't produce false alarms — the printed report still shows the
+# ⚠ counts for review.
 
 on:
   schedule:
@@ -21,18 +21,21 @@ jobs:
     name: Live tool + LSP smoke
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-    # The installer's GitHub-release strategy hits the GitHub REST API to resolve
-    # release assets. Unauthenticated = 60 req/hr per IP, exhausted on shared-IP
-    # runners → every github-strategy tool (rust-analyzer/taplo/opengrep/…) fails
-    # to install. The auto-provided token raises this to 5000 req/hr; the installer
-    # sends it ONLY to api.github.com, never the asset CDN.
+      contents: write # commit-back branch for the LSP-docs refresh PR (#390)
+      pull-requests: write # open/update the auto-refresh PR (#390)
+      issues: write # file/update/close the silentOnClean drift tracking issue (#529/#594)
+    # The installer hits the GitHub REST API to resolve release assets.
+    # Unauthenticated = 60 req/hr per IP, exhausted on shared-IP runners.
+    # The auto-provided token raises this to 5000 req/hr; the installer sends it
+    # ONLY to api.github.com, never the asset CDN.
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: '22'
 
@@ -40,32 +43,34 @@ jobs:
       # sqlfluff, mypy). GitHub-release tools (shellcheck/shfmt/hadolint/taplo/
       # tflint/terraform-ls/rust-analyzer) are fetched by the harness's own
       # --install; ubuntu-latest ships rustup/cargo so rust-analyzer can load.
-      - uses: actions/setup-python@v6
+      # yamllint disable-line rule:line-length
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
 
-      # Toolchain-gated languages. go/rust(rustup)/pwsh/.NET ship on ubuntu-latest;
+      # Toolchain-gated languages. go/rust(rustup)/pwsh/.NET ship on Ubuntu;
       # these set up the rest. All best-effort: a setup failure must NOT red the
       # nightly (the harness already treats an unavailable tool as ⚠, not a
       # failure), so each is continue-on-error.
-      - uses: actions/setup-java@v5
+      # yamllint disable-line rule:line-length
+      - uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5
         continue-on-error: true
         with:
           distribution: temurin
           java-version: '21'
-      - uses: ruby/setup-ruby@89f90524b88a01fe6e0b732220432cc6142926af # v1
+      - uses: ruby/setup-ruby@d45b1a4e94b71acab930e56e79c6aa188764e7f9 # v1
         continue-on-error: true
         with:
           ruby-version: '3.3'
       - uses: dart-lang/setup-dart@65eb853c7ba17dde3be364c3d2858773e7144260 # v1
         continue-on-error: true
-      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240
         continue-on-error: true
         with:
           php-version: '8.3'
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         continue-on-error: true
-      - uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
         continue-on-error: true
         with:
           otp-version: '27'
@@ -88,10 +93,78 @@ jobs:
       # advertised mode (pull vs push) — the first cut of the affirmative-clean
       # -signal classification (docs/lsp-capability-matrix.md). Best-effort: the
       # script always exits 0 and a server whose toolchain is absent reports
-      # "unavailable", so this never reds the nightly.
+      # "unavailable", so this never reds the nightly. MERGES into the doc — a
+      # server this ubuntu host couldn't spawn keeps its prior (dev-box) row (#390).
       - name: LSP capability matrix (characterize diagnostic mode per server)
         continue-on-error: true
         run: node scripts/characterize-lsp.mjs --install
 
-      - name: Format layer (select + reformat through the real formatter pipeline)
+      # Clean-signal probe (#460): among PUSH-mode servers, split Tier 2
+      # (publishes a versioned set on a clean scan — free affirmative signal) from
+      # Tier 3 (version-less/silent — the budget-wait case, #458). Merges into the
+      # same matrix's clean-behavior column (same dev/ci src + merge-guard as
+      # characterize). Best-effort: always exits 0, per-server hard timeouts.
+      # #529: also compares each observed clean-behavior against server-strategies
+      # .ts's hand-set `silentOnClean` marker and logs any mismatch to this step's
+      # output + a "## silentOnClean drift" footnote in the matrix doc — telemetry
+      # only, NEVER a build/CI gate (this step's own continue-on-error covers the
+      # probe already; the drift check can't fail the job either way).
+      - name: LSP clean-signal probe (Tier 2 vs 3 among push servers) + silentOnClean drift check
+        continue-on-error: true
+        run: node scripts/probe-clean-signal.mjs --install
+
+      # #594: make a genuine #529 drift finding ACTIONABLE instead of it only
+      # living in the step above's stdout + the docs-diff footnote, where
+      # nobody has a reason to look. Reads the JSON summary the probe step just
+      # wrote and files/updates a SINGLE persistent tracking issue (fixed
+      # `nightly-drift` label + title, never a new issue per night) when there
+      # IS a finding, or closes a prior open one when the drift has resolved.
+      # Reuses the job's existing GITHUB_TOKEN (same one the docs-refresh PR
+      # step below already uses) via `gh` — no new auth plumbing. Best-effort:
+      # never fails the job either way (continue-on-error, plus the script's
+      # own internal try/catch — same "always exit 0, telemetry only" contract
+      # as the probe itself).
+      - name: Notify on silentOnClean drift (file/update/close tracking issue)
+        continue-on-error: true
+        run: node scripts/notify-clean-signal-drift.mjs
+
+      # Server capability inventory (#390 item 1): regenerate
+      # docs/servercapabilities.md (mode + ws-pull + nav/edit ops + raw caps) —
+      # previously never run anywhere, so its ws-pull column (#389) stayed stale.
+      # Merges over the prior doc (keeps servers absent on this host).
+      - name: LSP server capability inventory (regenerate docs/servercapabilities.md)
+        continue-on-error: true
+        run: node scripts/server-capabilities.mjs --install
+
+      # Commit-back (#390 item 2): the three steps above regenerate the LSP docs
+      # in-place. master has required checks the schedule's GITHUB_TOKEN can't
+      # bypass, so we open/UPDATE a single auto-PR (fixed branch, force-pushed each
+      # run) instead of pushing to master. Docs change rarely (only when a server's
+      # caps/tier change), so this is low-noise. No-ops when nothing changed.
+      - name: Open/update LSP-docs refresh PR
+        continue-on-error: true
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: bot/lsp-docs-refresh
+          base: master
+          add-paths: |
+            docs/lsp-capability-matrix.md
+            docs/servercapabilities.md
+          commit-message: 'docs(nightly): refresh LSP capability docs'
+          title: 'docs(nightly): refresh LSP capability docs'
+          body: |
+            Automated refresh of the LSP capability docs from the nightly tool-smoke run.
+
+            - `docs/lsp-capability-matrix.md` — `mode` (characterize-lsp) + `clean-behavior` (probe-clean-signal, Tier 2 vs 3) columns (#460) + a `## silentOnClean drift` footnote (#529, telemetry only — never a gate)
+            - `docs/servercapabilities.md` — advertised capability inventory incl. ws-pull (#389)
+
+            Rows are **merged**, never blind-overwritten: a server this ubuntu host
+            couldn't spawn keeps its prior (dev-box) classification, so the nightly
+            can't regress a richer run (#390).
+
+            Refs #460, #390, #529.
+          delete-branch: false
+
+      - name: Format layer (select + reformat through formatter pipeline)
         run: node scripts/smoke-tools.mjs --format --install --verbose

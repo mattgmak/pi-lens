@@ -411,6 +411,143 @@ describe("computeCascadeForFile", () => {
 		}
 	});
 
+	it("#458: skips the in-lane wait for a tier-3 (push-only, silent-on-clean) neighbor touch and records it outstanding", async () => {
+		const env = setupTestEnvironment("cascade-tier3-skip-");
+		try {
+			const primary = path.join(env.tmpDir, "src", "primary.ts");
+			const neighbor = path.join(env.tmpDir, "src", "neighbor.ts");
+			fs.mkdirSync(path.dirname(primary), { recursive: true });
+			fs.writeFileSync(primary, "export const x = 1;\n");
+			fs.writeFileSync(neighbor, "import { x } from './primary';\n");
+			mocks.computeImpactCascade.mockReturnValue(impact(primary, [neighbor]));
+
+			const beforeTouch = Date.now();
+			const touchFile = vi.fn();
+			const getClientForFile = vi.fn().mockResolvedValue({
+				client: { serverId: "typescript" },
+			});
+			const getCapabilitySnapshots = vi.fn().mockResolvedValue([
+				{
+					serverId: "typescript",
+					root: env.tmpDir,
+					operationSupport: {},
+					workspaceDiagnosticsSupport: { mode: "push-only" },
+					advertisedCommands: [],
+					rawCapabilityKeys: [],
+				},
+			]);
+			mocks.getLSPService.mockReturnValue({
+				// Empty allDiags — no snapshot for neighbor (cold session), forces
+				// the active-touch branch rather than the passive-snapshot read.
+				getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+				getCapabilitySnapshots,
+				getClientForFile,
+				touchFile,
+				getDiagnostics: vi.fn(),
+			});
+
+			const { computeCascadeForFile } = await import(
+				"../../clients/dispatch/integration.js"
+			);
+			const { _getOutstandingCascadeTouchesForTests } = await import(
+				"../../clients/lsp/cascade-tier.js"
+			);
+
+			const result = await computeCascadeForFile(primary, env.tmpDir, {
+				turnSeq: 1,
+				writeSeq: 1,
+			});
+
+			// The wait-skipping touch still fires the notify (didOpen/didChange),
+			// just with the wait disabled — never a wholesale no-touch.
+			expect(touchFile).toHaveBeenCalledWith(
+				neighbor,
+				expect.any(String),
+				expect.objectContaining({
+					diagnostics: "none",
+					collectDiagnostics: false,
+					clientScope: "primary",
+				}),
+			);
+			// Recorded outstanding for the quiet-window reconcile — not silently
+			// dropped, not silently treated as clean.
+			const outstanding = _getOutstandingCascadeTouchesForTests();
+			expect(outstanding).toHaveLength(1);
+			expect(outstanding[0]).toMatchObject({ serverId: "typescript" });
+			// touchedAt is sampled BEFORE the notify (pre-touchFile), so a publish
+			// racing the record can never be misread as pre-touch at reconcile.
+			expect(outstanding[0].touchedAt).toBeGreaterThanOrEqual(beforeTouch);
+			expect(outstanding[0].touchedAt).toBeLessThanOrEqual(Date.now());
+			// No trustworthy diagnostics were produced by this touch, so the
+			// degraded-fallback path (empty diagnostics, not "clean") applies —
+			// never a false "no errors" for a skipped wait.
+			expect(result?.result?.neighbors[0]?.diagnostics ?? []).toEqual([]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("#458: PI_LENS_TIER_AWARE_CASCADE=0 disables the skip — tier-3 neighbor still waits in-lane", async () => {
+		const original = process.env.PI_LENS_TIER_AWARE_CASCADE;
+		process.env.PI_LENS_TIER_AWARE_CASCADE = "0";
+		const env = setupTestEnvironment("cascade-tier3-killswitch-");
+		try {
+			const primary = path.join(env.tmpDir, "src", "primary.ts");
+			const neighbor = path.join(env.tmpDir, "src", "neighbor.ts");
+			fs.mkdirSync(path.dirname(primary), { recursive: true });
+			fs.writeFileSync(primary, "export const x = 1;\n");
+			fs.writeFileSync(neighbor, "import { x } from './primary';\n");
+			mocks.computeImpactCascade.mockReturnValue(impact(primary, [neighbor]));
+
+			const touchFile = vi
+				.fn()
+				.mockResolvedValue([lspError("type error in neighbor")]);
+			const getCapabilitySnapshots = vi.fn();
+			const getClientForFile = vi.fn();
+			mocks.getLSPService.mockReturnValue({
+				getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+				getCapabilitySnapshots,
+				getClientForFile,
+				touchFile,
+				getDiagnostics: vi.fn(),
+			});
+
+			const {
+				computeCascadeForFile,
+				resetDispatchBaselines: _reset,
+			} = await import("../../clients/dispatch/integration.js");
+			const { _resetTierAwareCascadeEnabledForTests } = await import(
+				"../../clients/lsp/cascade-tier.js"
+			);
+			_resetTierAwareCascadeEnabledForTests();
+
+			await computeCascadeForFile(primary, env.tmpDir, {
+				turnSeq: 1,
+				writeSeq: 1,
+			});
+
+			// Kill switch off: classification is never even attempted, and the
+			// full in-lane wait (collectDiagnostics: true) is used, same as before #458.
+			expect(getCapabilitySnapshots).not.toHaveBeenCalled();
+			expect(touchFile).toHaveBeenCalledWith(
+				neighbor,
+				expect.any(String),
+				expect.objectContaining({ collectDiagnostics: true }),
+			);
+		} finally {
+			env.cleanup();
+			if (original === undefined) {
+				delete process.env.PI_LENS_TIER_AWARE_CASCADE;
+			} else {
+				process.env.PI_LENS_TIER_AWARE_CASCADE = original;
+			}
+			const { _resetTierAwareCascadeEnabledForTests } = await import(
+				"../../clients/lsp/cascade-tier.js"
+			);
+			_resetTierAwareCascadeEnabledForTests();
+		}
+	});
+
 	it("does not touch jsts neighbor when snapshot is valid (warm session)", async () => {
 		const env = setupTestEnvironment("cascade-warm-snapshot-");
 		try {
@@ -549,6 +686,114 @@ describe("computeCascadeForFile", () => {
 
 			expect(touchFile).toHaveBeenCalledTimes(2);
 			expect(second?.result?.neighbors[0]?.diagnostics[0]?.message).toBe("error2");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("suppresses an ignored neighbour from cascade snapshot output (#297)", async () => {
+		const env = setupTestEnvironment("cascade-ignore-snapshot-");
+		try {
+			// Anchor the ignore matcher at tmpDir (a .git marker stops
+			// resolveGitIgnoreRoot's upward walk) and ignore test files there.
+			fs.mkdirSync(path.join(env.tmpDir, ".git"), { recursive: true });
+			fs.writeFileSync(
+				path.join(env.tmpDir, ".pi-lens.json"),
+				JSON.stringify({ ignore: ["**/*.test.ts"] }),
+			);
+			const primary = path.join(env.tmpDir, "src", "reader.ts");
+			const ignoredNeighbor = path.join(env.tmpDir, "src", "reader.test.ts");
+			fs.mkdirSync(path.dirname(primary), { recursive: true });
+			fs.writeFileSync(primary, "export const countTotal = 1;\n");
+			fs.writeFileSync(
+				ignoredNeighbor,
+				"import { countTotal } from './reader';\n",
+			);
+			// The test file is a direct importer (a cascade neighbour) AND carries an
+			// LSP error in the passive snapshot — the exact #297 false-positive shape.
+			mocks.computeImpactCascade.mockReturnValue(
+				impact(primary, [ignoredNeighbor]),
+			);
+			mocks.getLSPService.mockReturnValue({
+				getAllDiagnostics: vi
+					.fn()
+					.mockResolvedValue(
+						new Map([
+							[
+								ignoredNeighbor.split(path.sep).join("/"),
+								{ diags: [lspError("countTotal not found")], ts: Date.now() },
+							],
+						]),
+					),
+				touchFile: vi.fn(),
+				getDiagnostics: vi.fn(),
+			});
+
+			const { computeCascadeForFile } = await import(
+				"../../clients/dispatch/integration.js"
+			);
+			const result = await computeCascadeForFile(primary, env.tmpDir, {
+				turnSeq: 1,
+				writeSeq: 1,
+			});
+
+			// The ignored test file must not surface as a cascade neighbour.
+			expect(result?.result).toBeUndefined();
+			expect(result?.skipReason).toBe("no_neighbors");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("suppresses an ignored neighbour from cascade fallback output (#297)", async () => {
+		const env = setupTestEnvironment("cascade-ignore-fallback-");
+		try {
+			fs.mkdirSync(path.join(env.tmpDir, ".git"), { recursive: true });
+			fs.writeFileSync(
+				path.join(env.tmpDir, ".pi-lens.json"),
+				JSON.stringify({ ignore: ["**/*.test.ts"] }),
+			);
+			// No-LSP neighbour keeps producedLspData false → fallback path runs and
+			// scans every open file in allDiags, including the ignored test file.
+			const primary = path.join(env.tmpDir, "main.ts");
+			const noLspNeighbor = path.join(env.tmpDir, "neighbor.foo");
+			const ignoredOpen = path.join(env.tmpDir, "src", "main.test.ts");
+			fs.mkdirSync(path.dirname(ignoredOpen), { recursive: true });
+			fs.writeFileSync(primary, "export const x = 1;\n");
+			fs.writeFileSync(noLspNeighbor, "neighbor\n");
+			fs.writeFileSync(ignoredOpen, "const x = 1;\n");
+			mocks.computeImpactCascade.mockReturnValue(
+				impact(primary, [noLspNeighbor]),
+			);
+			mocks.getLSPService.mockReturnValue({
+				getAllDiagnostics: vi
+					.fn()
+					.mockResolvedValue(
+						new Map([
+							[
+								ignoredOpen.split(path.sep).join("/"),
+								{ diags: [lspError("ignored fallback error")], ts: Date.now() },
+							],
+						]),
+					),
+				touchFile: vi.fn(),
+				getDiagnostics: vi.fn(),
+			});
+
+			const { computeCascadeForFile } = await import(
+				"../../clients/dispatch/integration.js"
+			);
+			const result = await computeCascadeForFile(primary, env.tmpDir, {
+				turnSeq: 1,
+				writeSeq: 1,
+			});
+
+			expect(result?.result?.formatted ?? "").not.toContain(
+				"ignored fallback error",
+			);
+			expect(
+				result?.result?.neighbors.some((n) => n.reason === "fallback"),
+			).not.toBe(true);
 		} finally {
 			env.cleanup();
 		}

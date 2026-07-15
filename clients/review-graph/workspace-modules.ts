@@ -28,6 +28,9 @@ export interface ModuleGraph {
 
 type WorkspaceType = "pnpm" | "npm" | "cargo" | "go";
 
+// Cap on candidate sub-directories probed per workspace glob level (#262).
+const MAX_WORKSPACE_CANDIDATES = 5_000;
+
 type PackageJson = {
 	name?: string;
 	main?: string;
@@ -126,6 +129,9 @@ function expandWorkspacePattern(cwd: string, pattern: string): string[] {
 				!ignoreMatcher.isIgnored(fullPath, true)
 			);
 		})
+		// Bound the manifest-probe fan-out so a pathological single directory
+		// can't trigger an unbounded existsSync sweep (#262).
+		.slice(0, MAX_WORKSPACE_CANDIDATES)
 		.map((entry) => path.join(baseDir, entry.name))
 		.filter(
 			(root) =>

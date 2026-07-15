@@ -7,15 +7,17 @@
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { Type } from "typebox";
+import { Type } from "../clients/deps/typebox.js";
 import { logLatency } from "../clients/latency-logger.js";
 import type { LSPCallHierarchyItem } from "../clients/lsp/client.js";
+import { compactRenderResult } from "./render-compact.js";
 import {
 	applyWorkspaceEdit,
 	summarizeWorkspaceEdit,
 } from "../clients/lsp/edits.js";
 import { getLSPService } from "../clients/lsp/index.js";
 import type { SearchReadLocation } from "../clients/search-read-registration.js";
+import { buildLspNavigationEnvelope } from "./lsp-structured-output.js";
 
 const VALID_OPERATIONS = [
 	"definition",
@@ -38,6 +40,17 @@ const VALID_OPERATIONS = [
 	"workspaceDiagnostics",
 	"capabilities",
 ] as const;
+
+const NAVIGABLE_SYMBOL_KINDS = new Set([
+	5, // Class
+	6, // Method
+	8, // Field
+	11, // Interface
+	12, // Function
+	13, // Variable
+	22, // EnumMember
+	23, // Struct
+]);
 
 type LspNavigationOperation = (typeof VALID_OPERATIONS)[number];
 
@@ -464,8 +477,8 @@ function dedupeWorkspaceSymbols<T extends SymbolNode>(symbols: T[]): T[] {
 }
 
 type RangeLike = {
-	start?: { line?: unknown };
-	end?: { line?: unknown };
+	start?: { line?: unknown; character?: unknown };
+	end?: { line?: unknown; character?: unknown };
 };
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -658,15 +671,12 @@ function formatCapabilities(
 			: `${snapshot.serverId} (${snapshot.root})`;
 		lines.push(label);
 		for (const [name, supported, note] of rows) {
-			const suffix = note ? `  (${note})` : "";
-			lines.push(
-				`  ${name.padEnd(22)} ${supported(snapshot) ? "✓" : "✗"}${suffix}`,
-			);
+			const suffix = note ? ` (${note})` : "";
+			lines.push(`  ${name} ${supported(snapshot) ? "✓" : "✗"}${suffix}`);
 		}
 		const commands = snapshot.advertisedCommands ?? [];
 		lines.push(
-			`  ${"executeCommand".padEnd(22)} ${commands.length > 0 ? "✓" : "✗"}` +
-				`  (${commands.length} advertised command(s)` +
+			`  executeCommand ${commands.length > 0 ? "✓" : "✗"} (${commands.length} advertised command(s)` +
 				(commands.length > 0 ? `: ${commands.slice(0, 20).join(", ")}` : "") +
 				")",
 		);
@@ -737,7 +747,7 @@ export function createLspNavigationTool(
 			"- signatureHelp: Show callable signatures at cursor\n" +
 			"- documentSymbol: List all symbols (functions/classes/vars) in a file\n" +
 			"- findSymbol: Search document symbols in a file by name/detail with optional kind/top-level/exact filters\n" +
-			"- workspaceSymbol: Search symbols across the whole project (best with filePath context)\n" +
+			"- workspaceSymbol: Search symbols across the whole project (best with path context)\n" +
 			"- codeAction: Find available quick fixes/refactors at a range\n" +
 			"- rename: Compute or apply workspace edits for renaming a symbol\n" +
 			"- rename_file: Preview/apply LSP-aware source file rename notifications\n" +
@@ -749,15 +759,32 @@ export function createLspNavigationTool(
 			"- workspaceDiagnostics: List all diagnostics tracked by active LSP clients\n" +
 			"- capabilities: Show cached operation support for active LSP servers\n\n" +
 			"Line and character are 1-based (as shown in editors). For position-based operations, prefer passing symbol when you know the line but not the exact character; character can be omitted or -1 and pi-lens will resolve the symbol column. Use symbol#N for repeated symbols on the same line (1-based occurrence).",
-		promptSnippet:
-			"Use lsp_navigation to find definitions, references, and hover info via LSP",
+		promptSnippet: "Find definitions, references, and hover info via LSP",
+		renderResult: compactRenderResult<{
+			operation?: string;
+			resultCount?: number;
+			supported?: boolean;
+			emptyReason?: string;
+		}>(({ details, args, isError, text }) => {
+			const op =
+				details?.operation ??
+				(typeof args.operation === "string" ? args.operation : "lsp");
+			if (isError || details?.supported === false) {
+				return `lsp_navigation ${op} — ${details?.emptyReason ?? text.split("\n")[0] ?? "unavailable"}`;
+			}
+			const n = details?.resultCount ?? 0;
+			if (n === 0) {
+				return `lsp_navigation ${op} — ${details?.emptyReason ?? "no results"}`;
+			}
+			return `lsp_navigation ${op} — ${n} result${n === 1 ? "" : "s"}`;
+		}),
 		parameters: Type.Object({
 			operation: Type.String({
 				description:
 					"LSP operation to perform. Valid values: " +
 					VALID_OPERATIONS.join(", "),
 			}),
-			filePath: Type.Optional(
+			path: Type.Optional(
 				Type.String({
 					description:
 						"Absolute or relative file path. Required for file-scoped operations; optional for workspaceSymbol/workspaceDiagnostics.",
@@ -929,8 +956,28 @@ export function createLspNavigationTool(
 					},
 				});
 
+				const text = payload.content[0]?.text ?? "";
+				const envelope = buildLspNavigationEnvelope({
+					operation: meta.operation,
+					filePath: meta.filePath,
+					failureKind: meta.failureKind,
+					resultCount: meta.resultCount,
+					text,
+					isError: payload.isError,
+					details: payload.details,
+				});
+
 				return {
 					...payload,
+					content: [
+						{
+							type: "text" as const,
+							// Compact JSON: omit indentation. Saves ~50% on rename / workspace-edits payloads
+							// while keeping the envelope machine-parseable. Tests use JSON.parse so
+							// they are agnostic to whitespace.
+							text: JSON.stringify(envelope),
+						},
+					],
 					details: {
 						...(payload.details ?? {}),
 						failureKind: meta.failureKind,
@@ -960,7 +1007,7 @@ export function createLspNavigationTool(
 
 			const {
 				operation: rawOperation,
-				filePath: rawPath,
+				path: rawPath,
 				line,
 				character,
 				symbol,
@@ -979,7 +1026,7 @@ export function createLspNavigationTool(
 				callHierarchyItem,
 			} = params as {
 				operation: string;
-				filePath?: string;
+				path?: string;
 				line?: number;
 				character?: number;
 				symbol?: string;
@@ -1040,7 +1087,7 @@ export function createLspNavigationTool(
 						content: [
 							{
 								type: "text" as const,
-								text: `filePath is required for ${operation}`,
+								text: `path is required for ${operation}`,
 							},
 						],
 						isError: true,
@@ -1134,20 +1181,20 @@ export function createLspNavigationTool(
 						},
 					];
 					const noteMap: Record<string, string> = {
-						pull: "Note: filePath mode requests pull diagnostics for this file and returns the aggregated result.",
+						pull: "Note: path mode requests pull diagnostics for this file and returns the aggregated result",
 						"push-only":
-							"Note: server is push-only; result depends on published diagnostics for this file.",
+							"Note: server is push-only; result depends on published diagnostics for this file",
 					};
 					const note =
 						noteMap[diagnosticsMode] ??
-						"Note: workspace diagnostics mode unknown (no active capability snapshot).";
+						"Note: workspace diagnostics mode unknown (no active capability snapshot)";
 					const resultCount = diagnostics.length;
 					return finalize(
 						{
 							content: [
 								{
 									type: "text" as const,
-									text: `${note}\n${JSON.stringify(result, null, 2)}`,
+									text: `${note}\n${JSON.stringify(result)}`,
 								},
 							],
 							details: {
@@ -1177,17 +1224,17 @@ export function createLspNavigationTool(
 				const noteMap2: Record<string, string> = {
 					"push-only":
 						"Note: push-only tracked diagnostics snapshot (not full workspace pull diagnostics).",
-					pull: "Note: tracked diagnostics snapshot from active clients. Provide filePath to force file-level diagnostics collection.",
+					pull: "Note: tracked diagnostics snapshot from active clients. Provide path to force file-level diagnostics collection",
 				};
 				const note =
 					noteMap2[diagnosticsMode] ??
-					"Note: workspace diagnostics mode unknown (no active capability snapshot).";
+					"Note: workspace diagnostics mode unknown (no active capability snapshot)";
 				return finalize(
 					{
 						content: [
 							{
 								type: "text" as const,
-								text: `${note}\n${JSON.stringify(result, null, 2)}`,
+								text: `${note}\n${JSON.stringify(result)}`,
 							},
 						],
 						details: {
@@ -1213,7 +1260,7 @@ export function createLspNavigationTool(
 						content: [
 							{
 								type: "text" as const,
-								text: `filePath must be a source file, got directory: ${filePath}. Pass a source file path, or omit filePath for workspace-level operations.`,
+								text: `path must be a source file, got directory: ${filePath}. Pass a source file path, or omit path for workspace-level operations.`,
 							},
 						],
 						isError: true,
@@ -1307,6 +1354,56 @@ export function createLspNavigationTool(
 			const lspEndLine = (endLine ?? line ?? 1) - 1;
 			const lspEndChar = (endCharacter ?? resolvedCharacter.character) - 1;
 
+			const runWorkspaceSymbolOperation = async (): Promise<SymbolNode[]> => {
+				supported = operationSupportStatus(
+					operation,
+					await lspService.getOperationSupport(rawPath ? filePath : undefined),
+				);
+				if (supported === false) {
+					throw new Error(
+						"__UNSUPPORTED__ Active LSP server does not advertise support for workspaceSymbol",
+					);
+				}
+				if (!query || query.trim().length === 0) {
+					throw new Error(
+						"__BADINPUT__ query parameter required for workspaceSymbol",
+					);
+				}
+				if (rawPath) {
+					await openFileBestEffort(lspService, filePath);
+				}
+				try {
+					const raw = await lspService.workspaceSymbol(
+						query ?? "",
+						rawPath ? filePath : undefined,
+					);
+					const filtered = (Array.isArray(raw) ? raw : [raw]).filter(
+						(s) =>
+							typeof s === "object" &&
+							s !== null &&
+							(!s.kind || NAVIGABLE_SYMBOL_KINDS.has(s.kind)),
+					) as SymbolNode[];
+					return dedupeWorkspaceSymbols(filtered).slice(0, 15);
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : String(err);
+					if (rawPath && /No Project/i.test(msg)) {
+						await openFileBestEffort(lspService, filePath);
+						await new Promise((resolve) => setTimeout(resolve, 120));
+						const retryRaw = await lspService.workspaceSymbol(
+							query ?? "",
+							filePath,
+						);
+						const retrySymbols = (
+							Array.isArray(retryRaw) ? retryRaw : [retryRaw]
+						).filter(
+							(s) => typeof s === "object" && s !== null,
+						) as SymbolNode[];
+						return dedupeWorkspaceSymbols(retrySymbols);
+					}
+					throw err;
+				}
+			};
+
 			const runOperation = async (): Promise<unknown> => {
 				switch (operation) {
 					case "definition":
@@ -1344,66 +1441,7 @@ export function createLspNavigationTool(
 						});
 					}
 					case "workspaceSymbol":
-						supported = operationSupportStatus(
-							operation,
-							await lspService.getOperationSupport(
-								rawPath ? filePath : undefined,
-							),
-						);
-						if (supported === false) {
-							throw new Error(
-								"__UNSUPPORTED__ Active LSP server does not advertise support for workspaceSymbol",
-							);
-						}
-						if (!query || query.trim().length === 0) {
-							throw new Error(
-								"__BADINPUT__ query parameter required for workspaceSymbol",
-							);
-						}
-						if (rawPath) {
-							await openFileBestEffort(lspService, filePath);
-						}
-						try {
-							const raw = await lspService.workspaceSymbol(
-								query ?? "",
-								rawPath ? filePath : undefined,
-							);
-							// Filter to navigable symbol kinds and cap results to save context tokens
-							const NAVIGABLE_KINDS = new Set([
-								5, // Class
-								6, // Method
-								8, // Field
-								11, // Interface
-								12, // Function
-								13, // Variable
-								22, // EnumMember
-								23, // Struct
-							]);
-							const filtered = (Array.isArray(raw) ? raw : [raw]).filter(
-								(s) =>
-									typeof s === "object" &&
-									s !== null &&
-									(!s.kind || NAVIGABLE_KINDS.has(s.kind)),
-							) as SymbolNode[];
-							return dedupeWorkspaceSymbols(filtered).slice(0, 15);
-						} catch (err) {
-							const msg = err instanceof Error ? err.message : String(err);
-							if (rawPath && /No Project/i.test(msg)) {
-								await openFileBestEffort(lspService, filePath);
-								await new Promise((resolve) => setTimeout(resolve, 120));
-								const retryRaw = await lspService.workspaceSymbol(
-									query ?? "",
-									filePath,
-								);
-								const retrySymbols = (
-									Array.isArray(retryRaw) ? retryRaw : [retryRaw]
-								).filter(
-									(s) => typeof s === "object" && s !== null,
-								) as SymbolNode[];
-								return dedupeWorkspaceSymbols(retrySymbols);
-							}
-							throw err;
-						}
+						return runWorkspaceSymbolOperation();
 					case "codeAction":
 						return lspService.codeAction(
 							filePath,
@@ -1635,10 +1673,10 @@ export function createLspNavigationTool(
 			const lineCtx = line ? ":" + line + ":" + character : "";
 			let output = isEmpty
 				? "No results for " + operation + fileCtx + lineCtx
-				: JSON.stringify(result, null, 2);
+				: JSON.stringify(result);
 			if (isEmpty && operation === "workspaceSymbol" && !rawPath) {
 				output +=
-					"\nHint: provide filePath to scope workspaceSymbol to the active language server/root.";
+					"\nHint: provide path to scope workspaceSymbol to the active language server/root.";
 			}
 			if (usedDocumentSymbolFallback) {
 				output +=

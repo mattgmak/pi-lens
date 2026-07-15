@@ -4,17 +4,17 @@
  * Log file: ~/.pi-lens/logs/{date}.jsonl
  */
 
-import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
+import { getGlobalPiLensDir } from "./file-utils.js";
+import { createNdjsonLogger } from "./ndjson-logger.js";
 
 export interface DiagnosticEntry {
 	// When
 	timestamp: string;
 
 	// What was caught
-	tool: "biome" | "eslint" | "ts-lsp" | "ruff" | "ast-grep" | "tree-sitter";
+	tool: "biome" | "eslint" | "lsp" | "ruff" | "ast-grep" | "tree-sitter";
 	ruleId: string;
 	severity: "error" | "warning" | "info";
 	language: string;
@@ -66,12 +66,7 @@ export interface LogContext {
 }
 
 function getLogDir(): string {
-	const home = os.homedir();
-	const logDir = path.join(home, ".pi-lens", "logs");
-	if (!fs.existsSync(logDir)) {
-		fs.mkdirSync(logDir, { recursive: true });
-	}
-	return logDir;
+	return path.join(getGlobalPiLensDir(), "logs");
 }
 
 function getLogFile(): string {
@@ -90,30 +85,16 @@ export function getDiagnosticLogger(): DiagnosticLogger {
 }
 
 export function createDiagnosticLogger(): DiagnosticLogger {
-	const pending: DiagnosticEntry[] = [];
-	let writing = false;
-
-	const writePending = async () => {
-		if (writing || pending.length === 0) return;
-		writing = true;
-		const toWrite = pending.splice(0, pending.length);
-		const lines = toWrite.map((e) => JSON.stringify(e)).join("\n") + "\n";
-		try {
-			await fs.promises.appendFile(getLogFile(), lines);
-		} catch (err) {
-			// pi-lens-ignore: missing-error-propagation — fire-and-forget log write, must not throw
-			console.error("Failed to write diagnostic log:", err);
-		}
-		writing = false;
-	};
+	// Lazy filePath: the log file is keyed on the current date, resolved per
+	// drain so a long-lived logger rolls over at midnight.
+	const writer = createNdjsonLogger({ filePath: () => getLogFile() });
 
 	return {
 		log(entry: DiagnosticEntry) {
 			if (isTestMode()) {
 				return;
 			}
-			pending.push(entry);
-			writePending(); // async, non-blocking
+			writer.log(entry); // async, non-blocking
 		},
 
 		logCaught(d: Diagnostic, context: LogContext, shownInline = false) {
@@ -141,11 +122,7 @@ export function createDiagnosticLogger(): DiagnosticLogger {
 		},
 
 		async flush() {
-			// Drain any buffered entries, then wait for the write to finish.
-			await writePending();
-			while (writing) {
-				await new Promise((resolve) => setTimeout(resolve, 10));
-			}
+			await writer.flush();
 		},
 	};
 }

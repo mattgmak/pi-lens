@@ -66,9 +66,12 @@ const pyrightRunner: RunnerDefinition = {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
-		// Run pyright with JSON output
+		// Run pyright with JSON output. Pass cwd so pyright resolves
+		// pyrightconfig.json / the project venv from the project root rather than
+		// falling back to process.cwd() (which mis-resolves in multi-root setups).
 		const result = await safeSpawnAsync(cmd, ["--outputjson", ctx.filePath], {
 			timeout: 60000,
+			cwd,
 		});
 
 		// Pyright returns non-zero when errors found, that's OK

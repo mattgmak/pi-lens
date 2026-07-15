@@ -1,11 +1,12 @@
 /**
  * LSP Configuration for pi-lens
  *
- * Allows users to define custom LSP servers via configuration.
+ * Allows users to define custom LSP servers and override initialization options
+ * for built-in servers via configuration.
  *
- * Config file: .pi-lens/lsp.json
+ * Config file: .pi-lens/lsp.json (or .pi-lens.json, pi-lsp.json)
  *
- * Example:
+ * Example — custom server:
  * {
  *   "servers": {
  *     "my-server": {
@@ -17,6 +18,33 @@
  *     }
  *   }
  * }
+ *
+ * Example — override initializationOptions for a built-in server:
+ * {
+ *   "serverOverrides": {
+ *     "rust": {
+ *       "initializationOptions": {
+ *         "check": { "command": "clippy", "allTargets": true },
+ *         "cargo": { "features": "all", "targetDir": true }
+ *       }
+ *     },
+ *     "nix": {
+ *       "initializationOptions": {
+ *         "nixpkgs": { "expr": "import <nixpkgs> {}" },
+ *         "options": {
+ *           "home_manager": { "expr": "(builtins.getFlake (toString ./.)).homeConfigurations.me.options" }
+ *         }
+ *       }
+ *     }
+ *   }
+ * }
+ *
+ * The `initializationOptions` object is deep-merged onto the server's built-in
+ * defaults, so you only need to specify the keys you want to change or add.
+ * User-supplied values win on conflicts at every level of nesting.
+ *
+ * Server IDs match the `id` field of each built-in server definition in
+ * clients/lsp/server.ts (e.g. "rust", "nix", "bash", "python", "go", "ts").
  */
 
 import fs from "node:fs/promises";
@@ -39,8 +67,27 @@ export interface CustomServerConfig {
 	env?: Record<string, string>;
 }
 
+/**
+ * Per-server initializationOptions overrides for built-in servers.
+ * Keys are built-in server IDs (e.g. "rust", "nix", "bash", "python", "go").
+ */
+export interface ServerInitOverride {
+	/**
+	 * Deep-merged onto the server's built-in initializationOptions defaults.
+	 * User values win on key conflicts at every nesting level.
+	 */
+	initializationOptions?: Record<string, unknown>;
+}
+
 export interface LSPConfig {
 	servers?: Record<string, CustomServerConfig>;
+	/**
+	 * Override initializationOptions for built-in servers.
+	 * Keys are built-in server IDs (e.g. "rust", "nix", "bash", "python").
+	 * Each entry's `initializationOptions` is deep-merged onto the server's
+	 * built-in defaults so you only need to specify the keys you want to change.
+	 */
+	serverOverrides?: Record<string, ServerInitOverride>;
 	disabledServers?: string[];
 	/** Files to open at session start to seed lazy LSP indexing (e.g., clangd). */
 	warmFiles?: string[];
@@ -49,6 +96,7 @@ export interface LSPConfig {
 interface RegisteredLSPConfig {
 	customServers: LSPServerInfo[];
 	disabledServerIds: Set<string>;
+	serverOverrides: Map<string, ServerInitOverride>;
 }
 
 // --- Config Loading ---
@@ -111,6 +159,7 @@ export function createCustomServer(
 const EMPTY_CONFIG: RegisteredLSPConfig = {
 	customServers: [],
 	disabledServerIds: new Set(),
+	serverOverrides: new Map(),
 };
 
 const workspaceConfigs = new Map<string, RegisteredLSPConfig>();
@@ -166,9 +215,29 @@ export async function initLSPConfig(cwd: string): Promise<void> {
 			}
 		}
 
+		const serverOverrides = new Map<string, ServerInitOverride>();
+		if (config.serverOverrides) {
+			for (const [id, entry] of Object.entries(config.serverOverrides)) {
+				if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+					const initOpts = (entry as Record<string, unknown>).initializationOptions;
+					if (
+						initOpts !== undefined &&
+						typeof initOpts === "object" &&
+						initOpts !== null &&
+						!Array.isArray(initOpts)
+					) {
+						serverOverrides.set(id, {
+							initializationOptions: initOpts as Record<string, unknown>,
+						});
+					}
+				}
+			}
+		}
+
 		workspaceConfigs.set(normalizedCwd, {
 			customServers,
 			disabledServerIds,
+			serverOverrides,
 		});
 	})();
 
@@ -204,8 +273,50 @@ export function getServersForFileWithConfig(filePath: string): LSPServerInfo[] {
 	const base = path.basename(filePath).toLowerCase();
 	return getAllServers(filePath).filter((server) => {
 		const extensions = server.extensions.map((value) => value.toLowerCase());
-		return extensions.includes(ext) || extensions.includes(base);
+		const extensionMatch = extensions.includes(ext) || extensions.includes(base);
+		if (!extensionMatch) return false;
+		// #636: a server's extension match can be intentionally broader than what
+		// it can usefully act on (zizmor attaches to "yaml" but only ever reports
+		// on GitHub Actions workflow/action/dependabot paths). `pathFilter`, when
+		// present, is an ADDITIONAL narrowing gate — never a widening one.
+		return server.pathFilter ? server.pathFilter(filePath) : true;
 	});
+}
+
+/**
+ * The primary language server for a file (e.g. "typescript"), as opposed to a
+ * cross-cutting auxiliary scanner attached via clientScope "all"/
+ * "with-auxiliary" (ast-grep, opengrep, zizmor, typos, marksman, ...). `role`
+ * is only ever set to "auxiliary" on those auxiliary entries (see
+ * clients/lsp/server.ts) — undefined means a real language server. Used to
+ * split a file's diagnostics into "primary confirmation" vs "auxiliary
+ * findings" so a page of ast-grep/opengrep/marksman noise never buries
+ * whether the actual type checker/compiler confirmed the file clean.
+ *
+ * #646: extracted from `tools/lsp-diagnostics.ts` (where it originated) so
+ * `tools/lens-diagnostics.ts`'s `mode=full` sweep can share the exact same
+ * primary/auxiliary classification instead of hand-copying it — both tools
+ * now report the same primary-vs-auxiliary split for the same file.
+ */
+export function primaryServerId(filePath: string): string | undefined {
+	return getServersForFileWithConfig(filePath).find((s) => s.role !== "auxiliary")
+		?.id;
+}
+
+/**
+ * Look up an initializationOptions override for a built-in server.
+ * Returns undefined when no config was loaded or no override was specified
+ * for this server ID.
+ *
+ * @param serverId  Built-in server id (e.g. "rust", "nix", "bash")
+ * @param filePath  Any file path within the project (used to locate the
+ *                  workspace config that was loaded for this directory tree)
+ */
+export function getServerInitOverride(
+	serverId: string,
+	filePath: string,
+): ServerInitOverride | undefined {
+	return getConfigForFile(filePath).serverOverrides.get(serverId);
 }
 
 export function resetLSPConfigStateForTests(): void {

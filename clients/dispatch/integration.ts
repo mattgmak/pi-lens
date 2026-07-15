@@ -43,14 +43,25 @@ export type { DispatchLatencyReport, RunnerLatency };
 export { clearLatencyReports, formatLatencyReport, getLatencyReports };
 
 import * as nodeFs from "node:fs";
+import * as nodePath from "node:path";
 import { fileURLToPath } from "node:url";
 import { formatCascadeNeighborDiagnostics } from "../cascade-format.js";
 import { logCascade } from "../cascade-logger.js";
-import type { CascadeResult, CascadeRun, CascadeSkipReason } from "../cascade-types.js";
+import type {
+	CascadeResult,
+	CascadeRun,
+	CascadeSkipReason,
+} from "../cascade-types.js";
 import { getDiagnosticTracker } from "../diagnostic-tracker.js";
+import {
+	classifyCascadeWaitTier,
+	isTierAwareCascadeEnabled,
+	recordOutstandingCascadeTouch,
+} from "../lsp/cascade-tier.js";
 import { getServersForFileWithConfig } from "../lsp/config.js";
 import { getLSPService } from "../lsp/index.js";
 import { isExternalOrVendorFile, normalizeMapKey } from "../path-utils.js";
+import { getProjectIgnoreMatcher } from "../file-utils.js";
 import {
 	clearReviewGraphWorkspaceCache,
 	getLastGraphBuildInfo,
@@ -59,6 +70,7 @@ import {
 	buildReverseDependencyIndexFromGraph,
 	getAffectedFilesFromIndex,
 	writeReverseDependencyIndexToSnapshot,
+	type ReverseDependencyIndex,
 } from "../reverse-deps.js";
 import {
 	buildOrUpdateGraph,
@@ -72,57 +84,51 @@ import {
 	findCompiledClassesDir,
 	hasJavaBuildDescriptor,
 } from "../tool-policy.js";
-// Register fact providers
+import {
+	removeWordIndexDocument,
+	updateWordIndexDocument,
+	WORD_INDEX_MAX_BYTES,
+	type WordIndex,
+} from "../word-index.js";
+// Register fact providers. All register eagerly here (the dispatch entry) — the
+// tree-sitter-backed providers included, since the parsing stack loads
+// `web-tree-sitter` lazily inside client.init(), not at module import, so it
+// stays out of the eager graph and degrades there rather than crashing at load.
 import { registerProvider, runProviders } from "./fact-runner.js";
+import { commentFactProvider } from "./facts/comment-facts.js";
 import { fileContentProvider } from "./facts/file-content.js";
+import { functionFactProvider } from "./facts/function-facts.js";
+import { importFactProvider } from "./facts/import-facts.js";
+import { tryCatchFactProvider } from "./facts/try-catch-facts.js";
 import { resolveRunnerPath, toRunnerDisplayPath } from "./runner-context.js";
 import { registerDefaultRunners } from "./runners/index.js";
 import { convertLspDiagnostics } from "./utils/lsp-diagnostics.js";
 
 registerProvider(fileContentProvider);
-
-import { tryCatchFactProvider } from "./facts/try-catch-facts.js";
-
 registerProvider(tryCatchFactProvider);
-
-import { functionFactProvider } from "./facts/function-facts.js";
-
 registerProvider(functionFactProvider);
-
-import { commentFactProvider } from "./facts/comment-facts.js";
-
 registerProvider(commentFactProvider);
-
-import { importFactProvider } from "./facts/import-facts.js";
-
 registerProvider(importFactProvider);
 
 // Register fact rules
 import { registerRule } from "./fact-rule-runner.js";
 import { asyncNoiseRule } from "./rules/async-noise.js";
 import { asyncUnnecessaryWrapperRule } from "./rules/async-unnecessary-wrapper.js";
+import { corsWildcardRule } from "./rules/cors-wildcard.js";
 import { errorObscuringRule } from "./rules/error-obscuring.js";
 import { errorSwallowingRule } from "./rules/error-swallowing.js";
 import { highComplexityRule } from "./rules/high-complexity.js";
 import { highFanOutRule } from "./rules/high-fan-out.js";
+import { highImportCouplingRule } from "./rules/high-import-coupling.js";
 import { missingErrorPropagationRule } from "./rules/missing-error-propagation.js";
+import { commentedCredentialsRule } from "./rules/no-commented-credentials.js";
 import { passThroughWrappersRule } from "./rules/pass-through-wrappers.js";
 import { placeholderCommentsRule } from "./rules/placeholder-comments.js";
-import {
-	highImportCouplingRule,
-	noBooleanParamsRule,
-	noComplexConditionalsRule,
-} from "./rules/quality-rules.js";
-import {
-	commentedCredentialsRule,
-	commentedOutCodeRule,
-	corsWildcardRule,
-	duplicateStringLiteralRule,
-	dynamicRegexpRule,
-	functionInLoopRule,
-	maxSwitchCasesRule,
-} from "./rules/sonar-rules.js";
 import { unsafeBoundaryRule } from "./rules/unsafe-boundary.js";
+import {
+	loadPiLensProjectConfig,
+	type PiLensProjectConfig,
+} from "../project-lens-config.js";
 
 registerRule(errorObscuringRule);
 registerRule(errorSwallowingRule);
@@ -134,16 +140,21 @@ registerRule(unsafeBoundaryRule);
 registerRule(asyncUnnecessaryWrapperRule);
 registerRule(missingErrorPropagationRule);
 registerRule(highFanOutRule);
-registerRule(commentedOutCodeRule);
-registerRule(duplicateStringLiteralRule);
-registerRule(functionInLoopRule);
-registerRule(corsWildcardRule);
-registerRule(dynamicRegexpRule);
-registerRule(maxSwitchCasesRule);
-registerRule(commentedCredentialsRule);
-registerRule(noBooleanParamsRule);
 registerRule(highImportCouplingRule);
-registerRule(noComplexConditionalsRule);
+registerRule(corsWildcardRule);
+registerRule(commentedCredentialsRule);
+
+/**
+ * Load a project's `.pi-lens.json` config.
+ *
+ * Rule thresholds are consumed from `DispatchContext.projectConfig` during rule
+ * evaluation, not applied to process-global module state. Keeping this helper as
+ * a thin loader preserves the existing integration seam while avoiding
+ * cross-workspace threshold bleed when multiple dispatches overlap.
+ */
+export function applyProjectLensConfig(cwd: string): PiLensProjectConfig {
+	return loadPiLensProjectConfig(cwd);
+}
 
 const sessionFacts = new FactStore();
 const cascadeDiagnosticBaselines = new Map<
@@ -313,10 +324,7 @@ function withSpotbugsGroup(
 ): RunnerGroup[] {
 	if (!SPOTBUGS_SUPPORTED_KINDS.has(kind)) return groups;
 	if (!ctx.pi.getFlag("lens-spotbugs")) return groups;
-	if (
-		!hasJavaBuildDescriptor(ctx.cwd) ||
-		!findCompiledClassesDir(ctx.cwd)
-	) {
+	if (!hasJavaBuildDescriptor(ctx.cwd) || !findCompiledClassesDir(ctx.cwd)) {
 		return groups;
 	}
 	if (groups.some((group) => group.runnerIds.includes("spotbugs")))
@@ -332,7 +340,6 @@ function withSpotbugsGroup(
 	];
 }
 
-
 function withPrimaryPolicyGroup(
 	kind: keyof typeof TOOL_PLANS,
 	groups: RunnerGroup[],
@@ -344,7 +351,7 @@ function withPrimaryPolicyGroup(
 		: groups
 				.map((group) => {
 					const runnerIds = group.runnerIds.filter(
-						(id) => id !== "lsp" && id !== "ts-lsp",
+						(id) => id !== "lsp",
 					);
 					if (runnerIds.length === 0) return null;
 					return {
@@ -391,12 +398,19 @@ export function getDispatchGroupsForKind(
 /**
  * Reset baselines — call on session_start so a new session
  * starts with a clean slate.
+ *
+ * Pass `cwd` to also re-apply the project's `.pi-lens.json` rule thresholds
+ * (a no-op when the file is absent or unchanged, since the loader is
+ * mtime-cached). Optional for backward compatibility with tests that don't
+ * care about per-project thresholds.
  */
-export function resetDispatchBaselines(): void {
+export function resetDispatchBaselines(cwd?: string): void {
+	if (cwd) applyProjectLensConfig(cwd);
 	sessionFacts.clearAll();
 	resetSessionSlopScore();
 	clearCoverageNoticeState();
 	clearReviewGraphWorkspaceCache();
+	clearReverseDepsIndexCache();
 	clearModuleGraphCache();
 	neighborTouchCache.clear();
 	recentlyCleanNeighborCache.clear();
@@ -467,6 +481,31 @@ const CASCADE_TTL_MS = 240_000;
 const MAX_PER_FILE = RUNTIME_CONFIG.pipeline.cascadeMaxDiagnosticsPerFile;
 const MAX_FILES = RUNTIME_CONFIG.pipeline.cascadeMaxFiles;
 
+// #459: the reverse-dependency index is a pure function of the review graph.
+// Rebuilding it (O(graph edges)) and re-writing it to the project snapshot
+// (disk write) on every cascade run is wasted work whenever the graph build
+// was a cache hit. Keyed per-workspace (normalized cwd — same key shape as
+// builder.ts's _workspaceGraphCache) so unrelated workspaces never share or
+// clobber each other's cached index. Freshness is keyed on the generation
+// stamp the entry's index was built from (ReviewGraph.buildGeneration).
+type ReverseDepsCacheEntry = {
+	index: ReverseDependencyIndex;
+	savedToSnapshot: boolean;
+	/** buildGeneration of the graph this index was derived from. */
+	generation: number | undefined;
+};
+const reverseDepsIndexCache = new Map<string, ReverseDepsCacheEntry>();
+
+function reverseDepsReuseEnabled(): boolean {
+	const raw = process.env.PI_LENS_REVERSE_DEPS_REUSE;
+	return raw !== "0" && raw !== "false";
+}
+
+/** Test-reset hook — mirrors clearReviewGraphWorkspaceCache's scope. */
+export function clearReverseDepsIndexCache(): void {
+	reverseDepsIndexCache.clear();
+}
+
 // Bounded transitive cascade (#162): expand neighbour derivation beyond the
 // one-hop importers/callers to depth-2 dependents, so an edit's blast radius
 // reaches indirect dependents — capped so the per-edit cost stays bounded. The
@@ -478,9 +517,14 @@ const CASCADE_TRANSITIVE_DEPTH = Math.max(
 );
 const CASCADE_NEIGHBOUR_BUDGET = Math.max(
 	MAX_FILES,
-	Number.parseInt(process.env.PI_LENS_CASCADE_NEIGHBOUR_BUDGET ?? "40", 10) || 40,
+	Number.parseInt(process.env.PI_LENS_CASCADE_NEIGHBOUR_BUDGET ?? "40", 10) ||
+		40,
 );
-const CASCADE_GRAPH_KINDS = new Set([
+// Exported (not just module-local) so the MCP warm-analyze seam
+// (clients/mcp/analyze.ts, #536) can gate its own buildOrUpdateGraph call on
+// the SAME file-kind eligibility this cascade path uses — one source of truth
+// for "does this language get graph nodes at all", never a second hardcoded copy.
+export const CASCADE_GRAPH_KINDS = new Set([
 	"jsts",
 	"python",
 	"go",
@@ -500,6 +544,88 @@ const CASCADE_GRAPH_KINDS = new Set([
  * like Java/Kotlin/C#), fall back to the passive LSP snapshot from getAllDiagnostics
  * to preserve cascade coverage.
  */
+/**
+ * Whether a cascade neighbour is suppressed by the project's ignore config
+ * (`.pi-lens.json` / `.gitignore` / global `~/.pi-lens/config.json`), via the
+ * same `getProjectIgnoreMatcher` every other scan surface uses. Cascade surfaces
+ * collateral diagnostics in OTHER files an edit touched; a file the user ignores
+ * (e.g. a `*.test.ts` glob in `.pi-lens.json`) must not be re-surfaced here just
+ * because it imports the edited file — project walk and lens_diagnostics already
+ * filter it, and cascade was the last surface that didn't (#297). Fail-open: a
+ * config-probe error never drops a neighbour, matching the walkers' behaviour.
+ */
+function isIgnoredCascadeNeighbor(filePath: string, cwd: string): boolean {
+	try {
+		return getProjectIgnoreMatcher(cwd).isIgnored(filePath, false);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * #348 phase 2 per-edit seam: update the warm in-memory word index for one
+ * file, mirroring the review graph's per-edit rebuild at the same call site.
+ *
+ * Rules (each a documented, deliberate simplicity choice, not an oversight):
+ *  - `wordIndex` null (no index loaded yet) ⇒ no-op. Cold-session handoff is
+ *    OWNED by phase 1's lifecycle/background build, never invented here — an
+ *    edit arriving before that build finishes just doesn't update anything;
+ *    the eventual full build already reflects every file on disk, incl. this
+ *    edit, so nothing is lost, only delayed.
+ *  - `wordIndex.forward` undefined (pre-phase-2 index shape, e.g. a snapshot
+ *    persisted before this feature or one still using the old serialized
+ *    shape) ⇒ no-op. `updateWordIndexDocument` already refuses to mutate a
+ *    forward-index-less index (see its doc comment) — this is the same rule
+ *    surfaced one layer up so the caller isn't left guessing why nothing
+ *    happened. The NEXT full rebuild (session-start lifecycle) installs a
+ *    forward-index-bearing index that later edits CAN update incrementally.
+ *  - `content` undefined (pipeline couldn't read the file — deleted, or a
+ *    transient race) ⇒ no-op. Deletions aren't plumbed at this seam (this
+ *    call site only ever sees the edited file's post-write content, never a
+ *    delete event) — a removed file ages out at the next full rebuild, same
+ *    scope boundary the review graph accepts for deletes.
+ *  - File over the shared `WORD_INDEX_MAX_BYTES` cap ⇒ removed/absent from
+ *    the index (never partially indexed) — same cap phase 1's build path
+ *    enforces via `collectWordIndexDocs`.
+ *  - On a successful update, `onUpdated` fires so the caller can schedule a
+ *    debounced persist (never a synchronous write per edit — same #260
+ *    discipline as the graph).
+ *
+ * Race safety against a build-in-progress: this function body is entirely
+ * synchronous (no `await` anywhere in it) and is called synchronously at
+ * `computeCascadeForFile`'s entry, before its own `await buildOrUpdateGraph`.
+ * Node is single-threaded, so two overlapping cascades (#450's unawaited
+ * concurrency) can never interleave mid-mutation here — each call runs to
+ * completion in one turn. The only cross-build hazard is a full session-start
+ * rebuild REPLACING `runtime.wordIndex` with a new object between the caller
+ * reading `runtime.wordIndex` (in runtime-tool-result.ts, also synchronous)
+ * and this function receiving it — in that case this call simply mutates
+ * whichever index object it was handed (old or new), and the other one is
+ * abandoned/superseded, never corrupted. No queue, no lock: the simplest rule
+ * that is still provably correct.
+ */
+function updateWordIndexForCascade(args: {
+	wordIndex?: WordIndex | null;
+	filePath: string;
+	content?: string;
+	onUpdated?: (index: WordIndex) => void;
+	dbg?: (msg: string) => void;
+}): void {
+	const { wordIndex, filePath, content, onUpdated, dbg } = args;
+	if (!wordIndex || !wordIndex.forward) return;
+	if (content === undefined) return;
+
+	const byteLength = Buffer.byteLength(content, "utf-8");
+	if (byteLength > WORD_INDEX_MAX_BYTES) {
+		removeWordIndexDocument(wordIndex, filePath);
+		dbg?.(`word-index per-edit: dropped ${filePath} (over size cap)`);
+	} else {
+		updateWordIndexDocument(wordIndex, { path: filePath, content });
+		dbg?.(`word-index per-edit: updated ${filePath}`);
+	}
+	onUpdated?.(wordIndex);
+}
+
 export async function computeCascadeForFile(
 	filePath: string,
 	cwd: string,
@@ -509,9 +635,48 @@ export async function computeCascadeForFile(
 		/** Turn/write sequence from RuntimeCoordinator — scopes cascade caches (A5/B10) */
 		turnSeq?: number;
 		writeSeq?: number;
+		/**
+		 * RuntimeCoordinator sequence state (#451). When present, the graph build
+		 * below can take the seq fast path and skip the O(project) walk+stat sweep.
+		 * `projectSeq` is read at build time (deferred cascade, #450).
+		 */
+		seqState?: {
+			projectSeq: () => number;
+			getFilesChangedSince: (seq: number) => string[];
+		};
+		/**
+		 * Post-format/post-fix file content, already read by the pipeline before
+		 * this deferred cascade runs (#348 phase 2). Reused here to update the
+		 * warm in-memory word index at the SAME seam as the graph rebuild below —
+		 * no extra I/O path, just one file's tokenization. `undefined` when the
+		 * pipeline couldn't read the file (deleted, race) — the word-index update
+		 * is skipped in that case.
+		 */
+		fileContent?: string;
+		/**
+		 * Live reference to `runtime.wordIndex` (#348 phase 2). `null` means no
+		 * index is loaded in memory yet — the per-edit path is then a documented
+		 * no-op (cold handoff): phase 1's lifecycle/background build owns "cold",
+		 * never this seam. A non-null index with no `forward` map (pre-phase-2 /
+		 * deserialized from an old snapshot) is also a no-op — the caller's next
+		 * full rebuild installs a forward-index-bearing index that later edits
+		 * CAN update incrementally.
+		 */
+		wordIndex?: WordIndex | null;
+		/** Debounced-persist hook for the updated word index (#348 phase 2). */
+		onWordIndexUpdated?: (index: WordIndex) => void;
 	} = {},
 ): Promise<CascadeRun> {
-	const { hasBlockers = false, dbg, turnSeq = 0, writeSeq } = options;
+	const {
+		hasBlockers = false,
+		dbg,
+		turnSeq = 0,
+		writeSeq,
+		seqState,
+		fileContent,
+		wordIndex,
+		onWordIndexUpdated,
+	} = options;
 
 	ensureCascadeTurnScope(turnSeq);
 
@@ -521,13 +686,25 @@ export async function computeCascadeForFile(
 			filePath,
 			reason: "primary_has_blockers",
 		});
-		return { filePath, result: undefined, neighborCount: 0, diagnosticCount: 0, skipReason: "blockers" as CascadeSkipReason };
+		return {
+			filePath,
+			result: undefined,
+			neighborCount: 0,
+			diagnosticCount: 0,
+			skipReason: "blockers" as CascadeSkipReason,
+		};
 	}
 
 	const fileKind = detectFileKind(filePath);
 	if (!fileKind) {
 		logCascade({ phase: "cascade_skip", filePath, reason: "non_code_file" });
-		return { filePath, result: undefined, neighborCount: 0, diagnosticCount: 0, skipReason: "non_code" as CascadeSkipReason };
+		return {
+			filePath,
+			result: undefined,
+			neighborCount: 0,
+			diagnosticCount: 0,
+			skipReason: "non_code" as CascadeSkipReason,
+		};
 	}
 
 	const normalizedFile = resolveRunnerPath(cwd, filePath);
@@ -536,6 +713,31 @@ export async function computeCascadeForFile(
 	// B10: record this file as a primary edit so later cascade calls in the same
 	// turn won't show it as a neighbor.
 	primaryFilesThisTurn.add(normalizedFileKey);
+
+	// #348 phase 2: warm per-edit word-index maintenance, review-graph style —
+	// update at the SAME seam as the graph rebuild below, using content the
+	// pipeline already read (no extra I/O). See computeCascadeForFile's
+	// `wordIndex`/`fileContent` doc comments for the cold/no-forward-index
+	// no-op rules.
+	//
+	// Deliberately keyed by `path.resolve(filePath)`, NOT `normalizedFile`
+	// (which is `normalizeMapKey`'d — realpath-canonicalized + lowercased on
+	// Windows). The word index's OWN keys come from `collectWordIndexDocs` →
+	// `collectSourceFilesAsync`'s file walk, which yields plain
+	// `path.resolve()`-joined paths (native separators, on-disk casing as
+	// reported by the walk, no realpath call). Keying this update with the
+	// cascade's normalized key would silently create a SECOND, orphaned entry
+	// next to the walker's original-cased entry instead of replacing it —
+	// exactly the kind of divergence the equivalence-property test is meant to
+	// catch, so the key shape here must match the build path's, not the
+	// cascade/graph's own (different) normalization scheme.
+	updateWordIndexForCascade({
+		wordIndex,
+		filePath: nodePath.resolve(filePath),
+		content: fileContent,
+		onUpdated: onWordIndexUpdated,
+		dbg,
+	});
 
 	let impact: ReturnType<typeof computeImpactCascade> = {
 		filePath: normalizedFile,
@@ -552,32 +754,78 @@ export async function computeCascadeForFile(
 
 	if (CASCADE_GRAPH_KINDS.has(fileKind)) {
 		const graphStart = Date.now();
-		const graph = await buildOrUpdateGraph(cwd, [normalizedFile], sessionFacts);
+		const graph = await buildOrUpdateGraph(
+			cwd,
+			[normalizedFile],
+			sessionFacts,
+			seqState,
+		);
 		const graphMs = Date.now() - graphStart;
-		const reverseDepsIndex = buildReverseDependencyIndexFromGraph({
-			cwd,
-			graph,
-		});
-		const reverseDepsSaved = writeReverseDependencyIndexToSnapshot({
-			cwd,
-			index: reverseDepsIndex,
-			dbg,
-		});
-		logCascade({
-			phase: "reverse_deps_cache",
-			filePath,
-			durationMs: Date.now() - graphStart,
-			metadata: {
-				action: "refresh_from_review_graph",
+		// #459: the reuse decision keys on graph.buildGeneration — a stamp that
+		// travels WITH the graph instance this cascade holds. Deliberately NOT the
+		// global last-build-info slot: post-#450 cascades overlap, and another
+		// cascade's cache-hit build can overwrite that slot (graphChanged:false)
+		// between this build mutating the graph and this read — which would turn a
+		// changed graph into a spurious reuse of a stale index that steady-state
+		// cache hits then never heal. Generation equality can't be clobbered into
+		// a false positive: a graph-mutating build always mints a new generation.
+		// An unstamped graph (mode "skipped") always rebuilds.
+		const graphBuildInfo = getLastGraphBuildInfo();
+		const workspaceKey = normalizeMapKey(cwd);
+		const cachedReverseDeps = reverseDepsIndexCache.get(workspaceKey);
+		const canReuse =
+			reverseDepsReuseEnabled() &&
+			cachedReverseDeps !== undefined &&
+			graph.buildGeneration !== undefined &&
+			cachedReverseDeps.generation === graph.buildGeneration;
+
+		let reverseDepsIndex: ReverseDependencyIndex;
+		let reverseDepsSaved: boolean;
+		if (canReuse && cachedReverseDeps) {
+			reverseDepsIndex = cachedReverseDeps.index;
+			reverseDepsSaved = cachedReverseDeps.savedToSnapshot;
+			logCascade({
+				phase: "reverse_deps_cache",
+				filePath,
+				durationMs: Date.now() - graphStart,
+				metadata: {
+					action: "reused_unchanged",
+					savedToSnapshot: reverseDepsSaved,
+					importsFileCount: Object.keys(reverseDepsIndex.imports).length,
+					importedByFileCount: Object.keys(reverseDepsIndex.importedBy).length,
+				},
+			});
+		} else {
+			reverseDepsIndex = buildReverseDependencyIndexFromGraph({
+				cwd,
+				graph,
+			});
+			reverseDepsSaved = writeReverseDependencyIndexToSnapshot({
+				cwd,
+				index: reverseDepsIndex,
+				dbg,
+			});
+			reverseDepsIndexCache.set(workspaceKey, {
+				index: reverseDepsIndex,
 				savedToSnapshot: reverseDepsSaved,
-				importsFileCount: Object.keys(reverseDepsIndex.imports).length,
-				importedByFileCount: Object.keys(reverseDepsIndex.importedBy).length,
-				importEdgeCount: Object.values(reverseDepsIndex.imports).reduce(
-					(total, imports) => total + imports.length,
-					0,
-				),
-			},
-		});
+				generation: graph.buildGeneration,
+			});
+			logCascade({
+				phase: "reverse_deps_cache",
+				filePath,
+				durationMs: Date.now() - graphStart,
+				metadata: {
+					action: "refresh_from_review_graph",
+					savedToSnapshot: reverseDepsSaved,
+					importsFileCount: Object.keys(reverseDepsIndex.imports).length,
+					importedByFileCount: Object.keys(reverseDepsIndex.importedBy).length,
+					importEdgeCount: Object.values(reverseDepsIndex.imports).reduce(
+						(total, imports) => total + imports.length,
+						0,
+					),
+				},
+			});
+		}
 
 		// Count files represented in the graph (nodes with a filePath).
 		const graphFileCount = new Set(
@@ -586,7 +834,6 @@ export async function computeCascadeForFile(
 			),
 		).size;
 
-		const graphBuildInfo = getLastGraphBuildInfo();
 		logCascade({
 			phase: "graph_build",
 			filePath,
@@ -602,6 +849,9 @@ export async function computeCascadeForFile(
 				skipReason: graphBuildInfo.skipReason,
 				sourceFileCount: graphBuildInfo.sourceFileCount,
 				maxFileCount: graphBuildInfo.maxFileCount,
+				// #451: when the seq fast path fell back (or was skipped), why — so
+				// cascade.log surfaces the fast-path hit/miss rate.
+				seqFastpathFallback: graphBuildInfo.seqFastpathFallback,
 			},
 		});
 
@@ -753,6 +1003,9 @@ export async function computeCascadeForFile(
 		sortedNeighbors = [...impact.neighborFiles]
 			.filter((n) => nodeFs.existsSync(n))
 			.filter((n) => !isExternalOrVendorFile(n, cwd))
+			// Honour the project's ignore config: a user-ignored neighbour (e.g.
+			// `**/*.test.ts`) must not surface as collateral cascade noise (#297).
+			.filter((n) => !isIgnoredCascadeNeighbor(n, cwd))
 			// B10: exclude files already edited as primary this turn — their own pipeline
 			// run is the authoritative diagnostic source; showing them as neighbors is noise.
 			.filter((n) => !primaryFilesThisTurn.has(normalizeMapKey(n)))
@@ -769,7 +1022,13 @@ export async function computeCascadeForFile(
 			reason: "unsupported_graph_kind",
 			metadata: { fileKind },
 		});
-		return { filePath, result: undefined, neighborCount: 0, diagnosticCount: 0, skipReason: "non_code" as CascadeSkipReason };
+		return {
+			filePath,
+			result: undefined,
+			neighborCount: 0,
+			diagnosticCount: 0,
+			skipReason: "non_code" as CascadeSkipReason,
+		};
 	}
 
 	logCascade({
@@ -944,6 +1203,76 @@ export async function computeCascadeForFile(
 
 				// A6: async read to avoid blocking event loop on network-mounted drives
 				const content = await nodeFs.promises.readFile(neighborPath, "utf8");
+
+				// #458: tier-aware cascade-lane wait. A Tier-3 (push-only,
+				// silent-on-clean — typescript is the lone core-set instance today)
+				// primary can never give this in-lane wait an affirmative clean
+				// signal, so the budget is pure cost. Fire the touch (didOpen/
+				// didChange still happens — the server starts real work) and record
+				// it as outstanding for the agent_settled quiet window to reconcile
+				// instead of waiting here. Ambiguous/missing capability data always
+				// classifies as "waits" (today's behavior) — see cascade-tier.ts.
+				// The whole attempt is try/caught: any surprise (a service shape
+				// that doesn't expose getCapabilitySnapshots/getClientForFile, a
+				// thrown rejection) falls through to the existing full-wait path
+				// below rather than skip the wait on a failure.
+				if (isTierAwareCascadeEnabled()) {
+					try {
+						const snapshots =
+							(await lspService.getCapabilitySnapshots?.(neighborPath)) ?? [];
+						const tier = classifyCascadeWaitTier(
+							lspService,
+							neighborPath,
+							snapshots,
+						);
+						if (tier === "tier3-silent") {
+							const spawnedForTouch =
+								await lspService.getClientForFile(neighborPath);
+							if (spawnedForTouch) {
+								// Sampled BEFORE the touchFile notify: a publish landing
+								// in the notify→record gap must read as post-touch at
+								// reconcile time, never be misclassified as pre-touch
+								// (the reconcile compares this against the client's
+								// PER-FILE publish timestamp — see cascade-tier.ts).
+								const touchedAt = Date.now();
+								await lspService.touchFile(neighborPath, content, {
+									diagnostics: "none",
+									collectDiagnostics: false,
+									silent: true,
+									source: "cascade",
+									clientScope: "primary",
+								});
+								recordOutstandingCascadeTouch({
+									filePath: neighborPath,
+									serverId: spawnedForTouch.client.serverId,
+									touchedAt,
+								});
+								const durationMs = Date.now() - neighborStart;
+								logCascade({
+									phase: "cascade_tier3_skip",
+									filePath,
+									neighborFile: neighborPath,
+									durationMs,
+									lspServerCount: configuredServerCount,
+									coldSnapshot: isColdSnapshot,
+									metadata: { serverId: spawnedForTouch.client.serverId },
+								});
+								// Deliberately NOT cached as clean/diagnosed — the wait was
+								// skipped, not resolved, so neither neighborTouchCache nor
+								// recentlyCleanNeighborCache may treat this as a real answer
+								// (#240 doctrine). Return undefined: the degraded-fallback
+								// path below still has a chance to surface a passive/stale
+								// snapshot, same as any other "no fresh data this touch" case.
+								return undefined;
+							}
+						}
+					} catch (tierErr) {
+						dbg?.(
+							`cascade tier-aware skip attempt failed for ${neighborPath}, falling back to full wait: ${tierErr}`,
+						);
+					}
+				}
+
 				// Open with silent=true (suppresses didChangeWatchedFiles rechecks, C2)
 				// and collect diagnostics from the same touched clients.
 				// Cold-snapshot neighbors (autoPropagate LSP, server warm) use a tighter
@@ -1090,7 +1419,10 @@ export async function computeCascadeForFile(
 		},
 	});
 
-	const diagCount = visibleNeighbors.reduce((sum, n) => sum + n.diagnostics.length, 0);
+	const diagCount = visibleNeighbors.reduce(
+		(sum, n) => sum + n.diagnostics.length,
+		0,
+	);
 
 	cascadeSessionStats.runs += 1;
 	cascadeSessionStats.diagnosticsSurfaced += diagCount;
@@ -1099,14 +1431,25 @@ export async function computeCascadeForFile(
 	if (!formatted) {
 		const skipReason: CascadeSkipReason =
 			visibleNeighbors.length === 0 ? "no_neighbors" : "clean";
-		return { filePath, result: undefined, neighborCount: visibleNeighbors.length, diagnosticCount: diagCount, skipReason };
+		return {
+			filePath,
+			result: undefined,
+			neighborCount: visibleNeighbors.length,
+			diagnosticCount: diagCount,
+			skipReason,
+		};
 	}
 
 	getDiagnosticTracker().trackShown(
 		visibleNeighbors.flatMap((n) => n.diagnostics),
 	);
 
-	return { filePath, result: { filePath, impact, neighbors: visibleNeighbors, formatted }, neighborCount: visibleNeighbors.length, diagnosticCount: diagCount };
+	return {
+		filePath,
+		result: { filePath, impact, neighbors: visibleNeighbors, formatted },
+		neighborCount: visibleNeighbors.length,
+		diagnosticCount: diagCount,
+	};
 }
 
 function diagnosticDeltaKey(
@@ -1160,6 +1503,7 @@ function appendFallbackNeighbors(
 		if (diagKey === normalizedFileKey || seen.has(diagKey)) continue;
 		if (primaryFilesThisTurn.has(diagKey)) continue;
 		if (isExternalOrVendorFile(diagPath, cwd)) continue;
+		if (isIgnoredCascadeNeighbor(diagPath, cwd)) continue;
 		if (!nodeFs.existsSync(diagPath)) continue;
 		if (now - ts > CASCADE_TTL_MS) continue;
 		const errors = convertLspDiagnostics(

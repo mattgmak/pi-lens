@@ -37,6 +37,7 @@ const ALTERNATES = [
 	{ id: "deno", defaultId: "typescript", ext: ".ts" },
 	{ id: "python-jedi", defaultId: "python", ext: ".py" },
 	{ id: "omnisharp", defaultId: "csharp", ext: ".cs" },
+	{ id: "expert", defaultId: "elixir", ext: ".ex" },
 ] as const;
 
 const NON_AUX = LSP_SERVERS.filter((s) => s.role !== "auxiliary");
@@ -78,6 +79,17 @@ describe("LSP primary reachability", () => {
 				`ALONGSIDE the primary. If it is a genuine alternate language server, add it to ALTERNATES ` +
 				`with the default it falls back from. Offenders: ${unreachable.join(", ")}`,
 		).toEqual([]);
+	});
+
+	it("marksman is the primary markdown server for .md and .mdx (#274)", () => {
+		expect(defaultPrimary(".md")).toBe("marksman");
+		expect(defaultPrimary(".mdx")).toBe("marksman");
+	});
+
+	it("PowerShell Editor Services is the primary server for .ps1/.psm1/.psd1 (#278)", () => {
+		expect(defaultPrimary(".ps1")).toBe("powershell");
+		expect(defaultPrimary(".psm1")).toBe("powershell");
+		expect(defaultPrimary(".psd1")).toBe("powershell");
 	});
 
 	it("each declared alternate is wired behind its default and is the next pick when predecessors drop out", () => {

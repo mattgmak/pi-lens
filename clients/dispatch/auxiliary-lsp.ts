@@ -18,8 +18,10 @@
  */
 
 import type { LSPDiagnostic } from "../lsp/client.js";
+import { shouldDegradeAuxiliaryLsp } from "../lsp-budget.js";
 import { findLocalOpengrepConfig } from "../opengrep-config.js";
-import { findLocalSgconfig } from "../sgconfig.js";
+import { findLocalTyposConfig } from "../typos-config.js";
+import { findLocalZizmorConfig } from "../zizmor-config.js";
 import { classifyDefect } from "./diagnostic-taxonomy.js";
 import type { DefectClass, OutputSemantic } from "./types.js";
 
@@ -39,9 +41,64 @@ export interface AuxiliaryLspProfile {
 	allowBlocking?: (cwd: string) => boolean;
 	/** Severity (+ whether blocking is allowed here) → semantic. Most auxiliaries
 	 *  are advisory; only high-signal ones block. */
-	semantic: (d: LSPDiagnostic, ctx: { blockingAllowed: boolean }) => OutputSemantic;
+	semantic: (
+		d: LSPDiagnostic,
+		ctx: { blockingAllowed: boolean },
+	) => OutputSemantic;
 	defectClass?: (d: LSPDiagnostic) => DefectClass | undefined;
+	/** Per-diagnostic suppression via the tool's NATIVE inline comment (e.g.
+	 *  semgrep's `# nosemgrep`, #441). Given the file content; return true to drop
+	 *  the finding. Distinct from pi-lens's own `# pi-lens-ignore` — this honors the
+	 *  suppression syntax the tool's own users already know. */
+	isSuppressed?: (d: LSPDiagnostic, content: string) => boolean;
 }
+
+/**
+ * Semgrep/opengrep `# nosemgrep` / `# nosemgrep: <rule-id>[,<rule-id>]` inline
+ * suppression (#441). A bare `# nosemgrep` drops every finding on its line; the
+ * `: <ids>` form drops only the listed rule ids. `d.code` is the semgrep rule id.
+ * Also accepts the `//` comment form.
+ *
+ * Matches Semgrep placement: honored on the finding's OWN line (inline or not),
+ * and on the line ABOVE only when that line is a STANDALONE comment (no code before
+ * it) — so `a()  # nosemgrep` suppresses a finding on `a()` but not the next line.
+ */
+const NOSEMGREP_RE = /(?:#|\/\/)\s*nosemgrep(?::\s*(.+))?/i;
+const NOSEMGREP_STANDALONE_RE = /^\s*(?:#|\/\/)\s*nosemgrep(?::\s*(.+))?\s*$/i;
+export function isNosemgrepSuppressed(
+	d: LSPDiagnostic,
+	content: string,
+): boolean {
+	const startLine = d.range?.start?.line; // 0-based
+	if (startLine == null) return false;
+	const lines = content.split("\n");
+	const ruleId = String(d.code ?? "");
+	const checkLine = (text: string | undefined, standaloneOnly: boolean): boolean => {
+		if (!text) return false;
+		const m = (standaloneOnly ? NOSEMGREP_STANDALONE_RE : NOSEMGREP_RE).exec(text);
+		if (!m) return false;
+		if (m[1] === undefined) return true; // bare nosemgrep → suppress the line
+		return m[1]
+			.split(",")
+			.map((s) => s.trim())
+			.filter(Boolean)
+			.includes(ruleId);
+	};
+	// The finding's own line (inline OK), then the line above (standalone comment only).
+	return (
+		checkLine(lines[startLine], false) ||
+		checkLine(lines[startLine - 1], true)
+	);
+}
+
+// #277 R7: every profile below used this exact same rule (ERROR-severity
+// findings block only when the workspace opted into curated/authored rules;
+// everything else stays advisory) — shared here instead of copy-pasted per
+// profile so a future policy change (e.g. a WARNING-blocking tier) is one edit.
+const blockOnErrorWhenAllowed = (
+	d: LSPDiagnostic,
+	{ blockingAllowed }: { blockingAllowed: boolean },
+): OutputSemantic => (blockingAllowed && d.severity === 1 ? "blocking" : "warning");
 
 export const AUXILIARY_LSP_PROFILES: readonly AuxiliaryLspProfile[] = [
 	{
@@ -58,10 +115,11 @@ export const AUXILIARY_LSP_PROFILES: readonly AuxiliaryLspProfile[] = [
 		// supplies its own curated rules (the author's deliberate severity); the
 		// auto set is advisory. Either way, findings surface via lens_diagnostics.
 		allowBlocking: (cwd) => Boolean(findLocalOpengrepConfig(cwd)),
-		semantic: (d, { blockingAllowed }) =>
-			blockingAllowed && d.severity === 1 ? "blocking" : "warning",
+		semantic: blockOnErrorWhenAllowed,
 		defectClass: (d) =>
 			classifyDefect(String(d.code ?? ""), "opengrep", d.message ?? ""),
+		// Honor the canonical Semgrep suppression the user already knows (#441).
+		isSuppressed: isNosemgrepSuppressed,
 	},
 	{
 		serverId: "ast-grep",
@@ -70,34 +128,128 @@ export const AUXILIARY_LSP_PROFILES: readonly AuxiliaryLspProfile[] = [
 		sourceMatch: /ast[-_]?grep/i,
 		killSwitchFlag: "no-ast-grep",
 		enabledByDefault: true,
-		// The ast-grep LSP server only attaches when the repo has an sgconfig
-		// (root-gated), so a finding here always stems from the team's own curated
-		// rules — deliberately authored, hence blocking-eligible (mirrors Opengrep's
-		// curated-config gate). The check is belt-and-suspenders for the runner.
-		allowBlocking: (cwd) => Boolean(findLocalSgconfig(cwd)),
-		semantic: (d, { blockingAllowed }) =>
-			blockingAllowed && d.severity === 1 ? "blocking" : "warning",
+		// The ast-grep LSP runs either the repo's own sgconfig (when present) or
+		// pi-lens's shipped baseline sgconfig. In both cases the rule severity is
+		// deliberate, so preserve ast-grep's severity semantics: ERROR can block,
+		// WARNING/INFO stay advisory.
+		allowBlocking: () => true,
+		semantic: blockOnErrorWhenAllowed,
 		defectClass: (d) =>
 			classifyDefect(String(d.code ?? ""), "ast-grep", d.message ?? ""),
+	},
+	{
+		serverId: "zizmor",
+		tool: "zizmor",
+		// zizmor tags its LSP diagnostics `source: "zizmor"`.
+		sourceMatch: /zizmor/i,
+		killSwitchFlag: "no-zizmor",
+		enabledByDefault: true,
+		// zizmor's default ("regular") persona is a curated, low-false-positive
+		// audit set, but as an always-on advisory we only let it BLOCK when the repo
+		// opts in with its own `zizmor.yml` (the author's deliberate severities /
+		// ignores). Advisory otherwise — findings still surface via lens_diagnostics.
+		// zizmor maps High→ERROR(1), Medium/Low→WARNING(2), Informational→INFO(3).
+		allowBlocking: (cwd) => Boolean(findLocalZizmorConfig(cwd)),
+		semantic: blockOnErrorWhenAllowed,
+		defectClass: (d) =>
+			classifyDefect(String(d.code ?? ""), "zizmor", d.message ?? ""),
+	},
+	{
+		serverId: "typos",
+		tool: "typos",
+		// typos-lsp tags its LSP diagnostics `source: "typos"`.
+		sourceMatch: /typos/i,
+		killSwitchFlag: "no-typos",
+		enabledByDefault: true,
+		// typos is allow-list based (only KNOWN misspellings with a known
+		// correction), but as an always-on advisory we only let it BLOCK when the
+		// repo opts in with its own `typos.toml`/`_typos.toml`/`.typos.toml` (the
+		// team's curated dictionary + chosen severity). Advisory otherwise —
+		// findings still surface via lens_diagnostics. Note typos-lsp's default
+		// severity is WARNING, so even with a config it stays advisory unless the
+		// repo raises `diagnostic-severity` to Error.
+		allowBlocking: (cwd) => Boolean(findLocalTyposConfig(cwd)),
+		semantic: blockOnErrorWhenAllowed,
+		// A misspelling is a documentation/quality defect — not security or
+		// correctness. "style" is the closest taxonomy class.
+		defectClass: () => "style",
 	},
 ];
 
 export type GetFlag = (flag: string) => boolean | string | undefined;
 
 /** The auxiliary server ids enabled for this turn (the lsp runner passes these
- *  to `touchFile` since it — not the LSP service — owns flag access). */
+ *  to `touchFile` since it — not the LSP service — owns flag access).
+ *
+ * #449 slice 2 (prototype): when this process decided at `session_start` that
+ * the machine-wide LSP budget is exceeded (`clients/lsp-budget.ts`), auxiliary
+ * servers are skipped entirely for the rest of the session — the primary
+ * language server per file is unaffected. This is a per-SESSION degrade, not
+ * per-file: once over budget, this session never spawns its auxiliary fleet,
+ * rather than flip-flopping file to file. */
 export function enabledAuxiliaryLspServerIds(getFlag: GetFlag): string[] {
-	return AUXILIARY_LSP_PROFILES.filter(
-		(p) =>
-			p.enabledByDefault &&
-			!(p.killSwitchFlag && getFlag(p.killSwitchFlag) === true),
-	).map((p) => p.serverId);
+	if (shouldDegradeAuxiliaryLsp()) return [];
+	return AUXILIARY_LSP_PROFILES.flatMap((p) =>
+		p.enabledByDefault &&
+		!(p.killSwitchFlag && getFlag(p.killSwitchFlag) === true)
+			? [p.serverId]
+			: [],
+	);
 }
+
+// #277 R7: `findAuxiliaryProfileForSource` is called once per diagnostic, and a
+// file's diagnostics are typically dominated by a handful of distinct `source`
+// strings (one per tool that fired). Memoizing by exact `source` turns an
+// O(profiles) regex scan per diagnostic into one scan per distinct source seen
+// — safe because `AUXILIARY_LSP_PROFILES` is a fixed module-level const, never
+// mutated at runtime, so a source's matching profile never changes.
+const profileForSourceCache = new Map<string, AuxiliaryLspProfile | undefined>();
 
 /** Find the profile whose server emitted a diagnostic with this `source`. */
 export function findAuxiliaryProfileForSource(
 	source: string | undefined,
 ): AuxiliaryLspProfile | undefined {
 	if (!source) return undefined;
-	return AUXILIARY_LSP_PROFILES.find((p) => p.sourceMatch.test(source));
+	const cached = profileForSourceCache.get(source);
+	if (cached !== undefined || profileForSourceCache.has(source)) return cached;
+	const found = AUXILIARY_LSP_PROFILES.find((p) => p.sourceMatch.test(source));
+	profileForSourceCache.set(source, found);
+	return found;
+}
+
+/**
+ * Single-diagnostic suppression check (#586): look up the diagnostic's
+ * auxiliary profile by `source` and, if that profile declares an
+ * `isSuppressed` callback (currently only opengrep's `# nosemgrep`, #441),
+ * apply it. Returns false for diagnostics with no matching profile or whose
+ * profile has no native suppression syntax — the common case for plain
+ * language-server diagnostics.
+ *
+ * This is the ONE lookup+apply implementation; every call site that decides
+ * whether to drop a diagnostic for its tool's own inline suppression comment
+ * should go through this (or `applyAuxiliarySuppressions` below) rather than
+ * re-deriving the profile lookup.
+ */
+export function isAuxiliaryDiagnosticSuppressed(
+	d: LSPDiagnostic,
+	content: string,
+): boolean {
+	const profile = findAuxiliaryProfileForSource(d.source);
+	return Boolean(profile?.isSuppressed?.(d, content));
+}
+
+/**
+ * Filter a diagnostic list down to the ones NOT suppressed by their
+ * auxiliary profile's native inline-comment syntax (#586). This is the
+ * shared helper `tools/lsp-diagnostics.ts` and `clients/lsp/index.ts`'s
+ * `runWorkspaceDiagnostics` use so a `// nosemgrep` (or any future profile's
+ * equivalent) suppresses a finding identically whether it's seen via the
+ * per-edit dispatch runner or a standalone diagnostics query — previously
+ * only the former honored it (#586).
+ */
+export function applyAuxiliarySuppressions(
+	diagnostics: readonly LSPDiagnostic[],
+	content: string,
+): LSPDiagnostic[] {
+	return diagnostics.filter((d) => !isAuxiliaryDiagnosticSuppressed(d, content));
 }

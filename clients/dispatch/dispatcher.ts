@@ -25,10 +25,12 @@ import { getPrimaryDispatchGroup } from "../language-policy.js";
 import { resolveLanguageRootForFile } from "../language-profile.js";
 import { logLatency } from "../latency-logger.js";
 import { normalizeMapKey } from "../path-utils.js";
+import { loadPiLensProjectConfig } from "../project-lens-config.js";
 import { RUNTIME_CONFIG, getRunnerTimeoutFloorMs } from "../runtime-config.js";
 import { safeSpawnAsync } from "../safe-spawn.js";
 import { classifyDiagnostic } from "./diagnostic-taxonomy.js";
 import type { FactStore } from "./fact-store.js";
+import { applyInlineSuppressions } from "./inline-suppressions.js";
 import { getToolPlan } from "./plan.js";
 import { resolveRunnerPath } from "./runner-context.js";
 import { getToolProfile } from "./tool-profile.js";
@@ -147,6 +149,7 @@ export function createDispatchContext(
 	modifiedRanges?: import("./types.js").ModifiedRange[],
 ): DispatchContext {
 	const absoluteFilePath = resolveRunnerPath(cwd, filePath);
+	const normalizedProjectRoot = normalizeMapKey(path.resolve(cwd));
 	const normalizedCwd = normalizeMapKey(
 		resolveLanguageRootForFile(absoluteFilePath, cwd),
 	);
@@ -156,9 +159,11 @@ export function createDispatchContext(
 		normalizedFilePath,
 		readFilePrefix(normalizedFilePath),
 	);
+	const projectConfig = loadPiLensProjectConfig(normalizedCwd);
 
 	return {
 		filePath: normalizedFilePath,
+		projectRoot: normalizedProjectRoot,
 		cwd: normalizedCwd,
 		kind,
 		fileRole,
@@ -166,6 +171,7 @@ export function createDispatchContext(
 		autofix: false,
 		deltaMode: !pi.getFlag("no-delta"),
 		facts,
+		projectConfig,
 		blockingOnly,
 		modifiedRanges,
 
@@ -238,45 +244,6 @@ function dedupeOverlappingDiagnostics(diagnostics: Diagnostic[]): Diagnostic[] {
 	return [...byKey.values()];
 }
 
-/**
- * Apply inline suppression comments.
- * Syntax: `// pi-lens-ignore: rule-id` (JS/TS) or `# pi-lens-ignore: rule-id` (Python/Ruby/etc.)
- * Place on the same line as the diagnostic or the line immediately above it.
- */
-function applyInlineSuppressions(
-	diagnostics: Diagnostic[],
-	content: string,
-): Diagnostic[] {
-	if (!content || !diagnostics.length) return diagnostics;
-
-	// Build a set of (line, ruleId) pairs that are suppressed.
-	// Line numbers are 1-based to match diagnostic line numbers.
-	const suppressed = new Set<string>();
-	const lines = content.split("\n");
-	const SUPPRESS_RE = /(?:\/\/|#)\s*pi-lens-ignore:\s*(.+)/;
-	for (let i = 0; i < lines.length; i++) {
-		const m = SUPPRESS_RE.exec(lines[i]);
-		if (!m) continue;
-		const rules = m[1]
-			.split(",")
-			.map((r) => r.trim())
-			.filter(Boolean);
-		const suppressedLine = i + 1; // same line (1-based)
-		const nextLine = i + 2; // next line (1-based)
-		for (const ruleId of rules) {
-			suppressed.add(`${suppressedLine}:${ruleId}`);
-			suppressed.add(`${nextLine}:${ruleId}`);
-		}
-	}
-
-	if (suppressed.size === 0) return diagnostics;
-
-	return diagnostics.filter((d) => {
-		const ruleId = d.rule ?? d.id ?? "";
-		const line = d.line ?? 1;
-		return !suppressed.has(`${line}:${ruleId}`);
-	});
-}
 
 function suppressLintOverlapsWithLsp(diagnostics: Diagnostic[]): Diagnostic[] {
 	const lspBySpanClass = new Set<string>();
@@ -286,7 +253,7 @@ function suppressLintOverlapsWithLsp(diagnostics: Diagnostic[]): Diagnostic[] {
 	};
 
 	for (const d of diagnostics) {
-		if (d.tool !== "lsp" && d.tool !== "ts-lsp") continue;
+		if (d.tool !== "lsp") continue;
 		const line = d.line ?? 1;
 		const defectClass = d.defectClass ?? classifyDiagnostic(d);
 		lspBySpanClass.add(`${d.filePath}:${line}:${defectClass}`);
@@ -296,7 +263,7 @@ function suppressLintOverlapsWithLsp(diagnostics: Diagnostic[]): Diagnostic[] {
 	if (lspByLine.size === 0) return diagnostics;
 
 	return diagnostics.filter((d) => {
-		if (d.tool === "lsp" || d.tool === "ts-lsp") return true;
+		if (d.tool === "lsp") return true;
 		if (!isLintTool(d.tool)) return true;
 		if (d.semantic === "blocking" || d.severity === "error") return true;
 
@@ -312,6 +279,32 @@ function suppressLintOverlapsWithLsp(diagnostics: Diagnostic[]): Diagnostic[] {
 
 		return true;
 	});
+}
+
+/**
+ * Dockerfile overlap dedup (#131 Mode 2): hadolint and `trivy config` both flag
+ * a few of the same Dockerfile issues (e.g. `:latest`, running as root) with
+ * different rule ids, which the rule-keyed `dedupeOverlappingDiagnostics` can't
+ * collapse. Keep hadolint authoritative on the lines it covers and drop the
+ * trivy-config finding there — trivy still contributes the security checks
+ * hadolint lacks (on other lines), and all Kubernetes findings (no hadolint
+ * diagnostics exist for YAML, so none are suppressed). Exported for unit tests.
+ */
+export function suppressTrivyConfigDockerOverlap(
+	diagnostics: Diagnostic[],
+): Diagnostic[] {
+	const hadolintLines = new Set<string>();
+	for (const d of diagnostics) {
+		if (d.tool === "hadolint") {
+			hadolintLines.add(`${d.filePath}:${d.line ?? 1}`);
+		}
+	}
+	if (hadolintLines.size === 0) return diagnostics;
+	return diagnostics.filter(
+		(d) =>
+			d.tool !== "trivy-config" ||
+			!hadolintLines.has(`${d.filePath}:${d.line ?? 1}`),
+	);
 }
 
 function isUnusedValueDiagnostic(d: Diagnostic): boolean {
@@ -756,7 +749,9 @@ export async function dispatchForFile(
 	// Apply delta mode ONCE across the full diagnostic set.
 	// This avoids partial-baseline corruption when processing multiple groups.
 	const dedupedDiagnostics = dedupeOverlappingDiagnostics(allDiagnostics);
-	const overlapSuppressed = suppressLintOverlapsWithLsp(dedupedDiagnostics);
+	const dockerOverlapSuppressed =
+		suppressTrivyConfigDockerOverlap(dedupedDiagnostics);
+	const overlapSuppressed = suppressLintOverlapsWithLsp(dockerOverlapSuppressed);
 	const fileContent =
 		ctx.facts.getFileFact<string>(ctx.filePath, "file.content") ?? "";
 	const inlineSuppressed = applyInlineSuppressions(
@@ -810,7 +805,7 @@ export async function dispatchForFile(
 	const coverageNotice = buildCoverageNotice(ctx, runnerLatencies);
 
 	// Format output — only blocking issues shown inline
-	// Warnings tracked but not shown (noise) — surfaced via /lens-booboo
+	// Warnings tracked but not shown (noise) — surfaced via lens_diagnostics
 	const blockerOutput = formatDiagnostics(inlineBlockers, "blocking");
 	let output = blockerOutput;
 	output += formatDiagnostics(inlineFixed, "fixed");
@@ -938,9 +933,7 @@ async function runRunner(
 				timer = setTimeout(
 					() =>
 						reject(
-							new Error(
-								`Runner ${runner.id} timed out after ${timeoutMs}ms`,
-							),
+							new Error(`Runner ${runner.id} timed out after ${timeoutMs}ms`),
 						),
 					timeoutMs,
 				);

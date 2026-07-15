@@ -224,3 +224,222 @@ describe("LSP Client Integration — cold start", () => {
 		expect(client.isAlive()).toBe(false);
 	});
 });
+
+describe("LSP Client Integration — UTF-8 position encoding (#269)", () => {
+	const prevEnv = process.env.FAKE_LSP_POSITION_ENCODING;
+	let proc: Awaited<ReturnType<typeof launchLSP>> | undefined;
+	let client: Awaited<ReturnType<typeof createLSPClient>> | undefined;
+	let tmpDir: string;
+	let filePath: string;
+	// 'value' begins at UTF-16 char 13 but UTF-8 byte 14 (é is 2 bytes).
+	const SRC = "const café = value;\n";
+
+	beforeEach(async () => {
+		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-posenc-"));
+		filePath = path.join(tmpDir, "a.ts");
+		fs.writeFileSync(filePath, SRC); // toWirePosition reads the line from disk
+		proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+			cwd: process.cwd(),
+			env: { ...process.env, FAKE_LSP_POSITION_ENCODING: "utf-8" },
+		});
+		client = await createLSPClient({
+			serverId: "fake-utf8",
+			process: proc,
+			root: process.cwd(),
+		});
+	});
+
+	afterEach(async () => {
+		try {
+			if (client) await client.shutdown();
+		} catch {
+			/* ignore */
+		}
+		try {
+			if (proc) await stopLSP(proc);
+		} catch {
+			/* ignore */
+		}
+		client = undefined;
+		proc = undefined;
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+		if (prevEnv === undefined) delete process.env.FAKE_LSP_POSITION_ENCODING;
+		else process.env.FAKE_LSP_POSITION_ENCODING = prevEnv;
+	});
+
+	it("sends a UTF-8 byte offset (not the raw UTF-16 offset) when the server negotiates utf-8", async () => {
+		await client!.notify.open(filePath, SRC, "typescript");
+		// 'value' is at UTF-16 char 13; the fake echoes back the position it received.
+		const locations = await client!.definition(filePath, 0, 13);
+		expect(locations.length).toBeGreaterThanOrEqual(1);
+		const sentChar = locations[0].range.start.character;
+		// The é before the offset costs one extra UTF-8 byte, so 13 → 14.
+		expect(sentChar).toBe(Buffer.byteLength("const café = ", "utf8"));
+		expect(sentChar).toBe(14);
+		expect(sentChar).toBeGreaterThan(13);
+	});
+});
+
+describe("LSP Client Integration — stale navigation drop (#276)", () => {
+	const prevDelay = process.env.FAKE_LSP_DEFINITION_DELAY_MS;
+	const prevFlag = process.env.PI_LENS_LSP_NAV_STALE_DROP;
+	let proc: Awaited<ReturnType<typeof launchLSP>> | undefined;
+	let client: Awaited<ReturnType<typeof createLSPClient>> | undefined;
+	let filePath: string;
+	// Let the in-flight request's version get captured before we bump it. The
+	// nav method yields at `await toWirePosition` before navRequest reads the
+	// version, so a change issued too eagerly would be seen as the request's own
+	// version. This gap (≪ the reply delay) makes the ordering deterministic.
+	const settle = () => new Promise((r) => setTimeout(r, 40));
+
+	beforeEach(async () => {
+		filePath = path.join(process.cwd(), "stale-nav.ts");
+		// The fake holds its definition reply for 300ms so we can land a
+		// notify.change (which bumps the client's documentVersions) mid-request.
+		proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+			cwd: process.cwd(),
+			env: { ...process.env, FAKE_LSP_DEFINITION_DELAY_MS: "300" },
+		});
+		client = await createLSPClient({
+			serverId: "fake-stale",
+			process: proc,
+			root: process.cwd(),
+		});
+	});
+
+	afterEach(async () => {
+		try {
+			if (client) await client.shutdown();
+		} catch {
+			/* ignore */
+		}
+		try {
+			if (proc) await stopLSP(proc);
+		} catch {
+			/* ignore */
+		}
+		client = undefined;
+		proc = undefined;
+		if (prevDelay === undefined) delete process.env.FAKE_LSP_DEFINITION_DELAY_MS;
+		else process.env.FAKE_LSP_DEFINITION_DELAY_MS = prevDelay;
+		if (prevFlag === undefined) delete process.env.PI_LENS_LSP_NAV_STALE_DROP;
+		else process.env.PI_LENS_LSP_NAV_STALE_DROP = prevFlag;
+	});
+
+	it("drops a nav result when the document is edited mid-request", async () => {
+		await client!.notify.open(filePath, "const x = 1;", "typescript");
+		// Fire the (delayed) request, let it send, then bump the version before
+		// it replies.
+		const pending = client!.definition(filePath, 0, 6);
+		await settle();
+		await client!.notify.change(filePath, "const x = 2;\nconst y = 3;");
+		const locations = await pending;
+		// The in-flight result referred to the pre-edit document → dropped.
+		expect(locations).toEqual([]);
+	});
+
+	it("returns a nav result when the document is not edited mid-request", async () => {
+		await client!.notify.open(filePath, "const x = 1;", "typescript");
+		// Same delay, but no edit lands → result is returned unchanged.
+		const locations = await client!.definition(filePath, 0, 6);
+		expect(locations.length).toBeGreaterThanOrEqual(1);
+	});
+
+	it("returns the stale result when the drop is disabled via env", async () => {
+		process.env.PI_LENS_LSP_NAV_STALE_DROP = "0";
+		await client!.notify.open(filePath, "const x = 1;", "typescript");
+		const pending = client!.definition(filePath, 0, 6);
+		await settle();
+		await client!.notify.change(filePath, "const x = 2;\nconst y = 3;");
+		const locations = await pending;
+		// Kill-switch off → the (now-stale) result is still returned.
+		expect(locations.length).toBeGreaterThanOrEqual(1);
+	});
+});
+
+describe("LSP Client Integration — batched watched-files (#271)", () => {
+	const prev = process.env.FAKE_LSP_ECHO_WATCHED_FILES;
+	let proc: Awaited<ReturnType<typeof launchLSP>> | undefined;
+	let client: Awaited<ReturnType<typeof createLSPClient>> | undefined;
+	// Frames the fake SERVER actually received over the wire (one entry = one
+	// didChangeWatchedFiles notification), echoed back via $/test/watchedFilesReceived.
+	let received: Array<Array<{ uri: string; type: number }>> = [];
+
+	beforeEach(async () => {
+		received = [];
+		proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+			cwd: process.cwd(),
+			env: { ...process.env, FAKE_LSP_ECHO_WATCHED_FILES: "1" },
+		});
+		client = await createLSPClient({
+			serverId: "fake-watch",
+			process: proc,
+			root: process.cwd(),
+		});
+		client.connection.onNotification(
+			"$/test/watchedFilesReceived",
+			(params: { changes: Array<{ uri: string; type: number }> }) => {
+				received.push(params.changes);
+			},
+		);
+	});
+
+	afterEach(async () => {
+		try {
+			if (client) await client.shutdown();
+		} catch {
+			/* ignore */
+		}
+		try {
+			if (proc) await stopLSP(proc);
+		} catch {
+			/* ignore */
+		}
+		client = undefined;
+		proc = undefined;
+		if (prev === undefined) delete process.env.FAKE_LSP_ECHO_WATCHED_FILES;
+		else process.env.FAKE_LSP_ECHO_WATCHED_FILES = prev;
+	});
+
+	// Poll until the server has echoed at least one frame (the flush is on a
+	// ~100ms debounce + a stdio round-trip), with a generous ceiling.
+	const waitForEcho = async () => {
+		for (let i = 0; i < 60 && received.length === 0; i++) {
+			await new Promise((r) => setTimeout(r, 25));
+		}
+	};
+
+	it("coalesces N rapid file opens into ONE wire frame with N changes", async () => {
+		const files = ["wf-a.ts", "wf-b.ts", "wf-c.ts"].map((f) =>
+			path.join(process.cwd(), f),
+		);
+		// Open three distinct files within the debounce window.
+		for (const f of files) {
+			await client!.notify.open(f, "const x = 1;", "typescript");
+		}
+
+		await waitForEcho();
+
+		// Exactly one notification reached the server for the whole burst…
+		expect(received).toHaveLength(1);
+		// …carrying all three URIs (deduped, insertion order).
+		expect(received[0]).toHaveLength(3);
+		const uris = received[0].map((c) => c.uri);
+		for (const f of files) {
+			expect(uris).toContain(pathToFileURL(f).href);
+		}
+	});
+
+	it("does not emit a frame for a silent open (cascade read)", async () => {
+		await client!.notify.open(
+			path.join(process.cwd(), "wf-silent.ts"),
+			"const x = 1;",
+			"typescript",
+			false,
+			true, // silent
+		);
+		// Wait out the debounce window — nothing should have been enqueued/sent.
+		await new Promise((r) => setTimeout(r, 200));
+		expect(received).toHaveLength(0);
+	});
+});

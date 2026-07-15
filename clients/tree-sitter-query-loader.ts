@@ -54,6 +54,14 @@ export interface TreeSitterQuery {
 	confidence?: "low" | "medium" | "high";
 	defect_class?: string;
 	inline_tier?: "blocking" | "warning" | "review";
+	/**
+	 * Skip this rule on test files (isTestFile). For advisories that are noise in
+	 * tests — e.g. `python-assert-production`: `assert` is the idiomatic test
+	 * assertion, so firing there just trains users to ignore the rule (#440).
+	 * The tree-sitter runner otherwise runs on test files (structural issues
+	 * matter there), so this is a deliberate per-rule carve-out.
+	 */
+	skip_test_files?: boolean;
 	has_fix: boolean;
 	fix_action?: string;
 	examples?: {
@@ -186,6 +194,7 @@ export class TreeSitterQueryLoader {
 				inline_tier: parsed.inline_tier
 					? (String(parsed.inline_tier) as "blocking" | "warning" | "review")
 					: undefined,
+				skip_test_files: parsed.skip_test_files === true,
 				// Parse predicates if present
 				predicates: Array.isArray(parsed.predicates)
 					? parsed.predicates.map((p: any) => ({
@@ -355,7 +364,26 @@ export class TreeSitterQueryLoader {
 			if (trimmed.startsWith("#") && key !== "query") continue;
 
 			// This is part of the multiline value
-			valueLines.push(line.slice(startIndent));
+			valueLines.push(line);
+		}
+
+		// Strip the common minimum indent (relative to startIndent).
+		// YAML's `|` block scalar preserves content with consistent
+		// indentation; we want to remove the leading whitespace that
+		// was used for YAML formatting.
+		// biome-ignore lint/suspicious/noExplicitAny: line iteration
+		const nonEmpty = valueLines.filter((l: string) => l.trim().length > 0);
+		if (nonEmpty.length > 0) {
+			const minExtraIndent = Math.min(
+				...nonEmpty.map((l: string) => {
+					const m = l.match(/^(\s*)/);
+					return (m?.[1].length ?? 0) - startIndent;
+				}),
+			);
+			for (let i = 0; i < valueLines.length; i++) {
+				if (valueLines[i].trim().length === 0) continue; // leave blank lines alone
+				valueLines[i] = valueLines[i].slice(startIndent + Math.max(0, minExtraIndent));
+			}
 		}
 
 		// Clean up - remove trailing empty lines

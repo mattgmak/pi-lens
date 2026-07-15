@@ -13,9 +13,15 @@ import * as nodeFs from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { isTestMode } from "../env-utils.js";
-import { getGlobalPiLensDir } from "../file-utils.js";
+import {
+	getGlobalPiLensDir,
+	getProjectIgnoreMatcher,
+	isExcludedDirName,
+} from "../file-utils.js";
 import { recordLsp } from "../widget-state.js";
+import { applyAuxiliarySuppressions } from "../dispatch/auxiliary-lsp.js";
 import { logLatency } from "../latency-logger.js";
+import { withDeadline } from "../deadline-utils.js";
 import { normalizeMapKey, uriToPath } from "../path-utils.js";
 import type {
 	LSPClientInfo,
@@ -24,10 +30,13 @@ import type {
 	LSPWorkspaceDiagnosticsSupport,
 } from "./client.js";
 import { createLSPClient } from "./client.js";
-import { getServersForFileWithConfig } from "./config.js";
+import { getServersForFileWithConfig, getServerInitOverride } from "./config.js";
 import { getLanguageId } from "./language.js";
 import type { LSPServerInfo } from "./server.js";
-import { isDirectLspCommandTemporarilyUnavailable } from "./server.js";
+import {
+	LSP_SERVERS,
+	isDirectLspCommandTemporarilyUnavailable,
+} from "./server.js";
 import { getStrategy } from "./server-strategies.js";
 import { raceToCompletion } from "./aggregation.js";
 import {
@@ -35,6 +44,53 @@ import {
 	mergeWorkspaceTextEditsByPriority,
 	summarizeWorkspaceEdit,
 } from "./edits.js";
+
+// --- Init override helpers ---
+
+/**
+ * Recursively merges `override` onto `base`. Override wins on leaf conflicts
+ * at every nesting level; arrays and non-plain-object values are replaced, not
+ * merged (consistent with standard LSP settings merge semantics).
+ */
+function deepMergeObjects(
+	base: Record<string, unknown>,
+	override: Record<string, unknown>,
+): Record<string, unknown> {
+	const result: Record<string, unknown> = { ...base };
+	for (const [key, val] of Object.entries(override)) {
+		if (
+			val !== null &&
+			typeof val === "object" &&
+			!Array.isArray(val) &&
+			result[key] !== null &&
+			typeof result[key] === "object" &&
+			!Array.isArray(result[key])
+		) {
+			result[key] = deepMergeObjects(
+				result[key] as Record<string, unknown>,
+				val as Record<string, unknown>,
+			);
+		} else {
+			result[key] = val;
+		}
+	}
+	return result;
+}
+
+/**
+ * Merges user-supplied initializationOptions onto a server's built-in defaults.
+ * - If neither side is defined → undefined (no options sent).
+ * - If only one side is defined → that side is returned directly.
+ * - Both defined → deep merge, user wins on conflicts.
+ */
+export function mergeInitializationOptions(
+	base: Record<string, unknown> | undefined,
+	override: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+	if (!override) return base;
+	if (!base) return override;
+	return deepMergeObjects(base, override);
+}
 
 // --- Types ---
 
@@ -44,6 +100,15 @@ export interface LSPState {
 	broken: Map<string, number>; // servers that failed to initialize with retry-at timestamp
 	inFlight: Map<string, Promise<SpawnedServer | undefined>>; // prevent duplicate spawns
 	clientSpawnedAt: Map<string, number>; // key: "serverId:root" → epoch ms of last successful spawn
+	/**
+	 * #667: key "serverId:root" of every client that has already answered at
+	 * least one diagnostics-mode `touchFile` (not `.inconclusive`) this
+	 * session. Deliberately a STRONGER bar than `isAlive()`/spawned/
+	 * initialize-handshake-complete (all already true at `serverCountReady:1`
+	 * while the server was still uselessly timing out on real requests — see
+	 * `ensureWarmForSweep`): only a confirmed round trip counts as "warm".
+	 */
+	demonstratedReady: Set<string>;
 }
 
 const BROKEN_BASE_COOLDOWN_MS = 15_000;
@@ -61,6 +126,20 @@ const TOUCH_DEBOUNCE_MS = Math.max(
 	Number.parseInt(process.env.PI_LENS_LSP_TOUCH_DEBOUNCE_MS ?? "1500", 10) ||
 		1500,
 );
+// #667: the sweep warm-up round trip's OWN generous, one-time budget —
+// deliberately larger than any single per-file sweep budget (`perFileMs` in
+// `runWorkspaceDiagnostics`, or the batch tool's per-file wait) because this
+// pays for whatever a cold tsserver-style server needs to finish its internal
+// project load/index before it can usefully answer ANY diagnostics request,
+// not just one file's worth of work. Env-tunable like every other wait budget
+// in this file.
+function warmupTimeoutMs(): number {
+	const raw = Number.parseInt(
+		process.env.PI_LENS_LSP_WARMUP_TIMEOUT_MS ?? "",
+		10,
+	);
+	return Number.isFinite(raw) && raw > 0 ? raw : 20_000;
+}
 
 /**
  * Read the `PI_LENS_LSP_DIAGNOSTICS_MAX_WAIT_MS` env override at call time
@@ -129,6 +208,13 @@ export interface LSPCapabilitySnapshot {
 	advertisedCommands: string[];
 	/** Top-level keys of the raw ServerCapabilities advertised at initialize. */
 	rawCapabilityKeys: string[];
+	/** See `LSPServerInfo.spawn`'s `launchVariant` (server.ts) — which concrete
+	 *  binary/protocol variant this server instance is actually running (e.g.
+	 *  classic typescript-language-server vs TS7's native `tsc --lsp --stdio`,
+	 *  both under server id "typescript"). Undefined = single-variant server or
+	 *  an older client that predates this marker; consumers (the #458 cascade
+	 *  tier classifier) must treat that as classic/default behavior. */
+	launchVariant?: "classic" | "native-ts7";
 }
 
 export interface LSPRenameFileResult {
@@ -185,6 +271,16 @@ export interface LSPTouchFileOptions {
 	 * enabled (it owns flag access); the service just spawns + collects them.
 	 */
 	auxiliaryServerIds?: readonly string[];
+	/**
+	 * For clientScope "all": server ids to skip even though they match the
+	 * file's extension. Used by `runWorkspaceDiagnostics` (#584) to keep
+	 * opengrep off the per-file bulk-sweep touch loop — its findings now come
+	 * from a dedicated CLI project-diagnostics extractor (`opengrep-client.ts`)
+	 * that runs once per project instead of once per file, so re-touching it
+	 * here would be redundant AND (per #584/#387) the slow auxiliary that
+	 * dominates the per-file wait during a full workspace sweep.
+	 */
+	excludeServerIds?: ReadonlySet<string>;
 	/** Budget for waiting on the LSP client to spawn / become ready. */
 	maxClientWaitMs?: number;
 	/**
@@ -203,6 +299,16 @@ export interface LSPTouchFileOptions {
 	collectDiagnostics?: boolean;
 	/** Skip workspace/didChangeWatchedFiles — use for cascade reads, not real fs changes */
 	silent?: boolean;
+	/**
+	 * #645: per-sweep gate (see `createSweepIndexGate`/`SweepIndexGate`) that
+	 * lets a `workspaceIndexing`-strategy server (e.g. marksman) pay its full
+	 * `aggregateWaitMs` wait only once per `runWorkspaceDiagnostics` sweep
+	 * instead of once per swept file. Only `runWorkspaceDiagnostics` passes
+	 * this; every other caller (per-edit dispatch, cascade touches) omits it,
+	 * so `perServerTimeout` below always falls back to the pre-#645 full-wait
+	 * behavior for them.
+	 */
+	sweepIndexGate?: SweepIndexGate;
 }
 
 export interface LSPWorkspaceDiagnosticResult {
@@ -210,37 +316,236 @@ export interface LSPWorkspaceDiagnosticResult {
 	diagnostics: import("./client.js").LSPDiagnostic[];
 	count: number;
 	error?: string;
+	/**
+	 * True when this file's per-file check was NOT confirmed — either
+	 * `touchFile`'s own `.inconclusive` flag was set (#570: the notify write
+	 * or the diagnostics wait itself timed out), the OUTER `perFileMs`
+	 * `withDeadline` wrapper never got a result back at all, or the check
+	 * threw. `diagnostics` is a default-empty placeholder in every one of
+	 * those cases, not a confirmed result, and must not be treated as
+	 * "confirmed clean" by any caller reconciling this into cached state
+	 * (#571). Absent/false means the per-file check completed within budget
+	 * AND was confirmed; workspace-pull results (`tryWorkspacePull`) are
+	 * always confirmed (a pull either returns a real report or the caller
+	 * falls back to per-file, never a silent empty default).
+	 */
+	timedOut?: boolean;
 }
 
-const WORKSPACE_DIAGNOSTICS_SKIP_DIRS = new Set([
-	"node_modules",
-	".git",
-	"dist",
-	"build",
-	".next",
-	"out",
-	"target",
-	"coverage",
-	"__pycache__",
-	".venv",
-	"venv",
-]);
+/**
+ * Group files by their primary language server id (#387/#631 — extracted
+ * from `runWorkspaceDiagnostics`'s inline grouping so other callers, e.g.
+ * `lsp_diagnostics`' batch/directory scan in tools/lsp-diagnostics.ts, can
+ * share the exact same server-affinity key instead of hand-copying it).
+ * `multiServer` flags a group containing at least one file with more than
+ * one attached server (primary + auxiliary) — callers that care about that
+ * distinction (the workspace-pull fast path below) can act on it; callers
+ * that don't (a plain per-file touch) can ignore it.
+ */
+export function groupFilesByPrimaryServer(
+	files: readonly string[],
+): Array<{ files: string[]; multiServer: boolean }> {
+	const byServer = new Map<
+		string,
+		{ files: string[]; multiServer: boolean }
+	>();
+	for (const filePath of files) {
+		const servers = getServersForFileWithConfig(filePath);
+		const primary = servers[0]?.id ?? "none";
+		const group = byServer.get(primary);
+		if (group) {
+			group.files.push(filePath);
+			if (servers.length > 1) group.multiServer = true;
+		} else {
+			byServer.set(primary, {
+				files: [filePath],
+				multiServer: servers.length > 1,
+			});
+		}
+	}
+	return [...byServer.values()];
+}
+
+/**
+ * #645: tracks, for ONE `runWorkspaceDiagnostics` sweep, which server ids
+ * have already had at least one file pay the full `aggregateWaitMs` wait
+ * budget. `touchFile` consults this (via `LSPTouchFileOptions.sweepIndexGate`)
+ * only for servers whose strategy is marked `workspaceIndexing: true` —
+ * every other server is untouched. Deliberately a plain per-sweep object
+ * (created fresh by `runWorkspaceDiagnostics`, never stored on `LSPService`
+ * itself) so this is scoped to a single sweep call and can never leak state
+ * across sweeps or affect a per-edit touch, which never receives one.
+ */
+export interface SweepIndexGate {
+	/**
+	 * Returns true the first time it's called for `serverId` in this sweep
+	 * (and records that it was called), false on every subsequent call for
+	 * the same `serverId`. Synchronous and side-effecting by design — callers
+	 * must call it exactly once per touched file's server list (see
+	 * `touchFile`'s upfront per-server precompute) so a single `touchFile`
+	 * call's internal helper re-invocations don't each consume a separate
+	 * "first touch" slot.
+	 */
+	consumeFirstTouch(serverId: string): boolean;
+}
+
+/** Create a fresh, empty {@link SweepIndexGate} for one `runWorkspaceDiagnostics` call. */
+export function createSweepIndexGate(): SweepIndexGate {
+	const seen = new Set<string>();
+	return {
+		consumeFirstTouch(serverId: string): boolean {
+			if (seen.has(serverId)) return false;
+			seen.add(serverId);
+			return true;
+		},
+	};
+}
+
+/**
+ * Run one worker per server group (#387/#631): at most one in-flight
+ * `processGroup` call per group at a time — each group's own callback is
+ * responsible for iterating its files serially, this scheduler never starts
+ * a second concurrent call into the same group — parallelized ACROSS
+ * distinct groups up to `concurrency` workers. This is the exact scheduling
+ * shape `runWorkspaceDiagnostics` (the engine behind `lens_diagnostics
+ * mode=full`) has used since #387 to avoid flooding a single-threaded LSP
+ * server with concurrent touches that only queue server-side instead of
+ * parallelizing (observed: 51/123 files "timed out" purely from queue
+ * position in a flat pool) — extracted here so `lsp_diagnostics`' batch/
+ * directory scan (tools/lsp-diagnostics.ts, #631) can share the identical
+ * property instead of running a flat, server-oblivious bounded pool.
+ *
+ * `concurrency` caps how many DISTINCT groups run at once, not how many
+ * files run at once — a single-language batch (one group, the common case)
+ * becomes effectively serial for that group regardless of `concurrency`.
+ * That is the intended #387 behavior, not something to work around.
+ *
+ * `processGroup` receives the whole group (not just `.files`) so a caller
+ * that cares about `multiServer` (e.g. the workspace-pull fast path below,
+ * which only applies to a single-server group) can still act on it; a
+ * caller that doesn't can just destructure `.files`.
+ */
+export async function runPerServerGroups<
+	G extends { files: readonly string[]; multiServer?: boolean },
+>(
+	groups: readonly G[],
+	concurrency: number,
+	processGroup: (group: G) => Promise<void>,
+	signal?: AbortSignal,
+): Promise<void> {
+	let nextGroup = 0;
+	const workers = Math.min(Math.max(1, concurrency), groups.length);
+	await Promise.all(
+		Array.from({ length: workers }, async () => {
+			while (true) {
+				if (signal?.aborted) return;
+				const gi = nextGroup;
+				nextGroup += 1;
+				if (gi >= groups.length) return;
+				await processGroup(groups[gi]!);
+			}
+		}),
+	);
+}
 
 const WORKSPACE_DIAGNOSTICS_CONCURRENCY = 8;
+
+// #621: a single-server group (the common case — one language, one server)
+// used to pre-open its ENTIRE file list in one uninterrupted burst (#608)
+// before the per-file diagnostics-wait loop even started. That coalesces
+// watched-files notifications into one flush (the #608 fix's intent), but at
+// real project scale (~150 files) it also dumps the whole group on the
+// server's single-threaded request queue essentially at once, forcing it to
+// ingest/typecheck the full burst before any per-file diagnostics request
+// even gets a turn — observed to collapse to near-100% per-file timeouts on
+// a ~150-file TS project (pi-drykiss dogfooding). `lsp_diagnostics`'
+// bounded-concurrency batch/directory mode (tools/lsp-diagnostics.ts, default
+// 8) never has this problem: it only ever has ~8 files in flight at once.
+// Chunking the pre-open+process cycle to the same width gets both properties:
+// each chunk's opens still land inside `WatchedFilesQueue`'s 100ms debounce
+// window and coalesce into one flush (bounded burst, not per-file — the
+// original #608 bug pre-opened lazily one file at a time with a full
+// diagnostics wait in between, which is what defeated the debounce), while no
+// single burst ever exceeds this width regardless of total group size.
+const WORKSPACE_SWEEP_PREOPEN_CHUNK_SIZE = (() => {
+	const raw = Number(process.env.PI_LENS_LSP_WORKSPACE_PREOPEN_CHUNK);
+	return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 8;
+})();
+
+// #584: opengrep has no `workspace/diagnostic` pull support (push-only,
+// docs/servercapabilities.md) and `reopenOnResync: true` (server-strategies.ts)
+// means every per-file LSP touch already forces a full re-scan anyway — there's
+// no incremental win from routing it through the sweep's per-file loop. On a
+// full workspace sweep it instead dominates the per-file wait (its own
+// wait-tier budget is the slowest of any spawned server) and serializes with
+// everything else in its server group (#387). Its findings for a BULK/
+// full-workspace scan come from `opengrep-client.ts` — a dedicated CLI
+// extractor that scans the whole tree once and is read via
+// `project-diagnostics/extractors.ts`, same architecture as knip/jscpd/
+// gitleaks. The per-edit real-time LSP path (clientScope "primary"/
+// "with-auxiliary") is untouched by this — opengrep still attaches there.
+const WORKSPACE_SWEEP_EXCLUDED_SERVER_IDS: ReadonlySet<string> = new Set([
+	"opengrep",
+]);
+
+// The notify write (didOpen/didChange) is normally instant, but it awaits a
+// JSON-RPC send that BACKPRESSURES when the server's stdin isn't being drained
+// (a wedged/CPU-bound server, e.g. TypeScript mid-recheck). Unbounded, that
+// write parks every touchFile caller: the pre-dispatch sync, the dispatch LSP
+// runner (which then rides to its 30s dispatcher timeout — the observed ~31s
+// edits), and the workspace sweep. Bounding it here degrades a wedged server to
+// "no fresh diagnostics" instead of hanging the edit, for ALL callers.
+function notifyWriteBudgetMs(): number {
+	const raw = Number(process.env.PI_LENS_LSP_NOTIFY_BUDGET_MS);
+	return Number.isFinite(raw) && raw > 0 ? raw : 2000;
+}
+
+// Budget for one project-wide `workspace/diagnostic` pull (#387 Item 2). Larger
+// than a per-file wait — it's a single request but scans the whole program —
+// yet bounded so a hung server still falls back to the per-file path.
+function workspacePullBudgetMs(): number {
+	const raw = Number(process.env.PI_LENS_LSP_WORKSPACE_PULL_MS);
+	return Number.isFinite(raw) && raw > 0 ? raw : 30_000;
+}
+
+// Hard cap on the workspace-diagnostics walk. Even though this is an explicit,
+// user-invoked project-wide tool, the walk must be bounded so a misrooted run
+// (e.g. cwd that resolves to $HOME) can't enumerate an entire home tree (#250).
+// Generous — real projects are well under this; override for monorepos.
+const DEFAULT_MAX_WORKSPACE_DIAGNOSTIC_FILES = 5000;
+
+function getMaxWorkspaceDiagnosticFiles(): number {
+	const override = Number.parseInt(
+		process.env.PI_LENS_LSP_WORKSPACE_MAX_FILES ?? "",
+		10,
+	);
+	return Number.isFinite(override) && override > 0
+		? override
+		: DEFAULT_MAX_WORKSPACE_DIAGNOSTIC_FILES;
+}
 
 /**
  * Async, event-loop-yielding walk of the workspace to find LSP-supported source
  * files. Uses `fs.promises.readdir` so each directory read hands control back to
  * the loop — a synchronous `readdirSync` recursion blocks the loop for the whole
- * O(N) enumeration (~44ms at 1.4k files, scaling linearly on monorepos). The
- * file set, skip-dirs, symlink handling and server-config filter are identical
- * to the previous synchronous version — only the I/O is async now.
+ * O(N) enumeration (~44ms at 1.4k files, scaling linearly on monorepos).
+ *
+ * Directory/file exclusion goes through the SAME ignore matcher every other scan
+ * surface uses: `isExcludedDirName` for default dependency/build dirs plus the
+ * project's `.pi-lens.json` / `.gitignore` patterns via `getProjectIgnoreMatcher`.
+ * Previously this walk used its own hardcoded skip-dir set, which silently
+ * dropped user `"ignore": [...]` patterns and diverged from the canonical list
+ * (#243). The walk is also hard-capped (#250).
  */
 async function collectWorkspaceDiagnosticFiles(
 	root: string,
+	maxFiles: number = getMaxWorkspaceDiagnosticFiles(),
+	signal?: AbortSignal,
 ): Promise<string[]> {
 	const files: string[] = [];
+	const ignoreMatcher = getProjectIgnoreMatcher(root);
 	async function walk(current: string): Promise<void> {
+		if (signal?.aborted || files.length >= maxFiles) return;
 		let entries: nodeFs.Dirent[];
 		try {
 			entries = await nodeFs.promises.readdir(current, {
@@ -250,12 +555,16 @@ async function collectWorkspaceDiagnosticFiles(
 			return;
 		}
 		for (const entry of entries) {
+			if (signal?.aborted || files.length >= maxFiles) return;
 			if (entry.isSymbolicLink()) continue;
 			const full = path.join(current, entry.name);
 			if (entry.isDirectory()) {
-				if (!WORKSPACE_DIAGNOSTICS_SKIP_DIRS.has(entry.name)) await walk(full);
+				if (isExcludedDirName(entry.name)) continue;
+				if (ignoreMatcher.isIgnored(full, true)) continue;
+				await walk(full);
 			} else if (
 				entry.isFile() &&
+				!ignoreMatcher.isIgnored(full, false) &&
 				getServersForFileWithConfig(full).length > 0
 			) {
 				files.push(full);
@@ -315,6 +624,7 @@ export class LSPService {
 			broken: new Map(),
 			inFlight: new Map(),
 			clientSpawnedAt: new Map(),
+			demonstratedReady: new Set(),
 		};
 	}
 
@@ -394,6 +704,30 @@ export class LSPService {
 				}
 			}
 		}
+	}
+
+	/**
+	 * Key `demonstratedReady`/`clientSpawnedAt`/`state.clients` all share:
+	 * "serverId:normalizedRoot" — the same identity `ensureClientForServer`
+	 * uses to store/look up a client. Deliberately resolved from the
+	 * `LSPServerInfo.root()` config resolver (NOT `LSPClientInfo.root`):
+	 * `touchFile`'s spawned entries carry both `{ client, info }`, and
+	 * resolving from `info.root()` guarantees this lines up with
+	 * `ensureWarmForSweep`'s own key derivation (also via `server.root()`)
+	 * even for a not-fully-real client (test fixture, or any future client
+	 * implementation that doesn't independently stamp `.root`).
+	 */
+	private async demonstratedReadyKeyFor(
+		server: LSPServerInfo,
+		filePath: string,
+	): Promise<string | undefined> {
+		const root = await server.root(filePath);
+		if (!root) return undefined;
+		return `${server.id}:${normalizeMapKey(root)}`;
+	}
+
+	private markDemonstratedReadyKey(key: string): void {
+		this.state.demonstratedReady.add(key);
 	}
 
 	private activeClientsForCwd(
@@ -539,8 +873,13 @@ export class LSPService {
 	 */
 	async getClientsForFile(
 		filePath: string,
+		excludeServerIds?: ReadonlySet<string>,
 	): Promise<{ clients: SpawnedServer[]; serverCountAttempted: number }> {
-		const servers = getServersForFileWithConfig(filePath);
+		const allServers = getServersForFileWithConfig(filePath);
+		const servers =
+			excludeServerIds && excludeServerIds.size > 0
+				? allServers.filter((s) => !excludeServerIds.has(s.id))
+				: allServers;
 		if (servers.length === 0) return { clients: [], serverCountAttempted: 0 };
 
 		// Count servers with a valid root as "attempted" — extension-only matches
@@ -747,6 +1086,20 @@ export class LSPService {
 					`lsp spawn ${server.id}: unavailable (${Date.now() - startedAt}ms)`,
 				);
 				recordLsp(server.id, root, "spawn_failed", Date.now() - startedAt);
+
+				// When installs are disabled, an unavailable binary is an expected
+				// policy outcome, not proof the server/root is broken. Cool down briefly
+				// to avoid hot-looping PATH probes, but do not count toward permanent
+				// disablement: a user may install or expose the binary on PATH during the
+				// same session and should not need a full LSP reset.
+				if (!allowInstall) {
+					logSessionStart(
+						`lsp spawn ${server.id}: unavailable with install disabled; temporary cooldown only`,
+					);
+					this.state.broken.set(key, Date.now() + BROKEN_BASE_COOLDOWN_MS);
+					return undefined;
+				}
+
 				const uCount = (this.failureCounts.get(key) ?? 0) + 1;
 				this.failureCounts.set(key, uCount);
 				const uCooldown = Math.min(
@@ -763,12 +1116,19 @@ export class LSPService {
 				return undefined;
 			}
 
+			const override = getServerInitOverride(server.id, filePath);
+			const mergedInit = mergeInitializationOptions(
+				spawned.initialization,
+				override?.initializationOptions,
+			);
+
 			const client = await createLSPClient({
 				serverId: server.id,
 				process: spawned.process,
 				root,
-				initialization: spawned.initialization,
+				initialization: mergedInit,
 				initializeTimeoutMs: server.initializeTimeoutMs,
+				launchVariant: spawned.launchVariant,
 			});
 			const wsDiag =
 				typeof client.getWorkspaceDiagnosticsSupport === "function"
@@ -873,7 +1233,26 @@ export class LSPService {
 		filePath: string,
 		content: string,
 		options: LSPTouchFileOptions = {},
-	): Promise<import("./client.js").LSPDiagnostic[] | undefined> {
+	): Promise<
+		| (import("./client.js").LSPDiagnostic[] & {
+				/**
+				 * True when this touch could NOT confirm its result — the notify
+				 * write and/or the diagnostics wait hit their deadline before the
+				 * server(s) confirmed completion. An `inconclusive` result must
+				 * never be read as "confirmed clean": the returned array may be
+				 * `[]` simply because nothing arrived in time, not because the
+				 * server actually reported zero diagnostics. Callers that care
+				 * about trustworthiness (dispatch runners, the `lsp_diagnostics`
+				 * tool) must check this before treating an empty result as clean.
+				 * Absent/`false` on a genuinely confirmed (fast or debounced-skip)
+				 * result — existing callers that only read the array are
+				 * unaffected (arrays are plain objects; this is a non-enumerable
+				 * bonus field, not a shape change).
+				 */
+				inconclusive?: boolean;
+			})
+		| undefined
+	> {
 		if (this.checkDestroyed()) return;
 		const startedAt = Date.now();
 		const normalizedPath = normalizeMapKey(filePath);
@@ -887,7 +1266,10 @@ export class LSPService {
 		let spawned: SpawnedServer[];
 		let serverCountAttempted: number;
 		if (useAllClients) {
-			const result = await this.getClientsForFile(filePath);
+			const result = await this.getClientsForFile(
+				filePath,
+				options.excludeServerIds,
+			);
 			spawned = result.clients;
 			serverCountAttempted = result.serverCountAttempted;
 		} else if (clientScope === "with-auxiliary") {
@@ -971,18 +1353,35 @@ export class LSPService {
 		const diagnosticBaselines = new Map(
 			spawned.map((entry) => [entry.client, entry.client.diagnosticsVersion]),
 		);
+		let notifyWriteTimedOut = false;
 		if (!notifySkipped) {
-			await Promise.all(
-				spawned.map((entry) =>
-					entry.client.notify.open(
-						filePath,
-						content,
-						languageId,
-						undefined,
-						silent,
+			// Bounded so a backpressured write can't hang the caller (see
+			// notifyWriteBudgetMs). On timeout we proceed: the diagnostics wait below
+			// is separately bounded and simply returns no fresh diagnostics.
+			const wrote = await withDeadline(
+				Promise.all(
+					spawned.map((entry) =>
+						entry.client.notify.open(
+							filePath,
+							content,
+							languageId,
+							undefined,
+							silent,
+						),
 					),
 				),
+				{ ms: notifyWriteBudgetMs(), onTimeout: "undefined", onReject: "undefined" },
 			);
+			if (wrote === undefined) {
+				notifyWriteTimedOut = true;
+				logLatency({
+					type: "phase",
+					phase: "lsp_notify_timeout",
+					filePath: normalizedPath,
+					durationMs: Date.now() - startedAt,
+					metadata: { source, clientScope, serverCount: spawned.length },
+				});
+			}
 		}
 
 		let diagnosticsTimedOut = false;
@@ -993,17 +1392,69 @@ export class LSPService {
 			// (TypeScript ~1s) isn't held to a flat multi-second wait while a slow
 			// one (rust-analyzer 3s) gets the time it needs — bounded by any caller
 			// ceiling that exists to protect the per-edit pipeline budget (#203).
-			// The multi-server "full"/cascade path keeps the flat resolution.
+			// #573: clientScope "all" (lsp_diagnostics, lens_diagnostics_full) now
+			// gets the same per-server treatment as "with-auxiliary" — each spawned
+			// server (primary + any auxiliaries) is bounded by ITS OWN strategy
+			// budget instead of one flat number shared by every server. This was
+			// never a deliberate "all means wait for the group ceiling" semantic:
+			// #203 introduced perServerTimeout only for the single-server primary
+			// path and left "full"/"all" on the pre-existing flat resolution
+			// ("full/cascade path unchanged"); #242 later added "with-auxiliary"
+			// without revisiting "all". The one property "all" genuinely needs —
+			// the touch's overall detection deadline is the SLOWEST spawned
+			// server's budget, not the fastest — is unaffected: `timeoutMs` below
+			// is always `Math.max(...spawned.map(timeoutFor))` regardless of which
+			// timeoutFor is selected, so a slow auxiliary still gets to run to its
+			// own budget before the touch is logged as timed out. What changes is
+			// only that a fast server's *individual* `waitForDiagnostics` call
+			// (further below) now resolves/times out against its own budget
+			// instead of blocking to the flat multi-server number.
 			const envWait = readEnvDiagnosticsWaitMs();
 			const callerCap = options.maxDiagnosticsWaitMs ?? options.maxClientWaitMs;
 			const modeFloor = diagnosticsMode === "full" ? 3000 : 1200;
+			// #645: resolve each spawned server's "is this the first same-sweep
+			// touch for it" verdict EXACTLY ONCE up front, before `perServerTimeout`
+			// is defined. `SweepIndexGate.consumeFirstTouch` is side-effecting
+			// (it marks the server seen), and `perServerTimeout` below is invoked
+			// twice per server in this call (once to compute the overall
+			// `timeoutMs` deadline, again inside the wait `Promise.all`) — calling
+			// the gate directly from inside `perServerTimeout` would consume the
+			// "first touch" slot on the first of those two calls and read as
+			// already-warm on the second, silently shortchanging the very touch
+			// that was supposed to get the full budget.
+			const sweepFirstTouch = new Map<string, boolean>();
+			if (options.sweepIndexGate) {
+				for (const entry of spawned) {
+					const strategy = getStrategy(entry.client.serverId);
+					if (strategy.workspaceIndexing) {
+						sweepFirstTouch.set(
+							entry.client.serverId,
+							options.sweepIndexGate.consumeFirstTouch(entry.client.serverId),
+						);
+					}
+				}
+			}
 			// Each server gets its OWN deadline, bounded by the caller cap as a
 			// CEILING (never a floor) — so a clean push-silent primary (typescript
 			// ~1s) can't hold the whole touch to a slow auxiliary's budget, and a
 			// slow aux (opengrep) can't override the per-edit cap. Resolves as soon
 			// as a server publishes; this is just its individual deadline. (#242)
 			const perServerTimeout = (serverId: string): number => {
-				const strategyWait = getStrategy(serverId).aggregateWaitMs;
+				const strategy = getStrategy(serverId);
+				let strategyWait = strategy.aggregateWaitMs;
+				// #645: a `workspaceIndexing` server (marksman) only needs the
+				// full budget for the FIRST same-sweep touch to it — every
+				// subsequent touch in this sweep uses the much shorter warm-wait
+				// instead, since the one-time index build only needs to finish
+				// once. `sweepFirstTouch` only has entries when a sweep gate was
+				// passed in AND the strategy is marked, so a per-edit touch
+				// (no gate) or an unmarked server is completely unaffected.
+				const isFirstTouch = sweepFirstTouch.get(serverId);
+				if (isFirstTouch === false && strategy.workspaceIndexing) {
+					strategyWait =
+						strategy.workspaceIndexingWarmWaitMs ??
+						Math.min(300, strategyWait);
+				}
 				if (callerCap !== undefined) {
 					return Math.min(callerCap, strategyWait > 0 ? strategyWait : callerCap);
 				}
@@ -1015,10 +1466,14 @@ export class LSPService {
 				timeoutFor = () => envWait;
 			} else if (
 				(!useAllClients && spawned.length === 1) ||
-				clientScope === "with-auxiliary"
+				clientScope === "with-auxiliary" ||
+				clientScope === "all"
 			) {
 				timeoutFor = perServerTimeout;
 			} else {
+				// Fail-safe for any future clientScope this branch hasn't been
+				// taught about yet — keep the old flat resolution rather than
+				// silently mis-budgeting an unrecognized scope.
 				timeoutFor = () => callerCap ?? modeFloor;
 			}
 			// Detection deadline = the slowest individual server's budget.
@@ -1067,12 +1522,38 @@ export class LSPService {
 				)
 			: undefined;
 
+		// A touch is inconclusive when EITHER the notify write or the
+		// diagnostics wait hit their deadline for ANY of the spawned servers
+		// (these flags are touch-wide, covering the whole `Promise.all` over
+		// `spawned` — see the field doc on the return type). We deliberately
+		// err toward caution here: `collected` merges diagnostics across every
+		// spawned server, so even a partial timeout (e.g. a slow auxiliary
+		// while the primary answered) means the merged result may be missing
+		// findings that just hadn't arrived yet — it must not be trusted as a
+		// confirmed answer.
+		const inconclusive = notifyWriteTimedOut || diagnosticsTimedOut;
+
+		// #667: a confirmed (non-inconclusive) diagnostics-mode touch is the
+		// "actually warm" signal `ensureWarmForSweep` waits for — mark every
+		// spawned server so a later sweep in this session sees the check as a
+		// no-op instead of paying the warm-up round trip again.
+		if (diagnosticsMode !== "none" && !inconclusive) {
+			for (const entry of spawned) {
+				const key = await this.demonstratedReadyKeyFor(entry.info, filePath);
+				if (key) this.markDemonstratedReadyKey(key);
+			}
+		}
+
 		// Prime the last-known cache WITH the hash of the content we just synced,
 		// so a hot-path consumer (actionable-warnings at turn_end) can verify the
 		// cached diagnostics are for the current bytes before reusing them instead
 		// of paying for a second open+wait. Only when we actually collected — a
 		// non-collecting touch (didChange-only) leaves the prior entry intact.
-		if (collected !== undefined) {
+		// Skip this entirely when the touch was inconclusive: an unconfirmed
+		// empty `collected` must never erase a previously-confirmed non-empty
+		// record (that's the #570 bug — a timeout silently reporting as clean
+		// and wiping out known-good diagnostic state).
+		if (collected !== undefined && !inconclusive) {
 			const normalizedKey = normalizeMapKey(filePath);
 			if (collected.length > 0) {
 				this.lastKnownDiagnostics.set(normalizedKey, collected);
@@ -1081,6 +1562,18 @@ export class LSPService {
 				this.lastKnownDiagnostics.delete(normalizedKey);
 				this.lastKnownContentHash.delete(normalizedKey);
 			}
+		}
+
+		if (collected !== undefined && inconclusive) {
+			// Non-enumerable so JSON.stringify / spread / logging of the
+			// diagnostics array is unaffected — this is a query-only bonus
+			// field, not a shape change existing array consumers need to know
+			// about.
+			Object.defineProperty(collected, "inconclusive", {
+				value: true,
+				enumerable: false,
+				configurable: true,
+			});
 		}
 
 		// Only refresh the recent-touches entry when we actually pushed. Skipping
@@ -1103,7 +1596,9 @@ export class LSPService {
 				failureKind: "success",
 				collectedDiagnostics: collected?.length,
 				notifySkipped,
+				notifyWriteTimedOut,
 				diagnosticsTimedOut,
+				inconclusive,
 			},
 		});
 		return collected ?? [];
@@ -1561,6 +2056,7 @@ export class LSPService {
 					workspaceDiagnosticsSupport: client.getWorkspaceDiagnosticsSupport(),
 					advertisedCommands: client.getAdvertisedCommands(),
 					rawCapabilityKeys: client.getRawCapabilityKeys?.() ?? [],
+					launchVariant: client.getLaunchVariant?.(),
 				});
 			}
 			return snapshots;
@@ -1577,6 +2073,7 @@ export class LSPService {
 				workspaceDiagnosticsSupport: client.getWorkspaceDiagnosticsSupport(),
 				advertisedCommands: client.getAdvertisedCommands(),
 				rawCapabilityKeys: client.getRawCapabilityKeys?.() ?? [],
+				launchVariant: client.getLaunchVariant?.(),
 			});
 		}
 		return snapshots;
@@ -1788,48 +2285,463 @@ export class LSPService {
 	}
 
 	/**
+	 * #667: shared warm-check/ensure-warm step for BOTH `lsp_diagnostics`
+	 * (`tools/lsp-diagnostics.ts`'s batch/directory sweep) and
+	 * `lens_diagnostics mode=full` (`runWorkspaceDiagnostics` below) — one
+	 * implementation instead of two hand-copied ones, since both already
+	 * share `groupFilesByPrimaryServer`/`runPerServerGroups` (#631).
+	 *
+	 * Root cause this closes (#667): `serverCountReady:1` only proves the
+	 * server process spawned and passed the LSP `initialize` handshake — it
+	 * does NOT prove the server can usefully answer a diagnostics request
+	 * yet. tsserver-style servers can still be loading/indexing the project
+	 * internally for seconds after `initialize` resolves, and without this
+	 * check whichever file(s) land first in a sweep pay that cost as
+	 * individual per-file timeouts (observed: the first 5 files of a
+	 * 100-file sweep all hit the exact per-file ceiling with
+	 * `serverCountReady:1`, file 6 onward clean and fast).
+	 *
+	 * `representativeFile` should be one file from the group/batch about to
+	 * be swept — used only to resolve which server(s) serve it and, if
+	 * needed, to perform the warm-up touch itself.
+	 *
+	 * Cheap/no-op when every non-auxiliary server for `representativeFile`
+	 * has already answered a confirmed diagnostics touch earlier in THIS
+	 * session (`isDemonstratedReady` — set by `touchFile` above): resolves
+	 * the server list and root(s) (no spawn, no I/O beyond that) and
+	 * returns immediately. Only when at least one candidate server hasn't
+	 * demonstrated readiness does this perform one deliberate warm-up
+	 * `touchFile` round trip against `representativeFile`, bounded by its
+	 * OWN generous budget (`warmupTimeoutMs`/`PI_LENS_LSP_WARMUP_TIMEOUT_MS`
+	 * — distinct from the per-file sweep budget), and waits for it to
+	 * settle (success, timeout, or abort) before returning. This does NOT
+	 * change the per-file wait budgets or confirmed/unconfirmed contract
+	 * (#242/#611/#634) the sweep itself uses — it only runs once, before
+	 * the sweep's own loop starts.
+	 *
+	 * Returns `performedWarmup: true` only when the round trip actually ran
+	 * (false = already warm, no-op) — tests assert on this to guard against
+	 * the warm-up becoming a mandatory extra round trip on every sweep.
+	 */
+	async ensureWarmForSweep(
+		representativeFile: string,
+		options: { timeoutMs?: number; signal?: AbortSignal } = {},
+	): Promise<{ performedWarmup: boolean }> {
+		if (this.checkDestroyed() || options.signal?.aborted) {
+			return { performedWarmup: false };
+		}
+		const servers = getServersForFileWithConfig(representativeFile).filter(
+			(s) => s.role !== "auxiliary",
+		);
+		if (servers.length === 0) return { performedWarmup: false };
+
+		// A server with no resolvable root never spawns a client for this file
+		// either way, so it can't block "already warm" — only servers that WILL
+		// actually be used count toward the readiness check. Same key
+		// derivation `touchFile` uses to mark readiness (`demonstratedReadyKeyFor`)
+		// so this lines up exactly regardless of what a client instance itself
+		// reports as its `.root`.
+		const keys = await Promise.all(
+			servers.map((server) =>
+				this.demonstratedReadyKeyFor(server, representativeFile),
+			),
+		);
+		const alreadyWarm = keys.every(
+			(key) => key === undefined || this.state.demonstratedReady.has(key),
+		);
+		if (alreadyWarm) return { performedWarmup: false };
+
+		let content: string;
+		try {
+			content = await nodeFs.promises.readFile(representativeFile, "utf-8");
+		} catch {
+			// Nothing to warm up with — the real sweep's own read will surface
+			// the file error.
+			return { performedWarmup: false };
+		}
+		if (options.signal?.aborted) return { performedWarmup: false };
+
+		const timeoutMs = options.timeoutMs ?? warmupTimeoutMs();
+		const startedAt = Date.now();
+		logLatency({
+			type: "phase",
+			phase: "lsp_sweep_warmup_start",
+			filePath: representativeFile,
+			durationMs: 0,
+			metadata: { serverIds: servers.map((s) => s.id), timeoutMs },
+		});
+		const warmupAttempt = this.touchFile(representativeFile, content, {
+			diagnostics: "document",
+			collectDiagnostics: false,
+			clientScope: "primary",
+			source: "lsp_sweep_warmup",
+			maxClientWaitMs: timeoutMs,
+			maxDiagnosticsWaitMs: timeoutMs,
+		});
+		await (options.signal
+			? Promise.race([
+					withDeadline(warmupAttempt, { ms: timeoutMs, onTimeout: "undefined" }),
+					new Promise<void>((resolve) => {
+						if (options.signal!.aborted) {
+							resolve();
+							return;
+						}
+						options.signal!.addEventListener("abort", () => resolve(), {
+							once: true,
+						});
+					}),
+				])
+			: withDeadline(warmupAttempt, { ms: timeoutMs, onTimeout: "undefined" }));
+		logLatency({
+			type: "phase",
+			phase: "lsp_sweep_warmup_done",
+			filePath: representativeFile,
+			durationMs: Date.now() - startedAt,
+			metadata: { serverIds: servers.map((s) => s.id), timeoutMs },
+		});
+		return { performedWarmup: true };
+	}
+
+	/**
 	 * Actively scan every LSP-supported source file under a project root.
 	 * This is intentionally expensive and used only by explicit project-wide tools.
 	 */
 	async runWorkspaceDiagnostics(
 		cwd: string,
+		options: {
+			maxFiles?: number;
+			signal?: AbortSignal;
+			onProgress?: (completed: number, total: number) => void;
+			/**
+			 * Explicit file list (#461): skip the project walk entirely and route
+			 * exactly these files through the sweep. Used by lens_diagnostics'
+			 * `paths` scope restrictor so a wrapper (e.g. "git-staged files only")
+			 * gets the full mode=full treatment without paying for a whole-project
+			 * walk. Caller is responsible for resolving/deduping/filtering these
+			 * (lens-diagnostics.ts already applies the ignore matcher the same way
+			 * the walk does before calling in).
+			 */
+			files?: string[];
+		} = {},
 	): Promise<LSPWorkspaceDiagnosticResult[]> {
 		const startedAt = Date.now();
 		const root = path.resolve(cwd);
-		const files = await collectWorkspaceDiagnosticFiles(root);
-		const results: LSPWorkspaceDiagnosticResult[] = new Array(files.length);
-		let nextIndex = 0;
-		const workers = Math.min(WORKSPACE_DIAGNOSTICS_CONCURRENCY, files.length);
-		await Promise.all(
-			Array.from({ length: workers }, async () => {
-				while (true) {
-					const index = nextIndex;
-					nextIndex += 1;
-					if (index >= files.length) return;
-					const filePath = files[index];
-					try {
-						const content = await nodeFs.promises.readFile(filePath, "utf-8");
-						const diagnostics = await this.touchFile(filePath, content, {
-							diagnostics: "document",
-							collectDiagnostics: true,
-							clientScope: "all",
-							source: "lens_diagnostics_full",
-						});
-						results[index] = {
+		const { signal } = options;
+		// Cap the per-file LSP sweep: a Next.js-scale project can route thousands
+		// of files through the language server at concurrency 8, and without a
+		// caller cap that grinds for tens of minutes (#341). `maxFiles` lets
+		// lens_diagnostics' `maxLspFiles` bound it; falls back to the env/default.
+		const maxFiles =
+			typeof options.maxFiles === "number" &&
+			Number.isFinite(options.maxFiles) &&
+			options.maxFiles > 0
+				? Math.floor(options.maxFiles)
+				: getMaxWorkspaceDiagnosticFiles();
+		const files = options.files
+			? options.files.slice(0, maxFiles)
+			: await collectWorkspaceDiagnosticFiles(root, maxFiles, signal);
+		// Per-file wall-clock: a language server that hangs during spawn/initialize
+		// would otherwise park a worker on `touchFile` FOREVER (the per-edit
+		// diagnostic wait is bounded, but client acquisition here is not) — the root
+		// of an observed multi-hour hang. Budget each file so the worker always
+		// returns to the loop (and its abort check). Env-tunable.
+		const perFileMs = (() => {
+			const raw = Number(process.env.PI_LENS_LSP_WORKSPACE_PER_FILE_MS);
+			return Number.isFinite(raw) && raw > 0 ? raw : 15_000;
+		})();
+		const results: LSPWorkspaceDiagnosticResult[] = [];
+		let completed = 0;
+		let timedOutFiles = 0;
+		let lastHeartbeat = Date.now();
+
+		// Group files by their primary language server (#387, extracted as
+		// `groupFilesByPrimaryServer` for #631). tsserver — and most servers — is
+		// single-threaded per project: N concurrent touches to ONE server don't
+		// parallelize, they queue. That inflates the working set (each didOpen can
+		// force a project recheck) and cascades per-file-budget timeouts by queue
+		// position (observed: 51/123 files "timed out" purely from being behind
+		// others in an 8-wide flat pool). So serialize WITHIN a server (one
+		// in-flight touch each) and parallelize ACROSS servers — real parallelism
+		// where it exists (a mixed TS+Python repo runs both), no flooding where it
+		// doesn't. Capped so a many-language monorepo can't spawn unbounded groups.
+		const groups = groupFilesByPrimaryServer(files);
+		// #645: shared across every file/group in THIS sweep — lets a
+		// `workspaceIndexing`-strategy server (marksman) pay its full
+		// aggregateWaitMs budget only for the first file that touches it,
+		// instead of every markdown file independently racing the same cold
+		// workspace-index build. Scoped to this one call (never stored on the
+		// service), so it can't leak into a later sweep or a per-edit touch.
+		const sweepIndexGate = createSweepIndexGate();
+		// Opt-in project-wide pull: one `workspace/diagnostic` per server instead of
+		// N per-file opens (#387 Item 2). Gated off by default — a cold server can
+		// answer with an empty/partial report that reads as a false "all clean", and
+		// the pull covers only the primary server (files with auxiliary scanners
+		// would lose those). Enabled per group only when the server advertises it and
+		// no file in the group has an auxiliary; any miss falls back to per-file.
+		const workspacePullEnabled = process.env.PI_LENS_LSP_WORKSPACE_PULL === "1";
+
+		// Start marker: without this a hang leaves no trace that the sweep even
+		// began (the completion log below never fires). Per-file `lsp_touch_file`
+		// phases + these heartbeats let a hang be bracketed to a file/time.
+		logLatency({
+			type: "phase",
+			phase: "lsp_workspace_diagnostics_start",
+			filePath: root,
+			durationMs: 0,
+			metadata: {
+				fileCount: files.length,
+				maxFiles,
+				perFileMs,
+				serverGroups: groups.length,
+			},
+		});
+
+		// #608: pre-open every swept file's document, across whichever server(s)
+		// it belongs to, in ONE fast pass BEFORE a group's serial per-file
+		// diagnostics-wait loop starts (see the per-group worker below).
+		// `handleNotifyOpen`'s workspace/didChangeWatchedFiles enqueue (#271)
+		// only coalesces opens that land within its 100ms debounce window
+		// (`WatchedFilesQueue`, watch-queue.ts) — it arms the flush timer on
+		// the FIRST enqueue and just accumulates on every call after that
+		// until the timer fires. The per-file loop waits up to several
+		// seconds per file for diagnostics before moving to the next one, so
+		// consecutive first-opens during a sweep land far outside that 100ms
+		// window: every previously-unopened file used to fire its OWN
+		// project-wide recheck notification instead of one for the whole
+		// sweep, and later files timed out purely from queueing behind those
+		// rechecks (#608). Firing every file's open notification here,
+		// back-to-back with no diagnostics wait between them, keeps them
+		// inside the debounce window so `WatchedFilesQueue` coalesces them
+		// into (at most a small handful of) flushes per server the same way
+		// a per-edit dispatch burst already does. By the time `processFile`
+		// below calls `touchFile`, each document is already in
+		// `openDocuments`, so `handleNotifyOpen` takes the cheap already-open
+		// `didChange` branch and enqueues nothing further. Content read here
+		// is cached so `processFile` doesn't re-read the same file from disk.
+		//
+		// Only used on the per-file fallback path — a group whose
+		// `workspace/diagnostic` pull (#387 Item 2) succeeds never opens
+		// per-file documents at all, so pre-opening ahead of a pull attempt
+		// would be pure waste (and would break that path's "no per-file
+		// opens" guarantee). Called from inside each group's own serial loop
+		// (below), so it inherits the SAME #387 shape: one in-flight open at
+		// a time per server, parallel across distinct servers via the
+		// existing group-worker pool.
+		const contentCache = new Map<string, string>();
+		const preOpenGroupFiles = async (
+			groupFiles: readonly string[],
+		): Promise<void> => {
+			for (const filePath of groupFiles) {
+				if (signal?.aborted) return;
+				let content: string;
+				try {
+					content = await nodeFs.promises.readFile(filePath, "utf-8");
+				} catch {
+					continue; // processFile's own read will surface the real error.
+				}
+				contentCache.set(filePath, content);
+				const languageId = getLanguageId(filePath) ?? "plaintext";
+				// #615: this pre-open pass had NO bound at all — unlike every other
+				// per-file step in this sweep (`processFile`'s `touchFile` call
+				// below is `withDeadline`-wrapped). `getClientsForFile` can wait on
+				// a server spawn/initialize handshake, and `notify.open` can wait
+				// on a stuck notification write; either hanging left the WHOLE
+				// sweep stuck with no heartbeat and no escape (a real dogfooding
+				// incident: `lsp_workspace_diagnostics_start` logged, then total
+				// silence — and pressing Escape didn't help either, since the
+				// per-iteration `signal?.aborted` check above never gets a turn
+				// while stuck inside a single file's await). Two bounds, not one:
+				// `withDeadline` catches a hang with no abort press at all; racing
+				// the abort signal directly means an explicit Escape unblocks
+				// immediately too, instead of waiting out the rest of `perFileMs`.
+				// `onTimeout:"undefined"` mirrors the existing catch-based "best
+				// effort" intent below: a timed-out/aborted pre-open just means
+				// `processFile`'s own touchFile call pays for the open instead,
+				// exactly like a thrown error already did.
+				const preOpenAttempt = withDeadline(
+					(async () => {
+						const { clients } = await this.getClientsForFile(
 							filePath,
-							diagnostics: diagnostics ?? [],
-							count: diagnostics?.length ?? 0,
-						};
-					} catch (err) {
-						results[index] = {
-							filePath,
-							diagnostics: [],
-							count: 0,
-							error: err instanceof Error ? err.message : String(err),
-						};
+							WORKSPACE_SWEEP_EXCLUDED_SERVER_IDS,
+						);
+						for (const entry of clients) {
+							try {
+								await entry.client.notify.open(filePath, content, languageId);
+							} catch {
+								// Best-effort: a failed pre-open just means processFile's own
+								// touchFile call below pays for the open instead.
+							}
+						}
+					})(),
+					{ ms: perFileMs, onTimeout: "undefined" },
+				);
+				await (signal
+					? Promise.race([
+							preOpenAttempt,
+							new Promise<void>((resolve) => {
+								if (signal.aborted) {
+									resolve();
+									return;
+								}
+								signal.addEventListener("abort", () => resolve(), {
+									once: true,
+								});
+							}),
+						])
+					: preOpenAttempt);
+			}
+		};
+
+		const processFile = async (filePath: string): Promise<void> => {
+			try {
+				const content =
+					contentCache.get(filePath) ??
+					(await nodeFs.promises.readFile(filePath, "utf-8"));
+				// onTimeout:"undefined" so a hung file yields no diagnostics and the
+				// worker moves on; a real touchFile rejection still propagates to the
+				// catch below and is recorded as an error.
+				const diagnostics = await withDeadline(
+					this.touchFile(filePath, content, {
+						diagnostics: "document",
+						collectDiagnostics: true,
+						clientScope: "all",
+						source: "lens_diagnostics_full",
+						// #584: opengrep's findings for a full sweep come from the
+						// `opengrep-client.ts` CLI extractor (one project-wide scan,
+						// cached, read via extractors.ts) instead — see the
+						// `excludeServerIds` doc on `LSPTouchFileOptions`.
+						excludeServerIds: WORKSPACE_SWEEP_EXCLUDED_SERVER_IDS,
+						// #645: lets a workspaceIndexing server (marksman) pay its
+						// full wait budget only once across this whole sweep.
+						sweepIndexGate,
+					}),
+					{ ms: perFileMs, onTimeout: "undefined" },
+				);
+				// #571: prefer #570's real per-touch inconclusive signal
+				// (`touchFile`'s non-enumerable `.inconclusive` flag — set when the
+				// notify write or the diagnostics wait itself timed out) over this
+				// sweep's own OUTER `perFileMs` deadline, which only catches a touch
+				// that never returned at all within budget. Either one means the
+				// result wasn't confirmed.
+				const inconclusive =
+					(diagnostics as (typeof diagnostics & { inconclusive?: boolean }))
+						?.inconclusive === true;
+				const timedOut = diagnostics === undefined || inconclusive;
+				if (timedOut) timedOutFiles += 1;
+				// #586: honor each auxiliary profile's native inline-suppression
+				// comment (e.g. opengrep's `// nosemgrep`, #441) — computed from the
+				// raw `diagnostics` (before this drops its non-enumerable
+				// `.inconclusive` flag, already read above) so a `lens_diagnostics
+				// mode=full` sweep suppresses the same findings the per-edit dispatch
+				// runner does, instead of only the latter honoring it.
+				const filteredDiagnostics = diagnostics
+					? applyAuxiliarySuppressions(diagnostics, content)
+					: diagnostics;
+				results.push({
+					filePath,
+					diagnostics: filteredDiagnostics ?? [],
+					count: filteredDiagnostics?.length ?? 0,
+					timedOut,
+				});
+			} catch (err) {
+				results.push({
+					filePath,
+					diagnostics: [],
+					count: 0,
+					error: err instanceof Error ? err.message : String(err),
+					// An errored check is exactly as inconclusive as a timed-out one —
+					// no confirmed result was obtained, so reconciliation (#571) must
+					// skip it the same way.
+					timedOut: true,
+				});
+			}
+			completed += 1;
+			// User-facing progress (streamed to the tool's onUpdate). Per-file so the
+			// bar moves; the tool throttles the actual UI writes.
+			options.onProgress?.(completed, files.length);
+			// Time-based heartbeat (every ~10s): a hang shows the last heartbeat
+			// then silence, so latency.log pinpoints how far it got.
+			if (Date.now() - lastHeartbeat >= 10_000) {
+				lastHeartbeat = Date.now();
+				logLatency({
+					type: "phase",
+					phase: "lsp_workspace_diagnostics_progress",
+					filePath: root,
+					durationMs: Date.now() - startedAt,
+					metadata: {
+						completed,
+						total: files.length,
+						timedOutFiles,
+						aborted: signal?.aborted ?? false,
+					},
+				});
+			}
+		};
+
+		// One worker per server group (serial within a server), up to the
+		// concurrency cap across distinct servers — `runPerServerGroups` (#631)
+		// is the same primitive `tools/lsp-diagnostics.ts`'s batch/directory scan
+		// now uses for its own file list.
+		const groupWorkers = Math.min(
+			WORKSPACE_DIAGNOSTICS_CONCURRENCY,
+			groups.length,
+		);
+		await runPerServerGroups(
+			groups,
+			groupWorkers,
+			async (group) => {
+				if (signal?.aborted) return;
+				// Fast path: one project-wide pull for the whole group (opt-in).
+				if (workspacePullEnabled && !group.multiServer) {
+					const pulled = await this.tryWorkspacePull(group.files, perFileMs);
+					if (pulled) {
+						for (const result of pulled) results.push(result);
+						completed += group.files.length;
+						options.onProgress?.(completed, files.length);
+						return;
 					}
 				}
-			}),
+				// #667: warm-check before this group's own per-file loop starts —
+				// cheap/no-op when the group's primary server already demonstrated
+				// readiness (from an earlier sweep, or an earlier group sharing the
+				// same server root, this session); pays one deliberate warm-up round
+				// trip against the group's first file only when genuinely cold. Not
+				// needed above the pull fast path: a `workspace/diagnostic` pull
+				// already covers the WHOLE group with its own generous per-server
+				// budget in one shot — the per-file "first N files eat individual
+				// timeouts" failure mode this fixes doesn't apply there.
+				const first = group.files[0];
+				if (first) {
+					await this.ensureWarmForSweep(first, { signal });
+					if (signal?.aborted) return;
+				}
+				// #608/#621: batch-open a CHUNK of this group's files before
+				// waiting on diagnostics for any of them individually — see
+				// `preOpenGroupFiles` above. Chunking (rather than the whole
+				// group at once) bounds how much a single burst can dump on
+				// the server's request queue at real project scale, while each
+				// chunk's opens still land inside the debounce window and
+				// coalesce into one flush — see `WORKSPACE_SWEEP_PREOPEN_CHUNK_SIZE`.
+				for (
+					let chunkStart = 0;
+					chunkStart < group.files.length;
+					chunkStart += WORKSPACE_SWEEP_PREOPEN_CHUNK_SIZE
+				) {
+					if (signal?.aborted) return;
+					const chunk = group.files.slice(
+						chunkStart,
+						chunkStart + WORKSPACE_SWEEP_PREOPEN_CHUNK_SIZE,
+					);
+					await preOpenGroupFiles(chunk);
+					for (const filePath of chunk) {
+						// Honor cancellation between files (#341); already-collected
+						// results are returned as a partial.
+						if (signal?.aborted) return;
+						await processFile(filePath);
+					}
+				}
+			},
+			signal,
 		);
 
 		logLatency({
@@ -1843,11 +2755,55 @@ export class LSPService {
 					(sum, result) => sum + (result?.count ?? 0),
 					0,
 				),
-				concurrency: WORKSPACE_DIAGNOSTICS_CONCURRENCY,
+				serverGroups: groups.length,
+				concurrency: groupWorkers,
+				maxFiles,
+				timedOutFiles,
+				aborted: signal?.aborted ?? false,
 			},
 		});
 
 		return results.filter(Boolean);
+	}
+
+	/**
+	 * #387 Item 2: one `workspace/diagnostic` pull covering a whole server group,
+	 * instead of N per-file opens. Returns per-file results (files absent from the
+	 * report are reported clean), or `undefined` when the server doesn't advertise
+	 * workspace pull / the pull fails — the caller then falls back to per-file.
+	 */
+	private async tryWorkspacePull(
+		groupFiles: string[],
+		perFileMs: number,
+	): Promise<LSPWorkspaceDiagnosticResult[] | undefined> {
+		try {
+			const first = groupFiles[0];
+			if (!first) return undefined;
+			const spawned = await this.getClientForFile(first, perFileMs);
+			if (!spawned) return undefined;
+			if (
+				!spawned.client.getWorkspaceDiagnosticsSupport().workspaceDiagnostics
+			) {
+				return undefined;
+			}
+			const report = await spawned.client.requestWorkspaceDiagnostics(
+				Math.max(perFileMs, workspacePullBudgetMs()),
+			);
+			if (!report) return undefined;
+			const byPath = new Map<string, import("./client.js").LSPDiagnostic[]>();
+			for (const entry of report) {
+				byPath.set(normalizeMapKey(entry.filePath), entry.diagnostics);
+			}
+			return groupFiles.map((filePath) => {
+				const diagnostics = byPath.get(normalizeMapKey(filePath)) ?? [];
+				// A pull that got here returned a real workspace/diagnostic report
+				// (see the `!report` guard above) — always confirmed, unlike a
+				// per-file touchFile default-empty on timeout.
+				return { filePath, diagnostics, count: diagnostics.length, timedOut: false };
+			});
+		} catch {
+			return undefined;
+		}
 	}
 
 	/**
@@ -1969,6 +2925,27 @@ export class LSPService {
 		}
 		return count;
 	}
+
+	/**
+	 * Distinct serverIds of currently-alive clients, ordered primary-first then
+	 * auxiliary (cross-cutting scanners like opengrep/ast-grep), stable within
+	 * each group. Deduped across roots — one warm server serving two roots
+	 * collapses to a single id. Lightweight: does not spawn or wait. (#267)
+	 */
+	getAliveServerIds(): string[] {
+		const primary: string[] = [];
+		const aux: string[] = [];
+		const seen = new Set<string>();
+		for (const client of this.state.clients.values()) {
+			if (!client.isAlive()) continue;
+			const id = client.serverId;
+			if (seen.has(id)) continue;
+			seen.add(id);
+			const role = LSP_SERVERS.find((s) => s.id === id)?.role;
+			(role === "auxiliary" ? aux : primary).push(id);
+		}
+		return [...primary, ...aux];
+	}
 }
 
 // --- Singleton Instance ---
@@ -1996,6 +2973,10 @@ export function resetLSPService(options: LSPShutdownOptions = {}): void {
  */
 export function __collectWorkspaceDiagnosticFilesForTest(
 	root: string,
+	maxFiles?: number,
+	signal?: AbortSignal,
 ): Promise<string[]> {
-	return collectWorkspaceDiagnosticFiles(path.resolve(root));
+	return maxFiles === undefined
+		? collectWorkspaceDiagnosticFiles(path.resolve(root), undefined, signal)
+		: collectWorkspaceDiagnosticFiles(path.resolve(root), maxFiles, signal);
 }

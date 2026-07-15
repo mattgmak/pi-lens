@@ -1,14 +1,18 @@
 import * as nodeFs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import type { AstGrepClient } from "./ast-grep-client.js";
 import type { BiomeClient } from "./biome-client.js";
 import type { CacheManager } from "./cache-manager.js";
+import type { DeadCodeClient, DeadCodeResult } from "./dead-code-client.js";
+import { deadCodeIssueCount } from "./dead-code-client.js";
+import { logDeadCodeScan } from "./dead-code-logger.js";
 import type { DependencyChecker } from "./dependency-checker.js";
 import { getDiagnosticTracker } from "./diagnostic-tracker.js";
 import { clearAllSessions as clearFileTimeSessions } from "./file-time.js";
 import { getKnipIgnorePatterns } from "./file-utils.js";
 import { GitleaksClient, type GitleaksResult } from "./gitleaks-client.js";
+import { OpengrepClient, type OpengrepResult } from "./opengrep-client.js";
+import { TrivyClient, type TrivyResult } from "./trivy-client.js";
 import type { GoClient } from "./go-client.js";
 import {
 	GovulncheckClient,
@@ -21,6 +25,7 @@ import {
 	detectProjectLanguageProfile,
 	getDefaultStartupTools,
 } from "./language-profile.js";
+import { logLatency } from "./latency-logger.js";
 import { runLogCleanup } from "./log-cleanup.js";
 import { setSessionLanguages } from "./widget-state.js";
 import { initLSPConfig, loadLSPConfig } from "./lsp/config.js";
@@ -41,6 +46,17 @@ import { scanProjectRules } from "./rules-scanner.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
 import type { RustClient } from "./rust-client.js";
 
+import { isAtOrAboveHomeDir } from "./path-utils.js";
+import {
+	getSlowFsVerdict,
+	isSlowFs,
+	slowFsDegradationNotice,
+} from "./slow-fs.js";
+import {
+	getSubagentIdentity,
+	isSubagentSession,
+	subagentLightModeNotice,
+} from "./subagent-mode.js";
 import {
 	findNearestProjectRoot,
 	resolveStartupScanContext,
@@ -48,7 +64,6 @@ import {
 } from "./startup-scan.js";
 import type { TestRunnerClient } from "./test-runner-client.js";
 import type { TodoScanner } from "./todo-scanner.js";
-import type { TypeCoverageClient } from "./type-coverage-client.js";
 
 interface SessionStartDeps {
 	ctxCwd?: string;
@@ -65,16 +80,18 @@ interface SessionStartDeps {
 	ruffClient: RuffClient;
 	knipClient: KnipClient;
 	jscpdClient: JscpdClient;
+	deadCodeClients: DeadCodeClient[];
 	govulncheckClient: GovulncheckClient;
 	gitleaksClient: GitleaksClient;
-	typeCoverageClient: TypeCoverageClient;
+	trivyClient: TrivyClient;
+	opengrepClient: OpengrepClient;
 	depChecker: DependencyChecker;
 	testRunnerClient: TestRunnerClient;
 	goClient: GoClient;
 	rustClient: RustClient;
 	ensureTool: (name: string) => Promise<string | null | undefined>;
 	cleanStaleTsBuildInfo: (cwd: string) => string[];
-	resetDispatchBaselines: () => void;
+	resetDispatchBaselines: (cwd?: string) => void;
 	resetLSPService: (options?: LSPShutdownOptions) => void;
 }
 
@@ -83,7 +100,9 @@ type StartupMode = "full" | "minimal" | "quick";
 function resolveSnapshotRoot(cwd: string): string {
 	const resolvedCwd = path.resolve(cwd);
 	const nearest = findNearestProjectRoot(resolvedCwd);
-	if (!nearest || path.resolve(nearest) === path.resolve(os.homedir())) {
+	// Reject a root at — or above — $HOME (the #250/#253 escape); fall back to
+	// the cwd so the snapshot stays scoped to the actual workspace.
+	if (!nearest || isAtOrAboveHomeDir(nearest)) {
 		return resolvedCwd;
 	}
 	return nearest;
@@ -378,6 +397,58 @@ async function collectTodoBaselineItems(
 	return items;
 }
 
+// word-index — identifier inverted index + BM25 for ranked symbol search
+// (#162). Shared load -> rebuild-if-stale -> persist lifecycle (#348), the same
+// shape the call-graph task uses: reuse a fresh persisted index when the
+// project `seq` hasn't moved since it was built, otherwise do a bounded
+// rebuild and persist. Called from the full-mode background task AND the
+// quick-mode cold-start warmup pass (below) so every startup mode ends up
+// with a queryable index once per session, off the hot path.
+async function buildOrRefreshWordIndex(args: {
+	runtime: RuntimeCoordinator;
+	sessionGeneration: number;
+	analysisRoot: string;
+	snapshotRoot: string;
+	dbg: (msg: string) => void;
+}): Promise<void> {
+	const { runtime, sessionGeneration, analysisRoot, snapshotRoot, dbg } = args;
+	if (!runtime.isCurrentSession(sessionGeneration)) return;
+	const startMs = Date.now();
+
+	const latestSeq = readLatestProjectSequence(snapshotRoot);
+	const effectiveSeq = runtime.projectSeq ?? latestSeq.projectSeq;
+	const snapshot = loadProjectSnapshot(snapshotRoot);
+	if (isProjectSnapshotFresh(snapshot, effectiveSeq) && snapshot.wordIndex) {
+		const { deserializeWordIndex } = await import("./word-index.js");
+		const index = deserializeWordIndex(snapshot.wordIndex);
+		if (index) {
+			runtime.wordIndex = index;
+			dbg(
+				`session_start word-index: reused fresh snapshot (seq=${effectiveSeq}, ${index.docCount} files, ${Date.now() - startMs}ms)`,
+			);
+			return;
+		}
+	}
+
+	// Shared file-walk-and-read helper (#348): the ONE collectWordIndexDocs
+	// implementation backs this task, the quick-mode warmup call below, AND the
+	// stateless cold-query background trigger in word-index.ts — a bound/skip
+	// -rule change lands once, not in three copies.
+	const { buildWordIndex, collectWordIndexDocs } = await import(
+		"./word-index.js"
+	);
+	const docs = await collectWordIndexDocs(analysisRoot, () =>
+		runtime.isCurrentSession(sessionGeneration),
+	);
+	if (!runtime.isCurrentSession(sessionGeneration)) return;
+	runtime.wordIndex = buildWordIndex(docs);
+	saveRuntimeProjectSnapshot({ cwd: snapshotRoot, runtime, dbg });
+	dbg(
+		`session_start word-index: rebuilt (absent/stale, seq=${effectiveSeq}) ` +
+			`${runtime.wordIndex.docCount} files, ${runtime.wordIndex.postings.size} tokens (${Date.now() - startMs}ms)`,
+	);
+}
+
 // Fire off heavy scans as background tasks — don't block session start.
 // Each consumer already handles the "not ready yet" case gracefully
 // (cachedExports.size > 0, cache miss paths).
@@ -395,9 +466,13 @@ function scheduleStartupScans(
 		cacheManager,
 		knipClient,
 		jscpdClient,
+		deadCodeClients,
 		govulncheckClient,
 		gitleaksClient,
+		trivyClient,
+		opengrepClient,
 		astGrepClient,
+		depChecker,
 	} = deps;
 
 	// Some background scans are CPU-heavy and arrive on the event loop
@@ -446,7 +521,7 @@ function scheduleStartupScans(
 	};
 
 	const canRunJsTsHeavyScans = canRunStartupHeavyScans(languageProfile, "jsts");
-	const scanNames = ["todo"];
+	const scanNames = ["todo", "dead-code"];
 	if (canRunJsTsHeavyScans) {
 		scanNames.push("knip", "jscpd", "ast-grep exports", "project index");
 	}
@@ -475,8 +550,48 @@ function scheduleStartupScans(
 		return;
 	}
 
+	// #462: knip/jscpd/madge/dead-code/govulncheck/gitleaks/trivy/opengrep each spawn an
+	// external CLI that walks the whole project tree on its own — a walk we
+	// don't control or get to route to an async collector. On a measured-slow
+	// filesystem that walk reproduces the exact multi-second freeze this
+	// feature exists to prevent, so skip exactly those seven with a visible
+	// reason instead of leaving the agent to read an empty/stale cache as
+	// "clean". The other scans in this function (todo above; call-graph/
+	// codebase-model/ast-grep-exports/word-index below) walk via
+	// `collectSourceFilesAsync` or build from cached review-graph data, so
+	// they stay on.
+	//
+	// #449 slice 0: the same gate also fires inside a nicobailon/pi-subagents
+	// child `pi` process (`PI_SUBAGENT_CHILD=1`) — a fan-out of N subagents in
+	// the same cwd otherwise pays N full heavyweight-scan fleets for
+	// short-lived task agents that rarely consult them. In-process scans stay
+	// on for the same reason as slow-FS: the subagent may still use symbol
+	// search / word-index.
+	const isSubagent = isSubagentSession();
+	const skipHeavyweightScans = isSlowFs(analysisRoot) || isSubagent;
+	const runHeavyweightTask = (
+		name: string,
+		task: () => Promise<void>,
+	): void => {
+		if (skipHeavyweightScans) return;
+		runTask(name, task);
+	};
+	if (skipHeavyweightScans) {
+		dbg(
+			`session_start: skipping knip/jscpd/madge/dead-code/govulncheck/gitleaks/trivy/opengrep (${
+				isSubagent ? "subagent" : "slow-fs"
+			})`,
+		);
+		deps.notify(
+			`⏭️ Skipped background code-quality scans (knip/jscpd/madge/dead-code/govulncheck/gitleaks/trivy/opengrep): ${
+				isSubagent ? subagentLightModeNotice() : slowFsDegradationNotice()
+			}`,
+			"info",
+		);
+	}
+
 	// Knip — dead code / unused exports
-	runTask("knip", async () => {
+	runHeavyweightTask("knip", async () => {
 		if (!runtime.isCurrentSession(sessionGeneration)) return;
 		const cached = cacheManager.readCache<KnipResult>("knip", analysisRoot);
 		if (cached) {
@@ -501,7 +616,7 @@ function scheduleStartupScans(
 	});
 
 	// jscpd — duplicate code detection
-	runTask("jscpd", async () => {
+	runHeavyweightTask("jscpd", async () => {
 		if (await jscpdClient.ensureAvailable()) {
 			if (!runtime.isCurrentSession(sessionGeneration)) return;
 			// Detect TS projects by tsconfig.json at the analysis root. When
@@ -543,10 +658,53 @@ function scheduleStartupScans(
 		}
 	});
 
+	// dead-code — cross-file dead-code for non-JS/TS languages (#127). Each
+	// client self-gates via detect() (a cheap fs marker probe), so only a
+	// matching-language project incurs the whole-tree scan cost. Knip remains
+	// the JS/TS path (above); these run alongside it for polyglot repos.
+	runHeavyweightTask("dead-code", async () => {
+		const applicable = deadCodeClients.filter((c) => c.detect(analysisRoot));
+		if (applicable.length === 0) return;
+		await Promise.all(
+			applicable.map(async (client) => {
+				if (!runtime.isCurrentSession(sessionGeneration)) return undefined;
+				const cacheKey = `dead-code-${client.id}`;
+				const cached = cacheManager.readCache<DeadCodeResult>(
+					cacheKey,
+					analysisRoot,
+				);
+				if (cached) {
+					dbg(`session_start dead-code(${client.id}): cache hit`);
+					return undefined;
+				}
+				const startMs = Date.now();
+				const result = await client.analyze(analysisRoot);
+				if (!runtime.isCurrentSession(sessionGeneration)) return undefined;
+				cacheManager.writeCache(cacheKey, result, analysisRoot, {
+					scanDurationMs: Date.now() - startMs,
+				});
+				logDeadCodeScan({
+					language: client.language,
+					success: result.success,
+					cached: false,
+					unusedExports: result.unusedExports.length,
+					unusedFiles: result.unusedFiles.length,
+					unusedDeps: result.unusedDeps.length,
+					unlistedDeps: result.unlistedDeps.length,
+					durationMs: result.durationMs ?? Date.now() - startMs,
+					...(!result.success && { reason: result.summary }),
+				});
+				dbg(
+					`session_start dead-code(${client.id}) done (${Date.now() - startMs}ms, ${deadCodeIssueCount(result)} issues)`,
+				);
+			}),
+		);
+	});
+
 	// govulncheck — Go module CVE detection (#132)
 	// Skipped silently when the project isn't a Go module or when
 	// `govulncheck` isn't installed (no auto-install in this slice).
-	runTask("govulncheck", async () => {
+	runHeavyweightTask("govulncheck", async () => {
 		if (!GovulncheckClient.hasGoModule(analysisRoot)) {
 			dbg("session_start govulncheck: no go.mod — skipped");
 			return;
@@ -584,7 +742,7 @@ function scheduleStartupScans(
 	// gitleaks — committed-secrets detection (#130)
 	// Config-gated: opts in via .gitleaks.toml / .gitleaksignore / git
 	// hook / gitleaks dep. Cross-language by design.
-	runTask("gitleaks", async () => {
+	runHeavyweightTask("gitleaks", async () => {
 		if (!GitleaksClient.hasGitleaksSignal(analysisRoot)) {
 			dbg("session_start gitleaks: no opt-in signal — skipped");
 			return;
@@ -617,12 +775,120 @@ function scheduleStartupScans(
 		);
 	});
 
+	// opengrep — full-workspace security/quality findings via a single CLI scan
+	// (#584). Structurally always-on (mirrors the LSP auxiliary's own
+	// enablement — see `OpengrepClient.resolveConfig`): the local rule file or
+	// `auto` registry ruleset always runs, `resolveOpengrepConfig` only picks
+	// which. Replaces the per-file LSP sweep as the source of opengrep
+	// findings for `lens_diagnostics mode=full` (`runWorkspaceDiagnostics` now
+	// excludes the opengrep server from its per-file "all"-scope touch —
+	// clients/lsp/index.ts `WORKSPACE_SWEEP_EXCLUDED_SERVER_IDS`); the per-edit
+	// real-time LSP path is untouched.
+	runHeavyweightTask("opengrep", async () => {
+		if (!(await opengrepClient.ensureAvailable())) {
+			if (!runtime.isCurrentSession(sessionGeneration)) return;
+			dbg("session_start opengrep: not available (install failed?)");
+			return;
+		}
+		if (!runtime.isCurrentSession(sessionGeneration)) return;
+		const cached = cacheManager.readCache<OpengrepResult>(
+			"opengrep",
+			analysisRoot,
+		);
+		if (cached) {
+			if (!runtime.isCurrentSession(sessionGeneration)) return;
+			dbg(
+				`session_start opengrep: cache hit (${cached.data.findings.length} findings)`,
+			);
+			return;
+		}
+		const startMs = Date.now();
+		const result = await opengrepClient.scan(analysisRoot);
+		if (!runtime.isCurrentSession(sessionGeneration)) return;
+		cacheManager.writeCache("opengrep", result, analysisRoot, {
+			scanDurationMs: Date.now() - startMs,
+		});
+		dbg(
+			`session_start opengrep: ${result.findings.length} findings (${Date.now() - startMs}ms)`,
+		);
+	});
+
+	// madge — whole-project circular-dependency detection. Session-start + cached
+	// (uniform with knip/jscpd/gitleaks) so lens_diagnostics mode=full reads it
+	// from the `madge` cache via the extractor registry — never a fresh scan.
+	runHeavyweightTask("madge", async () => {
+		if (!(await depChecker.ensureAvailable())) {
+			if (!runtime.isCurrentSession(sessionGeneration)) return;
+			dbg("session_start madge: not available");
+			return;
+		}
+		if (!runtime.isCurrentSession(sessionGeneration)) return;
+		const cached = cacheManager.readCache<{ circular: unknown[] }>(
+			"madge",
+			analysisRoot,
+		);
+		if (cached) {
+			dbg(
+				`session_start madge: cache hit (${cached.data.circular.length} cycles)`,
+			);
+			return;
+		}
+		const startMs = Date.now();
+		const result = await depChecker.scanProject(analysisRoot);
+		if (!runtime.isCurrentSession(sessionGeneration)) return;
+		cacheManager.writeCache("madge", result, analysisRoot, {
+			scanDurationMs: Date.now() - startMs,
+		});
+		dbg(
+			`session_start madge: ${result.circular.length} circular dependency chain(s) (${Date.now() - startMs}ms)`,
+		);
+	});
+
+	// trivy — dependency CVE detection (#131, Phase 1)
+	// Explicit opt-in: `trivy.enabled: true` in .pi-lens.json AND a dependency
+	// manifest present. The first run downloads Trivy's vuln DB (~30-200 MB);
+	// harmless here since this whole task runs in the background session_start
+	// wrapper.
+	runHeavyweightTask("trivy", async () => {
+		if (!TrivyClient.shouldScan(analysisRoot)) {
+			dbg(
+				"session_start trivy: not enabled / no dependency manifest — skipped",
+			);
+			return;
+		}
+		if (!(await trivyClient.ensureAvailable())) {
+			if (!runtime.isCurrentSession(sessionGeneration)) return;
+			dbg("session_start trivy: not available (install failed?)");
+			return;
+		}
+		if (!runtime.isCurrentSession(sessionGeneration)) return;
+		const cached = cacheManager.readCache<TrivyResult>("trivy", analysisRoot);
+		if (cached) {
+			if (!runtime.isCurrentSession(sessionGeneration)) return;
+			dbg(
+				`session_start trivy: cache hit (${cached.data.findings.length} findings)`,
+			);
+			return;
+		}
+		const startMs = Date.now();
+		const result = await trivyClient.scan(analysisRoot);
+		if (!runtime.isCurrentSession(sessionGeneration)) return;
+		cacheManager.writeCache("trivy", result, analysisRoot, {
+			scanDurationMs: Date.now() - startMs,
+		});
+		dbg(
+			`session_start trivy: ${result.findings.length} CVE findings (${Date.now() - startMs}ms)`,
+		);
+	});
+
 	// call-graph — build function-level call graph from review graph data
 	runTask("call-graph", async () => {
 		const { FactStore } = await import("./dispatch/fact-store.js");
-		const { buildOrUpdateGraph, extractSymbolsAndRefsFromGraph } = await import(
-			"./review-graph/builder.js"
-		);
+		const {
+			buildOrUpdateGraph,
+			extractSymbolsAndRefsFromGraph,
+			isReviewGraphMigrationNeeded,
+		} = await import("./review-graph/builder.js");
 		const {
 			buildCallGraph,
 			saveCallGraph,
@@ -637,7 +903,15 @@ function scheduleStartupScans(
 		if (cached) {
 			const cachedFiles = [...cached.fileMtimes.keys()];
 			const stale = staleFiles(cached.fileMtimes, cachedFiles);
-			if (stale.length === 0 && cachedFiles.length > 0) {
+			// #260: a stale REVIEW-graph version must force a rebuild even when the
+			// (separate) call-graph cache is fresh — otherwise an upgrade that
+			// invalidated the persisted graph (e.g. v2→v3 test exclusion) leaves
+			// reads cold until the next edit. The version check is cheap (file head).
+			if (
+				stale.length === 0 &&
+				cachedFiles.length > 0 &&
+				!isReviewGraphMigrationNeeded(analysisRoot)
+			) {
 				runtime.callGraph = cached.graph;
 				dbg(
 					`session_start call-graph: loaded from cache (${cached.graph.edges.length} edges, ${Date.now() - startMs}ms)`,
@@ -695,41 +969,17 @@ function scheduleStartupScans(
 		}
 	});
 
-	// word-index — identifier inverted index + BM25 for ranked symbol search (#162)
+	// word-index — identifier inverted index + BM25 for ranked symbol search
+	// (#162). Load -> rebuild-if-stale -> persist lifecycle (#348), shared with
+	// the quick-mode cold-start warmup pass below.
 	runTask("word-index", async () => {
-		if (!runtime.isCurrentSession(sessionGeneration)) return;
-		const { collectSourceFilesAsync } = await import("./source-filter.js");
-		const { buildWordIndex } = await import("./word-index.js");
-		const startMs = Date.now();
-		// Bounds keep the build off the critical path on large repos: cap the file
-		// count and skip files too large to be hand-written source (generated /
-		// bundled output the source filter didn't already exclude).
-		const MAX_FILES = 6000;
-		const MAX_BYTES = 512 * 1024;
-		const files = await collectSourceFilesAsync(analysisRoot);
-		if (!runtime.isCurrentSession(sessionGeneration)) return;
-		const docs: Array<{ path: string; content: string }> = [];
-		let processed = 0;
-		for (const file of files.slice(0, MAX_FILES)) {
-			try {
-				const stat = nodeFs.statSync(file);
-				if (stat.size <= MAX_BYTES) {
-					docs.push({ path: file, content: nodeFs.readFileSync(file, "utf-8") });
-				}
-			} catch {
-				// unreadable / vanished file — skip
-			}
-			if (++processed % 100 === 0) {
-				await new Promise<void>((resolve) => setImmediate(resolve));
-				if (!runtime.isCurrentSession(sessionGeneration)) return;
-			}
-		}
-		runtime.wordIndex = buildWordIndex(docs);
-		saveRuntimeProjectSnapshot({ cwd: snapshotRoot, runtime, dbg });
-		dbg(
-			`session_start word-index: ${runtime.wordIndex.docCount} files, ` +
-				`${runtime.wordIndex.postings.size} tokens (${Date.now() - startMs}ms)`,
-		);
+		await buildOrRefreshWordIndex({
+			runtime,
+			sessionGeneration,
+			analysisRoot,
+			snapshotRoot,
+			dbg,
+		});
 	});
 }
 
@@ -783,6 +1033,22 @@ function scheduleDeferredToolProbes(
 	})();
 }
 
+/**
+ * Session-start orientation prepended as a context message (gated by the
+ * context-injection toggle). Deliberately lean: it names the high-value tools
+ * and the one non-obvious behaviour (mode=all resurfaces stale blocking errors)
+ * — per-tool argument detail lives in each tool's own registered description, so
+ * re-documenting it here would just pay the tokens twice every session.
+ */
+export const SESSION_START_GUIDANCE: string[] = [
+	"📌 pi-lens active — automated checks run on every edit/write; blocking errors (including pre-existing) show inline and must be fixed.\n" +
+		"Key tools (see each tool's own description for args):\n" +
+		"• lens_diagnostics — session-wide diagnostic state; mode=all resurfaces stale blocking errors that dropped from turn context.\n" +
+		"• symbol_search → module_report → read_symbol/read_enclosing — ranked identifier search, then navigable outline/callback handles + exact body reads; cheaper than reading a whole file before editing.\n" +
+		"• lsp_diagnostics — probe LSP for errors in a file/folder/workspace.\n" +
+		"• Situational (activate via pi_lens_activate_tools): lsp_navigation, ast_grep_search, ast_grep_replace, ast_grep_dump.",
+];
+
 export async function handleSessionStart(
 	deps: SessionStartDeps,
 ): Promise<void> {
@@ -830,9 +1096,7 @@ export async function handleSessionStart(
 		!processGlobals.__piLensWarmupScheduled
 	) {
 		processGlobals.__piLensWarmupScheduled = true;
-		const warmupDelayMs = Number(
-			process.env.PI_LENS_WARMUP_DELAY_MS ?? 2000,
-		);
+		const warmupDelayMs = Number(process.env.PI_LENS_WARMUP_DELAY_MS ?? 2000);
 		const warmupCwd = deps.ctxCwd ?? process.cwd();
 		const warmupDbg = deps.dbg;
 		setTimeout(() => {
@@ -843,19 +1107,25 @@ export async function handleSessionStart(
 					// Dynamic imports keep the warmup pipeline off the hot
 					// startup path — these modules don't load until the timer
 					// fires, well after the TUI is interactive.
-					const startupScanModule = await import(
-						"./startup-scan.js"
-					);
-					const languageProfileModule = await import(
-						"./language-profile.js"
-					);
+					const startupScanModule = await import("./startup-scan.js");
+					const languageProfileModule = await import("./language-profile.js");
 					const scan =
-						await startupScanModule.resolveStartupScanContextAsync(
-							warmupCwd,
-						);
+						await startupScanModule.resolveStartupScanContextAsync(warmupCwd);
 					warmupDbg(
 						`warmup: scan-context done in ${Date.now() - warmupStartedAt}ms (canWarm=${scan.canWarmCaches})`,
 					);
+					// Respect the startup-scan guard (#250): canWarmCaches is false for
+					// home-dir / no-project-root / too-many-source-files. Proceeding into
+					// the language-profile source walk in those cases lets it root at an
+					// ancestor (e.g. a marker in $HOME when pi runs in ~/tmp) and traverse
+					// the entire home tree — multi-hour scans. Nothing to warm anyway when
+					// the guard says caches can't be warmed.
+					if (!scan.canWarmCaches) {
+						warmupDbg(
+							`warmup: skipping language-profile (canWarm=false, reason=${scan.reason ?? "unknown"})`,
+						);
+						return;
+					}
 					const languageRoot = scan.projectRoot ?? warmupCwd;
 					const languageProfileStartedAt = Date.now();
 					await languageProfileModule.detectProjectLanguageProfileAsync(
@@ -864,9 +1134,25 @@ export async function handleSessionStart(
 					warmupDbg(
 						`warmup: language-profile done in ${Date.now() - languageProfileStartedAt}ms`,
 					);
+					// #348: fold the word-index build/refresh into this existing
+					// cold-start warmup pass so quick-mode (and any session whose very
+					// first session_start is forced quick) still ends up with a
+					// queryable index — full-mode sessions get it via the "word-index"
+					// runTask above; this is the quick-mode equivalent, once per
+					// process, off the hot path.
+					const wordIndexStartedAt = Date.now();
+					const warmupSnapshotRoot = resolveSnapshotRoot(warmupCwd);
+					await buildOrRefreshWordIndex({
+						runtime: deps.runtime,
+						sessionGeneration: deps.runtime.sessionGeneration,
+						analysisRoot: languageRoot,
+						snapshotRoot: warmupSnapshotRoot,
+						dbg: warmupDbg,
+					});
 					warmupDbg(
-						`warmup: total ${Date.now() - warmupStartedAt}ms`,
+						`warmup: word-index done in ${Date.now() - wordIndexStartedAt}ms`,
 					);
+					warmupDbg(`warmup: total ${Date.now() - warmupStartedAt}ms`);
 				} catch (err) {
 					warmupDbg(`warmup: error ${err}`);
 					// Allow a future session to retry the warmup.
@@ -887,7 +1173,6 @@ export async function handleSessionStart(
 		runtime,
 		metricsClient,
 		cacheManager,
-		typeCoverageClient: _typeCoverageClient,
 		testRunnerClient,
 		goClient,
 		rustClient,
@@ -909,7 +1194,7 @@ export async function handleSessionStart(
 	getDiagnosticTracker().reset();
 	clearFileTimeSessions();
 	runtime.complexityBaselines.clear();
-	resetDispatchBaselines();
+	resetDispatchBaselines(ctxCwd);
 	runtime.resetForSession();
 
 	// Run log cleanup early in session start (non-blocking)
@@ -1045,6 +1330,56 @@ export async function handleSessionStart(
 		dbg(`session_start: monorepo analysis root override -> ${analysisRoot}`);
 	}
 
+	// Slow-FS probe (#462): classify the workspace filesystem by measurement
+	// (median fs.statSync cost) before any tree walk runs. WSL 9p mounts cost
+	// ~1.3ms/stat vs ~17µs native — a 75x slowdown that turns a 5,000-file sync
+	// walk into a multi-second TUI freeze. Logged to the latency log so
+	// dogfooding can see the verdict; a visible notice fires when engaged so a
+	// degraded scan is never mistaken for a silently-empty one.
+	const slowFsVerdict = getSlowFsVerdict(analysisRoot);
+	logLatency({
+		type: "phase",
+		phase: "slow_fs_probe",
+		filePath: analysisRoot,
+		durationMs: 0,
+		metadata: {
+			slow: slowFsVerdict.slow,
+			medianStatMicros: slowFsVerdict.medianStatMicros,
+			samples: slowFsVerdict.samples,
+		},
+	});
+	dbg(
+		`session_start slow-fs probe: slow=${slowFsVerdict.slow} medianStatMicros=${slowFsVerdict.medianStatMicros.toFixed(1)} samples=${slowFsVerdict.samples}`,
+	);
+	if (slowFsVerdict.slow) {
+		notify(
+			`🐢 Slow filesystem detected (median ${slowFsVerdict.medianStatMicros.toFixed(0)}µs/stat) — reduced-scan mode engaged (set PI_LENS_ALLOW_SLOW_FS_SCAN=1 to override).`,
+			"warning",
+		);
+	}
+
+	// Subagent light mode (#449 slice 0): detected once per session, alongside
+	// the slow-FS probe above. Logged to the latency log so dogfooding can see
+	// how often subagent fan-outs engage it and what identity they carry.
+	const subagentSession = isSubagentSession();
+	if (subagentSession) {
+		const identity = getSubagentIdentity();
+		logLatency({
+			type: "phase",
+			phase: "subagent_light_mode",
+			filePath: analysisRoot,
+			durationMs: 0,
+			metadata: {
+				runId: identity?.runId,
+				agentName: identity?.agentName,
+				marker: identity?.marker,
+			},
+		});
+		dbg(
+			`session_start subagent light mode: engaged (marker=${identity?.marker ?? "unknown"} runId=${identity?.runId ?? "unknown"} agentName=${identity?.agentName ?? "unknown"})`,
+		);
+	}
+
 	const lensLspEnabled = !getFlag("no-lsp");
 	const startupDefaults = getDefaultStartupTools(languageProfile).filter(
 		(tool) => {
@@ -1095,14 +1430,7 @@ export async function handleSessionStart(
 	log(`Active tools: ${tools.join(", ")}`);
 	dbg(`session_start tools: ${tools.join(", ")}`);
 
-	const agentStartupGuidance = [
-		"📌 pi-lens active — automated checks run on your edits and writes. Blocking errors will be shown inline; you must fix all errors including pre-existing ones.\n" +
-			"Key pi-lens tools:\n" +
-			"• lens_diagnostics mode=all — diagnostic state for every file EDITED this session (all runners: LSP + tree-sitter + ast-grep + linters). Stale blocking errors from earlier turns appear here even if they dropped from turn-end context. mode=delta (default) shows all warnings for the current turn only. mode=full is expensive: actively scans project-wide LSP diagnostics for unedited files too, then merges with cached runner state; add refreshRunners=cheap to refresh project-wide tree-sitter/fact-rule diagnostics.\n" +
-			"• lsp_diagnostics — actively probe LSP for errors in a specific file, folder, or workspace (LSP only, triggers a fresh server check).\n" +
-			"• lsp_navigation — definitions, references, symbols, rename_file, capabilities.\n" +
-			"• ast_grep_search / ast_grep_replace — structural code patterns. Cross-context queries: use insideKind/hasKind/follows/precedes params (synthesises YAML automatically). Full DSL: use rule= param with raw YAML for all/any/not/nthChild/regex. ast_dump to discover node kinds before writing patterns.",
-	];
+	const agentStartupGuidance = SESSION_START_GUIDANCE;
 
 	runtime.projectRulesScan = scanProjectRules(analysisRoot);
 	saveRuntimeProjectSnapshot({
@@ -1157,7 +1485,16 @@ export async function handleSessionStart(
 	// (several ENOENT readFile calls up the directory tree) never runs on the
 	// interactive path. setImmediate guarantees handleSessionStart has already
 	// resolved before loadLSPConfig is even called.
-	if (!getFlag("no-lsp") && allowBootstrapTasks) {
+	//
+	// #449 slice 0: skip both the explicit warmFiles warm and the
+	// dominant-language auto-warm inside a subagent session — a fan-out of N
+	// subagents otherwise pays N full LSP pre-warms in the same cwd. Per-edit
+	// LSP dispatch is untouched (see `pipeline.ts`), so a subagent that
+	// actually edits code still gets diagnostics; it just spawns the server
+	// lazily on first edit instead of eagerly at session start.
+	if (subagentSession) {
+		dbg("session_start lsp-warm: skipping pre-warm (subagent session)");
+	} else if (!getFlag("no-lsp") && allowBootstrapTasks) {
 		setImmediate(() => {
 			void loadLSPConfig(cwd).then((lspConfig) => {
 				const warmFiles = lspConfig.warmFiles ?? [];
@@ -1174,16 +1511,23 @@ export async function handleSessionStart(
 					).catch((err) =>
 						dbg(`session_start lsp-warm: unhandled error: ${err}`),
 					);
-				} else {
+				} else if (startupScan.canWarmCaches) {
 					// No explicit warmFiles — pre-spawn just the dominant language's
 					// LSP so the first edit doesn't pay the cold-spawn stall (#203).
+					// Only do the auto-discovery warm on guarded real project roots; on
+					// home/no-project/too-large roots this source walk can become the same
+					// delayed background tree scan that the startup-scan guard prevents.
 					igniteDominantLanguageWarm(
-						cwd,
+						analysisRoot,
 						runtime,
 						sessionGeneration,
 						dbg,
 					).catch((err) =>
 						dbg(`session_start lsp-warm: unhandled dominant error: ${err}`),
+					);
+				} else {
+					dbg(
+						`session_start lsp-warm: skipping dominant-language auto-warm (${startupScan.reason ?? "unknown"})`,
 					);
 				}
 			});

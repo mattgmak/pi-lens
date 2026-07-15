@@ -19,12 +19,15 @@ import {
 	type DispatchLatencyReport,
 	getLatencyReports,
 } from "./dispatch/integration.js";
+import {
+	getResourceFootprint as getResourceFootprintSnapshot,
+	type ResourceFootprint,
+} from "./instance-registry.js";
 import { initLSPConfig } from "./lsp/config.js";
 import { getLSPService } from "./lsp/index.js";
+import { getOrLoadWarmWordIndex } from "./mcp/analyze.js";
 import { scanProjectDiagnostics } from "./project-diagnostics/scanner.js";
 import type { ProjectDiagnosticsSnapshot } from "./project-diagnostics/types.js";
-import type { ImpactHit } from "./review-graph/query.js";
-import type { ReviewGraphEdgeKind } from "./review-graph/types.js";
 import * as path from "node:path";
 import { normalizeMapKey } from "./path-utils.js";
 import { loadProjectSnapshot } from "./project-snapshot.js";
@@ -33,6 +36,7 @@ import {
 	deserializeWordIndex,
 	type RankedFile,
 	searchWordIndex,
+	triggerBackgroundWordIndexBuild,
 } from "./word-index.js";
 
 // --- Facades (re-exported so adapters import only this module) ---------------
@@ -61,6 +65,19 @@ export {
 	type SessionStartOutcome,
 	type TurnEndOutcome,
 } from "./mcp/session.js";
+export {
+	moduleReport,
+	type ModuleReport,
+	type ModuleReportOptions,
+	type ModuleSymbolEntry,
+	readEnclosing,
+	type ReadEnclosingOptions,
+	type ReadEnclosingResult,
+	readSymbol,
+	type ReadSymbolResult,
+	type RecommendedRead,
+	renderCompactModuleReport,
+} from "./module-report.js";
 
 // --- Query wrappers (own the remaining internal reach-ins) -------------------
 
@@ -110,18 +127,84 @@ export function ensureLspConfig(cwd: string): Promise<void> {
 	return initLSPConfig(cwd);
 }
 
+export type { ResourceFootprint } from "./instance-registry.js";
+
+/**
+ * #620: total CPU/RAM footprint attributable to pi-lens across every process
+ * it owns — every registered instance's host, plus that instance's live LSP
+ * children. Reads the machine-global `~/.pi-lens/instances.json` registry, so
+ * this answers across ALL concurrent pi-lens sessions/worktrees on the box,
+ * not just this one. Best-effort: reflects whatever heartbeats have landed so
+ * far — a stale-heartbeat instance simply reports its last-sampled numbers.
+ */
+export function resourceFootprint(): Promise<ResourceFootprint> {
+	return getResourceFootprintSnapshot();
+}
+
+/** Slimmed wire shape (#517 conformity): `startLine`/`endLine` mark the hit's
+ * best-matching line (`lines[0]`, the file's own best-scoring identifier hit);
+ * a single-line span rather than a fabricated whole-file range, since the word
+ * index tracks scattered per-line matches, not a symbol span. Read derivation:
+ * offset=startLine, limit=endLine-startLine+1 for a one-line peek — prefer
+ * module_report on `file` for the real outline. No per-hit `read` block, no
+ * repeated raw `lines[]` array on the wire. */
+export interface SymbolSearchHit {
+	file: string;
+	score: number;
+	hits: number;
+	startLine: number;
+	endLine: number;
+}
+
 export interface SymbolSearchResult {
 	/** False when no word index has been built/persisted for this workspace yet. */
 	available: boolean;
 	query: string;
-	results: RankedFile[];
+	results: SymbolSearchHit[];
+	/** Actionable guidance when `available` is false (#348 decision 3): the
+	 * index build was kicked off in the background (deduped per cwd), never
+	 * blocking this call — retry shortly. */
+	hint?: string;
+	/**
+	 * ISO timestamp the persisted project snapshot (`ProjectSnapshot.generatedAt`)
+	 * was last written — the snapshot backs BOTH the word index this search ranks
+	 * over and the `reverseDeps` centrality boost. Present whenever `available` is
+	 * true. Additive (#536): an MCP adapter uses this to compute a staleness hint;
+	 * omitted (not surfaced) on the pi tool surface, whose index is per-edit warm.
+	 */
+	snapshotGeneratedAt?: string;
+}
+
+function toSymbolSearchHit(result: RankedFile): SymbolSearchHit {
+	const line = result.lines[0] ?? 1;
+	return {
+		file: result.file,
+		score: result.score,
+		hits: result.hits,
+		startLine: line,
+		endLine: line,
+	};
 }
 
 /**
- * Ranked identifier search over the persisted word index (#162). Stateless:
- * loads the index from the project snapshot (built by the session scan, in
- * either the pi extension or the MCP session), so it works without a warm
- * runtime. Returns `available: false` when no index exists yet.
+ * Ranked identifier search over the persisted word index (#162). Mostly
+ * stateless: loads the index from the project snapshot (built by the session
+ * scan, in either the pi extension or the MCP session), so it works without a
+ * warm runtime. Returns `available: false` when no index exists yet — and
+ * kicks off a single bounded background build for this workspace (deduped per
+ * cwd, never blocking this call) so a retry shortly after succeeds (#348
+ * decision 3).
+ *
+ * #536 rider: prefers the warm in-memory index (`getOrLoadWarmWordIndex`,
+ * clients/mcp/analyze.ts) over a fresh disk read when one exists for this
+ * cwd — a warm `pilens_analyze` call updates that live copy synchronously but
+ * persists it to disk on a debounce (default 1500ms), so without this a query
+ * immediately following an analyze in the SAME process would read stale
+ * on-disk state until the debounce flushes. Falls back to the stateless disk
+ * read exactly as before when no warm copy is cached (nothing has called
+ * pilens_analyze yet this process, or #348 phase 2's forward-index isn't
+ * available) — this function's public contract (available/hint/results shape)
+ * is unchanged either way.
  */
 export function symbolSearch(
 	query: string,
@@ -129,8 +212,16 @@ export function symbolSearch(
 	limit = 20,
 ): SymbolSearchResult {
 	const snapshot = loadProjectSnapshot(cwd);
-	const index = deserializeWordIndex(snapshot?.wordIndex);
-	if (!index) return { available: false, query, results: [] };
+	const index = getOrLoadWarmWordIndex(cwd) ?? deserializeWordIndex(snapshot?.wordIndex);
+	if (!index) {
+		triggerBackgroundWordIndexBuild(cwd);
+		return {
+			available: false,
+			query,
+			results: [],
+			hint: "Word index is building in the background for this workspace — retry this query shortly.",
+		};
+	}
 	// Boost well-connected files using the snapshot's reverse-dependency
 	// (importedBy) counts; snapshot keys are normalized, index keys are raw.
 	const centrality = centralityFromReverseDeps(
@@ -138,45 +229,16 @@ export function symbolSearch(
 		snapshot?.reverseDeps,
 		(file) => normalizeMapKey(path.resolve(file)),
 	);
+	const results = searchWordIndex(index, query, { limit, centrality });
 	return {
 		available: true,
 		query,
-		results: searchWordIndex(index, query, { limit, centrality }),
+		results: results.map(toSymbolSearchHit),
+		snapshotGeneratedAt: snapshot?.generatedAt,
 	};
 }
 
-export interface SymbolImpactResult {
-	/** False when the review graph is empty (no session scan has run). */
-	available: boolean;
-	seedFile: string;
-	hits: ImpactHit[];
-	truncated: boolean;
-	maxDepthReached: number;
-}
-
-/**
- * Transitive, depth-bounded impact of a file ("what depends on this") over the
- * review graph's call/reference/import edges (#162). Builds/loads the review
- * graph (3-tier cached, so cheap after the first build) and walks incoming
- * edges. Read-only.
- */
-export async function symbolImpact(
-	file: string,
-	cwd: string,
-	options?: {
-		maxDepth?: number;
-		relations?: ReviewGraphEdgeKind[];
-		maxHits?: number;
-	},
-): Promise<SymbolImpactResult> {
-	const { buildOrUpdateGraph } = await import("./review-graph/builder.js");
-	const { computeTransitiveImpact } = await import("./review-graph/query.js");
-	const { FactStore } = await import("./dispatch/fact-store.js");
-	const graph = await buildOrUpdateGraph(cwd, [], new FactStore());
-	const result = computeTransitiveImpact(
-		graph,
-		path.resolve(cwd, file),
-		options,
-	);
-	return { available: graph.nodes.size > 0, ...result };
-}
+// symbolImpact was removed (#304 follow-up): the transitive blast radius is now
+// served by module_report's `blastRadius` option (clients/module-report.ts), which
+// calls computeTransitiveImpact (review-graph/query.ts) directly over the cached
+// graph. No engine wrapper is needed.

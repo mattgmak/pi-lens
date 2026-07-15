@@ -14,6 +14,13 @@
  * embeddings, no native deps, no daemon — pure in-process TypeScript.
  */
 
+import * as fs from "node:fs";
+import * as path from "node:path";
+import {
+	createDebounceScheduler,
+	type DebounceScheduler,
+} from "./persist-debounce.js";
+
 export interface WordHit {
 	file: string;
 	line: number;
@@ -26,6 +33,18 @@ export interface WordIndex {
 	docLengths: Map<string, number>;
 	totalTokens: number;
 	docCount: number;
+	/**
+	 * Forward index (#348 phase 2): file → (token → distinct-line count for that
+	 * token in that file). Mirrors exactly what the postings list holds for this
+	 * file, so a single-document replace is mechanical — subtract this file's own
+	 * contribution from `postings`/`docLengths`/`totalTokens`/`docCount` via the
+	 * forward entry, then add the new one, instead of re-walking every other
+	 * file's postings to find what to remove. Absent (`undefined`) on indexes
+	 * built by phase 1 or deserialized from a pre-phase-2 snapshot — callers that
+	 * need incremental updates must treat a missing forward index as "no
+	 * incremental primitive available" and fall back to a full rebuild.
+	 */
+	forward?: Map<string, Map<string, number>>;
 }
 
 export interface RankedFile {
@@ -124,11 +143,13 @@ export function buildWordIndex(
 ): WordIndex {
 	const postings = new Map<string, WordHit[]>();
 	const docLengths = new Map<string, number>();
+	const forward = new Map<string, Map<string, number>>();
 	let totalTokens = 0;
 
 	for (const { path: filePath, content } of files) {
 		const lines = content.split(/\r?\n/);
 		let docLength = 0;
+		const tokenLineCounts = new Map<string, number>();
 		for (let i = 0; i < lines.length; i += 1) {
 			const lineTokens = tokenizeLine(lines[i]);
 			docLength += lineTokens.length;
@@ -139,13 +160,147 @@ export function buildWordIndex(
 				const arr = postings.get(token);
 				if (arr) arr.push({ file: filePath, line: i + 1 });
 				else postings.set(token, [{ file: filePath, line: i + 1 }]);
+				tokenLineCounts.set(token, (tokenLineCounts.get(token) ?? 0) + 1);
 			}
 		}
 		docLengths.set(filePath, docLength);
+		forward.set(filePath, tokenLineCounts);
 		totalTokens += docLength;
 	}
 
-	return { postings, docLengths, totalTokens, docCount: files.length };
+	return { postings, docLengths, totalTokens, docCount: files.length, forward };
+}
+
+/**
+ * Remove `filePath`'s postings/docLength/forward entry from `index` in place,
+ * using the forward index to know exactly which tokens to touch (no scan of
+ * unrelated postings). No-op (returns false) if the index has no forward
+ * index yet (pre-phase-2 / deserialized-old-shape) or the file isn't present —
+ * callers must treat `false` as "fall back to a full rebuild", never as
+ * silent success.
+ */
+export function removeWordIndexDocument(
+	index: WordIndex,
+	filePath: string,
+): boolean {
+	if (!index.forward) return false;
+	const tokenLineCounts = index.forward.get(filePath);
+	if (!tokenLineCounts) return false;
+
+	for (const token of tokenLineCounts.keys()) {
+		const arr = index.postings.get(token);
+		if (!arr) continue;
+		const next = arr.filter((hit) => hit.file !== filePath);
+		if (next.length > 0) index.postings.set(token, next);
+		else index.postings.delete(token);
+	}
+
+	const docLength = index.docLengths.get(filePath) ?? 0;
+	index.docLengths.delete(filePath);
+	index.forward.delete(filePath);
+	index.totalTokens -= docLength;
+	index.docCount = Math.max(0, index.docCount - 1);
+	return true;
+}
+
+/**
+ * Add or replace `filePath`'s document in `index` in place: removes the prior
+ * postings for this file (if any, via {@link removeWordIndexDocument}'s
+ * forward-index lookup) then re-tokenizes `content` and adds the new
+ * postings/docLength/forward entry. df/N/totalTokens (avgdl) are updated as
+ * running stats — no full recompute over other documents.
+ *
+ * Returns `false` (no-op on `index`) when the index has no forward index —
+ * the caller must fall back to a full {@link buildWordIndex} rebuild in that
+ * case (documented at the `forward` field and enforced by callers, not
+ * silently patched here: a partially-forward-consistent index would corrupt
+ * future incremental updates).
+ */
+export function updateWordIndexDocument(
+	index: WordIndex,
+	doc: { path: string; content: string },
+): boolean {
+	if (!index.forward) return false;
+
+	// Remove the old contribution first (no-op if this is a brand new doc).
+	if (index.forward.has(doc.path)) {
+		removeWordIndexDocument(index, doc.path);
+	}
+
+	// Tokenize with line numbers attached (needed for WordHit.line) — this also
+	// yields the forward-index entry (distinct-line count per token) so the
+	// tokenization work happens exactly once for this document.
+	const lines = doc.content.split(/\r?\n/);
+	const perTokenHits = new Map<string, number[]>();
+	let docLength = 0;
+	for (let i = 0; i < lines.length; i += 1) {
+		const lineTokens = tokenizeLine(lines[i]);
+		docLength += lineTokens.length;
+		const seenOnLine = new Set<string>();
+		for (const token of lineTokens) {
+			if (seenOnLine.has(token)) continue;
+			seenOnLine.add(token);
+			const arr = perTokenHits.get(token);
+			if (arr) arr.push(i + 1);
+			else perTokenHits.set(token, [i + 1]);
+		}
+	}
+
+	const tokenLineCounts = new Map<string, number>();
+	for (const [token, lineNumbers] of perTokenHits) {
+		tokenLineCounts.set(token, lineNumbers.length);
+		const hits = lineNumbers.map((line) => ({ file: doc.path, line }));
+		const arr = index.postings.get(token);
+		if (arr) arr.push(...hits);
+		else index.postings.set(token, hits);
+	}
+
+	index.docLengths.set(doc.path, docLength);
+	index.forward.set(doc.path, tokenLineCounts);
+	index.totalTokens += docLength;
+	index.docCount += 1;
+	return true;
+}
+
+/** Bounds shared by every word-index build path — keep the walk off the
+ * critical path on large repos: cap the file count, and skip files too large
+ * to be hand-written source (generated/bundled output the source filter
+ * didn't already exclude). */
+export const WORD_INDEX_MAX_FILES = 6000;
+export const WORD_INDEX_MAX_BYTES = 512 * 1024;
+
+/**
+ * Collect the bounded `{path, content}` doc set `buildWordIndex` consumes —
+ * the ONE file-walk-and-read implementation shared by every build path
+ * (session-start task, quick-mode warmup, cold-query background trigger),
+ * so a bound/skip-rule change lands in one place instead of three copies.
+ * `shouldContinue` lets a session-scoped caller abort early (session
+ * superseded) without this module knowing about RuntimeCoordinator.
+ */
+export async function collectWordIndexDocs(
+	root: string,
+	shouldContinue: () => boolean = () => true,
+): Promise<Array<{ path: string; content: string }>> {
+	const { collectSourceFilesAsync } = await import("./source-filter.js");
+	const files = await collectSourceFilesAsync(root);
+	if (!shouldContinue()) return [];
+	const docs: Array<{ path: string; content: string }> = [];
+	let processed = 0;
+	for (const file of files.slice(0, WORD_INDEX_MAX_FILES)) {
+		try {
+			const stat = fs.statSync(file);
+			if (stat.size <= WORD_INDEX_MAX_BYTES) {
+				docs.push({ path: file, content: fs.readFileSync(file, "utf-8") });
+			}
+		} catch {
+			// unreadable / vanished file — skip
+		}
+		if (++processed % 100 === 0) {
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			if (!shouldContinue()) return docs;
+		}
+	}
+	return docs;
 }
 
 /**
@@ -269,6 +424,15 @@ export interface SerializedWordIndex {
 	/** Parallel to {@link files}: indexed token count per file. */
 	docLengths: number[];
 	totalTokens: number;
+	/**
+	 * Forward index (#348 phase 2): `[fileIdx, [[token, lineCount], …]]` per
+	 * file. Optional so pre-phase-2 snapshots parse unchanged. When ABSENT on
+	 * load, {@link deserializeWordIndex} returns a `WordIndex` with `forward:
+	 * undefined` — callers that want incremental per-edit updates must treat
+	 * that as "no incremental primitive available" and trigger one full
+	 * rebuild (never migrate an old snapshot's shape in place).
+	 */
+	forward?: Array<[number, Array<[string, number]>]>;
 }
 
 export function serializeWordIndex(index: WordIndex): SerializedWordIndex {
@@ -287,11 +451,20 @@ export function serializeWordIndex(index: WordIndex): SerializedWordIndex {
 		if (flat.length > 0) postings.push([token, flat]);
 	}
 
+	const forward: Array<[number, Array<[string, number]>]> | undefined =
+		index.forward
+			? files.map((file, i) => [
+					i,
+					[...(index.forward!.get(file) ?? new Map()).entries()],
+				])
+			: undefined;
+
 	return {
 		files,
 		postings,
 		docLengths: files.map((file) => index.docLengths.get(file) ?? 0),
 		totalTokens: index.totalTokens,
+		forward,
 	};
 }
 
@@ -323,11 +496,195 @@ export function deserializeWordIndex(
 		if (hits.length > 0) postings.set(token, hits);
 	}
 
+	let forward: Map<string, Map<string, number>> | undefined;
+	if (Array.isArray(data.forward)) {
+		forward = new Map();
+		for (const entry of data.forward) {
+			if (!Array.isArray(entry) || entry.length !== 2) continue;
+			const [fileIdx, tokenCounts] = entry;
+			const file = data.files[fileIdx];
+			if (typeof file !== "string" || !Array.isArray(tokenCounts)) continue;
+			const perToken = new Map<string, number>();
+			for (const pair of tokenCounts) {
+				if (!Array.isArray(pair) || pair.length !== 2) continue;
+				const [token, count] = pair;
+				if (typeof token === "string" && typeof count === "number") {
+					perToken.set(token, count);
+				}
+			}
+			forward.set(file, perToken);
+		}
+	}
+
 	return {
 		postings,
 		docLengths,
 		totalTokens:
 			typeof data.totalTokens === "number" ? data.totalTokens : 0,
 		docCount: data.files.length,
+		forward,
 	};
+}
+
+// --- Cold-query background build trigger (#348) -------------------------------
+//
+// `symbol_search` (pi tool) / `pilens_symbol_search` (MCP) are stateless callers:
+// no RuntimeCoordinator, no session lifecycle — just a synchronous read of the
+// persisted snapshot via `symbolSearch()`. When the index is missing (e.g. the
+// session-start / warmup lifecycle in runtime-session.ts hasn't run yet, or this
+// is an MCP-only session that never ran pilens_session_start), the tool must
+// never block the query on a project walk (#348 decision 3): it triggers a
+// single background build, keyed by the resolved cwd so a burst of queries in
+// the same cold window only pays for one walk, and returns immediately.
+
+const inFlightBuilds = new Set<string>();
+
+/** Test-only: reset the in-flight-build guard between test files/cases. */
+export function _resetWordIndexBuildGuardForTests(): void {
+	inFlightBuilds.clear();
+}
+
+/**
+ * Fire a one-time bounded background build for `cwd` if one isn't already
+ * running. Persists into the existing project snapshot (preserving its other
+ * fields) so the next query — or the next real session — picks it up. Errors
+ * are swallowed (this is best-effort warmth, not a request the caller is
+ * waiting on); the guard always clears in a `finally` so a failed build can be
+ * retried by a later query.
+ */
+export function triggerBackgroundWordIndexBuild(
+	cwd: string,
+	dbg?: (msg: string) => void,
+): void {
+	const key = path.resolve(cwd);
+	if (inFlightBuilds.has(key)) return;
+	inFlightBuilds.add(key);
+	void (async () => {
+		const startMs = Date.now();
+		try {
+			const { loadProjectSnapshot, saveProjectSnapshot, PROJECT_SNAPSHOT_VERSION } =
+				await import("./project-snapshot.js");
+			const docs = await collectWordIndexDocs(key);
+			const index = buildWordIndex(docs);
+			const existing = loadProjectSnapshot(key);
+			const snapshot = existing ?? {
+				version: PROJECT_SNAPSHOT_VERSION,
+				projectRoot: key,
+				generatedAt: new Date().toISOString(),
+				seq: 0,
+				files: {},
+				symbols: {},
+				reverseDeps: {},
+				cachedExports: [],
+			};
+			snapshot.generatedAt = new Date().toISOString();
+			snapshot.wordIndex = serializeWordIndex(index);
+			saveProjectSnapshot(key, snapshot);
+			dbg?.(
+				`word-index cold-build: ${index.docCount} files, ${index.postings.size} tokens (${Date.now() - startMs}ms)`,
+			);
+		} catch (err) {
+			dbg?.(`word-index cold-build: failed: ${err}`);
+		} finally {
+			inFlightBuilds.delete(key);
+		}
+	})();
+}
+
+// --- Debounced per-edit persist (#348 phase 2) --------------------------------
+//
+// The per-edit seam (dispatch/integration.ts) updates `runtime.wordIndex` in
+// memory on every write, same as the review graph's per-edit rebuild. Without
+// coalescing, persisting that in-memory index on every single edit would mean
+// one full-snapshot JSON.stringify+write per keystroke-adjacent edit — the
+// same OOM-risking spike the graph's #260 circuit-breaker exists to prevent.
+// This reuses `createDebounceScheduler` (persist-debounce.ts) rather than
+// growing a second copy of the graph's bespoke pending-map+timer bookkeeping;
+// only the "write" callback differs, because the target differs: the graph
+// owns its own cache file, but the word index must merge into the SHARED
+// project-snapshot file via `saveRuntimeProjectSnapshot`/`saveProjectSnapshot`
+// (preserving unrelated snapshot fields, and honoring the seq-laundering guard
+// in project-snapshot.ts — see saveRuntimeProjectSnapshot's comment).
+
+const WORD_INDEX_PERSIST_DEBOUNCE_MS_DEFAULT = 1500;
+
+function wordIndexPersistDebounceMs(): number {
+	const raw = Number(process.env.PI_LENS_WORD_INDEX_PERSIST_DEBOUNCE_MS);
+	return Number.isFinite(raw) && raw >= 0
+		? raw
+		: WORD_INDEX_PERSIST_DEBOUNCE_MS_DEFAULT;
+}
+
+interface PendingWordIndexPersist {
+	cwd: string;
+	index: WordIndex;
+	dbg?: (msg: string) => void;
+}
+
+let wordIndexPersistScheduler:
+	| DebounceScheduler<PendingWordIndexPersist>
+	| undefined;
+
+function getWordIndexPersistScheduler(): DebounceScheduler<PendingWordIndexPersist> {
+	if (wordIndexPersistScheduler) return wordIndexPersistScheduler;
+	wordIndexPersistScheduler = createDebounceScheduler<PendingWordIndexPersist>({
+		debounceMs: wordIndexPersistDebounceMs,
+		write(_key, pending) {
+			void writeWordIndexSnapshot(pending.cwd, pending.index, pending.dbg);
+		},
+	});
+	return wordIndexPersistScheduler;
+}
+
+async function writeWordIndexSnapshot(
+	cwd: string,
+	index: WordIndex,
+	dbg?: (msg: string) => void,
+): Promise<void> {
+	try {
+		const { loadProjectSnapshot, saveProjectSnapshot, PROJECT_SNAPSHOT_VERSION } =
+			await import("./project-snapshot.js");
+		const existing = loadProjectSnapshot(cwd);
+		const snapshot = existing ?? {
+			version: PROJECT_SNAPSHOT_VERSION,
+			projectRoot: path.resolve(cwd),
+			generatedAt: new Date().toISOString(),
+			seq: 0,
+			files: {},
+			symbols: {},
+			reverseDeps: {},
+			cachedExports: [],
+		};
+		snapshot.generatedAt = new Date().toISOString();
+		snapshot.wordIndex = serializeWordIndex(index);
+		saveProjectSnapshot(cwd, snapshot);
+		dbg?.(
+			`word-index persist: ${index.docCount} files, ${index.postings.size} tokens`,
+		);
+	} catch (err) {
+		dbg?.(`word-index persist: failed: ${err}`);
+	}
+}
+
+/**
+ * Schedule a debounced persist of `index` for `cwd`, coalescing a burst of
+ * per-edit updates into one write after a quiet window (default 1500ms,
+ * override via `PI_LENS_WORD_INDEX_PERSIST_DEBOUNCE_MS`, mirroring the review
+ * graph's `PI_LENS_GRAPH_PERSIST_DEBOUNCE_MS`). Merges through the same
+ * `saveProjectSnapshot` path phase 1 uses — preserves unrelated snapshot
+ * fields and respects the seq-laundering guard (only ever writes wordIndex
+ * for the CURRENT in-memory index, never re-stamps a stale one).
+ */
+export function scheduleWordIndexPersist(
+	cwd: string,
+	index: WordIndex,
+	dbg?: (msg: string) => void,
+): void {
+	const key = path.resolve(cwd);
+	getWordIndexPersistScheduler().schedule(key, { cwd: key, index, dbg });
+}
+
+/** Test hook: force any pending debounced word-index persist to write immediately. */
+export function flushWordIndexPersistsForTests(): void {
+	getWordIndexPersistScheduler().flushAll();
 }

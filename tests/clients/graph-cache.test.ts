@@ -111,7 +111,12 @@ describe("buildOrUpdateGraph — Promise dedup cache", () => {
 		expect(getLastGraphBuildInfo().reused).toBe(false);
 		clearGraphCache();
 		await buildOrUpdateGraph(cwd, [path.join(cwd, "b.ts")], facts);
-		expect(getLastGraphBuildInfo()).toEqual({ reused: true, mode: "cached" });
+		expect(getLastGraphBuildInfo()).toEqual({
+			reused: true,
+			mode: "cached",
+			graphChanged: false,
+			seqFastpathFallback: undefined,
+		});
 	});
 
 	it("reuses the cached graph when mtime drifts but content is unchanged (#202)", async () => {
@@ -136,6 +141,34 @@ describe("buildOrUpdateGraph — Promise dedup cache", () => {
 		const info = getLastGraphBuildInfo();
 		expect(info.reused).toBe(true);
 		expect(info.mode).toBe("cached");
+	});
+
+	it("stamps buildGeneration — no-op builds carry it forward, content changes mint a new one (#459)", async () => {
+		const facts = new FactStore();
+		const cwd = tmpDir();
+		const file = path.join(cwd, "gen.ts");
+		fs.writeFileSync(file, "export function genA() {\n\treturn 1;\n}\n");
+
+		const g1 = await buildOrUpdateGraph(cwd, [file], facts);
+		expect(g1.buildGeneration).toBeDefined();
+
+		// Unchanged content → cache-hit build returns a fresh clone with the SAME
+		// stamp, so derived-data caches (reverse-deps index) can prove reusability.
+		clearGraphCache();
+		const g2 = await buildOrUpdateGraph(cwd, [file], facts);
+		expect(getLastGraphBuildInfo().mode).toBe("cached");
+		expect(g2.buildGeneration).toBe(g1.buildGeneration);
+
+		// A graph-mutating build (here: full rebuild after a workspace-cache clear)
+		// mints a NEW stamp. (The incremental/content-change paths are covered with
+		// real files in review-graph-seq-fastpath.test.ts — this harness mocks the
+		// source walk, so content edits are invisible to the signature here.)
+		clearReviewGraphWorkspaceCache();
+		clearGraphCache();
+		const g3 = await buildOrUpdateGraph(cwd, [file], facts);
+		expect(getLastGraphBuildInfo().mode).toBe("full");
+		expect(g3.buildGeneration).toBeDefined();
+		expect(g3.buildGeneration).not.toBe(g1.buildGeneration);
 	});
 
 	it("resolves to a ReviewGraph with version and builtAt fields", async () => {
@@ -167,5 +200,82 @@ describe("buildOrUpdateGraph — Promise dedup cache", () => {
 
 		expect(fs.existsSync(path.join(cwd, ".pi-lens"))).toBe(false);
 		expect(fs.existsSync(cachePath)).toBe(true);
+	});
+
+	it("incrementally adds a newly-created file instead of a full rebuild (#202)", async () => {
+		const facts = new FactStore();
+		const cwd = tmpDir();
+		const a = path.join(cwd, "a.ts");
+		fs.writeFileSync(a, "export function alphaSymbol() {\n\treturn 1;\n}\n");
+		await buildOrUpdateGraph(cwd, [a], facts);
+		expect(getLastGraphBuildInfo().reused).toBe(false); // full build
+
+		// A new sibling file appears — pre-#202 the differing file COUNT bailed to
+		// a full whole-repo rebuild; now it's an incremental add.
+		const b = path.join(cwd, "b.ts");
+		fs.writeFileSync(b, "export function bravoSymbol() {\n\treturn 2;\n}\n");
+
+		clearGraphCache(); // drop promise-dedup; keep the warm workspace cache
+		const graph = await buildOrUpdateGraph(cwd, [b], facts);
+		const info = getLastGraphBuildInfo();
+		expect(info.reused).toBe(true);
+		expect(info.mode).toBe("incremental"); // NOT a full rebuild
+		expect(
+			[...graph.nodes.values()].some((n) =>
+				n.symbolName?.includes("bravoSymbol"),
+			),
+		).toBe(true);
+	});
+
+	it("incrementally updates a file that changed on disk outside the edit set (#202)", async () => {
+		const facts = new FactStore();
+		const cwd = tmpDir();
+		const a = path.join(cwd, "a.ts");
+		const b = path.join(cwd, "b.ts");
+		fs.writeFileSync(a, "export function alphaSymbol() {\n\treturn 1;\n}\n");
+		fs.writeFileSync(b, "export function bravoOldName() {\n\treturn 2;\n}\n");
+		await buildOrUpdateGraph(cwd, [a], facts);
+		expect(getLastGraphBuildInfo().reused).toBe(false);
+
+		// b changes on disk, but the caller only declares `a` changed. The dropped
+		// `.every(in changedSet)` guard used to force a full rebuild here.
+		fs.writeFileSync(b, "export function bravoNewName() {\n\treturn 3;\n}\n");
+		const future = new Date(Date.now() + 10_000);
+		fs.utimesSync(b, future, future);
+
+		clearGraphCache();
+		const graph = await buildOrUpdateGraph(cwd, [a], facts);
+		const info = getLastGraphBuildInfo();
+		expect(info.reused).toBe(true);
+		expect(info.mode).toBe("incremental");
+		const names = [...graph.nodes.values()].map((n) => n.symbolName ?? "");
+		expect(names.some((n) => n.includes("bravoNewName"))).toBe(true);
+		expect(names.some((n) => n.includes("bravoOldName"))).toBe(false);
+	});
+
+	it("falls back to a full rebuild when a file is removed (#202)", async () => {
+		const facts = new FactStore();
+		const cwd = tmpDir();
+		const a = path.join(cwd, "a.ts");
+		const b = path.join(cwd, "b.ts");
+		fs.writeFileSync(a, "export function alphaSymbol() {\n\treturn 1;\n}\n");
+		fs.writeFileSync(b, "export function bravoSymbol() {\n\treturn 2;\n}\n");
+		await buildOrUpdateGraph(cwd, [a], facts);
+		expect(getLastGraphBuildInfo().reused).toBe(false);
+
+		// A removal must prune nodes/edges — incremental update doesn't apply, so
+		// the helper bails and the caller does a correct full rebuild.
+		fs.rmSync(b);
+
+		clearGraphCache();
+		const graph = await buildOrUpdateGraph(cwd, [a], facts);
+		const info = getLastGraphBuildInfo();
+		expect(info.reused).toBe(false);
+		expect(info.mode).toBe("full");
+		expect(
+			[...graph.nodes.values()].some((n) =>
+				n.symbolName?.includes("bravoSymbol"),
+			),
+		).toBe(false);
 	});
 });

@@ -18,7 +18,13 @@
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
+import { loadWebTreeSitter } from "./deps/web-tree-sitter.js";
 import { getProjectIgnoreMatcher, isExcludedDirName } from "./file-utils.js";
+import {
+	downloadGrammar,
+	grammarBlockReason,
+	LANGUAGE_TO_GRAMMAR,
+} from "./grammar-source.js";
 import { resolvePackagePath } from "./package-root.js";
 
 const _require = createRequire(import.meta.url);
@@ -29,6 +35,11 @@ import {
 	type TreeSitterQuery,
 	TreeSitterQueryLoader,
 } from "./tree-sitter-query-loader.js";
+
+// Hard cap on a single structural-search file walk. Bounds a misrooted scan so
+// it can't enumerate an unbounded tree synchronously before result collection
+// short-circuits (#262).
+const TREE_SITTER_MAX_SCAN_FILES = 20_000;
 
 // --- Type Declarations (local, no import needed) ---
 
@@ -55,37 +66,6 @@ interface TreeSitterParserInstance {
 	setLanguage: (lang: TreeSitterLanguage) => void;
 	parse: (content: string) => TreeSitterTree;
 }
-
-// --- WASM Grammar Mapping ---
-
-const LANGUAGE_TO_GRAMMAR: Record<string, string> = {
-	typescript: "tree-sitter-typescript.wasm",
-	tsx: "tree-sitter-tsx.wasm",
-	javascript: "tree-sitter-javascript.wasm",
-	python: "tree-sitter-python.wasm",
-	rust: "tree-sitter-rust.wasm",
-	go: "tree-sitter-go.wasm",
-	java: "tree-sitter-java.wasm",
-	kotlin: "tree-sitter-kotlin.wasm",
-	dart: "tree-sitter-dart.wasm",
-	c: "tree-sitter-c.wasm",
-	cpp: "tree-sitter-cpp.wasm",
-	elixir: "tree-sitter-elixir.wasm",
-	ruby: "tree-sitter-ruby.wasm",
-	bash: "tree-sitter-bash.wasm",
-	csharp: "tree-sitter-c_sharp.wasm",
-	css: "tree-sitter-css.wasm",
-	html: "tree-sitter-html.wasm",
-	json: "tree-sitter-json.wasm",
-	lua: "tree-sitter-lua.wasm",
-	ocaml: "tree-sitter-ocaml.wasm",
-	php: "tree-sitter-php.wasm",
-	swift: "tree-sitter-swift.wasm",
-	toml: "tree-sitter-toml.wasm",
-	vue: "tree-sitter-vue.wasm",
-	yaml: "tree-sitter-yaml.wasm",
-	zig: "tree-sitter-zig.wasm",
-};
 
 // --- Types ---
 
@@ -115,6 +95,8 @@ export class TreeSitterClient {
 	private treeCache: TreeCache;
 	private navigator = new TreeSitterNavigator();
 	private grammarsDir: string;
+	/** In-flight/settled lazy grammar fetches, keyed by wasm filename. */
+	private grammarEnsurePromises = new Map<string, Promise<boolean>>();
 	// biome-ignore lint/suspicious/noExplicitAny: Optional dependency loaded dynamically
 	private ParserClass: any = null;
 	// biome-ignore lint/suspicious/noExplicitAny: Language loader from module
@@ -181,6 +163,51 @@ export class TreeSitterClient {
 		return undefined;
 	}
 
+	/**
+	 * The `grammars/` dir bundled inside the pi-lens package (the core grammars
+	 * shipped in the tarball, so common languages parse offline on every package
+	 * manager). Resolved from the package root; cached. Absent in a source
+	 * checkout where `prepare` hasn't populated it.
+	 */
+	private _bundledGrammarsDir?: string;
+	private bundledGrammarsDir(): string | undefined {
+		// Cache only a positive hit; keep re-checking until it exists (prepare may
+		// not have populated it yet at first probe).
+		if (this._bundledGrammarsDir) return this._bundledGrammarsDir;
+		try {
+			const dir = resolvePackagePath(import.meta.url, "grammars");
+			if (fs.existsSync(dir)) this._bundledGrammarsDir = dir;
+			return this._bundledGrammarsDir;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * All directories that may hold grammar wasms, in precedence order: the
+	 * bundled core dir, the resolved `this.grammarsDir`, and the web-tree-sitter
+	 * grammars dir (the lazy-fetch write target). Deduped.
+	 */
+	private grammarSourceDirs(): string[] {
+		const dirs: string[] = [];
+		const push = (d: string | undefined): void => {
+			if (d && !dirs.includes(d)) dirs.push(d);
+		};
+		push(this.bundledGrammarsDir());
+		push(this.grammarsDir || undefined);
+		push(this.resolveWebTreeSitterAsset("grammars"));
+		return dirs;
+	}
+
+	/** Absolute path to `grammarFile` across all source dirs, else undefined. */
+	private resolveGrammarFile(grammarFile: string): string | undefined {
+		for (const dir of this.grammarSourceDirs()) {
+			const candidate = path.join(dir, grammarFile);
+			if (fs.existsSync(candidate)) return candidate;
+		}
+		return undefined;
+	}
+
 	/** Find tree-sitter grammar directory */
 	private findGrammarsDir(): string {
 		const grammarsDir = this.resolveWebTreeSitterAsset("grammars");
@@ -191,7 +218,8 @@ export class TreeSitterClient {
 			return grammarsDir;
 		}
 
-		// Fallback: tree-sitter-wasms package (real installs, not npm:null)
+		// Fallback: a real `tree-sitter-wasms` package, if the user installed one
+		// (it is not a pi-lens dependency — grammars ship bundled / lazy-fetched).
 		try {
 			const wasmsOut = path.join(
 				path.dirname(_require.resolve("tree-sitter-wasms/package.json")),
@@ -213,6 +241,76 @@ export class TreeSitterClient {
 		return "";
 	}
 
+	/**
+	 * The directory where grammars SHOULD live (web-tree-sitter/grammars),
+	 * whether or not it exists yet — so we can create + populate it when the
+	 * postinstall download was skipped (pnpm/bun). Returns undefined if
+	 * web-tree-sitter itself can't be located.
+	 */
+	private grammarsWriteDir(): string | undefined {
+		try {
+			let dir = path.dirname(_require.resolve("web-tree-sitter"));
+			while (
+				path.basename(dir) !== "web-tree-sitter" &&
+				dir !== path.dirname(dir)
+			) {
+				dir = path.dirname(dir);
+			}
+			if (path.basename(dir) === "web-tree-sitter") {
+				return path.join(dir, "grammars");
+			}
+		} catch {
+			/* fall through */
+		}
+		return undefined;
+	}
+
+	/**
+	 * Ensure a single grammar wasm is on disk, fetching it at runtime if the
+	 * postinstall didn't (pnpm/bun skip lifecycle scripts — the documented
+	 * build-scripts gap). Idempotent and de-duplicated per file. Best-effort:
+	 * a failed fetch (e.g. offline) degrades to "grammar unavailable", never
+	 * throws.
+	 */
+	private async ensureGrammar(grammarFile: string): Promise<boolean> {
+		if (this.resolveGrammarFile(grammarFile)) {
+			return true;
+		}
+		const inflight = this.grammarEnsurePromises.get(grammarFile);
+		if (inflight) return inflight;
+
+		const task = (async (): Promise<boolean> => {
+			const dir =
+				this.grammarsDir && fs.existsSync(this.grammarsDir)
+					? this.grammarsDir
+					: this.grammarsWriteDir();
+			if (!dir) return false;
+			// Reuse the shared single-file downloader (same CDN/source as the
+			// postinstall) — see clients/grammar-source.ts.
+			const ok = await downloadGrammar(dir, grammarFile);
+			if (ok) {
+				if (!this.grammarsDir) this.grammarsDir = dir;
+				console.error(
+					`[pi-lens] fetched missing tree-sitter grammar ${grammarFile} at runtime (install scripts were skipped by the package manager)`,
+				);
+			} else {
+				// Surface the degradation once per grammar (the promise cache dedupes)
+				// instead of failing silently — otherwise pnpm/bun users offline get
+				// no signal that a language's tree-sitter features are unavailable.
+				console.error(
+					`[pi-lens] tree-sitter grammar '${grammarFile}' is unavailable — ` +
+						`symbol search, module reports and structural rules for this language will be degraded. ` +
+						`The package manager skipped install scripts and the runtime download failed (offline or CDN unreachable). ` +
+						`Fix: reinstall with a manager that runs postinstall, allow its build scripts ` +
+						`(pnpm approve-builds / bun trustedDependencies), or restore network access.`,
+				);
+			}
+			return ok;
+		})();
+		this.grammarEnsurePromises.set(grammarFile, task);
+		return task;
+	}
+
 	/** Initialize tree-sitter WASM runtime */
 	async init(): Promise<boolean> {
 		if (this.initialized) return true;
@@ -220,9 +318,10 @@ export class TreeSitterClient {
 
 		this.initPromise = (async () => {
 			try {
-				const mod = await import("web-tree-sitter");
-				// biome-ignore lint/suspicious/noExplicitAny: Dynamic import of optional dependency
-				const ParserClass = mod.Parser || mod.default || mod;
+				const mod = await loadWebTreeSitter();
+				// biome-ignore lint/suspicious/noExplicitAny: web-tree-sitter module shape varies (Parser direct / default-wrapped)
+				const anyMod = mod as any;
+				const ParserClass = anyMod.Parser || anyMod.default || anyMod;
 				if (!ParserClass || typeof ParserClass.init !== "function") {
 					this.dbg("Parser class not found or missing init method");
 					return false;
@@ -287,12 +386,30 @@ export class TreeSitterClient {
 			return null;
 		}
 
-		const grammarPath = path.join(this.grammarsDir, grammarFile);
+		// A grammar that fatally crashes this runtime (uncatchable V8 abort) must
+		// never be loaded — skip it and degrade to "unavailable" (#423/#432). The
+		// grammar-health nightly is what decides membership of BLOCKED_GRAMMARS.
+		const blockReason = grammarBlockReason(grammarFile);
+		if (blockReason) {
+			this.dbg(`Grammar ${grammarFile} blocked on this runtime — ${blockReason}`);
+			return null;
+		}
+
+		// Look across the bundled core `grammars/` dir and the postinstall/lazy
+		// dir. Lazily fetch only if the grammar is in neither (pnpm/bun skip
+		// postinstall; the long-tail grammars aren't bundled). Only the language
+		// actually being parsed is fetched.
+		let grammarPath = this.resolveGrammarFile(grammarFile);
+		if (!grammarPath) {
+			if (await this.ensureGrammar(grammarFile)) {
+				grammarPath = this.resolveGrammarFile(grammarFile);
+			}
+		}
 		this.dbg(
-			`Grammar path: ${grammarPath}, exists: ${fs.existsSync(grammarPath)}`,
+			`Grammar path: ${grammarPath}, exists: ${grammarPath && fs.existsSync(grammarPath)}`,
 		);
 
-		if (!fs.existsSync(grammarPath)) {
+		if (!grammarPath || !fs.existsSync(grammarPath)) {
 			this.dbg(`Grammar file not found: ${grammarPath}`);
 			return null;
 		}
@@ -431,13 +548,16 @@ export class TreeSitterClient {
 		return injections;
 	}
 
-	/** Check if tree-sitter is available (grammars installed) */
+	/** Check if tree-sitter is available (a core grammar resolves somewhere). */
 	isAvailable(): boolean {
-		if (fs.existsSync(this.grammarsDir)) return true;
-		// Re-evaluate in case grammars were installed after process start
+		// Available if the core TS grammar resolves in ANY source dir — the bundled
+		// `grammars/` counts even when web-tree-sitter/grammars is empty (no
+		// postinstall on pnpm/bun, or a fresh CI checkout).
+		if (this.resolveGrammarFile("tree-sitter-typescript.wasm")) return true;
+		// Re-evaluate the legacy dir in case grammars were installed after start.
 		const dir = this.findGrammarsDir();
 		this.grammarsDir = dir;
-		return fs.existsSync(dir);
+		return !!dir && fs.existsSync(dir);
 	}
 
 	/** Check if specific language is supported */
@@ -724,7 +844,7 @@ export class TreeSitterClient {
 
 		try {
 			// biome-ignore lint/suspicious/noExplicitAny: Query constructor
-			const Query = (await import("web-tree-sitter")).Query;
+			const Query = (await loadWebTreeSitter()).Query;
 			// biome-ignore lint/suspicious/noExplicitAny: Language type compatibility
 			const query = new Query(language as any, queryStr);
 			this.dbg(`Query compiled with ${query.patternCount} patterns`);
@@ -767,7 +887,7 @@ export class TreeSitterClient {
 
 		try {
 			// biome-ignore lint/suspicious/noExplicitAny: Query constructor from web-tree-sitter
-			const Query = (await import("web-tree-sitter")).Query;
+			const Query = (await loadWebTreeSitter()).Query;
 			// biome-ignore lint/suspicious/noExplicitAny: Language type compatibility
 			const query = new Query(language as any, queryStr);
 			const result = { query, metavars, postFilter, postFilterParams };
@@ -833,6 +953,57 @@ export class TreeSitterClient {
 		postFilterParams: any,
 		captures: Record<string, TreeSitterNode>,
 	): boolean {
+		/**
+		 * Extract the list of declared slot names from a class_definition's
+		 * `__slots__` assignment. Returns:
+		 *   - `null` if the class has no `__slots__` declaration
+		 *   - an array of slot names (strings) otherwise
+		 *
+		 * Handles both common shapes:
+		 *   - string tuple/list: `__slots__ = ("a", "b")` or `['a', 'b']`
+		 *   - single string:     `__slots__ = "a"` (Python's quirky single-slot form)
+		 *   - parent inheritance: returns null (we don't follow MRO)
+		 */
+		function extractSlots(classNode: any): string[] | null {
+			const classText = classNode.text ?? "";
+			if (!classText.includes("__slots__")) return null;
+			// biome-ignore lint/suspicious/noExplicitAny: AST iteration
+			const body = classNode.children?.find((c: any) => c.type === "block");
+			if (!body) return null;
+			const slots: string[] = [];
+			// biome-ignore lint/suspicious/noExplicitAny: AST iteration
+			for (const stmt of body.children ?? []) {
+				if (stmt.type !== "expression_statement") continue;
+				// biome-ignore lint/suspicious/noExplicitAny: AST traversal
+				const assignment = stmt.children?.find((c: any) => c.type === "assignment");
+				if (!assignment) continue;
+				// biome-ignore lint/suspicious/noExplicitAny: LHS check
+				// LHS text may include a leading whitespace token from the AST
+				// (tree-sitter separates the space before the LHS identifier).
+				const lhsText = (assignment.children?.[0]?.text ?? "").trim();
+				if (lhsText !== "__slots__") continue;
+				// biome-ignore lint/suspicious/noExplicitAny: RHS extraction
+				// children layout: [LHS identifier, `=` operator, RHS expression]
+				const rhs = assignment.children?.[2];
+				if (!rhs) continue;
+				if (rhs.type === "string") {
+					// __slots__ = "a" — single string form (Python quirk)
+					const s = (rhs.text ?? "").replace(/^["']|["']$/g, "");
+					if (s) slots.push(s);
+				} else if (rhs.type === "tuple" || rhs.type === "list") {
+					// biome-ignore lint/suspicious/noExplicitAny: list element extraction
+					for (const el of rhs.children ?? []) {
+						if (!el.isNamed) continue; // skip "," punctuation
+						if (el.type === "string") {
+							slots.push((el.text ?? "").replace(/^["']|["']$/g, ""));
+						}
+					}
+				}
+				break; // first __slots__ wins
+			}
+			return slots;
+		}
+
 		switch (postFilter) {
 			case "is_generator_with_valued_return": {
 				const returnNode = captures.RETURN;
@@ -883,10 +1054,104 @@ export class TreeSitterClient {
 			case "bare_except_only": {
 				const clauseNode = captures.CLAUSE;
 				if (!clauseNode) return true;
-				// biome-ignore lint/suspicious/noExplicitAny: Check for identifier
-				return !clauseNode.children.some(
-					(c: any) => c.isNamed && c.type === "identifier",
-				);
+				// A typed `except` clause has a named child for the exception
+				// spec — one of: identifier (e.g. `except ValueError`),
+				// tuple (e.g. `except (E, F)`), or as_pattern (e.g. `except E as e`).
+				// Bare `except:` has NO named children (just the `except` keyword,
+				// the `:` colon, and the body block).
+				// biome-ignore lint/suspicious/noExplicitAny: AST iteration
+				const hasExceptionSpec = clauseNode.children.some((c: any) => {
+					if (!c.isNamed) return false;
+					return (
+						c.type === "identifier" ||
+						c.type === "tuple" ||
+						c.type === "as_pattern" ||
+						c.type === "parenthesized_expression"
+					);
+				});
+				// Fire ONLY when bare (no exception spec)
+				return !hasExceptionSpec;
+			}
+			case "eq_mod_fn": {
+				// Workaround for web-tree-sitter not auto-applying #eq? predicates
+				// on the structural pattern of a query that has predicates. The
+				// query captures @MOD, @FN but the predicates aren't enforced
+				// (see evaluatePredicates in clients/tree-sitter-client.ts).
+				// This filter re-applies the #eq? checks at post_filter time.
+				const mod = captures.MOD?.text ?? "";
+				const fn = captures.FN?.text ?? "";
+				return mod === "threading" && fn === "Thread";
+			}
+			case "regex_first_arg_identifier": {
+				// Workaround for web-tree-sitter not auto-applying #eq?/#match?
+				// predicates on the structural pattern (see evaluatePredicates).
+				// This post_filter re-applies both predicate checks AND
+				// the first-argument check:
+				// 1. MOD must be "re"  (would-be #eq? @MOD "re")
+				// 2. FUNC must match the regex method pattern (#match? @FUNC ...)
+				// 3. First arg must be an identifier (dynamic pattern)
+				//    String literals (r"...", "...") are safe static patterns.
+				const mod = captures.MOD?.text ?? "";
+				if (mod !== "re") return false;
+				const func = captures.FUNC?.text ?? "";
+				if (!/^(compile|match|search|fullmatch|findall|finditer|sub|subn|split)$/.test(func)) {
+					return false;
+				}
+				const argsNode = captures.ARGS;
+				if (!argsNode) return false;
+				// biome-ignore lint/suspicious/noExplicitAny: AST iteration
+				const firstNamed = (argsNode.children ?? []).find((c: any) => c.isNamed);
+				if (!firstNamed) return false;
+				return firstNamed.type === "identifier";
+			}
+			case "open_mode_invalid": {
+				const modeNode = captures.MODE;
+				if (!modeNode) return false;
+				// Python's open() mode accepts: r, w, a, x (basic), b/t/+ (suffix).
+				// Strip surrounding quotes from the string literal text.
+				const text = modeNode.text ?? "";
+				const stripped = text.replace(/^["']|["']$/g, "");
+				// Skip empty mode (defaults to 'r')
+				if (stripped.length === 0) return false;
+				// Skip single-char modes (r/w/a/x — always valid)
+				if (stripped.length === 1) return false;
+				// Must contain only valid characters
+				if (!/^[rwxabt+]+$/.test(stripped)) return true;
+				// Multi-char must be exactly: basic + optional (b|t) + optional +
+				// Examples valid: "rb", "rb+", "r+", "ab", "rt"
+				// Examples invalid: "rwb", "rrr", "rw", "rbb" (no + between r and w is invalid)
+				// The "rw" case (basic mode followed by another basic mode without +) is invalid
+				// Allow: [basic][bt]?[+]
+				const validShape = /^[rwax][bt]?\+?$/;
+				if (!validShape.test(stripped)) return true;
+				return false;
+			}
+			case "status_204_with_value_return": {
+				const funcNode = captures.FUNC;
+				const valNode = captures.VAL;
+				if (!funcNode || !valNode) return false;
+				// Only fire if status_code=204
+				if (Number(valNode.text ?? 0) !== 204) return false;
+				// Walk the function subtree looking for return_statement nodes.
+				// Manual BFS because web-tree-sitter doesn't expose
+				// descendantsOfType directly.
+				// biome-ignore lint/suspicious/noExplicitAny: tree-sitter node iteration
+				const queue: any[] = [funcNode];
+				while (queue.length > 0) {
+					const node = queue.shift();
+					if (node.type === "return_statement") {
+						// Has a value child (not just the `return` keyword)
+						// biome-ignore lint/suspicious/noExplicitAny: child check
+						const hasValue = node.children.some(
+							(c: any) =>
+								c.isNamed && c.type !== "comment",
+						);
+						if (hasValue) return true;
+					}
+					// biome-ignore lint/suspicious/noExplicitAny: child queue
+					if (node.children) queue.push(...node.children);
+				}
+				return false;
 			}
 			case "has_mixed_async": {
 				const bodyNode = captures.BODY;
@@ -895,6 +1160,137 @@ export class TreeSitterClient {
 				return (
 					bodyText.includes("await") && /\.\s*(then|catch)\s*\(/.test(bodyText)
 				);
+			}
+			case "format_arity_mismatch": {
+				const formatNode = captures.FORMAT;
+				const argsNode = captures.ARGS;
+				if (!formatNode || !argsNode) return false;
+				// Strip quotes from format string
+				const fmtText = (formatNode.text ?? "").replace(/^["']|["']$/g, "");
+				// Don't strip a leading "%" — the format string's contents are
+				// intact after stripping only the surrounding quotes. The original
+				// code stripped the first "%" thinking it was the operator, but
+				// the operator is a separate binary_operator node, not part of
+				// the string literal's text.
+				const fmt = fmtText;
+				// Count placeholders: %s, %d, %f, %(name)s, %i, etc.
+				// The simple %s/%d style: each %X counts as 1
+				// The %(name)s style: counts as 1 with name
+				// The %% escape: doesn't count
+				let placeholderCount = 0;
+				let namedKeys: string[] = [];
+				// biome-ignore lint/suspicious/noExplicitAny: regex match
+				const positionalRegex = /%(?:\([^)]+\))?[#0\- +]*\d*(?:\.\d+)?[hlL]?[diouxXeEfFgGcrs%]/g;
+				// biome-ignore lint/suspicious/noExplicitAny: regex match
+				const positionalMatches = fmt.match(positionalRegex) ?? [];
+				for (const m of positionalMatches) {
+					if (m === "%%") continue;
+					placeholderCount++;
+					// biome-ignore lint/suspicious/noExplicitAny: capture group
+					const namedMatch = m.match(/^%\(([^)]+)\)/);
+					if (namedMatch) namedKeys.push(namedMatch[1]);
+				}
+				// If format uses named placeholders, RHS should be a dict
+				if (namedKeys.length > 0) {
+					// Check if dict contains all named keys
+					if (argsNode.type === "dictionary") {
+						// biome-ignore lint/suspicious/noExplicitAny: AST iteration
+						const dictKeys: string[] = [];
+						for (const child of argsNode.children ?? []) {
+							// biome-ignore lint/suspicious/noExplicitAny: child check
+							if (child.type === "pair" && child.children?.[0]) {
+								// biome-ignore lint/suspicious/noExplicitAny: child text
+								// Strip quotes — child is a string literal node,
+								// text includes the surrounding "...".
+								dictKeys.push(
+									(child.children[0].text ?? "").replace(/^["']|["']$/g, ""),
+								);
+							}
+						}
+						const missing = namedKeys.filter((k) => !dictKeys.includes(k));
+						return missing.length > 0;
+					}
+					// Format uses named but RHS isn't a dict — definitely wrong
+					return true;
+				}
+				// Positional: count tuple args
+				if (argsNode.type === "tuple") {
+					const argCount = (argsNode.children ?? []).filter((c: any) => c.isNamed).length;
+					if (argCount !== placeholderCount) return true;
+				}
+				return false;
+			}
+			case "aws_policy_public": {
+				const policyNode = captures.POLICY;
+				if (!policyNode) return false;
+				const text = policyNode.text ?? "";
+				// Match patterns indicating public access
+				const patterns = [
+					/"Principal"\s*:\s*"\*"/,  // direct wildcard
+					/"Principal"\s*:\s*\{\s*"AWS"\s*:\s*"\*"\s*\}/,  // AWS wildcard
+					/"Effect"\s*:\s*"Allow"[\s\S]*?"Action"\s*:\s*"\*"[\s\S]*?"Resource"\s*:\s*"\*"/,  // full admin
+					/"Principal"\s*:\s*"\*"/,
+				];
+				return patterns.some((p) => p.test(text));
+			}
+			case "slots_attribute_mismatch": {
+				const selfNode = captures.SELF;
+				const attrNode = captures.ATTR;
+				const methodNode = captures.METHOD;
+				if (!selfNode || !attrNode || !methodNode) return false;
+				// Only consider self.X = (not other.X)
+				if (selfNode.text !== "self") return false;
+				const attrName = attrNode.text ?? "";
+				// Find parent class_definition
+				// biome-ignore lint/suspicious/noExplicitAny: AST navigation
+				let parent = methodNode.parent;
+				while (parent && parent.type !== "class_definition") {
+					parent = parent.parent;
+				}
+				if (!parent) return false;
+				// Parse the class's __slots__ list and check if attrName is in it.
+				// Fires ONLY when self.X = ... assigns to an attribute NOT in __slots__
+				// (a real S8494 violation — the assignment will raise AttributeError).
+				const slots = extractSlots(parent);
+				// null = no __slots__ declared in this class. [] = __slots__ declared
+				// but we couldn't parse it (treat as null to avoid FPs on inner-class
+				// parent walks where the parent text mentions __slots__ but the
+				// direct children don't contain the assignment).
+				if (slots === null || slots.length === 0) return false;
+				return !slots.includes(attrName);
+			}
+			case "special_method_arity": {
+				const nameNode = captures.NAME;
+				const paramsNode = captures.PARAMS;
+				if (!nameNode || !paramsNode) return false;
+				const name = nameNode.text ?? "";
+				// Expected arities: {method_name: expected_arg_count}
+				// (excluding `self`/`cls` which is always 1)
+				const expected: Record<string, number> = {
+					__del__: 0,
+					__repr__: 0,
+					__str__: 0,
+					__hash__: 0,
+					__bool__: 0,
+					__len__: 0,
+					__eq__: 1,
+					__lt__: 1,
+					__le__: 1,
+					__gt__: 1,
+					__ge__: 1,
+					__ne__: 1,
+				};
+				const expectedCount = expected[name];
+				if (expectedCount === undefined) return false; // not in our list
+				// Count required params (excluding defaults)
+				// biome-ignore lint/suspicious/noExplicitAny: AST iteration
+				const paramCount = (paramsNode.children ?? []).filter((c: any) => {
+					if (c.type !== "identifier" && c.type !== "typed_parameter") return false;
+					if (c.text.includes("=")) return false;
+					return true;
+				}).length;
+				// Expected total = expectedCount + 1 (for self/cls)
+				return paramCount !== expectedCount + 1;
 			}
 			case "no_super_call": {
 				const bodyNode = captures.BODY;
@@ -935,7 +1331,14 @@ export class TreeSitterClient {
 				);
 			}
 			case "check_secret_pattern": {
-				const varName = (captures.VARNAME?.text ?? "").toLowerCase();
+				const varName = (captures.VARNAME?.text ?? "");
+				const varNameLower = varName.toLowerCase();
+				// Skip UPPER_CASE constants — they're module-level constants
+				// (e.g. `GITHUB_TYPE_FOR_PERSONAL_API_KEY = "..."`), not secrets.
+				// A constant has no lowercase letters in its name.
+				if (varName === varName.toUpperCase() && /[A-Z]/.test(varName)) {
+					return false;
+				}
 				return [
 					/api[_-]?key/,
 					/api[_-]?secret/,
@@ -950,7 +1353,7 @@ export class TreeSitterClient {
 					/aws[_-]?secret/,
 					/github[_-]?token/,
 					/client[_-]?secret/,
-				].some((p) => p.test(varName));
+				].some((p) => p.test(varNameLower));
 			}
 			case "returns_error": {
 				const first = Object.values(captures)[0];
@@ -1447,10 +1850,16 @@ export class TreeSitterClient {
 		const rootDir = path.resolve(dir);
 		const ignoreMatcher = getProjectIgnoreMatcher(rootDir);
 
+		// Hard cap on the walk itself (not just result collection). The per-file
+		// `maxResults` break upstream only stops gathering matches *after* the walk
+		// has already enumerated the whole tree — so a misrooted structuralSearch
+		// would still synchronously read every directory. Bound the walk (#262).
 		const scan = (d: string) => {
+			if (files.length >= TREE_SITTER_MAX_SCAN_FILES) return;
 			try {
 				const entries = fs.readdirSync(d, { withFileTypes: true });
 				for (const entry of entries) {
+					if (files.length >= TREE_SITTER_MAX_SCAN_FILES) return;
 					const full = path.join(d, entry.name);
 					if (entry.isDirectory()) {
 						if (isExcludedDirName(entry.name)) continue;

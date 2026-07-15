@@ -14,10 +14,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	getExcludedDirGlobs,
+	getGlobalPiLensDir,
 	getProjectIgnoreGlobs,
 	getProjectIgnoreMatcher,
 	isExcludedDirName,
 } from "./file-utils.js";
+import { findNodeToolBinary } from "./package-manager.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
 
 // --- Types ---
@@ -140,8 +142,7 @@ export class JscpdClient {
 		// Fast path: check local install before any spawn
 		const isWin = process.platform === "win32";
 		const localBase = path.join(
-			os.homedir(),
-			".pi-lens",
+			getGlobalPiLensDir(),
 			"tools",
 			"node_modules",
 			".bin",
@@ -258,10 +259,15 @@ export class JscpdClient {
 		const ignorePattern = baseIgnores.join(",");
 
 		try {
+			// Prefer a local/global-installed jscpd (any manager) over npx (#375).
+			const bin = await findNodeToolBinary("jscpd", cwd);
+			const { cmd, prefix } = bin
+				? { cmd: bin, prefix: [] as string[] }
+				: { cmd: "npx", prefix: ["jscpd"] };
 			const result = await safeSpawnAsync(
-				"npx",
+				cmd,
 				[
-					"jscpd",
+					...prefix,
 					".",
 					"--min-lines",
 					String(minLines),

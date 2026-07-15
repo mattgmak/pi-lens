@@ -4,7 +4,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	__testing,
 	clearWidgetState,
+	getFailedLspServerIds,
+	getFileDiagnostics,
 	getFileDiagnosticSummaries,
+	getSessionLanguages,
+	reconcileScanDiagnostics,
 	recordDiagnostics,
 	recordFormatter,
 	recordLsp,
@@ -21,6 +25,56 @@ const theme = {
 
 afterEach(() => {
 	clearWidgetState();
+});
+
+describe("LSP failure accessors (#170)", () => {
+	it("getFailedLspServerIds returns only failed records, deduped by serverId", () => {
+		recordLsp("ruby", "/a", "spawn_failed");
+		recordLsp("ruby", "/b", "spawn_failed"); // same server, two roots → one id
+		recordLsp("python", "/a", "spawn_success"); // ready, not failed
+		recordLsp("typescript", "/a", "spawn_start"); // spawning, not failed
+		expect(getFailedLspServerIds()).toEqual(["ruby"]);
+	});
+
+	it("a successful respawn clears the failed state for that key", () => {
+		recordLsp("python", "/a", "spawn_failed");
+		expect(getFailedLspServerIds()).toEqual(["python"]);
+		recordLsp("python", "/a", "spawn_success"); // same key flips failed → ready
+		expect(getFailedLspServerIds()).toEqual([]);
+	});
+
+	it("getSessionLanguages reflects the in-use kinds", () => {
+		expect(getSessionLanguages()).toEqual([]);
+		setSessionLanguages(["python", "ruby"]);
+		expect(getSessionLanguages()).toEqual(["python", "ruby"]);
+	});
+});
+
+describe("getFileDiagnostics (#502 single-file accessor)", () => {
+	it("returns undefined for a file never recorded", () => {
+		expect(getFileDiagnostics(`${process.cwd()}/never-seen.ts`)).toBeUndefined();
+	});
+
+	it("returns the full uncapped set for a recorded file", () => {
+		const filePath = `${process.cwd()}/single.ts`;
+		recordDiagnostics(filePath, [
+			{ severity: "error", rule: "typescript:2322", message: "bad", tool: "tsserver" },
+			{ severity: "warning", rule: "no-console", message: "noisy", tool: "eslint" },
+		]);
+
+		const result = getFileDiagnostics(filePath);
+		expect(result).toHaveLength(2);
+		expect(result?.[0].severity).toBe("error");
+	});
+
+	it("returns an explicit empty array when the file was recorded clean", () => {
+		const filePath = `${process.cwd()}/clean.ts`;
+		recordDiagnostics(filePath, [{ severity: "error", message: "bad", tool: "eslint" }]);
+		recordDiagnostics(filePath, []); // transitions to clean
+
+		const result = getFileDiagnostics(filePath);
+		expect(result).toEqual([]);
+	});
 });
 
 describe("getFileDiagnosticSummaries", () => {
@@ -495,5 +549,214 @@ describe("widget-state renderWidget", () => {
 		expect(finalFrame).toContain("warning-storm.cpp");
 		expect(intermediateFrames.join("\n")).not.toContain("✓ clean");
 		expect(new Set(nonEmptyFrames).size).toBeLessThanOrEqual(3);
+	});
+});
+
+describe("recordDiagnostics — superseded write guard (same race class as #555)", () => {
+	it("drops a late write whose writeIndex lags the already-recorded writeIndex, without poisoning the cache", () => {
+		const filePath = `${process.cwd()}/race.ts`;
+
+		// A newer, faster edit's pipeline finishes first.
+		recordDiagnostics(
+			filePath,
+			[{ severity: "warning", message: "current diagnostic", rule: "Y" }],
+			2,
+		);
+
+		// An older, slower edit's pipeline finishes late — must be dropped.
+		recordDiagnostics(
+			filePath,
+			[{ severity: "error", message: "stale diagnostic from edit #1", rule: "X" }],
+			1,
+		);
+
+		const result = getFileDiagnostics(filePath);
+		expect(result).toHaveLength(1);
+		expect(result?.[0]?.message).toBe("current diagnostic");
+
+		const entry = getFileDiagnosticSummaries().find(
+			(s) => s.filePath === filePath,
+		);
+		// The dropped write must not corrupt counts either — still reflects the
+		// winning (writeIndex 2) write, not a mix of both.
+		expect(entry?.warnings).toBe(1);
+		expect(entry?.errors).toBe(0);
+	});
+
+	it("records a write whose writeIndex matches or advances the last-recorded one (no false-positive drops)", () => {
+		const filePath = `${process.cwd()}/advance.ts`;
+
+		recordDiagnostics(
+			filePath,
+			[{ severity: "warning", message: "first", rule: "Y" }],
+			1,
+		);
+		recordDiagnostics(
+			filePath,
+			[{ severity: "error", message: "second", rule: "X" }],
+			2,
+		);
+
+		const result = getFileDiagnostics(filePath);
+		expect(result).toHaveLength(1);
+		expect(result?.[0]?.message).toBe("second");
+	});
+
+	it("always records the first write for a path regardless of its writeIndex (nothing to compare against yet)", () => {
+		const filePath = `${process.cwd()}/first-write.ts`;
+
+		recordDiagnostics(
+			filePath,
+			[{ severity: "error", message: "only diagnostic", rule: "X" }],
+			99,
+		);
+
+		const result = getFileDiagnostics(filePath);
+		expect(result).toHaveLength(1);
+		expect(result?.[0]?.message).toBe("only diagnostic");
+	});
+
+	it("always records writes with no writeIndex (mirrors version-less-server tradeoff; e.g. the mcp/analyze.ts on-demand call site)", () => {
+		const filePath = `${process.cwd()}/no-token.ts`;
+
+		recordDiagnostics(
+			filePath,
+			[{ severity: "warning", message: "current", rule: "Y" }],
+			5,
+		);
+		// A write with no ordering token at all must never be treated as stale.
+		recordDiagnostics(filePath, [
+			{ severity: "error", message: "untokened write", rule: "X" },
+		]);
+
+		const result = getFileDiagnostics(filePath);
+		expect(result).toHaveLength(1);
+		expect(result?.[0]?.message).toBe("untokened write");
+	});
+
+	it("clearWidgetState resets tracked writeIndex ordering so a later low index is not treated as stale", () => {
+		const filePath = `${process.cwd()}/reset.ts`;
+
+		recordDiagnostics(
+			filePath,
+			[{ severity: "error", message: "before clear", rule: "X" }],
+			10,
+		);
+		clearWidgetState();
+		recordDiagnostics(
+			filePath,
+			[{ severity: "warning", message: "after clear", rule: "Y" }],
+			1,
+		);
+
+		const result = getFileDiagnostics(filePath);
+		expect(result).toHaveLength(1);
+		expect(result?.[0]?.message).toBe("after clear");
+	});
+});
+
+describe("reconcileScanDiagnostics — full-scan/on-demand footer reconciliation (#571)", () => {
+	it("does NOT write a timed-out/inconclusive scan result into the footer (confirmed=false)", () => {
+		const filePath = `${process.cwd()}/unconfirmed.ts`;
+
+		// A prior confirmed-dirty entry the footer already has (e.g. from a
+		// per-edit dispatch).
+		recordDiagnostics(
+			filePath,
+			[{ severity: "error", message: "real prior error", rule: "X" }],
+			1,
+		);
+
+		// A scan that timed out / was inconclusive must not overwrite it with a
+		// misleading "confirmed clean" default-empty result.
+		reconcileScanDiagnostics(filePath, [], false, 2);
+
+		const result = getFileDiagnostics(filePath);
+		expect(result).toHaveLength(1);
+		expect(result?.[0]?.message).toBe("real prior error");
+	});
+
+	it("a confirmed scan result DOES correct a stale footer entry for a file never re-edited", () => {
+		const filePath = `${process.cwd()}/stale.ts`;
+
+		// Stale footer entry, e.g. left over from before a dependency fix.
+		recordDiagnostics(
+			filePath,
+			[{ severity: "error", message: "stale error, already fixed", rule: "X" }],
+			1,
+		);
+
+		// A full-scan/on-demand check confirms the file is actually clean now.
+		reconcileScanDiagnostics(filePath, [], true, 2);
+
+		const result = getFileDiagnostics(filePath);
+		expect(result).toEqual([]);
+	});
+
+	it("a confirmed scan write does NOT clobber a newer, concurrent per-edit write (write-ordering guard respected)", () => {
+		const filePath = `${process.cwd()}/race-with-edit.ts`;
+
+		// A scan starts, but a concurrent per-edit pipeline for the SAME file
+		// finishes first with a higher (newer) writeIndex.
+		recordDiagnostics(
+			filePath,
+			[{ severity: "warning", message: "newer per-edit result", rule: "Y" }],
+			5,
+		);
+
+		// The scan's own confirmed result was drawn from an OLDER writeIndex
+		// (it started before the edit) and lands after — must be dropped, not
+		// clobber the fresher per-edit write.
+		reconcileScanDiagnostics(
+			filePath,
+			[{ severity: "error", message: "stale scan result", rule: "X" }],
+			true,
+			3,
+		);
+
+		const result = getFileDiagnostics(filePath);
+		expect(result).toHaveLength(1);
+		expect(result?.[0]?.message).toBe("newer per-edit result");
+	});
+
+	it("a confirmed scan write DOES win when its writeIndex is newer than the last-recorded one", () => {
+		const filePath = `${process.cwd()}/scan-wins.ts`;
+
+		recordDiagnostics(
+			filePath,
+			[{ severity: "warning", message: "older per-edit result", rule: "Y" }],
+			1,
+		);
+
+		reconcileScanDiagnostics(
+			filePath,
+			[{ severity: "error", message: "fresher scan result", rule: "X" }],
+			true,
+			2,
+		);
+
+		const result = getFileDiagnostics(filePath);
+		expect(result).toHaveLength(1);
+		expect(result?.[0]?.message).toBe("fresher scan result");
+	});
+
+	it("an omitted writeIndex always proceeds when confirmed (no ordering token available)", () => {
+		const filePath = `${process.cwd()}/no-token-scan.ts`;
+
+		recordDiagnostics(
+			filePath,
+			[{ severity: "warning", message: "before", rule: "Y" }],
+			5,
+		);
+
+		reconcileScanDiagnostics(
+			filePath,
+			[{ severity: "error", message: "untokened confirmed scan", rule: "X" }],
+			true,
+		);
+
+		const result = getFileDiagnostics(filePath);
+		expect(result).toHaveLength(1);
+		expect(result?.[0]?.message).toBe("untokened confirmed scan");
 	});
 });

@@ -9,7 +9,6 @@ process.env.PI_LENS_TEST_MODE = "1";
 const ensureTool = vi.fn();
 const getToolEnvironment = vi.fn(async () => ({}));
 const launchLSP = vi.fn();
-const launchViaPackageManager = vi.fn();
 
 vi.mock("../../../clients/installer/index.js", () => ({
 	ensureTool,
@@ -18,7 +17,6 @@ vi.mock("../../../clients/installer/index.js", () => ({
 
 vi.mock("../../../clients/lsp/launch.js", () => ({
 	launchLSP,
-	launchViaPackageManager,
 }));
 
 // Suppress sync disk I/O from logLatency — prevents timeout under full-suite load
@@ -36,7 +34,6 @@ afterEach(() => {
 	delete process.env.PI_LENS_DISABLE_LSP_INSTALL;
 	ensureTool.mockReset();
 	launchLSP.mockReset();
-	launchViaPackageManager.mockReset();
 	vi.resetModules();
 });
 
@@ -156,10 +153,10 @@ describe("lsp server policy", () => {
 		expect(root).toBe(path.dirname(file));
 	});
 
-	it("falls back to file directory for standalone csharp files", async () => {
+	it("skips standalone csharp files without a project marker (#201)", async () => {
 		const { CSharpServer } = await import("../../../clients/lsp/server.js");
 		const tmp = fs.mkdtempSync(
-			path.join(os.tmpdir(), "pi-lens-csharp-fallback-root-"),
+			path.join(os.tmpdir(), "pi-lens-csharp-no-root-"),
 		);
 		dirs.push(tmp);
 
@@ -167,11 +164,110 @@ describe("lsp server policy", () => {
 		fs.writeFileSync(file, 'Console.WriteLine("ok");\n');
 
 		const root = await CSharpServer.root(file);
-		expect(root).toBe(path.dirname(file));
+		expect(root).toBeUndefined();
+	});
+
+	it("resolves csharp roots from real .csproj/.sln filenames (#201)", async () => {
+		const { CSharpServer, OmniSharpServer } = await import(
+			"../../../clients/lsp/server.js"
+		);
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-csharp-root-"));
+		dirs.push(tmp);
+
+		const project = path.join(tmp, "src", "App");
+		const file = path.join(project, "Program.cs");
+		fs.mkdirSync(project, { recursive: true });
+		fs.writeFileSync(path.join(project, "App.csproj"), "<Project />\n");
+		fs.writeFileSync(file, 'Console.WriteLine("ok");\n');
+
+		await expect(CSharpServer.root(file)).resolves.toBe(project);
+		await expect(OmniSharpServer.root(file)).resolves.toBe(project);
+
+		const solutionRoot = path.join(tmp, "solution");
+		const solutionProject = path.join(solutionRoot, "Nested");
+		const solutionFile = path.join(solutionProject, "Program.cs");
+		fs.mkdirSync(solutionProject, { recursive: true });
+		fs.writeFileSync(path.join(solutionRoot, "Workspace.sln"), "\n");
+		fs.writeFileSync(solutionFile, 'Console.WriteLine("ok");\n');
+		await expect(CSharpServer.root(solutionFile)).resolves.toBe(solutionRoot);
+
+		const slnxRoot = path.join(tmp, "slnx");
+		const slnxProject = path.join(slnxRoot, "Nested");
+		const slnxFile = path.join(slnxProject, "Program.cs");
+		fs.mkdirSync(slnxProject, { recursive: true });
+		fs.writeFileSync(path.join(slnxRoot, "Workspace.slnx"), "\n");
+		fs.writeFileSync(slnxFile, 'Console.WriteLine("ok");\n');
+		await expect(CSharpServer.root(slnxFile)).resolves.toBe(slnxRoot);
+		await expect(OmniSharpServer.root(slnxFile)).resolves.toBe(slnxRoot);
+	});
+
+	it("does not treat a directory named like a project marker as a root (#201)", async () => {
+		const { CSharpServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-csharp-dirmarker-"));
+		dirs.push(tmp);
+
+		const project = path.join(tmp, "App");
+		const file = path.join(project, "Program.cs");
+		fs.mkdirSync(project, { recursive: true });
+		// A *directory* whose name matches `*.csproj` must not count as a marker.
+		fs.mkdirSync(path.join(project, "Fake.csproj"));
+		fs.writeFileSync(file, 'Console.WriteLine("ok");\n');
+
+		await expect(CSharpServer.root(file)).resolves.toBeUndefined();
+	});
+
+	it("matches csharp project markers case-insensitively on win32 (#201)", async () => {
+		const { CSharpServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-csharp-nocase-"));
+		dirs.push(tmp);
+
+		const project = path.join(tmp, "App");
+		const file = path.join(project, "Program.cs");
+		fs.mkdirSync(project, { recursive: true });
+		// Uppercase extension: the marker glob is `*.csproj` (lowercase).
+		fs.writeFileSync(path.join(project, "App.CSPROJ"), "<Project />\n");
+		fs.writeFileSync(file, 'Console.WriteLine("ok");\n');
+
+		const root = await CSharpServer.root(file);
+		if (process.platform === "win32") {
+			expect(root).toBe(project); // nocase match
+		} else {
+			expect(root).toBeUndefined(); // case-sensitive FS → no match
+		}
+	});
+
+	it("resolves fsharp roots from real .fsproj filenames (#201)", async () => {
+		const { FSharpServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-fsharp-root-"));
+		dirs.push(tmp);
+
+		const project = path.join(tmp, "src", "App");
+		const file = path.join(project, "Program.fs");
+		fs.mkdirSync(project, { recursive: true });
+		fs.writeFileSync(path.join(project, "App.fsproj"), "<Project />\n");
+		fs.writeFileSync(file, 'printfn "ok"\n');
+
+		await expect(FSharpServer.root(file)).resolves.toBe(project);
+	});
+
+	it("skips standalone fsharp files without a project marker (#201)", async () => {
+		const { FSharpServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-fsharp-no-root-"),
+		);
+		dirs.push(tmp);
+
+		const file = path.join(tmp, "Program.fs");
+		fs.writeFileSync(file, 'printfn "ok"\n');
+
+		await expect(FSharpServer.root(file)).resolves.toBeUndefined();
 	});
 
 	it("tries pi-lens managed csharp candidates before legacy global dotnet tools", async () => {
 		const { CSharpServer } = await import("../../../clients/lsp/server.js");
+		const { getGlobalPiLensDir } = await import(
+			"../../../clients/file-utils.js"
+		);
 		const tmp = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-csharp-candidates-"),
 		);
@@ -183,10 +279,11 @@ describe("lsp server policy", () => {
 		expect(spawned).toBeUndefined();
 		expect(launchLSP).toHaveBeenCalled();
 		const commands = launchLSP.mock.calls.map((call) => String(call[0] ?? ""));
+		// Asserts against the actual machine-global root (respects #525's
+		// PI_LENS_HOME test override) rather than hardcoding ".pi-lens".
+		const managedBinDir = path.join(getGlobalPiLensDir(), "bin", "csharp-ls");
 		expect(
-			commands.some((command) =>
-				command.includes(path.join(".pi-lens", "bin", "csharp-ls")),
-			),
+			commands.some((command) => command.includes(managedBinDir)),
 		).toBe(true);
 	});
 
@@ -439,7 +536,12 @@ describe("lsp server policy", () => {
 
 		const spawned = await TypeScriptServer.spawn(tmp, { allowInstall: false });
 		expect(spawned).toBeUndefined();
-		expect(ensureTool).not.toHaveBeenCalled();
+		// Discovery is decoupled from install: ensureTool still runs (to probe an
+		// existing PATH/npm-global binary) but is told NOT to install. The mock
+		// returns undefined (nothing discovered), so spawn yields undefined.
+		expect(ensureTool).toHaveBeenCalledWith("typescript-language-server", {
+			allowInstall: false,
+		});
 	});
 
 	it("skips package-manager fallback when lsp install is disabled", async () => {
@@ -453,7 +555,6 @@ describe("lsp server policy", () => {
 
 		const spawned = await SvelteServer.spawn(tmp);
 		expect(spawned?.process).toBeUndefined();
-		expect(launchViaPackageManager).not.toHaveBeenCalled();
 	});
 
 	it("skips package-manager fallback when install is disallowed for file", async () => {
@@ -468,7 +569,6 @@ describe("lsp server policy", () => {
 
 		const spawned = await SvelteServer.spawn(tmp, { allowInstall: false });
 		expect(spawned?.process).toBeUndefined();
-		expect(launchViaPackageManager).not.toHaveBeenCalled();
 	});
 
 	it("keeps custom LSP config scoped per workspace", async () => {
@@ -564,7 +664,7 @@ describe("lsp server policy", () => {
 		const spawned = await PythonServer.spawn(tmp, { allowInstall: true });
 
 		expect(spawned).toBeDefined();
-		expect(ensureTool).toHaveBeenCalledWith("pyright");
+		expect(ensureTool).toHaveBeenCalledWith("pyright", { allowInstall: true });
 		expect(
 			launchLSP.mock.calls.some(
 				([command]) =>
@@ -980,7 +1080,9 @@ describe("lsp server policy", () => {
 describe("heavy workspace servers do not fall back to per-file dirs (#201)", () => {
 	it("RustServer.root → undefined when no Cargo manifest exists", async () => {
 		const { RustServer } = await import("../../../clients/lsp/server.js");
-		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-rust-nomanifest-"));
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-rust-nomanifest-"),
+		);
 		dirs.push(tmp);
 		const file = path.join(tmp, "src", "main.rs");
 		fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -993,7 +1095,9 @@ describe("heavy workspace servers do not fall back to per-file dirs (#201)", () 
 
 	it("RustServer.root → the crate root when a Cargo.toml exists", async () => {
 		const { RustServer } = await import("../../../clients/lsp/server.js");
-		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-rust-manifest-"));
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-rust-manifest-"),
+		);
 		dirs.push(tmp);
 		const file = path.join(tmp, "src", "main.rs");
 		fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -1006,4 +1110,45 @@ describe("heavy workspace servers do not fall back to per-file dirs (#201)", () 
 	// C# is intentionally NOT changed here (#201): its markers are matched by
 	// exact filename, so `.csproj` never matches a real `Foo.csproj` and C# still
 	// depends on the FileDirRoot fallback. See the standalone-csharp test above.
+});
+
+describe("zizmor LSP candidacy path gate (#636)", () => {
+	// zizmor's extension match is "any YAML" — the real filter that keeps it out
+	// of the candidate list for a guaranteed-no-op file (measured directly
+	// against a real `zizmor --lsp` process: no publishDiagnostics at all for a
+	// non-workflow YAML, so `waitForDiagnostics` would otherwise burn its full
+	// budget for zero signal) is `getServersForFileWithConfig`'s pathFilter gate.
+	it("includes zizmor as a candidate for a real GitHub Actions workflow file", async () => {
+		const { getServersForFileWithConfig } = await import(
+			"../../../clients/lsp/config.js"
+		);
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-zizmor-candidacy-"),
+		);
+		dirs.push(tmp);
+		const file = path.join(tmp, ".github", "workflows", "ci.yml");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, "on: push\njobs: {}\n");
+
+		const ids = getServersForFileWithConfig(file).map((s) => s.id);
+		expect(ids).toContain("zizmor");
+	});
+
+	it("excludes zizmor as a candidate for a plain, non-workflow YAML file", async () => {
+		const { getServersForFileWithConfig } = await import(
+			"../../../clients/lsp/config.js"
+		);
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-zizmor-candidacy-"),
+		);
+		dirs.push(tmp);
+		const file = path.join(tmp, "docker-compose.yml");
+		fs.writeFileSync(file, "version: '3.8'\nservices: {}\n");
+
+		const ids = getServersForFileWithConfig(file).map((s) => s.id);
+		expect(ids).not.toContain("zizmor");
+		// The primary yaml language server still attaches — only zizmor (the
+		// auxiliary that can never report on this file) is gated out.
+		expect(ids).toContain("yaml");
+	});
 });

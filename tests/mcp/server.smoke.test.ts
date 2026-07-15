@@ -7,63 +7,9 @@
  * that is the project's standing build-before-vitest rule.
  */
 
-import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-const serverJs = path.join(repoRoot, "mcp", "server.js");
-
-class McpHarness {
-	private child: ChildProcessWithoutNullStreams;
-	private buffer = "";
-	private pending = new Map<number, (msg: Record<string, unknown>) => void>();
-
-	constructor() {
-		this.child = spawn(process.execPath, [serverJs, `--cwd=${repoRoot}`], {
-			stdio: ["pipe", "pipe", "pipe"],
-		});
-		this.child.stdout.setEncoding("utf8");
-		this.child.stdout.on("data", (chunk: string) => {
-			this.buffer += chunk;
-			let nl = this.buffer.indexOf("\n");
-			while (nl !== -1) {
-				const line = this.buffer.slice(0, nl).trim();
-				this.buffer = this.buffer.slice(nl + 1);
-				if (line) {
-					const msg = JSON.parse(line) as Record<string, unknown>;
-					const id = msg.id as number | undefined;
-					if (typeof id === "number" && this.pending.has(id)) {
-						this.pending.get(id)?.(msg);
-						this.pending.delete(id);
-					}
-				}
-				nl = this.buffer.indexOf("\n");
-			}
-		});
-	}
-
-	request(id: number, method: string, params?: unknown): Promise<Record<string, unknown>> {
-		return new Promise((resolve, reject) => {
-			const timer = setTimeout(() => reject(new Error(`timeout: ${method}`)), 20_000);
-			this.pending.set(id, (msg) => {
-				clearTimeout(timer);
-				resolve(msg);
-			});
-			this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
-		});
-	}
-
-	notify(method: string, params?: unknown): void {
-		this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
-	}
-
-	dispose(): void {
-		this.child.stdin.end();
-		this.child.kill();
-	}
-}
+import { McpHarness, repoRoot } from "./harness.js";
 
 // Spawns the MCP server as a real stdio subprocess; like analyze-cli, it can lose
 // a CPU-starvation race in the full parallel suite (passes in isolation). retry: 2
@@ -111,11 +57,23 @@ describe("pi-lens MCP server (stdio smoke)", { retry: 2 }, () => {
 		expect(names).toContain("pilens_lsp_navigation");
 		expect(names).toContain("pilens_lsp_diagnostics");
 		expect(names).toContain("pilens_symbol_search");
-		expect(names).toContain("pilens_impact");
+		// pilens_impact was removed (#304) — its blast radius folded into
+		// pilens_module_report's `blastRadius` option.
+		expect(names).not.toContain("pilens_impact");
+		expect(names).toContain("pilens_module_report");
+		expect(names).toContain("pilens_read_symbol");
 		// Each tool advertises an object input schema.
 		for (const tool of tools) {
 			expect(tool.inputSchema.type).toBe("object");
 		}
+		// pilens_diagnostics mirrors lens_diagnostics' typebox schema verbatim
+		// (schemaWithCwd); `paths` (#461) must be present on the MCP side too, not
+		// just the pi tool — this is the one guard that would catch schema drift
+		// between the two if the mirror ever stopped being a direct passthrough.
+		const diagnosticsTool = tools.find((t) => t.name === "pilens_diagnostics") as
+			| { inputSchema: { properties?: Record<string, unknown> } }
+			| undefined;
+		expect(diagnosticsTool?.inputSchema.properties).toHaveProperty("paths");
 	}, 25_000);
 
 	it("answers tools/call pilens_health with LSP + dispatch state", async () => {
@@ -123,9 +81,23 @@ describe("pi-lens MCP server (stdio smoke)", { retry: 2 }, () => {
 			name: "pilens_health",
 			arguments: {},
 		});
-		const result = res.result as { content: { type: string; text: string }[] };
+		const result = res.result as {
+			content: { type: string; text: string }[];
+		};
 		expect(result.content[0].type).toBe("text");
 		expect(result.content[0].text).toContain("LSP:");
+		// #544: this harness never sets PI_LENS_MCP_AUTO_SESSION, so the health
+		// response must report the feature as off (`null`), distinguishable from
+		// "attempted and failed" — not merely omit the field.
+		expect(result.content[0].text).toContain(
+			"Auto session_start: disabled (PI_LENS_MCP_AUTO_SESSION not set)",
+		);
+		const jsonMatch = result.content[0].text.match(/```json\n([\s\S]*)\n```/);
+		expect(jsonMatch).toBeTruthy();
+		const payload = JSON.parse(jsonMatch?.[1] ?? "{}") as {
+			autoSession: unknown;
+		};
+		expect(payload.autoSession).toBeNull();
 	}, 25_000);
 
 	it("answers tools/call pilens_diagnostics (lens_diagnostics, delta mode)", async () => {
@@ -158,6 +130,10 @@ describe("pi-lens MCP server (stdio smoke)", { retry: 2 }, () => {
 		// The structured JSON payload (fenced) carries the latency record.
 		expect(result.content[0].text).toContain("\"latency\"");
 	}, 60_000);
+
+	// pilens_module_report + pilens_read_symbol execute against a tiny project in
+	// module-report.smoke.test.ts — targeting the whole repo here cold-builds the
+	// review graph and blocks the server. tools/list above asserts they're wired.
 
 	it("answers tools/call pilens_ast_grep_search with content", async () => {
 		const res = await harness.request(8, "tools/call", {

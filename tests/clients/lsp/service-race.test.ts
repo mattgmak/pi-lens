@@ -5,6 +5,7 @@ const createLSPClient = vi.fn();
 
 vi.mock("../../../clients/lsp/config.js", () => ({
 	getServersForFileWithConfig,
+	getServerInitOverride: vi.fn().mockReturnValue(undefined),
 }));
 
 vi.mock("../../../clients/lsp/client.js", () => ({
@@ -95,6 +96,45 @@ describe("LSPService race hardening", () => {
 		await service.getClientForFile(file);
 		expect(spawn).toHaveBeenCalledTimes(2);
 		now.mockRestore();
+	}, 15000);
+
+	it("does not permanently disable unavailable servers when install is disabled", async () => {
+		const savedDisable = process.env.PI_LENS_DISABLE_LSP_INSTALL;
+		process.env.PI_LENS_DISABLE_LSP_INSTALL = "1";
+		const now = vi.spyOn(Date, "now");
+
+		try {
+			const { LSPService } = await import("../../../clients/lsp/index.js");
+			const service = new LSPService();
+
+			const spawn = vi.fn(async () => undefined);
+			getServersForFileWithConfig.mockReturnValue([
+				{
+					id: "python",
+					name: "Python",
+					extensions: [".py"],
+					root: async () => "C:/repo",
+					spawn,
+				},
+			]);
+
+			const file = "C:/repo/main.py";
+			for (let i = 0; i < 6; i++) {
+				now.mockReturnValue(i * 16_000);
+				await service.getClientForFile(file);
+			}
+
+			// A normal unavailable server would be permanently disabled after five
+			// misses. With install disabled, misses are policy/unavailable outcomes;
+			// keep retrying after cooldown so a newly installed PATH binary can recover
+			// without resetting the whole LSP service.
+			expect(spawn).toHaveBeenCalledTimes(6);
+			expect(createLSPClient).not.toHaveBeenCalled();
+		} finally {
+			now.mockRestore();
+			if (savedDisable === undefined) delete process.env.PI_LENS_DISABLE_LSP_INSTALL;
+			else process.env.PI_LENS_DISABLE_LSP_INSTALL = savedDisable;
+		}
 	}, 15000);
 
 	it("uses a server-specific wait budget override for slow startup", async () => {

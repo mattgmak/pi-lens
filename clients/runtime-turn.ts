@@ -13,6 +13,7 @@ import {
 	writeCodeQualityWarningsReport,
 } from "./code-quality-warnings.js";
 import type { CacheManager } from "./cache-manager.js";
+import type { CascadeSkipReason } from "./cascade-types.js";
 import { logCascade } from "./cascade-logger.js";
 import { normalizeMapKey } from "./path-utils.js";
 import type { DependencyChecker } from "./dependency-checker.js";
@@ -23,7 +24,18 @@ import {
 import { getKnipIgnorePatterns } from "./file-utils.js";
 import type { GitleaksResult } from "./gitleaks-client.js";
 import type { GovulncheckResult } from "./govulncheck-client.js";
+import type { TrivyResult } from "./trivy-client.js";
+import {
+	dedupeSecretFindings,
+	fromAstGrepWarnings,
+	fromGitleaks,
+	fromTrivySecrets,
+	isSecretWarning,
+	secretLocationKey,
+} from "./secret-findings.js";
 import type { KnipClient, KnipIssue, KnipResult } from "./knip-client.js";
+import type { DeadCodeClient, DeadCodeResult } from "./dead-code-client.js";
+import { formatDeadCodeAdvisory } from "./dead-code-client.js";
 import {
 	PROJECT_DIAGNOSTICS_CACHE_VERSION,
 	writeProjectDiagnosticsDeltaReport,
@@ -31,10 +43,11 @@ import {
 import { knipIssuesToProjectDiagnostics } from "./project-diagnostics/runner-adapters/knip.js";
 import type { ProjectDiagnostic } from "./project-diagnostics/types.js";
 import { logLatency } from "./latency-logger.js";
+import { updateHeartbeat } from "./instance-registry.js";
 import { emitLensTurnFindings } from "./lens-events.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
-import type { TestRunnerClient } from "./test-runner-client.js";
+import type { TestResult, TestRunnerClient } from "./test-runner-client.js";
 
 interface TurnEndDeps {
 	ctxCwd?: string;
@@ -43,6 +56,7 @@ interface TurnEndDeps {
 	runtime: RuntimeCoordinator;
 	cacheManager: CacheManager;
 	knipClient: KnipClient;
+	deadCodeClients: DeadCodeClient[];
 	depChecker: DependencyChecker;
 	testRunnerClient: TestRunnerClient;
 	resetLSPService: () => void;
@@ -52,14 +66,54 @@ interface TurnEndDeps {
 // LSP idle reset scheduling — prevents thrashing by delaying shutdown
 let lspIdleResetTimeout: ReturnType<typeof setTimeout> | null = null;
 
-function scheduleLSPIdleReset(resetFn: () => void, delayMs: number): void {
+function emitIdleResetReporterWarning(reportErr: unknown): void {
+	try {
+		process.emitWarning(
+			`pi-lens LSP idle reset error reporter failed: ${reportErr}`,
+			{ code: "PI_LENS_LSP_IDLE_RESET_REPORTER_FAILED" },
+		);
+	} catch {
+		// Preserve the detached-timer invariant: this path must never crash.
+		void reportErr;
+	}
+}
+
+function reportIdleResetError(
+	onError: ((err: unknown) => void) | undefined,
+	err: unknown,
+): void {
+	try {
+		onError?.(err);
+	} catch (reportErr) {
+		emitIdleResetReporterWarning(reportErr);
+	}
+}
+
+function scheduleLSPIdleReset(
+	resetFn: () => void,
+	delayMs: number,
+	options: {
+		isCurrentSession?: () => boolean;
+		onError?: (err: unknown) => void;
+	} = {},
+): void {
 	// Clear any pending reset to avoid multiple timers
 	if (lspIdleResetTimeout) {
 		clearTimeout(lspIdleResetTimeout);
 	}
 	lspIdleResetTimeout = setTimeout(() => {
-		resetFn();
 		lspIdleResetTimeout = null;
+		try {
+			if (options.isCurrentSession && !options.isCurrentSession()) {
+				return;
+			}
+			resetFn();
+		} catch (err) {
+			// Detached timers run outside a pi event boundary. They must never crash
+			// the extension process (for example if a host UI object was invalidated
+			// by session replacement before the timer fired).
+			reportIdleResetError(options.onError, err);
+		}
 	}, delayMs);
 	// unref so this timer does not prevent the process from exiting naturally
 	// (critical for subagent / --mode json -p usage where the process should
@@ -72,6 +126,13 @@ export function cancelLSPIdleReset(): void {
 		clearTimeout(lspIdleResetTimeout);
 		lspIdleResetTimeout = null;
 	}
+}
+
+// Bounded wait for the turn's deferred cascade computes (#450) to settle before
+// they are merged below. A late compute is carried over to the next turn_end.
+function cascadeSettleWaitMs(): number {
+	const raw = Number(process.env.PI_LENS_CASCADE_SETTLE_WAIT_MS);
+	return Number.isFinite(raw) && raw >= 0 ? raw : 5000;
 }
 
 function capTurnEndMessage(content: string): string {
@@ -98,11 +159,30 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		runtime,
 		cacheManager,
 		knipClient,
+		deadCodeClients,
 		depChecker,
 		testRunnerClient,
 		resetLSPService,
 		resetFormatService,
 	} = deps;
+
+	// #449 slice 1: piggyback the instance-registry heartbeat on this existing
+	// per-turn touchpoint rather than adding a new timer/interval. Cheap (reads
+	// process.memoryUsage().rss, one read-modify-write of instances.json) and
+	// fire-and-forget — the kill-switch check + no-op behavior live inside
+	// updateHeartbeat itself, so this call site doesn't need to know about it.
+	//
+	// #620: intentionally RSS-only here — CPU%/LSP-child sampling (which shells
+	// out to `pidusage`, and a full CIM query on Windows for a spawn's process
+	// tree) is left to the quiet-window "instance_registry_heartbeat" task
+	// (clients/quiet-window.ts's `buildHeartbeatResourcePatch`), which fires on
+	// the idle `agent_settled` window rather than every single turn end. Every
+	// turn end is a much hotter path than an idle window, and the issue's own
+	// guardrail is not to let the measurement itself become a new source of
+	// per-turn overhead worth investigating.
+	void updateHeartbeat().catch(() => {
+		// best-effort observability — never fail turn_end over this
+	});
 
 	const cwd = ctxCwd ?? process.cwd();
 	let turnState = cacheManager.readTurnState(cwd);
@@ -125,7 +205,11 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	if (files.length === 0) {
 		dbg("turn_end: no modified files, scheduling LSP idle reset (240s)");
 		if (!getFlag("no-lsp")) {
-			scheduleLSPIdleReset(resetLSPService, 240_000);
+			const sessionGeneration = runtime.sessionGeneration;
+			scheduleLSPIdleReset(resetLSPService, 240_000, {
+				isCurrentSession: () => runtime.isCurrentSession(sessionGeneration),
+				onError: (err) => dbg(`lsp idle reset failed: ${err}`),
+			});
 		}
 		resetFormatService();
 		return;
@@ -133,8 +217,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 
 	// Cancel any pending idle reset since we're actively working
 	if (lspIdleResetTimeout) {
-		clearTimeout(lspIdleResetTimeout);
-		lspIdleResetTimeout = null;
+		cancelLSPIdleReset();
 		dbg("turn_end: cancelled pending LSP idle reset (active editing)");
 	}
 
@@ -165,6 +248,23 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			`Unresolved from this turn — ${displayPath}:\n${summary}`,
 		);
 	}
+
+	// Drain the deferred cascade computes kicked off this turn (#450). They ran
+	// concurrently off the write hot path; wait a bounded time for them here so
+	// their runs are available to the merge below. A compute still in flight at
+	// the cap is carried over to the next turn_end (never dropped).
+	const cascadeSettleStart = Date.now();
+	const { settled, timedOut } = await runtime.settleCascadeRuns(
+		cascadeSettleWaitMs(),
+	);
+	logLatency({
+		type: "phase",
+		toolName: "turn_end",
+		filePath: cwd,
+		phase: "cascade_settle_wait",
+		durationMs: Date.now() - cascadeSettleStart,
+		metadata: { settled, timedOut },
+	});
 
 	// Merge accumulated cascade results from all pipeline runs this turn.
 	// Two-pass dedup:
@@ -241,11 +341,12 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			},
 		});
 	}
-	const cascadeSkipped = {
+	const cascadeSkipped: Record<CascadeSkipReason, number> = {
 		blockers: 0,
 		non_code: 0,
 		no_neighbors: 0,
 		clean: 0,
+		error: 0,
 	};
 	for (const r of cascadeRuns) {
 		if (r.skipReason)
@@ -348,14 +449,21 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					blockerParts.push(report);
 				}
 
-				// Newly-unused exports in modified files: symbol was clean before this turn
-				// (not in prevKnip issues) but is now flagged — likely a caller was removed or
-				// an interface changed. Advisory only — the agent may be mid-task.
-				const unusedExportIssues = newIssues.filter((i) => i.type === "export");
-				if (unusedExportIssues.length > 0) {
+				// Turn-end injects only this turn's HIGH-CONFIDENCE, ATTRIBUTABLE
+				// delta: symbols in files the agent just edited that became unused
+				// (weren't flagged in the previous scan) — low-volume and actionable
+				// now. The FULL project-wide dead-code picture is deliberately NOT
+				// injected per turn (hundreds of mostly-pre-existing findings would
+				// drown the blockers and burn context every turn); it's available
+				// on demand via lens_diagnostics. The delta also feeds the session-slop
+				// record (`projectDiagnosticsDelta`) above.
+				const unusedExportDelta = newIssues.filter(
+					(i) => i.type === "export" || i.type === "enumMember",
+				);
+				if (unusedExportDelta.length > 0) {
 					let report =
-						"⚠️ Newly unused exports in modified files — check if callers need updating (Knip):\n";
-					for (const issue of unusedExportIssues.slice(0, 5)) {
+						"⚠️ Newly unused exports in files you edited — check if callers need updating (Knip):\n";
+					for (const issue of unusedExportDelta.slice(0, 5)) {
 						const display = issue.file
 							? toRunnerDisplayPath(cwd, issue.file)
 							: "(unknown)";
@@ -401,25 +509,106 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		advisoryParts.push(report);
 	}
 
-	// gitleaks — surface session_start-cached committed-secret findings.
-	// Treated as a BLOCKER (not advisory) because committed credentials
-	// are real production risk and need rotation before merge.
-	const gitleaksCacheEntry = cacheManager.readCache<GitleaksResult>(
+	const trivyCacheEntry = cacheManager.readCache<TrivyResult>("trivy", cwd);
+
+	// Secrets — UNIFIED surfacing (#131 Mode 3). gitleaks, trivy secret, and the
+	// ast-grep hardcoded-secret rules can each flag the SAME line with different
+	// rule ids, which the rule-keyed diagnostic dedup can't collapse. Collapse by
+	// location so a committed/hardcoded secret is reported ONCE (with combined
+	// provenance) — a blocker, since credentials need rotation before merge.
+	const gitleaksData = cacheManager.readCache<GitleaksResult>(
 		"gitleaks",
 		cwd,
+	)?.data;
+	const astSecretWarnings = runtime
+		.peekActionableWarnings()
+		.filter(isSecretWarning);
+	const sessionSecrets = dedupeSecretFindings([
+		...fromGitleaks(gitleaksData?.findings ?? []),
+		...fromTrivySecrets(trivyCacheEntry?.data?.secrets ?? []),
+	]);
+	// Locations already surfaced as session-scan secret blockers — used to enrich
+	// provenance where ast-grep agrees and to suppress the duplicate ast-grep copy
+	// from the actionable-warnings advisory below.
+	const secretBlockedLocations = new Set(
+		sessionSecrets.map((f) => secretLocationKey(f.file, f.line)),
 	);
-	if (gitleaksCacheEntry?.data?.findings?.length) {
-		const findings = gitleaksCacheEntry.data.findings.slice(0, 5);
+	if (sessionSecrets.length) {
+		// Fold in ast-grep provenance ONLY where it coincides with a session
+		// secret — don't promote ast-grep-only findings out of their advisory tier.
+		const enriched = dedupeSecretFindings([
+			...sessionSecrets,
+			...fromAstGrepWarnings(astSecretWarnings).filter((a) =>
+				secretBlockedLocations.has(secretLocationKey(a.file, a.line)),
+			),
+		]);
+		const shown = enriched.slice(0, 5);
 		let report =
-			"🔴 STOP — committed secrets detected (gitleaks). Rotate the credentials and remove from source:\n";
-		for (const f of findings) {
-			const where = `${toRunnerDisplayPath(cwd, f.file)}:${f.startLine}`;
-			report += `  ${where} — ${f.ruleId}${f.description ? `: ${f.description}` : ""}\n`;
+			"🔴 STOP — hardcoded secrets detected. Rotate the credentials and remove them from source:\n";
+		for (const f of shown) {
+			const where = `${toRunnerDisplayPath(cwd, f.file)}:${f.line}`;
+			report += `  ${where} — ${f.rule} [${f.sources.join(" + ")}]${f.description ? `: ${f.description}` : ""}\n`;
 		}
-		if (gitleaksCacheEntry.data.findings.length > findings.length) {
-			report += `  … and ${gitleaksCacheEntry.data.findings.length - findings.length} more\n`;
+		if (enriched.length > shown.length) {
+			report += `  … and ${enriched.length - shown.length} more\n`;
 		}
 		blockerParts.push(report);
+	}
+
+	// trivy — surface session_start-cached dependency CVEs (#131, Phase 1).
+	// CRITICAL is a blocker (a known-exploitable CVE in a shipped dep is real
+	// production risk); HIGH/MEDIUM/LOW are advisory. The agent gets the upgrade
+	// target as a hint and decides — we never auto-edit lockfiles.
+	if (trivyCacheEntry?.data?.findings?.length) {
+		const all = trivyCacheEntry.data.findings;
+		const critical = all.filter((f) => f.severity === "CRITICAL");
+		const advisory = all.filter((f) => f.severity !== "CRITICAL");
+		const fmt = (f: TrivyResult["findings"][number]): string => {
+			const pkg = f.installedVersion
+				? `${f.pkgName}@${f.installedVersion}`
+				: f.pkgName;
+			const fix = f.fixedVersion
+				? ` — upgrade to ${f.fixedVersion} or later`
+				: " — no fix yet, track upstream";
+			return `  ${f.vulnerabilityId} (${pkg})${fix}\n`;
+		};
+		if (critical.length) {
+			const shown = critical.slice(0, 5);
+			let report =
+				"🔴 STOP — CRITICAL dependency CVEs (trivy). Upgrade before shipping:\n";
+			for (const f of shown) report += fmt(f);
+			if (critical.length > shown.length) {
+				report += `  … and ${critical.length - shown.length} more\n`;
+			}
+			blockerParts.push(report);
+		}
+		if (advisory.length) {
+			const shown = advisory.slice(0, 5);
+			let report = "🛡️ Dependency CVEs (trivy) — upgrade where possible:\n";
+			for (const f of shown) report += fmt(f);
+			if (advisory.length > shown.length) {
+				report += `  … and ${advisory.length - shown.length} more\n`;
+			}
+			advisoryParts.push(report);
+		}
+	}
+
+	// trivy — dependency license risk (#131 Mode 4). Advisory only: a copyleft /
+	// restricted license in a proprietary tree is a compliance signal, not a
+	// build break. Surfaced from the same cached `trivy fs` pass.
+	const licenses = trivyCacheEntry?.data?.licenses ?? [];
+	if (licenses.length) {
+		const shown = licenses.slice(0, 5);
+		let report =
+			"📜 Dependency license risk (trivy) — review for compliance:\n";
+		for (const l of shown) {
+			const cat = l.category ? `, ${l.category}` : "";
+			report += `  ${l.pkgName} — ${l.license} (${l.severity}${cat})\n`;
+		}
+		if (licenses.length > shown.length) {
+			report += `  … and ${licenses.length - shown.length} more\n`;
+		}
+		advisoryParts.push(report);
 	}
 
 	const t3 = Date.now();
@@ -432,16 +621,20 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			for (const file of madgeFiles) {
 				const absPath = path.resolve(cwd, file);
 				const depResult = await depChecker.checkFile(absPath, cwd);
+				if (depResult.localSkips && depResult.localSkips > 0) {
+					// Not silent: a skipped LOCAL import means madge couldn't resolve
+					// it into the graph, so a cycle through it would be missed.
+					dbg(
+						`turn_end: madge skipped ${depResult.localSkips} local file(s) resolving ${file} — possible silent cycle-miss`,
+					);
+				}
 				if (depResult.hasCircular && depResult.circular.length > 0) {
-					const circularDeps = depResult.circular
-						.flatMap((d) => d.path)
-						.filter((p: string) => !absPath.endsWith(path.basename(p)));
-					const uniqueDeps = [...new Set(circularDeps)];
-					if (uniqueDeps.length > 0) {
-						dbg(
-							`turn_end: circular dependency note for ${file} (suppressed in blockers-only mode)`,
-						);
-					}
+					// Whole-project circular deps are surfaced in lens_diagnostics via the
+					// session-start `madge` cache + extractor; this per-file turn-end pass
+					// only logs (blockers-only mode suppresses circular-dep notes).
+					dbg(
+						`turn_end: circular dependency note for ${file} (suppressed in blockers-only mode)`,
+					);
 				}
 			}
 		}
@@ -463,17 +656,48 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		const targets: NonNullable<
 			ReturnType<TestRunnerClient["getTestRunTarget"]>
 		>[] = [];
+
+		// #628: also target the test companions of this turn's cascade neighbors
+		// (files that import an edited file) — a neighbor's own tests can break
+		// even though the neighbor's source wasn't touched. Reuses `cascadeResults`,
+		// already computed above (from the same #450 deferred-cascade drain) for the
+		// LSP cascade-diagnostics merge — no second reverse-dependency walk, and the
+		// neighbor set inherits whatever budget the cascade compute already applied
+		// (CASCADE_NEIGHBOUR_BUDGET), so this can't turn into unbounded per-edit work.
+		const candidates: Array<{ display: string; abs: string; isNeighbor: boolean }> =
+			[];
+		const seenCandidateKeys = new Set<string>();
 		for (const file of files) {
 			const abs = resolveRunnerPath(cwd, file);
+			const key = normalizeMapKey(abs);
+			if (seenCandidateKeys.has(key)) continue;
+			seenCandidateKeys.add(key);
+			candidates.push({ display: file, abs, isNeighbor: false });
+		}
+		for (const result of cascadeResults) {
+			for (const neighbor of result.neighbors) {
+				const abs = path.isAbsolute(neighbor.filePath)
+					? neighbor.filePath
+					: resolveRunnerPath(cwd, neighbor.filePath);
+				const key = normalizeMapKey(abs);
+				if (seenCandidateKeys.has(key)) continue;
+				seenCandidateKeys.add(key);
+				candidates.push({ display: neighbor.filePath, abs, isNeighbor: true });
+			}
+		}
+
+		for (const { display, abs, isNeighbor } of candidates) {
 			const target = testRunnerClient.getTestRunTarget(abs, cwd);
 			if (target && !seen.has(target.testFile)) {
 				seen.add(target.testFile);
 				targets.push(target);
 				dbg(
-					`turn_end: ${file} → test ${target.runner} ${path.relative(cwd, target.testFile)} (${target.strategy})`,
+					`turn_end: ${display} → test ${target.runner} ${path.relative(cwd, target.testFile)} (${target.strategy}${isNeighbor ? ", cascade-neighbor" : ""})`,
 				);
 			} else if (!target) {
-				dbg(`turn_end: ${file} → no test file found`);
+				dbg(
+					`turn_end: ${display} → no test file found${isNeighbor ? " (cascade-neighbor)" : ""}`,
+				);
 			}
 		}
 		if (targets.length > 0) {
@@ -492,13 +716,20 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				),
 			)
 				.then((results) => {
+					// #628: the turn advancing while tests ran no longer means the
+					// results are thrown away — a late result is still real
+					// information about what's currently broken. It's tagged `stale`
+					// so a downstream consumer can distinguish it from a result that
+					// arrived in time, but it's cached either way.
 					const stale = runtime.turnIndex !== firedAtTurn;
 					const failures: string[] = [];
+					const resultValues: TestResult[] = [];
 					for (const r of results) {
 						if (r.status === "rejected") {
 							dbg(`turn_end: test run rejected — ${r.reason}`);
 							continue;
 						}
+						resultValues.push(r.value);
 						const { file, runner, passed, failed, duration, error } = r.value;
 						const shortFile = path.basename(file);
 						const summary =
@@ -508,25 +739,27 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						dbg(
 							`turn_end: ${stale ? "[stale] " : ""}test ${runner} ${shortFile} → ${summary}`,
 						);
-						if (!stale && failed > 0) {
+						if (failed > 0) {
 							const formatted = testRunnerClient.formatResult(r.value);
 							if (formatted) failures.push(formatted);
 						}
 					}
-					if (stale) {
-						dbg(
-							`turn_end: discarding test results — turn advanced while tests ran`,
-						);
-						return;
-					}
 					if (failures.length > 0) {
-						const content = failures.join("\n\n");
-						cacheManager.writeCache("test-runner-findings", { content }, cwd);
+						const content = stale
+							? `[from a prior turn — the edit that triggered this run had already been superseded by the time results came back]\n\n${failures.join("\n\n")}`
+							: failures.join("\n\n");
+						cacheManager.writeCache(
+							"test-runner-findings",
+							{ content, stale, results: resultValues },
+							cwd,
+						);
 						dbg(
-							`turn_end: ${failures.length} test failure(s) cached for next context injection`,
+							`turn_end: ${failures.length} test failure(s) cached for next context injection${stale ? " (stale — turn advanced while tests ran)" : ""}`,
 						);
 					} else if (results.length > 0) {
-						dbg(`turn_end: all tests passed`);
+						dbg(
+							`turn_end: all tests passed${stale ? " (stale — turn advanced while tests ran)" : ""}`,
+						);
 					}
 				})
 				.catch(() => {});
@@ -587,7 +820,21 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				turnIndex: runtime.turnIndex,
 				files,
 				modifiedRangesByFile,
-				dispatchWarnings: runtime.peekActionableWarnings(),
+				// Suppress the ast-grep secret advisory at any location already
+				// surfaced in the unified secrets blocker above (#131 Mode 3) — the
+				// secret is reported once, not twice.
+				dispatchWarnings: runtime
+					.peekActionableWarnings()
+					.filter(
+						(w) =>
+							!(
+								isSecretWarning(w) &&
+								typeof w.line === "number" &&
+								secretBlockedLocations.has(
+									secretLocationKey(w.filePath, w.line),
+								)
+							),
+					),
 				includeLspCodeActions: !!getFlag("lens-actionable-warning-actions"),
 				projectSeqStart: runtime.turnStartProjectSeq,
 				projectSeqEnd: runtime.projectSeq,
@@ -697,6 +944,26 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				error: err instanceof Error ? err.message : String(err),
 			},
 		});
+	}
+
+	// Cross-file dead-code (#127): surface the cached session_start scan as an
+	// advisory (project-wide unused symbols are slow to compute, so we read the
+	// cache rather than re-scanning every turn — the analogue of knip's cache
+	// for non-JS/TS languages). Merged across languages for polyglot repos.
+	try {
+		const deadCodeResults: DeadCodeResult[] = [];
+		for (const client of deadCodeClients) {
+			if (!client.detect(cwd)) continue;
+			const cached = cacheManager.readCache<DeadCodeResult>(
+				`dead-code-${client.id}`,
+				cwd,
+			);
+			if (cached?.data) deadCodeResults.push(cached.data);
+		}
+		const advisory = formatDeadCodeAdvisory(deadCodeResults);
+		if (advisory) advisoryParts.push(advisory);
+	} catch (err) {
+		dbg(`turn_end: dead-code advisory failed: ${err}`);
 	}
 
 	cacheManager.incrementTurnCycle(cwd);

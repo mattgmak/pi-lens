@@ -18,10 +18,51 @@ export interface Symbol {
 	kind: SymbolKind;
 	filePath: string;
 	line: number;
+	/** 1-based last line of the definition (inclusive). Drives module-report
+	 * read ranges and the read-guard's `enclosingSymbol` coverage. */
+	endLine?: number;
 	column: number;
 	signature?: string; // For functions: "(a: T, b: U) => R"
 	isExported: boolean;
+	/**
+	 * Access visibility when the language exposes a REAL, detectable modifier
+	 * (TS/JS `private`/`protected`/`#`). Undefined = public or not applicable —
+	 * never faked for convention-only languages (Python `_name`, Go casing).
+	 * module-report routes private/protected members of an exported class to
+	 * `internal` rather than the public `api` (#258).
+	 */
+	visibility?: "private" | "protected";
+	/**
+	 * True when the symbol is declared inside a function/block body (a
+	 * function-local), as opposed to a module-level declaration or a class
+	 * member. module-report drops locals from its outline (#259); the review
+	 * graph keeps the full symbol set regardless, so its edges are unaffected.
+	 */
+	local?: boolean;
 	doc?: string; // JSDoc comment if available
+	/**
+	 * 1-based start line of the attached doc-comment block that `doc` was
+	 * summarized from (same attachment computation — position-based, blank-line-
+	 * gap aware). Undefined when no doc comment is attached. Lets a body reader
+	 * (readSymbol) extend its returned range to include the comment (#523) without
+	 * re-deriving attachment.
+	 */
+	docStartLine?: number;
+	/**
+	 * Decorators / attributes / annotations attached to the declaration, in source
+	 * order (e.g. `@app.get("/x")`, `#[tokio::main]`, `@Override`). Tells an agent
+	 * a symbol's ROLE (route/test/fixture/entrypoint) without reading its body.
+	 * Language-uniform over the tree-sitter declaration node; omitted when none.
+	 */
+	decorators?: string[];
+	/**
+	 * True when the declaration is an async/suspend function or method — a
+	 * concurrency boundary where await points and lifecycle bugs live. Detected
+	 * structurally (an `async` keyword node, or `async`/`suspend` in a modifiers
+	 * container); conservative, so it's false-negative-safe for grammars that
+	 * spell it differently. Omitted when false.
+	 */
+	isAsync?: boolean;
 }
 
 export interface SymbolRef {

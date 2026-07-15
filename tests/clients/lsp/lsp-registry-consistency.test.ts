@@ -1,5 +1,18 @@
 import { describe, expect, it } from "vitest";
+import * as serverModule from "../../../clients/lsp/server.js";
 import { LSP_SERVERS } from "../../../clients/lsp/server.js";
+
+/** A module export that is shaped like an LSPServerInfo (duck-typed). */
+function isServerInfoLike(v: unknown): v is { id: string } {
+	if (typeof v !== "object" || v === null) return false;
+	const o = v as Record<string, unknown>;
+	return (
+		typeof o.id === "string" &&
+		typeof o.spawn === "function" &&
+		typeof o.root === "function" &&
+		Array.isArray(o.extensions)
+	);
+}
 
 /**
  * Deterministic, server-free guard on the LSP registry wiring. The live
@@ -24,6 +37,21 @@ describe("LSP_SERVERS registry consistency", () => {
 			expect(Array.isArray(s.extensions), `extensions on ${s.id}`).toBe(true);
 			expect(s.extensions.length, `non-empty extensions on ${s.id}`).toBeGreaterThan(0);
 		}
+	});
+
+	it("has no orphan servers — every exported *Server is registered in LSP_SERVERS (#270)", () => {
+		// Catches the dead-code class the consistency checks above can't see: a
+		// fully-defined server const that was never added to LSP_SERVERS, so it can
+		// never be a candidate for any file (e.g. the removed ruby-solargraph).
+		const registered = new Set(LSP_SERVERS);
+		const orphans = Object.entries(serverModule)
+			.filter(([, v]) => isServerInfoLike(v))
+			.filter(([, v]) => !registered.has(v as (typeof LSP_SERVERS)[number]))
+			.map(([name, v]) => `${name} (id="${(v as { id: string }).id}")`);
+		expect(
+			orphans,
+			`server(s) defined but not in LSP_SERVERS: ${orphans.join(", ")}`,
+		).toEqual([]);
 	});
 
 	it("server ids are globally unique", () => {

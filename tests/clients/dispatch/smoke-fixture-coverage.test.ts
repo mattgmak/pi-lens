@@ -25,23 +25,24 @@ const EXEMPT = new Map<string, string>([
 	["tree-sitter", "structural; runs on every dispatch"],
 	["fact-rules", "structural; runs on every dispatch"],
 	["ast-grep-napi", "structural; covered by ast-grep-napi unit tests"],
-	["python-slop", "structural slop rules; not a spawn-a-tool runner"],
 	["spotbugs", "dynamic group (withSpotbugsGroup); opt-in, JVM bytecode + flag-gated"],
 	// Per-language ALTERNATES whose primary IS covered for that language.
 	["eslint", "JS alt; oxlint covered in lint, eslint covered in --autofix"],
-	["biome-lint", "JS alt; biome covered in --format/--autofix"],
 	["biome-check-json", "JSON biome alt"],
 	["credo", "Elixir alt; elixir-check covered"],
 	["detekt", "Kotlin alt to ktlint; wired+consistency-tested, live CI-deferred"],
 	["golangci-lint", "Go; go-vet covered in lint, golangci-lint in --autofix"],
 	// Covered via the --lsp handshake layer rather than a dispatch fixture.
 	["lsp", "covered as the target across LSP fixtures"],
-	["ts-lsp", "TS LSP; covered via --lsp typescript"],
 	["pyright", "covered via --lsp python"],
 	["prisma-validate", "covered via --lsp prisma"],
 	// Config-gated checkers with no fixture yet.
 	["mypy", "config-gated type-checker; no fixture yet"],
 	["phpstan", "config-gated; no fixture yet"],
+	[
+		"trivy-config",
+		"IaC misconfig; trivy.enabled-gated (off by default), needs trivy + opt-in fixture",
+	],
 	// No live fixture yet — the remaining-linters backlog.
 	["actionlint", "no fixture yet"],
 	["vale", "no fixture yet"],

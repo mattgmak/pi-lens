@@ -257,6 +257,35 @@ describe("runner status/semantic edge cases", () => {
 		}
 	});
 
+	it("lsp runner returns skipped (not succeeded) when the touch is inconclusive (timed out) (#570)", async () => {
+		// touchFile resolves an array flagged `inconclusive` — the notify write
+		// and/or diagnostics wait hit their deadline without the server
+		// confirming completion. Reporting "succeeded, 0 diagnostics" here would
+		// read as a confirmed clean bill of health when the check simply never
+		// completed; the runner must report "skipped" (same treatment as the
+		// no-client-ready case) so the coverage notice flags the gap.
+		const runner = (await import("../../../../clients/dispatch/runners/lsp.js"))
+			.default;
+		const env = setupTestEnvironment("pi-lens-lsp-inconclusive-");
+		try {
+			const filePath = path.join(env.tmpDir, "main.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+
+			supportsLSP.mockReturnValue(true);
+			const inconclusiveResult: unknown[] = [];
+			Object.defineProperty(inconclusiveResult, "inconclusive", {
+				value: true,
+			});
+			touchFile.mockResolvedValue(inconclusiveResult);
+
+			const result = await runner.run(ctx(filePath, env.tmpDir) as never);
+			expect(result.status).toBe("skipped");
+			expect(result.diagnostics).toEqual([]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("lsp runner returns warning semantic when server open fails", async () => {
 		const runner = (await import("../../../../clients/dispatch/runners/lsp.js"))
 			.default;
@@ -350,6 +379,59 @@ describe("runner status/semantic edge cases", () => {
 			expect(result.semantic).toBe("blocking");
 			expect(result.diagnostics[0]?.fixable).toBe(false);
 			expect(result.diagnostics[0]?.fixSuggestion).toBeUndefined();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("lsp runner looks up codeAction for multiple blocking diagnostics in parallel (#453)", async () => {
+		const runner = (await import("../../../../clients/dispatch/runners/lsp.js"))
+			.default;
+		const env = setupTestEnvironment("pi-lens-lsp-parallel-");
+		try {
+			const filePath = path.join(env.tmpDir, "main.ts");
+			fs.writeFileSync(
+				filePath,
+				"const a: string = 1;\nconst b: string = 2;\nconst c: string = 3;\n",
+			);
+
+			hasLSP.mockResolvedValue(true);
+			openFile.mockResolvedValue(undefined);
+			touchFile.mockResolvedValue(
+				[0, 1, 2].map((line) => ({
+					severity: 1,
+					message: "Type 'number' is not assignable to type 'string'.",
+					range: {
+						start: { line, character: 6 },
+						end: { line, character: 7 },
+					},
+					code: "2322",
+				})),
+			);
+			// Assert concurrency by observed overlap (max in-flight lookups), not
+			// wall-clock — elapsed-time bounds flake under parallel vitest load.
+			// Sequential awaits would never have more than 1 lookup in flight.
+			let inFlight = 0;
+			let maxInFlight = 0;
+			codeAction.mockImplementation(
+				() =>
+					new Promise((resolve) => {
+						inFlight += 1;
+						maxInFlight = Math.max(maxInFlight, inFlight);
+						setTimeout(() => {
+							inFlight -= 1;
+							resolve([{ title: "Fix it", kind: "quickfix" }]);
+						}, 20);
+					}),
+			);
+
+			const result = await runner.run(ctx(filePath, env.tmpDir) as never);
+
+			expect(codeAction).toHaveBeenCalledTimes(3);
+			expect(maxInFlight).toBe(3);
+			expect(
+				result.diagnostics.every((d) => d.fixSuggestion?.includes("Fix it")),
+			).toBe(true);
 		} finally {
 			env.cleanup();
 		}

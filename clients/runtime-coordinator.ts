@@ -10,6 +10,7 @@ import { normalizeMapKey } from "./path-utils.js";
 import { ReadGuard } from "./read-guard.js";
 import type { RuleScanResult } from "./rules-scanner.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
+import { TurnSummaryCollector } from "./turn-summary.js";
 
 export interface ErrorDebtBaseline {
 	testsPassed: boolean;
@@ -47,6 +48,10 @@ export class RuntimeCoordinator {
 	private _cachedExports = new Map<string, string>();
 	private _startupScansInFlight = new Map<string, number>();
 	private _cascadeRuns: CascadeRun[] = [];
+	// Cascade computes are kicked off unawaited by the pipeline (#450); their
+	// promises park here until turn_end drains them via settleCascadeRuns. Each is
+	// guaranteed non-rejecting by the pipeline's .catch.
+	private _pendingCascadeRuns: Promise<CascadeRun>[] = [];
 	private _cascadeSessionStats: CascadeSessionStats = {
 		runs: 0,
 		diagnosticsSurfaced: 0,
@@ -68,6 +73,11 @@ export class RuntimeCoordinator {
 	private _projectSeq = 0;
 	private _turnStartProjectSeq = 0;
 	private readonly _fileSeq = new Map<string, number>();
+	// File key → the projectSeq value at that file's most recent bump (#451). Lets
+	// the review-graph builder ask "which files changed since I last built?" and
+	// skip its per-build O(project) walk+stat sweep when only pi-observed edits
+	// occurred. Keyed identically to _fileSeq (normalizeMapKey + path.resolve).
+	private readonly _fileLastProjectSeq = new Map<string, number>();
 	private _gitGuardHasBlockers = false;
 	private _gitGuardSummary = "";
 	callGraph: FunctionCallGraph | null = null;
@@ -93,6 +103,12 @@ export class RuntimeCoordinator {
 		string,
 		CodeQualityWarningRecord
 	>();
+	// #484: opt-in per-RUN summary of diagnostics/autofixes/formats,
+	// accumulated across the run's turns and consumed once at the
+	// agent_settled quiet window. The collector itself is always constructed
+	// (cheap, empty Map) but callers gate recording behind the
+	// `lens-turn-summary` flag so it's a true no-op when the feature is off.
+	private readonly _turnSummary = new TurnSummaryCollector();
 
 	resetForSession(): void {
 		this._sessionGeneration += 1;
@@ -103,6 +119,7 @@ export class RuntimeCoordinator {
 		this.wordIndex = null;
 		this._startupScansInFlight.clear();
 		this._cascadeRuns = [];
+		this._pendingCascadeRuns = [];
 		this._cascadeSessionStats = {
 			runs: 0,
 			diagnosticsSurfaced: 0,
@@ -118,6 +135,7 @@ export class RuntimeCoordinator {
 		this._projectSeq = 0;
 		this._turnStartProjectSeq = 0;
 		this._fileSeq.clear();
+		this._fileLastProjectSeq.clear();
 		this._gitGuardHasBlockers = false;
 		this._gitGuardSummary = "";
 		this._readGuard = null;
@@ -126,6 +144,7 @@ export class RuntimeCoordinator {
 		this._pendingInlineBlockers.clear();
 		this._actionableWarningsThisTurn.clear();
 		this._codeQualityWarningsThisTurn.clear();
+		this._turnSummary.clear();
 	}
 
 	get sessionStartedAt(): number {
@@ -171,9 +190,20 @@ export class RuntimeCoordinator {
 
 	beginTurn(): void {
 		this._cascadeRuns = [];
+		// _pendingCascadeRuns is deliberately NOT cleared here: a cascade compute
+		// still in flight past last turn_end's settle cap (fresh graph builds have
+		// measured up to ~19s) must surface on the NEXT turn_end, not be dropped —
+		// pre-#450 those findings were always awaited, never lost. Session reset
+		// still clears it.
 		this._pendingInlineBlockers.clear();
 		this._actionableWarningsThisTurn.clear();
 		this._codeQualityWarningsThisTurn.clear();
+		// _turnSummary is deliberately NOT cleared here (#484 rework): the
+		// summary entry is emitted once per RUN at the agent_settled quiet
+		// window (sendMessage during a live stream would STEER the agent, and
+		// turn_end can fire mid-stream), so the collector must accumulate
+		// across the run's turns. It is cleared only by consume() at emit and
+		// by resetForSession().
 		this._turnStartProjectSeq = this._projectSeq;
 		this._turnIndex += 1;
 		this._writeIndex = 0;
@@ -266,6 +296,10 @@ export class RuntimeCoordinator {
 		this._projectSeq = Math.max(0, Math.floor(projectSeq));
 		this._turnStartProjectSeq = this._projectSeq;
 		this._fileSeq.clear();
+		// Seeded per-file counters carry no projectSeq provenance, so start the
+		// changed-since map empty; the graph fast path simply won't fire until an
+		// in-process bump records a seq-stamped change (safe: falls back to sweep).
+		this._fileLastProjectSeq.clear();
 		for (const [filePath, seq] of fileSeqByPath ?? []) {
 			this._fileSeq.set(
 				normalizeMapKey(path.resolve(filePath)),
@@ -279,7 +313,23 @@ export class RuntimeCoordinator {
 		this._projectSeq += 1;
 		const fileSeq = (this._fileSeq.get(key) ?? 0) + 1;
 		this._fileSeq.set(key, fileSeq);
+		this._fileLastProjectSeq.set(key, this._projectSeq);
 		return { projectSeq: this._projectSeq, fileSeq };
+	}
+
+	/**
+	 * Files whose most recent bump happened AFTER `seq` — i.e. every file the
+	 * review graph would need to re-ingest to catch up from a build taken at
+	 * projectSeq `seq` (#451). Returns NORMALIZED keys (normalizeMapKey +
+	 * path.resolve), the same form the builder's fileSignatures map uses, so the
+	 * caller can compare without re-normalizing.
+	 */
+	getFilesChangedSince(seq: number): string[] {
+		const changed: string[] = [];
+		for (const [key, lastSeq] of this._fileLastProjectSeq) {
+			if (lastSeq > seq) changed.push(key);
+		}
+		return changed;
 	}
 
 	getFileSeq(filePath: string): number {
@@ -361,6 +411,59 @@ export class RuntimeCoordinator {
 		this._cascadeRuns.push(run);
 	}
 
+	appendCascadePromise(p: Promise<CascadeRun>): void {
+		this._pendingCascadeRuns.push(p);
+	}
+
+	/**
+	 * Drain the deferred cascade computes kicked off this turn (#450), racing them
+	 * against a bounded wait. Fulfilled runs feed the same accumulator as inline
+	 * runs (appendCascadeRun). A promise still pending at the cap is retained so a
+	 * late-resolving compute is picked up on the next turn_end rather than lost.
+	 * The stored promises never reject (pipeline guarantees an "error" skip-run).
+	 */
+	async settleCascadeRuns(
+		maxWaitMs: number,
+	): Promise<{ settled: number; timedOut: number }> {
+		const pending = this._pendingCascadeRuns;
+		if (pending.length === 0) return { settled: 0, timedOut: 0 };
+		this._pendingCascadeRuns = [];
+
+		// Track per-promise settlement so promises still in flight at the cap can be
+		// carried over. A settled entry records its run; an unsettled one is re-parked.
+		const tracked = pending.map((p) => {
+			const entry: { done: boolean; run?: CascadeRun; promise: Promise<CascadeRun> } =
+				{ done: false, promise: p };
+			entry.promise = p.then((run) => {
+				entry.done = true;
+				entry.run = run;
+				return run;
+			});
+			return entry;
+		});
+
+		const timeout = new Promise<void>((resolve) => {
+			setTimeout(resolve, maxWaitMs).unref?.();
+		});
+		await Promise.race([
+			Promise.allSettled(tracked.map((t) => t.promise)),
+			timeout,
+		]);
+
+		let settled = 0;
+		let timedOut = 0;
+		for (const entry of tracked) {
+			if (entry.done && entry.run) {
+				this.appendCascadeRun(entry.run);
+				settled += 1;
+			} else {
+				this._pendingCascadeRuns.push(entry.promise);
+				timedOut += 1;
+			}
+		}
+		return { settled, timedOut };
+	}
+
 	consumeCascadeRuns(): CascadeRun[] {
 		const runs = this._cascadeRuns;
 		this._cascadeRuns = [];
@@ -410,6 +513,14 @@ export class RuntimeCoordinator {
 
 	clearCodeQualityWarnings(): void {
 		this._codeQualityWarningsThisTurn.clear();
+	}
+
+	/** #484: the per-run diagnostics/autofix/format collector (accumulates
+	 * across turns; consumed once at the agent_settled quiet window). Always
+	 * present; callers gate recording behind the `lens-turn-summary` opt-in
+	 * flag. */
+	get turnSummary(): TurnSummaryCollector {
+		return this._turnSummary;
 	}
 
 	get complexityBaselines(): Map<string, FileComplexity> {
