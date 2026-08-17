@@ -2,8 +2,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { TreeSitterClient } from "../../clients/tree-sitter-client.js";
+import { getSharedTreeSitterClient } from "../../clients/tree-sitter-shared.js";
 import { TreeSitterQueryLoader } from "../../clients/tree-sitter-query-loader.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 const tmpDirs: string[] = [];
 
@@ -29,13 +30,13 @@ async function getCQuery(id: string) {
 
 afterAll(() => {
 	for (const dir of tmpDirs) {
-		fs.rmSync(dir, { recursive: true, force: true });
+		removeTempDirSync(dir);
 	}
 });
 
 describe("tree-sitter C rules", () => {
 	it("matches memset-sensitive-data only on sensitive args", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getCQuery("memset-sensitive-data");
 
 		const positivePath = writeTempCFile(`
@@ -56,7 +57,7 @@ void clear_buffer(char* buf) {
 	});
 
 	it("matches noreturn-returns when return is present", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getCQuery("noreturn-returns");
 		const filePath = writeTempCFile(`
 __attribute__((noreturn)) void fatal() {
@@ -69,7 +70,7 @@ __attribute__((noreturn)) void fatal() {
 	});
 
 	it("matches no-octal-literals", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getCQuery("no-octal-literals");
 		const filePath = writeTempCFile(`
 int x = 010;
@@ -81,7 +82,7 @@ int y = 0x10;
 	});
 
 	it("matches no-reserved-identifiers", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getCQuery("no-reserved-identifiers");
 		const filePath = writeTempCFile(`
 int _Reserved = 1;
@@ -96,7 +97,7 @@ int normal = 3;
 	});
 
 	it("matches no-stdlib-name-as-id", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getCQuery("no-stdlib-name-as-id");
 		const filePath = writeTempCFile(`
 int malloc = 10;
@@ -108,7 +109,7 @@ int my_size = 20;
 	});
 
 	it("matches no-bit-fields", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getCQuery("no-bit-fields");
 		const filePath = writeTempCFile(`
 struct Flags {
@@ -121,7 +122,7 @@ struct Flags {
 	});
 
 	it("matches no-redundant-pointer-ops", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getCQuery("no-redundant-pointer-ops");
 		const filePath = writeTempCFile(`
 void test() {
@@ -136,7 +137,7 @@ void test() {
 	});
 
 	it("matches no-pointer-arithmetic-array-access", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getCQuery("no-pointer-arithmetic-array-access");
 		const filePath = writeTempCFile(`
 void test() {
@@ -149,7 +150,7 @@ void test() {
 	});
 
 	it("matches c-hardcoded-secrets", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getCQuery("c-hardcoded-secrets");
 		const filePath = writeTempCFile(`
 const char* api_key = "sk-1234567890abcdef";
@@ -161,7 +162,7 @@ const char* msg = "hello";
 	});
 
 	it("matches non-case-label-in-switch", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getCQuery("non-case-label-in-switch");
 		const filePath = writeTempCFile(`
 void test(int x) {

@@ -37,7 +37,15 @@ const PS_TIMEOUT_MS = 30000;
 
 function spawnPs(cmd: string, args: string[], timeoutMs = PS_TIMEOUT_MS): Promise<{ stdout: string; stderr: string; status: number | null }> {
 	return new Promise((resolve) => {
-		const child = spawn(cmd, args, { windowsHide: true, shell: false });
+		let child: ReturnType<typeof spawn>;
+		try {
+			child = spawn(cmd, args, { windowsHide: true, shell: false });
+		} catch {
+			// SYNCHRONOUS spawn throw (Windows `spawn UNKNOWN`/EINVAL, the pidusage
+			// bug class, #533) — this best-effort runner must resolve, not reject.
+			resolve({ stdout: "", stderr: "", status: null });
+			return;
+		}
 		let stdout = "";
 		let stderr = "";
 		let settled = false;

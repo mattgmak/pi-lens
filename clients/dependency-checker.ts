@@ -9,10 +9,19 @@
  * Docs: https://github.com/pahen/madge
  */
 
+import { createSubsystemLogger } from "./extension-log.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { findNodeToolBinary } from "./package-manager.js";
+import { isFullyQualified } from "./path-utils.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
+import {
+	createAvailabilityChecker,
+	discoverManagedTool,
+	getManagedToolEnvironment,
+	resolveAvailableOrInstall,
+} from "./dispatch/runners/utils/runner-helpers.js";
+import { createAvailabilityLatch } from "./dispatch/runners/utils/availability-policy.js";
 
 // --- Types ---
 
@@ -86,17 +95,175 @@ export interface DepCheckResult {
 	localSkips?: number;
 }
 
+/**
+ * Which madge invocation a project root resolved to. Classified from the
+ * resolved STRING rather than the resolution step that produced it: the
+ * installer's discovery can hand back the managed install, an npm-global path
+ * or a bare PATH name, and only `"npx"` pays module resolution on every spawn.
+ */
+export type MadgeCommandKind = "local" | "managed" | "global" | "path" | "npx";
+
+interface ResolvedMadge {
+	cmd: string;
+	prefix: string[];
+	kind: MadgeCommandKind;
+}
+
+/**
+ * Per-batch madge telemetry, attached to the turn-end `phase: "madge"` latency
+ * entry so a slow turn can be attributed to spawn count, a single slow target,
+ * or command resolution — the p99 tail #766 is about.
+ *
+ * A type alias rather than an interface because it is passed straight through
+ * as `LatencyEntry.metadata` (`Record<string, unknown>`), which an interface is
+ * not assignable to.
+ */
+export type MadgeBatchStats = {
+	requested: number;
+	missing: number;
+	cacheHits: number;
+	spawned: number;
+	failed: number;
+	/** Absent when the batch resolved nothing — no misses, or madge unavailable. */
+	commandKind?: MadgeCommandKind;
+	/** Command-resolution cost; ~0 once memoized for this project root. */
+	resolveMs: number;
+	/** Slow per-spawn timings in array order, capped at `MADGE_STATS_TARGET_CAP`. */
+	targets: Array<{ file: string; durationMs: number; ok: boolean }>;
+	/** Set when the cap dropped entries, so capping is never silent. */
+	targetsTruncated: boolean;
+};
+
 // --- Graph Cache ---
 
 interface FileImports {
 	imports: Set<string>;
 	timestamp: number;
+	/**
+	 * File byte size at cache time (#1105). The mtime fast-path below is a stale
+	 * signal on its own: a content change that PRESERVES mtime (git checkout
+	 * timestamp restoration, a formatter preserving mtime, a same-second write)
+	 * would let `importsChanged` return false and skip the madge circular-dep
+	 * re-check against edited imports. Size is free (the stat already ran) and is
+	 * the review-graph gold-standard second axis — an import edit almost always
+	 * changes byte length, so this closes the common case at zero I/O cost.
+	 */
+	size: number;
+}
+
+/**
+ * Defensive cap on concurrent madge spawns for a single `checkFilesBatch`
+ * call. A turn usually only touches 1-3 import-changed files, so this rarely
+ * binds — it just guards against a pathological turn (bulk rename/move) from
+ * fork-bombing subprocesses.
+ */
+const MADGE_BATCH_CONCURRENCY = 6;
+
+/**
+ * Cap on per-target timings kept in `MadgeBatchStats`. A bulk rename can hand
+ * the batch hundreds of files; the latency log is a diagnostic breadcrumb, not
+ * a transcript, and the aggregate counts stay exact either way.
+ */
+const MADGE_STATS_TARGET_CAP = 12;
+
+/**
+ * Fast madge targets are not useful enough to justify widening the shared
+ * latency.log records. Aggregate counts remain unconditional; retain a
+ * target breadcrumb only when the spawn itself was slow enough to explain a
+ * turn-end tail.
+ */
+const MADGE_STATS_TARGET_MIN_DURATION_MS = 100;
+
+/** Is `target` inside `dir`? */
+function isWithin(dir: string, target: string): boolean {
+	const rel = path.relative(dir, target);
+	return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
+/**
+ * Classify a resolved madge command for `MadgeCommandKind`. Both resolution
+ * steps feed this: `findNodeToolBinary` walks up to the project's
+ * `node_modules/.bin` but ALSO probes the npm/pnpm/yarn/bun global bins, so
+ * "which step answered" says nothing about where the binary actually lives.
+ */
+function classifyMadgeKind(
+	resolved: string,
+	managedToolsDir: string,
+	projectRoot: string,
+): MadgeCommandKind {
+	if (!isFullyQualified(resolved)) return "path";
+	if (isWithin(managedToolsDir, resolved)) return "managed";
+	if (isWithin(projectRoot, resolved)) return "local";
+	return "global";
+}
+
+/**
+ * Has the memoized resolution stopped being reachable? An absolute path is
+ * checked with a plain `existsSync` (madge uninstalled, the managed tree
+ * wiped). `"npx"` is the deliberate no-memo fallback (already dropped from
+ * the cache the moment it's produced — see `resolveUnlessNpx`) and is never
+ * itself stale. Everything else is a bare PATH name (`"madge"`, a shell
+ * alias resolved via `findNodeToolBinary`'s global-bin probes, …) — #1276:
+ * `existsSync` can't check those, so without this they were never
+ * revalidated and a PATH change or removed global install kept serving the
+ * old answer for the rest of the process.
+ *
+ * `spawnableCache` memoizes the bare-command branch per checker instance
+ * (P2 fix, #1276 review): `isSpawnableCommand` does a synchronous PATH walk,
+ * and without this it re-ran on every single cached `madgeCommand` hit —
+ * once per file when callers resolve per-file instead of via
+ * `checkFilesBatch`'s single per-batch resolution. The cache is cleared by
+ * `resetMadgeMemo()` alongside `madgeCommand`, so it stays exactly as fresh
+ * as the memo it's revalidating.
+ */
+async function resolvedCommandIsStale(
+	resolved: ResolvedMadge,
+	spawnableCache: Map<string, boolean>,
+): Promise<boolean> {
+	if (resolved.kind === "npx") return false;
+	if (isFullyQualified(resolved.cmd)) return !fs.existsSync(resolved.cmd);
+	const cached = spawnableCache.get(resolved.cmd);
+	if (cached !== undefined) return !cached;
+	const { isSpawnableCommand } = await import("./installer/index.js");
+	const spawnable = await isSpawnableCommand(resolved.cmd);
+	spawnableCache.set(resolved.cmd, spawnable);
+	return !spawnable;
+}
+
+/** Run `mapper` over `items` with at most `concurrency` in flight at once. */
+async function mapWithConcurrency<T>(
+	items: T[],
+	concurrency: number,
+	mapper: (item: T) => Promise<void>,
+): Promise<void> {
+	if (items.length === 0) return;
+	let nextIndex = 0;
+	const workerCount = Math.max(1, Math.min(concurrency, items.length));
+	const worker = async (): Promise<void> => {
+		while (true) {
+			const index = nextIndex++;
+			if (index >= items.length) return;
+			await mapper(items[index]);
+		}
+	};
+	const workers = Array.from({ length: workerCount }, () => worker());
+	await Promise.all(workers);
 }
 
 // --- Client ---
 
 export class DependencyChecker {
-	private available: boolean | null = null;
+	private readonly madgeAvailability = createAvailabilityChecker(
+		"madge",
+		".cmd",
+		["--version"],
+		{
+			environment: (cwd) => getManagedToolEnvironment("madge", cwd),
+			unclassifiedFailureOutcome: "missing",
+		},
+	);
+	/** Transient-aware availability memo — see `ensureAvailable` (#1467). */
+	private readonly availabilityLatch = createAvailabilityLatch();
 	private ensureInFlight: Promise<boolean> | null = null;
 	private checkInFlight = new Map<string, Promise<DepCheckResult>>();
 	private scanInFlight = new Map<
@@ -114,34 +281,181 @@ export class DependencyChecker {
 	// Files that are part of a circular dependency
 	private circularFiles = new Set<string>();
 
+	// Newest-classification-wins guard over the two fields above — see the
+	// cross-operation contract on `checkFilesBatch`.
+	private opGeneration = 0;
+	private stateGeneration = 0;
+
+	// projectRoot -> resolved madge command
+	private madgeCommand = new Map<string, Promise<ResolvedMadge>>();
+
+	// Bare command -> last-known spawnability (#1276 revalidation, P2 fix). A
+	// cache hit on `madgeCommand` used to re-run `isSpawnableCommand`'s
+	// synchronous PATH walk on EVERY resolution — unbounded FS work on a path
+	// that can run once per file in a batch. Memoized here instead, and
+	// invalidated by the exact same `resetMadgeMemo()` call the madge-command
+	// memo uses, so a madge removed/reinstalled mid-session is still detected
+	// on the next resolution after an install completes.
+	private spawnableCache = new Map<string, boolean>();
+
+	// #1276: every live checker registers itself so `resetMadgeManagedPathMemo`
+	// (called from installer's `finishInstallAttempt`, mirroring
+	// `resetSafeSpawnWindowsCommandCache`) can drop every instance's memo, not
+	// just whichever one happened to run the install. Held via `WeakRef` (not a
+	// strong `Set<DependencyChecker>`) so a checker that's no longer referenced
+	// anywhere else (test/reinit instances; production only ever constructs one
+	// in `bootstrap.ts`) can still be garbage-collected instead of being
+	// retained for the rest of the process — dead refs are pruned lazily the
+	// next time the registry is walked.
+	private static readonly instances = new Set<WeakRef<DependencyChecker>>();
+
 	constructor(verbose = false) {
 		this.log = verbose
-			? (msg: string) => console.error(`[deps] ${msg}`)
+			? createSubsystemLogger("deps")
 			: () => {};
+		DependencyChecker.instances.add(new WeakRef(this));
+	}
+
+	/** Drop this instance's memoized madge resolution for every project root. */
+	private resetMadgeMemo(): void {
+		this.madgeCommand.clear();
+		this.spawnableCache.clear();
 	}
 
 	/**
-	 * Resolve how to invoke madge for `cwd`: a local/global-installed binary
-	 * (npm/pnpm/yarn/bun) if found, else `npx madge` (#375). `prefix` is prepended
-	 * to the madge args (empty for a resolved binary, `["madge"]` for the npx
-	 * fallback).
+	 * Reset hook for #1276: the madge managed-path memo is keyed only by
+	 * `projectRoot`, but the memoized resolution reads PATH/PATHEXT, local/
+	 * global tool discovery, and managed-install state — all of which a
+	 * completed install can change. Call this from `finishInstallAttempt()`
+	 * right alongside `resetSafeSpawnWindowsCommandCache()` so a mid-session
+	 * install is picked up instead of serving the pre-install answer for the
+	 * rest of the process.
 	 */
-	private async resolveMadge(
-		cwd: string,
-	): Promise<{ cmd: string; prefix: string[] }> {
-		const bin = await findNodeToolBinary("madge", cwd);
-		return bin ? { cmd: bin, prefix: [] } : { cmd: "npx", prefix: ["madge"] };
+	static resetMadgeManagedPathMemo(): void {
+		for (const ref of DependencyChecker.instances) {
+			const checker = ref.deref();
+			if (!checker) {
+				// Garbage-collected since registration — prune the dead ref instead
+				// of leaving it around forever.
+				DependencyChecker.instances.delete(ref);
+				continue;
+			}
+			checker.resetMadgeMemo();
+		}
 	}
 
 	/**
-	 * Check if madge is available, auto-install if not
+	 * Resolve how to invoke madge for `projectRoot`: a project-local/global
+	 * binary (npm/pnpm/yarn/bun) if found, else whatever the installer already
+	 * has on disk, else `npx madge` (#375). `prefix` is prepended to the madge
+	 * args (empty for a resolved binary, `["madge"]` for the npx fallback).
+	 *
+	 * Memoized per project root: `findNodeToolBinary` falls through to
+	 * `npm config get prefix` / `pnpm bin -g` / `yarn global bin` spawns that
+	 * nothing caches, and this used to run once per file inside the batch
+	 * mapper (#766). The memo must not become one-way, though: resolution used
+	 * to re-probe on every spawn and so healed itself, and both escapes below
+	 * buy that back.
 	 */
-	async ensureAvailable(): Promise<boolean> {
-		// Fast path: already checked
-		if (this.available !== null) return this.available;
+	private async resolveMadge(projectRoot: string): Promise<ResolvedMadge> {
+		const cached = this.madgeCommand.get(projectRoot);
+		if (cached) {
+			// One stat per resolution: a binary that has since been uninstalled or
+			// moved must re-resolve, not fail every spawn for the rest of the
+			// session.
+			const resolved = await cached;
+			if (!(await resolvedCommandIsStale(resolved, this.spawnableCache)))
+				return resolved;
+			// Several callers may have observed the same stale promise before any
+			// continuation ran. Only remove the entry if it is still the promise
+			// this caller observed; otherwise join the newer resolution already in
+			// flight instead of deleting it and starting a duplicate probe.
+			const current = this.madgeCommand.get(projectRoot);
+			if (current === cached) {
+				this.madgeCommand.delete(projectRoot);
+			} else {
+				// An npx result may have resolved and removed itself already. In that
+				// case falling through starts the intended fresh probe.
+				if (current) return current;
+			}
+		}
+
+		const resolving = this.resolveUnlessNpx(projectRoot);
+		this.madgeCommand.set(projectRoot, resolving);
+		return resolving;
+	}
+
+	/**
+	 * Resolve, and drop the memo entry again if all we found was `npx` — pinning
+	 * it would pin precisely the slow path #766 removes, and a transient
+	 * installer failure would disable managed resolution for the whole session.
+	 * Callers already in flight still coalesce on this promise; only the next
+	 * one re-probes.
+	 */
+	private async resolveUnlessNpx(projectRoot: string): Promise<ResolvedMadge> {
+		const resolved = await this.doResolveMadge(projectRoot);
+		if (resolved.kind === "npx") this.madgeCommand.delete(projectRoot);
+		return resolved;
+	}
+
+	/**
+	 * `allowInstall: false` is load-bearing: discovery here must never trigger a
+	 * download, because installation is `ensureAvailable()`'s job and this runs
+	 * on the spawn path. Resolution also never rejects — a throwing probe would
+	 * otherwise poison the memo with a rejected promise for the whole session.
+	 */
+	private async doResolveMadge(projectRoot: string): Promise<ResolvedMadge> {
+		try {
+			const { getManagedToolsDir } = await import("./installer/index.js");
+			const classify = (cmd: string): ResolvedMadge => ({
+				cmd,
+				prefix: [],
+				kind: classifyMadgeKind(cmd, getManagedToolsDir(), projectRoot),
+			});
+
+			const bin = await findNodeToolBinary("madge", projectRoot);
+			if (bin) return classify(bin);
+
+			const discovered = await discoverManagedTool("madge");
+			if (discovered) return classify(discovered);
+		} catch (err) {
+			this.log(`Madge resolution failed, falling back to npx: ${String(err)}`);
+		}
+		return { cmd: "npx", prefix: ["madge"], kind: "npx" };
+	}
+
+	/**
+	 * Apply a circular-dep state update on behalf of the operation that took
+	 * generation `gen`. See the cross-operation contract on `checkFilesBatch`:
+	 * an operation that classified EARLIER but finished later carries a smaller
+	 * generation, and its write is dropped rather than resurrecting its stale
+	 * view over newer state.
+	 */
+	private publishState(
+		gen: number,
+		circular: CircularDep[],
+		circularFiles: Set<string>,
+	): void {
+		if (gen < this.stateGeneration) return;
+		this.stateGeneration = gen;
+		this.lastCircular = circular;
+		this.circularFiles = circularFiles;
+	}
+
+	/**
+	 * Check if madge is available, auto-install if not.
+	 *
+	 * Shares knip's latch policy (#1467): only a durable verdict is memoized, so
+	 * a probe that timed out — madge's `--version` is ~0.7 s today, but a host
+	 * event-loop stall can expire any budget — does not disable madge for the
+	 * life of the process.
+	 */
+	async ensureAvailable(cwd = process.cwd()): Promise<boolean> {
+		const memo = this.availabilityLatch.read();
+		if (memo !== null) return memo;
 		if (this.ensureInFlight) return this.ensureInFlight;
 
-		this.ensureInFlight = this.doEnsureAvailable();
+		this.ensureInFlight = this.doEnsureAvailable(cwd);
 		try {
 			return await this.ensureInFlight;
 		} finally {
@@ -149,31 +463,21 @@ export class DependencyChecker {
 		}
 	}
 
-	private async doEnsureAvailable(): Promise<boolean> {
-		// Check if available in PATH
-		const result = await safeSpawnAsync("madge", ["--version"], {
-			timeout: 5000,
-		});
-		this.available = !result.error && result.status === 0;
-
-		if (this.available) {
-			this.log(`Madge found: ${result.stdout?.trim()}`);
+	private async doEnsureAvailable(cwd: string): Promise<boolean> {
+		const resolved = await resolveAvailableOrInstall(
+			this.madgeAvailability,
+			"madge",
+			cwd,
+		);
+		if (resolved !== null) {
+			this.availabilityLatch.noteAvailable();
 			return true;
 		}
-
-		// Auto-install via pi-lens installer
-		this.log("Madge not found, attempting auto-install...");
-		const { ensureTool } = await import("./installer/index.js");
-		const installedPath = await ensureTool("madge");
-
-		if (installedPath) {
-			this.log(`Madge auto-installed: ${installedPath}`);
-			this.available = true;
-			return true;
-		}
-
-		this.available = false;
-		this.log("Madge auto-install failed");
+		const verdict = this.madgeAvailability.getVerdict(cwd);
+		this.availabilityLatch.noteUnavailable(
+			verdict.outcome ?? "missing",
+			verdict.cause ?? "not-found",
+		);
 		return false;
 	}
 
@@ -248,8 +552,9 @@ export class DependencyChecker {
 		const stat = fs.statSync(normalized);
 		const cached = this.importCache.get(normalized);
 
-		// Fast path: timestamp hasn't changed
-		if (cached && cached.timestamp >= stat.mtimeMs) {
+		// Fast path: neither mtime NOR size moved (#1105 — size guards the
+		// mtime-preserving content change that mtime alone would miss).
+		if (cached && cached.timestamp >= stat.mtimeMs && cached.size === stat.size) {
 			return false;
 		}
 
@@ -261,6 +566,7 @@ export class DependencyChecker {
 		this.importCache.set(normalized, {
 			imports: newImports,
 			timestamp: stat.mtimeMs,
+			size: stat.size,
 		});
 		return hasChanged;
 	}
@@ -310,7 +616,10 @@ export class DependencyChecker {
 			};
 		}
 
-		if (!(await this.ensureAvailable())) {
+		// Taken at classification time, not at publish time (see checkFilesBatch).
+		const gen = ++this.opGeneration;
+
+		if (!(await this.ensureAvailable(projectRoot))) {
 			return {
 				hasCircular: false,
 				circular: [],
@@ -323,9 +632,11 @@ export class DependencyChecker {
 		const existing = this.checkInFlight.get(key);
 		if (existing) return existing;
 
-		const promise = this.runCheckFile(normalized, projectRoot).finally(() => {
-			this.checkInFlight.delete(key);
-		});
+		const promise = this.runCheckFile(normalized, projectRoot, gen).finally(
+			() => {
+				this.checkInFlight.delete(key);
+			},
+		);
 		this.checkInFlight.set(key, promise);
 		return promise;
 	}
@@ -333,14 +644,62 @@ export class DependencyChecker {
 	private async runCheckFile(
 		normalized: string,
 		projectRoot: string,
+		gen: number,
 	): Promise<DepCheckResult> {
+		const resolved = await this.resolveMadge(projectRoot);
+		const spawnResult = await this.runMadgeSpawn(
+			normalized,
+			projectRoot,
+			resolved,
+		);
+		if (!spawnResult.ok) {
+			return {
+				hasCircular: false,
+				circular: [],
+				checked: false,
+				cacheHit: false,
+			};
+		}
+
+		this.publishState(gen, spawnResult.circular, spawnResult.circularFiles);
+
+		return {
+			hasCircular: spawnResult.circular.length > 0,
+			circular: spawnResult.circular.filter(
+				(d) => d.file === normalized || d.path.includes(normalized),
+			),
+			checked: true,
+			cacheHit: false,
+			localSkips: spawnResult.localSkips,
+		};
+	}
+
+	/**
+	 * Run madge on a single file and parse its cycle output. Pure: unlike
+	 * `runCheckFile`, this does NOT mutate `lastCircular`/`circularFiles` — it
+	 * hands the parsed result back so callers can apply the shared-state update
+	 * themselves (`runCheckFile` does so immediately; `checkFilesBatch` defers
+	 * it so concurrent spawns can't clobber each other's writes, see #766).
+	 */
+	private async runMadgeSpawn(
+		normalized: string,
+		projectRoot: string,
+		{ cmd, prefix }: ResolvedMadge,
+	): Promise<
+		| {
+				ok: true;
+				circular: CircularDep[];
+				circularFiles: Set<string>;
+				localSkips: number;
+		  }
+		| { ok: false }
+	> {
 		this.log(
 			`Imports changed for ${path.basename(normalized)}, checking dependencies...`,
 		);
 
 		// Run madge on the specific file (fast)
 		try {
-			const { cmd, prefix } = await this.resolveMadge(projectRoot);
 			const result = await safeSpawnAsync(
 				cmd,
 				[...prefix, ...buildMadgeArgs(normalized, projectRoot)],
@@ -352,12 +711,7 @@ export class DependencyChecker {
 
 			if (result.error) {
 				this.log(`Check error: ${result.error.message}`);
-				return {
-					hasCircular: false,
-					circular: [],
-					checked: false,
-					cacheHit: false,
-				};
+				return { ok: false };
 			}
 
 			const output = result.stdout || "[]";
@@ -381,9 +735,6 @@ export class DependencyChecker {
 				});
 			}
 
-			this.lastCircular = circular;
-			this.circularFiles = circularFiles;
-
 			const skips = parseMadgeSkips(result.stderr || "");
 			if (skips.local.length > 0) {
 				this.log(
@@ -391,24 +742,231 @@ export class DependencyChecker {
 				);
 			}
 
-			return {
-				hasCircular: circular.length > 0,
-				circular: circular.filter(
-					(d) => d.file === normalized || d.path.includes(normalized),
+			return { ok: true, circular, circularFiles, localSkips: skips.local.length };
+		} catch (err: any) {
+			this.log(`Check error: ${err.message}`);
+			return { ok: false };
+		}
+	}
+
+	/** Build the cache-hit `DepCheckResult` for `normalized` from a state snapshot. */
+	private buildCachedResult(
+		normalized: string,
+		circular: CircularDep[],
+		circularFiles: Set<string>,
+	): DepCheckResult {
+		return {
+			hasCircular: circularFiles.has(normalized),
+			circular: circular.filter(
+				(d) => d.file === normalized || d.path.includes(normalized),
+			),
+			checked: true,
+			cacheHit: true,
+		};
+	}
+
+	/**
+	 * Batch-check multiple files for circular deps in one turn-end pass,
+	 * running the madge subprocess spawns concurrently (bounded by
+	 * `MADGE_BATCH_CONCURRENCY`) instead of one at a time (#766).
+	 *
+	 * `lastCircular`/`circularFiles` are shared instance state that every madge
+	 * run OVERWRITES wholesale, so ordering has to be pinned on two axes.
+	 *
+	 * WITHIN a batch — equivalence with the sequential `for…await
+	 * checkFile(file)` loop this replaces:
+	 *  - Classification (existence + `importsChanged`) runs synchronously in
+	 *    original array order first — identical to what each sequential
+	 *    `checkFile()` call would do, including the `importCache` side effect.
+	 *  - Only the actual madge spawns for import-changed ("miss") files run
+	 *    concurrently; each one's parsed result stays LOCAL (no shared-state
+	 *    write) until every spawn has settled.
+	 *  - The miss results are then folded in ORIGINAL array order (not
+	 *    completion order) into a BATCH-LOCAL copy of the state, so each
+	 *    cache-hit file's result reads the state as of its own position in the
+	 *    array — byte-for-byte what the sequential last-write-wins loop
+	 *    returned. The fold is synchronous, so the instance-state write is one
+	 *    atomic assignment at the end; no concurrent spawn can interleave into
+	 *    it, and the returned map is unaffected by whether that write survives
+	 *    the rule below.
+	 *
+	 * ACROSS operations — newest classification wins:
+	 *  - `checkFile`, `checkFilesBatch` and `scanProject` all write the same
+	 *    shared state and genuinely overlap (turn-end vs. the background scans
+	 *    in runtime-session and project-diagnostics/fresh-fetch). Each takes a
+	 *    generation when it classifies, and `publishState` drops a write whose
+	 *    generation is no longer the newest — so an operation that started
+	 *    against OLDER file content cannot resurrect that view over a newer
+	 *    operation that already published, whatever order the spawns finish in.
+	 *  - ONLY the shared-state write is gated. Every per-file result handed back
+	 *    to the caller is built from that file's own spawn output, so a dropped
+	 *    publish never fabricates or hides a cycle for the caller.
+	 *  - No result cache is introduced (#533, "when in doubt, re-run"): changed
+	 *    content still re-runs madge every time, and the guard only skips writes
+	 *    that a newest-wins sequential interleaving would also have discarded.
+	 */
+	async checkFilesBatch(
+		filePaths: string[],
+		cwd?: string,
+	): Promise<{ results: Map<string, DepCheckResult>; stats: MadgeBatchStats }> {
+		const projectRoot = path.resolve(cwd || process.cwd());
+		const results = new Map<string, DepCheckResult>();
+		const gen = ++this.opGeneration;
+
+		type Entry =
+			| { kind: "missing"; file: string }
+			| { kind: "hit"; file: string; normalized: string }
+			| { kind: "miss"; file: string; normalized: string };
+
+		const entries: Entry[] = [];
+		for (const file of filePaths) {
+			const normalized = path.resolve(projectRoot, file);
+			if (!fs.existsSync(normalized)) {
+				entries.push({ kind: "missing", file });
+				continue;
+			}
+			entries.push(
+				this.importsChanged(normalized)
+					? { kind: "miss", file, normalized }
+					: { kind: "hit", file, normalized },
+			);
+		}
+
+		const missEntries = entries.filter(
+			(e): e is Extract<Entry, { kind: "miss" }> => e.kind === "miss",
+		);
+
+		const notAvailableResult: DepCheckResult = {
+			hasCircular: false,
+			circular: [],
+			checked: false,
+			cacheHit: false,
+		};
+
+		const stats: MadgeBatchStats = {
+			requested: filePaths.length,
+			missing: entries.filter((e) => e.kind === "missing").length,
+			cacheHits: entries.filter((e) => e.kind === "hit").length,
+			spawned: 0,
+			failed: 0,
+			resolveMs: 0,
+			targets: [],
+			targetsTruncated: false,
+		};
+
+		if (missEntries.length > 0 && !(await this.ensureAvailable(projectRoot))) {
+			// madge unavailable: mirrors checkFile()'s "not available" branch for
+			// every miss; hits still read whatever shared state already exists.
+			// The miss set counts as failed — reporting it as zero-of-everything
+			// would read as a clean turn that simply had nothing to do.
+			stats.failed = missEntries.length;
+			for (const entry of entries) {
+				if (entry.kind === "hit") {
+					results.set(
+						entry.file,
+						this.buildCachedResult(
+							entry.normalized,
+							this.lastCircular,
+							this.circularFiles,
+						),
+					);
+				} else {
+					results.set(entry.file, notAvailableResult);
+				}
+			}
+			return { results, stats };
+		}
+
+		// Run the concurrent (bounded) madge spawns for the miss set only. Each
+		// result stays local — keyed by normalized path — until folded below.
+		const spawnResults = new Map<
+			string,
+			Awaited<ReturnType<DependencyChecker["runMadgeSpawn"]>>
+		>();
+		const spawnDurations = new Map<string, number>();
+		if (missEntries.length > 0) {
+			const resolveStart = Date.now();
+			const resolved = await this.resolveMadge(projectRoot);
+			stats.resolveMs = Date.now() - resolveStart;
+			stats.commandKind = resolved.kind;
+			await mapWithConcurrency(
+				missEntries,
+				MADGE_BATCH_CONCURRENCY,
+				async (entry) => {
+					stats.spawned++;
+					const startedAt = Date.now();
+					spawnResults.set(
+						entry.normalized,
+						await this.runMadgeSpawn(entry.normalized, projectRoot, resolved),
+					);
+					spawnDurations.set(entry.normalized, Date.now() - startedAt);
+				},
+			);
+		}
+
+		// Fold in original order into a batch-local view: each miss overwrites it
+		// exactly as the sequential loop would overwrite the shared state, and
+		// each hit is resolved against the view as folded up to (but not past)
+		// its own position.
+		let foldedCircular = this.lastCircular;
+		let foldedCircularFiles = this.circularFiles;
+		let folded = false;
+		for (const entry of entries) {
+			if (entry.kind === "missing") {
+				results.set(entry.file, notAvailableResult);
+				continue;
+			}
+			if (entry.kind === "hit") {
+				results.set(
+					entry.file,
+					this.buildCachedResult(
+						entry.normalized,
+						foldedCircular,
+						foldedCircularFiles,
+					),
+				);
+				continue;
+			}
+			const spawnResult = spawnResults.get(entry.normalized);
+			const durationMs = spawnDurations.get(entry.normalized) ?? 0;
+			if (durationMs >= MADGE_STATS_TARGET_MIN_DURATION_MS &&
+				stats.targets.length < MADGE_STATS_TARGET_CAP) {
+				stats.targets.push({
+					file: path.relative(projectRoot, entry.normalized),
+					durationMs,
+					ok: spawnResult?.ok === true,
+				});
+			} else if (durationMs >= MADGE_STATS_TARGET_MIN_DURATION_MS) {
+				stats.targetsTruncated = true;
+			}
+			if (!spawnResult || !spawnResult.ok) {
+				stats.failed++;
+				results.set(entry.file, notAvailableResult);
+				continue;
+			}
+			foldedCircular = spawnResult.circular;
+			foldedCircularFiles = spawnResult.circularFiles;
+			folded = true;
+			results.set(entry.file, {
+				hasCircular: spawnResult.circular.length > 0,
+				circular: spawnResult.circular.filter(
+					(d) =>
+						d.file === entry.normalized || d.path.includes(entry.normalized),
 				),
 				checked: true,
 				cacheHit: false,
-				localSkips: skips.local.length,
-			};
-		} catch (err: any) {
-			this.log(`Check error: ${err.message}`);
-			return {
-				hasCircular: false,
-				circular: [],
-				checked: false,
-				cacheHit: false,
-			};
+				localSkips: spawnResult.localSkips,
+			});
 		}
+
+		// A batch that learned nothing publishes nothing — advancing the
+		// generation on an unchanged view would suppress an older operation's
+		// still-legitimate write for free.
+		if (folded) {
+			this.publishState(gen, foldedCircular, foldedCircularFiles);
+		}
+
+		return { results, stats };
 	}
 
 	/**
@@ -447,14 +1005,18 @@ export class DependencyChecker {
 			return { circular: [], count: 0 };
 		}
 
-		if (!(await this.ensureAvailable())) {
+		if (!(await this.ensureAvailable(projectRoot))) {
 			return { circular: [], count: 0 };
 		}
 
 		const existing = this.scanInFlight.get(projectRoot);
 		if (existing) return existing;
 
-		const promise = this.runScanProject(projectRoot).finally(() => {
+		// A whole-project scan writes the same shared state a turn-end batch
+		// does, and the two overlap (runtime-session, fresh-fetch), so it takes a
+		// generation too — claimed before the spawn, as late as a scan can.
+		const gen = ++this.opGeneration;
+		const promise = this.runScanProject(projectRoot, gen).finally(() => {
 			this.scanInFlight.delete(projectRoot);
 		});
 		this.scanInFlight.set(projectRoot, promise);
@@ -463,6 +1025,7 @@ export class DependencyChecker {
 
 	private async runScanProject(
 		projectRoot: string,
+		gen: number,
 	): Promise<{ circular: CircularDep[]; count: number }> {
 		try {
 			const { cmd, prefix } = await this.resolveMadge(projectRoot);
@@ -498,8 +1061,7 @@ export class DependencyChecker {
 				}
 			}
 
-			this.lastCircular = circular;
-			this.circularFiles = circularFiles;
+			this.publishState(gen, circular, circularFiles);
 
 			return { circular, count: circular.length };
 		} catch (err: any) {
@@ -531,4 +1093,14 @@ export class DependencyChecker {
 
 		return output;
 	}
+}
+
+/**
+ * Reset the madge managed-path memo on every live `DependencyChecker`.
+ * Free-function wrapper (matching `resetSafeSpawnWindowsCommandCache`'s
+ * shape) so callers reset without needing a checker instance in hand — see
+ * `DependencyChecker.resetMadgeManagedPathMemo` for why this exists (#1276).
+ */
+export function resetMadgeManagedPathMemo(): void {
+	DependencyChecker.resetMadgeManagedPathMemo();
 }

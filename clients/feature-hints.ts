@@ -11,7 +11,33 @@ export type TrustBoundary =
 	| "user-input";
 
 function normalizeHintInput(value: string): string {
-	return value.replace(/\\/g, "/").toLowerCase();
+	return value.replace(/\\/g, "/");
+}
+
+function hasHintToken(value: string, tokens: readonly string[]): boolean {
+	const escaped = tokens.map((token) =>
+		token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+	);
+	const alternatives = escaped.join("|");
+	// Path/word boundaries are deliberately explicit: a token must occupy a
+	// segment (or a dot/dash/underscore-separated word), never an arbitrary
+	// substring. The second expression preserves camelCase names such as
+	// authStore and DatabaseClient without making `adb` match `db`.
+	return (
+		new RegExp(`(?:^|[/_.\\-\\s])(?:${alternatives})(?=[/_.\\-\\s]|$)`, "i").test(
+			value,
+		) ||
+		new RegExp(
+			`(?:^|(?<=[a-z0-9]))(?:${tokens
+				.flatMap((token) => [
+					token[0].toUpperCase() + token.slice(1),
+					...(token === "openai" ? ["OpenAI"] : []),
+					...(token === "github" ? ["GitHub"] : []),
+					...(token === "gitlab" ? ["GitLab"] : []),
+				])
+				.join("|")})(?=[A-Z]|[/_.\\-\\s]|$)`,
+		).test(value)
+	);
 }
 
 /**
@@ -20,10 +46,21 @@ function normalizeHintInput(value: string): string {
  */
 export function inferFeatureKind(nameOrPath: string): FeatureHintKind {
 	const normalized = normalizeHintInput(nameOrPath);
-	if (/config|store|db|database|github|openai|sync|service/.test(normalized)) {
+	if (
+		hasHintToken(normalized, [
+			"config",
+			"store",
+			"db",
+			"database",
+			"github",
+			"openai",
+			"sync",
+			"service",
+		])
+	) {
 		return "service";
 	}
-	if (/(^|[/_.\-\s])(cli|command|bin)([/_.\-\s]|$)/.test(normalized)) {
+	if (/(^|[/_.\-\s])(cli|command|bin)([/_.\-\s]|$)/i.test(normalized)) {
 		return "cli-command";
 	}
 	return "library";
@@ -38,29 +75,47 @@ export function inferTrustBoundaries(nameOrPath: string): TrustBoundary[] {
 	const boundaries = new Set<TrustBoundary>();
 
 	if (
-		/config|store|db|database|repo|repository|model|migration/.test(normalized)
+		hasHintToken(normalized, [
+			"config",
+			"store",
+			"db",
+			"database",
+			"repo",
+			"repository",
+			"model",
+			"migration",
+		])
 	) {
 		boundaries.add("filesystem");
 		boundaries.add("database");
 	}
 	if (
-		/github|gitlab|openai|anthropic|stripe|slack|sync|webhook|api|client/.test(
-			normalized,
-		)
+		hasHintToken(normalized, [
+			"github",
+			"gitlab",
+			"openai",
+			"anthropic",
+			"stripe",
+			"slack",
+			"sync",
+			"webhook",
+			"api",
+			"client",
+		])
 	) {
 		boundaries.add("network");
 		boundaries.add("external-api");
 		boundaries.add("serialization");
 	}
 	if (
-		/(^|[/_.\-\s])(cli|command|bin|exec|spawn|process|shell)([/_.\-\s]|$)/.test(
+		/(^|[/_.\-\s])(cli|command|bin|exec|spawn|process|shell)([/_.\-\s]|$)/i.test(
 			normalized,
 		)
 	) {
 		boundaries.add("user-input");
 		boundaries.add("process-exec");
 	}
-	if (/auth|login|token|session|oauth|jwt/.test(normalized)) {
+	if (hasHintToken(normalized, ["auth", "login", "token", "session", "oauth", "jwt"])) {
 		boundaries.add("auth");
 		boundaries.add("user-input");
 	}

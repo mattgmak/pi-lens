@@ -24,11 +24,13 @@ import { _resetGeneratedArtifactCaches } from "../../clients/generated-artifacts
 import {
 	collectSourceFiles,
 	collectSourceFilesAsync,
+	DEFAULT_MAX_SOURCE_FILES,
 } from "../../clients/source-filter.js";
 import {
 	generateSourceTree,
 	measureMaxSyncBlockMs,
 } from "../support/perf-harness.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 let tmpDir: string;
 
@@ -38,7 +40,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-	fs.rmSync(tmpDir, { recursive: true, force: true });
+	removeTempDirSync(tmpDir);
 	_resetGeneratedArtifactCaches();
 });
 
@@ -76,6 +78,26 @@ describe("collectSourceFilesAsync — correctness", () => {
 	});
 });
 
+describe("Dart source enumeration (#880)", () => {
+	it("collectSourceFiles keeps .dart files", () => {
+		fs.writeFileSync(
+			path.join(tmpDir, "main.dart"),
+			"void main() {}\n",
+		);
+		const files = collectSourceFiles(tmpDir);
+		expect(files.some((f) => f.endsWith("main.dart"))).toBe(true);
+	});
+
+	it("collectSourceFilesAsync keeps .dart files", async () => {
+		fs.writeFileSync(
+			path.join(tmpDir, "main.dart"),
+			"void main() {}\n",
+		);
+		const files = await collectSourceFilesAsync(tmpDir);
+		expect(files.some((f) => f.endsWith("main.dart"))).toBe(true);
+	});
+});
+
 describe("collectSourceFilesAsync — event-loop budget", () => {
 	// Budget guard: the longest synchronous stretch between yields must stay
 	// well under pi's typing window. Generous ceiling + retry so this is a
@@ -93,7 +115,7 @@ describe("collectSourceFilesAsync — event-loop budget", () => {
 		// stops yielding entirely (the catastrophic case) — that would surface
 		// as one large block, not a missed measurement.
 		const maxBlock = await measureMaxSyncBlockMs(async () => {
-			const files = await collectSourceFilesAsync(tmpDir, { yieldEvery: 50 });
+			const files = await collectSourceFilesAsync(tmpDir, { budgetMs: 8 });
 			expect(files.length).toBeGreaterThan(0);
 		});
 
@@ -122,14 +144,23 @@ describe("maxFiles cap (#250) — bounds the walk", () => {
 		expect(capped.length).toBe(10);
 	});
 
-	it("treats a non-positive / non-finite maxFiles as unbounded", async () => {
+	it("treats a non-positive / non-finite maxFiles as the finite default cap (#747)", async () => {
 		generateSourceTree(tmpDir, 120);
 		const uncapped = await collectSourceFilesAsync(tmpDir);
-		// 0, negative, and NaN must NOT cap to zero — they mean "no cap".
+		// 0, negative, and NaN must NOT cap to zero — they fall back to the finite
+		// structural default (never `Infinity`), which on a small tree returns
+		// everything just like an omitted cap.
 		for (const bad of [0, -5, Number.NaN]) {
 			const result = await collectSourceFilesAsync(tmpDir, { maxFiles: bad });
 			expect(result.length).toBe(uncapped.length);
 		}
+	});
+
+	it("the default cap is finite, not unbounded (#747/#250)", () => {
+		// The structural safety net: an omitted `maxFiles` must never mean an
+		// unbounded walk — a misrooted cwd could otherwise enumerate all of $HOME.
+		expect(Number.isFinite(DEFAULT_MAX_SOURCE_FILES)).toBe(true);
+		expect(DEFAULT_MAX_SOURCE_FILES).toBeGreaterThan(0);
 	});
 
 	it("a cap larger than the tree returns everything (cap is a ceiling)", async () => {
@@ -139,6 +170,53 @@ describe("maxFiles cap (#250) — bounds the walk", () => {
 			maxFiles: uncapped.length + 1000,
 		});
 		expect(new Set(capped)).toEqual(new Set(uncapped));
+	});
+});
+
+describe("prioritizeCodeKinds (#894 review)", () => {
+	// Root-level files come before subdirectories in walk order, so the json
+	// pile fills the cap first — without prioritization, the code files under
+	// src/ would be evicted from the capped collection entirely.
+	function makeNoisyTree(): void {
+		for (let i = 0; i < 8; i++) {
+			fs.writeFileSync(path.join(tmpDir, `locale${i}.json`), `{"n": ${i}}\n`);
+		}
+		fs.mkdirSync(path.join(tmpDir, "src"), { recursive: true });
+		fs.writeFileSync(path.join(tmpDir, "src", "a.ts"), "export const a = 1;\n");
+		fs.writeFileSync(path.join(tmpDir, "src", "b.ts"), "export const b = 1;\n");
+	}
+
+	it("async: code files survive a cap exhausted by data files in walk order", async () => {
+		makeNoisyTree();
+		const files = await collectSourceFilesAsync(tmpDir, {
+			maxFiles: 4,
+			prioritizeCodeKinds: true,
+		});
+		expect(files.length).toBe(4);
+		expect(files.some((f) => f.endsWith("a.ts"))).toBe(true);
+		expect(files.some((f) => f.endsWith("b.ts"))).toBe(true);
+		// Code files sort ahead of the non-code fill.
+		expect(files[0].endsWith(".ts")).toBe(true);
+		expect(files[1].endsWith(".ts")).toBe(true);
+	});
+
+	it("sync: code files survive a cap exhausted by data files in walk order", () => {
+		makeNoisyTree();
+		const files = collectSourceFiles(tmpDir, {
+			maxFiles: 4,
+			prioritizeCodeKinds: true,
+		});
+		expect(files.length).toBe(4);
+		expect(files.some((f) => f.endsWith("a.ts"))).toBe(true);
+		expect(files.some((f) => f.endsWith("b.ts"))).toBe(true);
+	});
+
+	it("default (unprioritized) behavior is unchanged", async () => {
+		makeNoisyTree();
+		const files = await collectSourceFilesAsync(tmpDir, { maxFiles: 4 });
+		// Walk order fills the cap with the root-level json files.
+		expect(files.length).toBe(4);
+		expect(files.every((f) => f.endsWith(".json"))).toBe(true);
 	});
 });
 

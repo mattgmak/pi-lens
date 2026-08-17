@@ -14,13 +14,17 @@ import {
 	loadAstGrepNapi,
 	type SgRoot,
 } from "../../deps/ast-grep-napi.js";
+import { minimatch } from "../../deps/minimatch.js";
 import {
 	type AstGrepRuleSource,
 	getAstGrepRuleSources,
 } from "../../sgconfig.js";
+import { logLatency } from "../../latency-logger.js";
 import { hasEslintConfig } from "../../tool-policy.js";
 import { enabledAuxiliaryLspServerIds } from "../auxiliary-lsp.js";
 import { classifyDefect } from "../diagnostic-taxonomy.js";
+import { isAuxiliaryLspAlive } from "../../lsp/index.js";
+import { resolveAstGrepNativeExe } from "../../lsp/wait-policy/index.js";
 import { PRIORITY } from "../priorities.js";
 import type {
 	Diagnostic,
@@ -37,6 +41,14 @@ import {
 	MAX_BLOCKING_RULE_COMPLEXITY,
 	type YamlRule,
 } from "./yaml-rule-parser.js";
+
+const defaultUnsupportedLanguageLog = new Set<string>();
+const UNSUPPORTED_RULE_ID_SAMPLE_SIZE = 5;
+
+/** Clear per-session unsupported-language telemetry dedupe. */
+export function resetAstGrepUnsupportedLanguageLog(): void {
+	defaultUnsupportedLanguageLog.clear();
+}
 
 // Lazy load the napi package
 let sg: AstGrepNapi | undefined;
@@ -149,6 +161,27 @@ function normalizeRuleId(ruleId: string): string {
 	return ruleId.replace(/-js$/, "");
 }
 
+/**
+ * `filePath` relative to `root`, forward-slashed, for matching a rule's
+ * `ignores` globs (#965). Falls back to the absolute (slash-normalized) path
+ * when `filePath` isn't under `root` (e.g. an out-of-tree temp file), so a
+ * glob like `scripts/**` simply never matches rather than throwing.
+ */
+function relativeForIgnoreGlob(filePath: string, root: string): string {
+	const rel = path.relative(root, filePath);
+	return (rel.startsWith("..") ? filePath : rel).split(path.sep).join("/");
+}
+
+function matchesRuleIgnores(
+	filePath: string,
+	root: string,
+	patterns: string[] | undefined,
+): boolean {
+	if (!patterns || patterns.length === 0) return false;
+	const rel = relativeForIgnoreGlob(filePath, root);
+	return patterns.some((pattern) => minimatch(rel, pattern, { dot: true }));
+}
+
 export function canHandle(filePath: string): boolean {
 	return SUPPORTED_EXTS.includes(path.extname(filePath).toLowerCase());
 }
@@ -156,24 +189,28 @@ export function canHandle(filePath: string): boolean {
 /**
  * The TypeScript grammar is a syntactic superset of JavaScript, so a
  * `JavaScript`-tagged rule using generic node kinds (`variable_declarator`,
- * `assignment_expression`, …) still matches against a parsed `.ts`/`.tsx`
- * root — and vice versa isn't an issue since JS files never parse
+ * `assignment_expression`, …) still matches against a parsed `.ts` root
+ * — and vice versa isn't an issue since JS files never parse
  * TS-only syntax, but a `TypeScript`-tagged rule with a plain-JS-compatible
  * body would equally double-fire alongside a `JavaScript` twin on a `.ts`
  * file. Without this, `language:` reads as a real filter but isn't one for
  * ts↔js pairs, so twin rules sharing a base name (e.g. `hardcoded-url` /
  * `hardcoded-url-js`) both match the same construct in the SAME runner
- * invocation (#657). Returns undefined for extensions this scoping doesn't
- * apply to (css/html), where no filtering is added.
+ * invocation (#657). TSX is deliberately its own grammar here: the primary
+ * ast-grep CLI/LSP also treats `tsx` as distinct from `typescript`, so a
+ * language-tagged rule only runs on the exact grammar it names. Returns
+ * undefined for extensions this scoping doesn't apply to (css/html), where
+ * no filtering is added.
  */
 export function ruleLanguageForFile(
 	filePath: string,
-): "typescript" | "javascript" | undefined {
+): "typescript" | "tsx" | "javascript" | undefined {
 	const ext = path.extname(filePath).toLowerCase();
 	switch (ext) {
 		case ".ts":
-		case ".tsx":
 			return "typescript";
+		case ".tsx":
+			return "tsx";
 		case ".js":
 		case ".jsx":
 			return "javascript";
@@ -223,6 +260,8 @@ export interface AstGrepEvaluateOptions {
 	 * Best-effort only — never let a logging failure affect matching.
 	 */
 	log?: (message: string) => void;
+	/** Rule ids already reported as unsupported by the surrounding scan/run. */
+	unsupportedLanguageLog?: Set<string>;
 }
 
 function duplicateRuleIds(rules: YamlRule[]): string[] {
@@ -288,15 +327,54 @@ export function evaluateAstGrepRules(
 		options.maxTotalDiagnostics ?? MAX_TOTAL_DIAGNOSTICS;
 	const blockingOnly = options.blockingOnly === true;
 	const log = options.log;
+	const unsupportedLanguageLog =
+		options.unsupportedLanguageLog ?? defaultUnsupportedLanguageLog;
 
 	const diagnostics: Diagnostic[] = [];
 	const seenRuleIds = new Set<string>();
 	const suppressLinterOverlap = kind === "jsts" && hasEslintConfig(cwd);
 	const fileLang = ruleLanguageForFile(filePath);
+	// Unsupported-language skips are expected in bulk (every non-jsts rule in the
+	// catalog, e.g. ~30 Python rules) — aggregate them into ONE latency-log entry
+	// per evaluation instead of per-rule terminal lines (#282 follow-up).
+	const newlyUnsupported = new Map<string, string[]>();
+	const flushUnsupportedRuleSkips = (): void => {
+		if (newlyUnsupported.size === 0) return;
+		const firstSeenLanguages = Array.from(newlyUnsupported.entries()).filter(
+			([language]) => !unsupportedLanguageLog.has(language),
+		);
+		for (const [language] of firstSeenLanguages) {
+			unsupportedLanguageLog.add(language);
+		}
+		if (firstSeenLanguages.length === 0) {
+			newlyUnsupported.clear();
+			return;
+		}
+		for (const [language] of firstSeenLanguages) unsupportedLanguageLog.add(language);
+		logLatency({
+			type: "phase",
+			phase: "astgrep_napi_unsupported_rules_skipped",
+			filePath,
+			durationMs: 0,
+			metadata: {
+				skippedByLanguage: Object.fromEntries(
+					firstSeenLanguages.map(([language, ruleIds]) => [
+						language,
+						{
+							count: ruleIds.length,
+							ruleIds: ruleIds.slice(0, UNSUPPORTED_RULE_ID_SAMPLE_SIZE),
+						},
+					]),
+				),
+			},
+		});
+		newlyUnsupported.clear();
+	};
 
 	// Shared with the raw sgconfig materializer so both surfaces walk the same
 	// workspace-rooted sources in the same precedence order.
-	const ruleSources = getAstGrepRuleSources(options.projectRoot ?? cwd);
+	const ignoreRoot = options.projectRoot ?? cwd;
+	const ruleSources = getAstGrepRuleSources(ignoreRoot);
 
 	for (const source of ruleSources) {
 		let rules: YamlRule[];
@@ -321,6 +399,7 @@ export function evaluateAstGrepRules(
 				maxTotalDiagnostics,
 			)
 		) {
+			flushUnsupportedRuleSkips();
 			return diagnostics;
 		}
 		const duplicateSet = new Set(duplicates);
@@ -331,6 +410,10 @@ export function evaluateAstGrepRules(
 			if (seenRuleIds.has(rule.id)) continue;
 			seenRuleIds.add(rule.id);
 			if (blockingOnly && rule.severity !== "error") continue;
+			// Per-rule path carve-out (#965): a rule that's noise on CLI scripts or
+			// a project's own logging sink (e.g. no-console-except-error firing
+			// inside scripts/** or lib/logger.ts) opts out via `ignores`.
+			if (matchesRuleIgnores(filePath, ignoreRoot, rule.ignores)) continue;
 
 			if (
 				suppressLinterOverlap &&
@@ -351,7 +434,17 @@ export function evaluateAstGrepRules(
 			}
 
 			const lang = rule.language?.toLowerCase();
-			if (lang && lang !== "typescript" && lang !== "javascript") {
+			if (
+				lang &&
+				lang !== "typescript" &&
+				lang !== "tsx" &&
+				lang !== "javascript"
+			) {
+				if (!unsupportedLanguageLog.has(lang)) {
+					const ids = newlyUnsupported.get(lang) ?? [];
+					ids.push(rule.id);
+					newlyUnsupported.set(lang, ids);
+				}
 				continue;
 			}
 			// Scope TypeScript/JavaScript-tagged rules to the file's actual
@@ -445,6 +538,7 @@ export function evaluateAstGrepRules(
 		}
 	}
 
+	flushUnsupportedRuleSkips();
 	return diagnostics;
 }
 
@@ -470,7 +564,20 @@ const astGrepNapiRunner: RunnerDefinition = {
 		const astGrepLspEnabled = enabledAuxiliaryLspServerIds((f) =>
 			ctx.pi?.getFlag?.(f),
 		).includes("ast-grep");
-		if (astGrepLspEnabled && (await ctx.hasTool("ast-grep"))) {
+		// Gate B asks whether the LSP will handle this file, not whether a bare
+		// `ast-grep` command happens to be on PATH. The launcher first tries the
+		// platform-native package binary, then PATH; mirror that resolution here.
+		// A live client covers the already-warm case, while a resolvable binary
+		// covers the cold case before the LSP has spawned for this root.
+		const astGrepLspAlive = astGrepLspEnabled
+			? await isAuxiliaryLspAlive("ast-grep", ctx.filePath)
+			: false;
+		let astGrepBinaryResolvable = false;
+		if (astGrepLspEnabled && !astGrepLspAlive) {
+			astGrepBinaryResolvable =
+				Boolean(resolveAstGrepNativeExe()) || (await ctx.hasTool("ast-grep"));
+		}
+		if (astGrepLspEnabled && (astGrepLspAlive || astGrepBinaryResolvable)) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 

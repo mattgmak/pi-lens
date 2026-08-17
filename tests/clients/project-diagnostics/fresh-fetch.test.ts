@@ -3,7 +3,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BootstrapClients } from "../../../clients/bootstrap.js";
+import { snapshotAdvisoryProvenance } from "../../../clients/advisory-provenance.js";
 import { fetchFreshProjectDiagnostics } from "../../../clients/project-diagnostics/fresh-fetch.js";
+import { RuntimeCoordinator } from "../../../clients/runtime-coordinator.js";
+import { removeTempDirSync } from "../test-utils.js";
 
 // fetchFreshProjectDiagnostics calls each client through the plain
 // `BootstrapClients` interface, so a hand-rolled stub (not a real client
@@ -19,7 +22,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-	fs.rmSync(tmp, { recursive: true, force: true });
+	removeTempDirSync(tmp);
 });
 
 function makeCacheManager() {
@@ -34,6 +37,7 @@ function makeCacheManager() {
 function makeClients(
 	overrides: Partial<{
 		knipIssues: unknown[];
+		knipResult: unknown;
 		jscpdAvailable: boolean;
 		jscpdResult: unknown;
 		madgeAvailable: boolean;
@@ -42,15 +46,17 @@ function makeClients(
 ): BootstrapClients {
 	return {
 		knipClient: {
-			analyze: vi.fn().mockResolvedValue({
-				success: true,
-				issues: overrides.knipIssues ?? [],
-				unusedExports: [],
-				unusedFiles: [],
-				unusedDeps: [],
-				unlistedDeps: [],
-				summary: "ok",
-			}),
+			analyze: vi.fn().mockResolvedValue(
+				overrides.knipResult ?? {
+					success: true,
+					issues: overrides.knipIssues ?? [],
+					unusedExports: [],
+					unusedFiles: [],
+					unusedDeps: [],
+					unlistedDeps: [],
+					summary: "ok",
+				},
+			),
 		},
 		jscpdClient: {
 			ensureAvailable: vi
@@ -98,6 +104,16 @@ function makeClients(
 				scannedAt: "now",
 			}),
 		},
+		// opengrep is structurally always-on (no static project gate) — the stub
+		// defaults to available + a clean scan; individual tests override `scan`.
+		opengrepClient: {
+			ensureAvailable: vi.fn().mockResolvedValue(true),
+			scan: vi.fn().mockResolvedValue({
+				success: true,
+				findings: [],
+				scannedAt: "now",
+			}),
+		},
 		deadCodeClients: [],
 		// The remaining BootstrapClients fields are unused by fetchFreshProjectDiagnostics.
 	} as unknown as BootstrapClients;
@@ -124,6 +140,105 @@ describe("fetchFreshProjectDiagnostics (#585)", () => {
 		expect(result.runners).toContain("knip");
 		expect(result.diagnostics.length).toBeGreaterThan(0);
 		expect(result.timings.knip).toBeGreaterThanOrEqual(0);
+	});
+
+	it("reports a failed knip run and does not cache it (#925)", async () => {
+		const cacheManager = makeCacheManager();
+		const clients = makeClients({
+			knipResult: {
+				success: false,
+				issues: [],
+				summary: "knip process failed",
+			},
+		});
+
+		const result = await fetchFreshProjectDiagnostics(cacheManager, tmp, clients);
+
+		expect(result.failed).toEqual([
+			{ id: "knip", summary: "knip process failed" },
+		]);
+		expect(result.runners).not.toContain("knip");
+		expect(cacheManager.writeCache).not.toHaveBeenCalledWith(
+			"knip",
+			expect.anything(),
+			expect.anything(),
+			expect.anything(),
+		);
+	});
+
+	// #747: cwd at — or above — $HOME must never spawn a single analyzer; the
+	// observed failure was a jscpd walk of an entire WSL home (44 GB RSS, OOM
+	// kill of the whole instance).
+	it("refuses to run anything when cwd IS the home directory (#747)", async () => {
+		const cacheManager = makeCacheManager();
+		const clients = makeClients({ jscpdAvailable: true, madgeAvailable: true });
+
+		const result = await fetchFreshProjectDiagnostics(
+			cacheManager,
+			tmp,
+			clients,
+			undefined,
+			{ homeDir: tmp },
+		);
+
+		expect(result.unsafeRoot).toBe(true);
+		expect(result.diagnostics).toEqual([]);
+		expect(result.runners).toEqual([]);
+		expect(result.cold).toEqual([
+			"knip",
+			"jscpd",
+			"madge",
+			"gitleaks",
+			"govulncheck",
+			"opengrep",
+			"trivy",
+			"dead-code",
+			"test-runner",
+		]);
+		expect(clients.knipClient.analyze).not.toHaveBeenCalled();
+		expect(clients.jscpdClient.ensureAvailable).not.toHaveBeenCalled();
+		expect(clients.jscpdClient.scan).not.toHaveBeenCalled();
+		expect(clients.depChecker.scanProject).not.toHaveBeenCalled();
+		expect(clients.gitleaksClient.scan).not.toHaveBeenCalled();
+		expect(cacheManager.writeCache).not.toHaveBeenCalled();
+	});
+
+	it("refuses to run anything when cwd is an ANCESTOR of the home directory (#747)", async () => {
+		const cacheManager = makeCacheManager();
+		const clients = makeClients({ jscpdAvailable: true });
+		const fakeHome = path.join(tmp, "home", "user");
+		fs.mkdirSync(fakeHome, { recursive: true });
+
+		const result = await fetchFreshProjectDiagnostics(
+			cacheManager,
+			tmp,
+			clients,
+			undefined,
+			{ homeDir: fakeHome },
+		);
+
+		expect(result.unsafeRoot).toBe(true);
+		expect(clients.knipClient.analyze).not.toHaveBeenCalled();
+		expect(cacheManager.writeCache).not.toHaveBeenCalled();
+	});
+
+	it("runs normally for a project directory UNDER the home directory (#747)", async () => {
+		const cacheManager = makeCacheManager();
+		const clients = makeClients();
+		const fakeHome = path.join(tmp, "home", "user");
+		const project = path.join(fakeHome, "code", "app");
+		fs.mkdirSync(project, { recursive: true });
+
+		const result = await fetchFreshProjectDiagnostics(
+			cacheManager,
+			project,
+			clients,
+			undefined,
+			{ homeDir: fakeHome },
+		);
+
+		expect(result.unsafeRoot).toBeUndefined();
+		expect(clients.knipClient.analyze).toHaveBeenCalledTimes(1);
 	});
 
 	it("reports jscpd cold when the tool isn't available, without writing cache", async () => {
@@ -180,6 +295,32 @@ describe("fetchFreshProjectDiagnostics (#585)", () => {
 			expect.anything(),
 		);
 		expect(result.runners).toContain("jscpd");
+		expect(cacheManager.writeCache).toHaveBeenCalledWith(
+			"jscpd-ts",
+			expect.objectContaining({ duplicatedLines: 4, percentage: 40 }),
+			path.resolve(tmp),
+			expect.anything(),
+		);
+	});
+
+	it("persists the present madge result for downstream diagnostics", async () => {
+		const cacheManager = makeCacheManager();
+		const madgeResult = {
+			circular: [[path.join(tmp, "src", "a.ts"), path.join(tmp, "src", "b.ts")]],
+			count: 1,
+		};
+		const clients = makeClients({ madgeAvailable: true, madgeResult });
+
+		const result = await fetchFreshProjectDiagnostics(cacheManager, tmp, clients);
+
+		expect(clients.depChecker.scanProject).toHaveBeenCalledWith(path.resolve(tmp));
+		expect(cacheManager.writeCache).toHaveBeenCalledWith(
+			"madge",
+			madgeResult,
+			path.resolve(tmp),
+			expect.anything(),
+		);
+		expect(result.cold).not.toContain("madge");
 	});
 
 	it("gates govulncheck/trivy on their own static signals, without cache reads", async () => {
@@ -290,6 +431,197 @@ describe("fetchFreshProjectDiagnostics (#585)", () => {
 			path.resolve(tmp),
 			expect.anything(),
 		);
+	});
+
+	// #585 regression: opengrep was registered in the cache-only extractor
+	// registry (extractors.ts) but MISSING from this fresh-fetch path, so its
+	// session-start scan cached findings that `lens_diagnostics mode=full` never
+	// read back — a scan-and-orphan honesty gap (#533). It must surface here the
+	// same way gitleaks/trivy do: fresh scan → cache write → adapted diagnostics.
+	it("surfaces opengrep findings (ERROR→blocking, CWE-tagged) and caches them (#585)", async () => {
+		const cacheManager = makeCacheManager();
+		const clients = makeClients();
+		(clients.opengrepClient.scan as ReturnType<typeof vi.fn>).mockResolvedValue({
+			success: true,
+			scannedAt: "now",
+			findings: [
+				{
+					checkId: "python.lang.security.audit.subprocess-shell-true",
+					path: "src/run.py",
+					startLine: 7,
+					startCol: 3,
+					endLine: 7,
+					endCol: 20,
+					message: "shell=True is dangerous",
+					severity: "ERROR",
+					cwe: ["CWE-78: OS Command Injection"],
+				},
+			],
+		});
+
+		const result = await fetchFreshProjectDiagnostics(cacheManager, tmp, clients);
+
+		// Structurally always-on: no static project gate, only an availability
+		// probe — the scan runs even on a bare tmp dir with no manifest/marker.
+		expect(clients.opengrepClient.scan).toHaveBeenCalledTimes(1);
+		expect(clients.opengrepClient.scan).toHaveBeenCalledWith(path.resolve(tmp));
+		expect(cacheManager.writeCache).toHaveBeenCalledWith(
+			"opengrep",
+			expect.objectContaining({ success: true }),
+			path.resolve(tmp),
+			expect.objectContaining({ scanDurationMs: expect.any(Number) }),
+		);
+		expect(result.runners).toContain("opengrep");
+		const diag = result.diagnostics.find((d) => d.runner === "opengrep");
+		expect(diag).toMatchObject({
+			filePath: path.join(path.resolve(tmp), "src/run.py"),
+			line: 7,
+			column: 3,
+			severity: "error",
+			semantic: "blocking",
+			tool: "opengrep",
+			rule: "opengrep:python.lang.security.audit.subprocess-shell-true",
+			message: "shell=True is dangerous (CWE-78: OS Command Injection)",
+		});
+	});
+
+	it("reports opengrep cold (not clean) when the tool isn't available (#585)", async () => {
+		const cacheManager = makeCacheManager();
+		const clients = makeClients();
+		(
+			clients.opengrepClient.ensureAvailable as ReturnType<typeof vi.fn>
+		).mockResolvedValue(false);
+
+		const result = await fetchFreshProjectDiagnostics(cacheManager, tmp, clients);
+
+		expect(clients.opengrepClient.scan).not.toHaveBeenCalled();
+		expect(result.cold).toContain("opengrep");
+		expect(result.runners).not.toContain("opengrep");
+	});
+
+	// #1004 regression: test-runner was omitted from ANALYZER_IDS (the same
+	// #585-class gap opengrep had) — the turn_end test fire cached findings
+	// under "test-runner-findings" but nothing in fetchFreshProjectDiagnostics
+	// read them back, so mode=full silently dropped test failures for
+	// unedited/project-wide calls. This must FAIL on pre-fix code (ANALYZER_IDS
+	// missing "test-runner") and pass once the cache-read task is wired.
+	it("surfaces cached test-runner findings via mode=full without re-running the suite (#1004)", async () => {
+		const cacheManager = makeCacheManager();
+		fs.mkdirSync(path.join(tmp, "src"), { recursive: true });
+		fs.writeFileSync(path.join(tmp, "src/foo.test.ts"), "test('foo', () => {});\n");
+		const testResult = {
+			file: path.join(path.resolve(tmp), "src/foo.test.ts"),
+			runner: "vitest",
+			passed: 1,
+			failed: 1,
+			duration: 42,
+			failures: [
+				{
+					name: "foo works",
+					message: "expected true to be false",
+					location: "src/foo.test.ts:17",
+				},
+			],
+		};
+		const provenance = snapshotAdvisoryProvenance({
+			cwd: tmp,
+			runtime: { telemetrySessionId: "scan", projectSeq: 0, turnIndex: 0 },
+			generation: 1,
+			files: [{ path: testResult.file, role: "test" }],
+		});
+		(cacheManager.readCache as ReturnType<typeof vi.fn>).mockImplementation(
+			(scanner: string) => {
+				if (scanner === "test-runner-findings") {
+					return {
+						data: { content: "FAIL", stale: false, results: [testResult], provenance },
+						meta: { timestamp: new Date().toISOString() },
+					};
+				}
+				return null;
+			},
+		);
+		const clients = makeClients();
+
+		const result = await fetchFreshProjectDiagnostics(cacheManager, tmp, clients);
+
+		// Cache-read only — no client method exists to "run" test-runner here,
+		// and this must NOT write back to the cache (nothing fresher to write).
+		expect(cacheManager.writeCache).not.toHaveBeenCalledWith(
+			"test-runner-findings",
+			expect.anything(),
+			expect.anything(),
+			expect.anything(),
+		);
+		expect(result.runners).toContain("test-runner");
+		const diag = result.diagnostics.find((d) => d.tool === "test-runner");
+		// #1004 review follow-up: `TestFailure.location` ("relPath:line") must
+		// reach `ProjectDiagnostic.line` — before the fix every test-runner
+		// finding rendered as `L?:` in lens-diagnostics, unlike jscpd/knip/madge
+		// which all carry real line numbers.
+		expect(diag).toMatchObject({
+			filePath: testResult.file,
+			line: 17,
+			severity: "error",
+			semantic: "blocking",
+			tool: "test-runner",
+			runner: "vitest",
+			rule: "test:vitest",
+			message: "foo works: expected true to be false",
+		});
+
+		const mismatched = await fetchFreshProjectDiagnostics(
+			cacheManager,
+			tmp,
+			clients,
+			undefined,
+			{ runtime: new RuntimeCoordinator() },
+		);
+		expect(mismatched.diagnostics.find((d) => d.tool === "test-runner"))
+			.toMatchObject({ severity: "info", semantic: "none" });
+	});
+
+	// #1004 review follow-up (honesty gap, #533): test-runner's cache can be
+	// STALE (the turn advanced before the test run finished —
+	// `runtime-turn.ts`'s `stale` flag) — mode=full must not present a stale
+	// result as if it were fresh, the same way the one-shot turn-context
+	// message already prefixes stale failures.
+	it("prefixes test-runner findings with a stale marker when the cache says stale (#1004)", async () => {
+		const cacheManager = makeCacheManager();
+		const testResult = {
+			file: path.join(path.resolve(tmp), "src/bar.test.ts"),
+			runner: "vitest",
+			passed: 0,
+			failed: 1,
+			duration: 10,
+			failures: [{ name: "bar works", message: "boom" }],
+		};
+		(cacheManager.readCache as ReturnType<typeof vi.fn>).mockImplementation(
+			(scanner: string) => {
+				if (scanner === "test-runner-findings") {
+					return {
+						data: { content: "FAIL", stale: true, results: [testResult] },
+						meta: { timestamp: new Date().toISOString() },
+					};
+				}
+				return null;
+			},
+		);
+		const clients = makeClients();
+
+		const result = await fetchFreshProjectDiagnostics(cacheManager, tmp, clients);
+
+		const diag = result.diagnostics.find((d) => d.tool === "test-runner");
+		expect(diag?.message).toMatch(/^\[stale/);
+	});
+
+	it("reports test-runner cold (not clean) when no turn_end cache exists yet (#1004)", async () => {
+		const cacheManager = makeCacheManager();
+		const clients = makeClients();
+
+		const result = await fetchFreshProjectDiagnostics(cacheManager, tmp, clients);
+
+		expect(result.cold).toContain("test-runner");
+		expect(result.runners).not.toContain("test-runner");
 	});
 
 	it("runs every applicable dead-code language client and reports 'dead-code' cold only when none apply", async () => {

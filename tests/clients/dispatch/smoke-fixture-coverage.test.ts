@@ -24,7 +24,10 @@ const EXEMPT = new Map<string, string>([
 	// not a per-tool live target.
 	["tree-sitter", "structural; runs on every dispatch"],
 	["fact-rules", "structural; runs on every dispatch"],
-	["ast-grep-napi", "structural; covered by ast-grep-napi unit tests"],
+	[
+		"ast-grep-napi",
+		"structural; real-engine coverage via ast-grep-rule-tests + the real-runner sonar/utils-block suites (the mocked unit tests only cover control flow)",
+	],
 	["spotbugs", "dynamic group (withSpotbugsGroup); opt-in, JVM bytecode + flag-gated"],
 	// Per-language ALTERNATES whose primary IS covered for that language.
 	["eslint", "JS alt; oxlint covered in lint, eslint covered in --autofix"],
@@ -42,6 +45,10 @@ const EXEMPT = new Map<string, string>([
 	[
 		"trivy-config",
 		"IaC misconfig; trivy.enabled-gated (off by default), needs trivy + opt-in fixture",
+	],
+	[
+		"terragrunt",
+		"terragrunt CLI JSON shape is unverified (binary not installed in dev/CI to confirm `hcl validate --json` output); no fixture yet",
 	],
 	// No live fixture yet — the remaining-linters backlog.
 	["actionlint", "no fixture yet"],

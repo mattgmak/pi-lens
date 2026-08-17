@@ -9,11 +9,22 @@
  * Docs: https://knip.dev/
  */
 
+import { createSubsystemLogger } from "./extension-log.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getProjectDataDir } from "./file-utils.js";
 import { findNearestMarkerRoot } from "./path-utils.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
+import {
+	createAvailabilityChecker,
+	findManagedNodeToolBinary,
+	getManagedToolEnvironment,
+	resolveAvailableOrInstall,
+} from "./dispatch/runners/utils/runner-helpers.js";
+import {
+	createAvailabilityLatch,
+	describeUnavailability,
+} from "./dispatch/runners/utils/availability-policy.js";
 
 // --- Types ---
 
@@ -40,6 +51,13 @@ export interface KnipResult {
 	unusedDeps: KnipIssue[];
 	unlistedDeps: KnipIssue[];
 	summary: string;
+	/**
+	 * Why an unsuccessful run failed, in a form readers can branch on without
+	 * pattern-matching prose (#1467). `unavailable-transient` marks a result the
+	 * cache must NOT keep over a good one and the turn loop must not treat as a
+	 * hard knip failure — the tool is installed, the probe just timed out.
+	 */
+	failureKind?: "unavailable-transient" | "unavailable-missing";
 }
 
 const EMPTY_RESULT: Omit<KnipResult, "summary"> = {
@@ -53,10 +71,62 @@ const EMPTY_RESULT: Omit<KnipResult, "summary"> = {
 
 const ANALYSIS_TIMEOUT_MS = 30_000;
 
+/**
+ * Every package name referenced as a KEY (at any nesting depth — npm's
+ * `overrides` and pnpm's `pnpm.overrides` allow nested "for this dependency's
+ * sub-dependency" overrides) in `package.json`'s `overrides`, `resolutions`
+ * (Yarn's equivalent), or `pnpm.overrides` fields. These are the project's
+ * own explicit signal that a package is deliberately present to pin a
+ * resolution — not a source-imported dependency knip's import graph can see.
+ * Missing/malformed `package.json` degrades to an empty set (never throws) —
+ * this is a best-effort narrowing, not a required input.
+ */
+export function readOverridePinnedPackageNames(targetDir: string): Set<string> {
+	const names = new Set<string>();
+	let pkg: Record<string, unknown>;
+	try {
+		pkg = JSON.parse(
+			fs.readFileSync(path.join(targetDir, "package.json"), "utf-8"),
+		);
+	} catch {
+		return names;
+	}
+
+	const collectKeys = (value: unknown): void => {
+		if (!value || typeof value !== "object" || Array.isArray(value)) return;
+		for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+			names.add(key);
+			collectKeys(nested);
+		}
+	};
+
+	collectKeys(pkg.overrides);
+	collectKeys(pkg.resolutions);
+	collectKeys((pkg.pnpm as { overrides?: unknown } | undefined)?.overrides);
+
+	return names;
+}
+
 // --- Client ---
 
 export class KnipClient {
-	private knipAvailable: boolean | null = null;
+	private readonly knipAvailability = createAvailabilityChecker(
+		"knip",
+		".cmd",
+		["--version"],
+		{
+			environment: (cwd) => getManagedToolEnvironment("knip", cwd),
+			unclassifiedFailureOutcome: "missing",
+			fastPath: () => findManagedNodeToolBinary("knip"),
+		},
+	);
+	/**
+	 * Client-side memo. Only a DURABLE verdict is latched — a transient probe
+	 * failure expires, so an installed knip becomes available again without a
+	 * host restart (#1467).
+	 */
+	private readonly availabilityLatch = createAvailabilityLatch();
+	private knipCommand = "knip";
 	private ensureInFlight: Promise<boolean> | null = null;
 	private log: (msg: string) => void;
 
@@ -77,7 +147,7 @@ export class KnipClient {
 
 	constructor(verbose = false) {
 		this.log = verbose
-			? (msg: string) => console.error(`[knip] ${msg}`)
+			? createSubsystemLogger("knip")
 			: () => {};
 	}
 
@@ -108,11 +178,16 @@ export class KnipClient {
 	}
 
 	/**
-	 * Check if knip CLI is available, auto-install if not
+	 * Check if knip CLI is available, auto-install if not.
+	 *
+	 * The memo returns `null` when the last verdict was transient and its
+	 * cooldown has expired, which re-enters the probe. That is the difference
+	 * between "knip is missing" (a fact worth caching) and "the probe timed out"
+	 * (a moment worth retrying).
 	 */
 	async ensureAvailable(): Promise<boolean> {
-		// Fast path: already checked
-		if (this.knipAvailable !== null) return this.knipAvailable;
+		const memo = this.availabilityLatch.read();
+		if (memo !== null) return memo;
 		if (this.ensureInFlight) return this.ensureInFlight;
 
 		this.ensureInFlight = this.doEnsureAvailable();
@@ -124,29 +199,47 @@ export class KnipClient {
 	}
 
 	private async doEnsureAvailable(): Promise<boolean> {
-		// Check if available in PATH (fast)
-		const pathResult = await safeSpawnAsync("knip", ["--version"], {
-			timeout: 5000,
-		});
-		if (!pathResult.error && pathResult.status === 0) {
-			this.knipAvailable = true;
-			this.log("Knip found in PATH");
+		const cwd = process.cwd();
+		const resolved = await resolveAvailableOrInstall(
+			this.knipAvailability,
+			"knip",
+			cwd,
+		);
+		if (resolved !== null) {
+			this.knipCommand = resolved;
+			this.availabilityLatch.noteAvailable();
 			return true;
 		}
-
-		// Auto-install via pi-lens installer
-		this.log("Knip not found, attempting auto-install...");
-		const { ensureTool } = await import("./installer/index.js");
-		const installedPath = await ensureTool("knip");
-
-		if (installedPath) {
-			this.knipAvailable = true;
-			this.log(`Knip auto-installed: ${installedPath}`);
-			return true;
-		}
-
-		this.knipAvailable = false;
+		const verdict = this.knipAvailability.getVerdict(cwd);
+		this.availabilityLatch.noteUnavailable(
+			verdict.outcome ?? "missing",
+			verdict.cause ?? "not-found",
+		);
 		return false;
+	}
+
+	/**
+	 * The single place a knip-unavailable result is worded. A transient probe
+	 * failure must never be reported as "install knip" — knip is on disk.
+	 */
+	private unavailableResult(): KnipResult {
+		const verdict = this.knipAvailability.getVerdict(process.cwd());
+		const transient = verdict.outcome === "transient";
+		const retryAfterMs = verdict.retryAtMs
+			? Math.max(0, verdict.retryAtMs - Date.now())
+			: undefined;
+		return {
+			...EMPTY_RESULT,
+			failureKind: transient ? "unavailable-transient" : "unavailable-missing",
+			summary: describeUnavailability({
+				tool: "Knip",
+				installHint: "npm install -D knip",
+				outcome: verdict.outcome,
+				cause: verdict.cause,
+				elapsedMs: verdict.elapsedMs,
+				retryAfterMs,
+			}),
+		};
 	}
 
 	/**
@@ -177,10 +270,7 @@ export class KnipClient {
 		}
 
 		if (!(await this.ensureAvailable())) {
-			return {
-				...EMPTY_RESULT,
-				summary: "Knip not available. Install with: npm install -D knip",
-			};
+			return this.unavailableResult();
 		}
 
 		const key = path.resolve(targetDir);
@@ -235,10 +325,10 @@ export class KnipClient {
 			cacheLocation,
 		];
 
-		const result = await safeSpawnAsync("knip", args, {
+		const result = await safeSpawnAsync(this.knipCommand, args, {
 			timeout: ANALYSIS_TIMEOUT_MS,
 			cwd: targetDir,
-			env: await this.getKnipEnvironment(targetDir),
+			env: await getManagedToolEnvironment("knip", targetDir),
 		});
 
 		if (result.error) {
@@ -263,22 +353,45 @@ export class KnipClient {
 			};
 		}
 
-		return this.parseOutput(output);
+		return this.dropOverridePinnedDeps(this.parseOutput(output), targetDir);
 	}
 
-	private async getKnipEnvironment(targetDir: string): Promise<NodeJS.ProcessEnv> {
-		const { getToolEnvironment } = await import("./installer/index.js");
-		const env = await getToolEnvironment();
-		const separator = process.platform === "win32" ? ";" : ":";
-		const currentPath = env.PATH || env.Path || process.env.PATH || "";
-		const localBin = path.join(targetDir, "node_modules", ".bin");
-		const augmentedPath = `${localBin}${separator}${currentPath}`;
+	/**
+	 * Drop `dependency`/`devDependency` issues for a package that's also
+	 * referenced as an npm `overrides` (or Yarn `resolutions` / pnpm
+	 * `pnpm.overrides`) key in this project's `package.json` (#968).
+	 *
+	 * A direct devDependency whose only job is pinning a vulnerable
+	 * transitive/peer resolution has no source import — that's WORKING AS
+	 * INTENDED, not dead code, and knip has no concept of "this dependency
+	 * exists only to satisfy an overrides entry" (it only sees imports).
+	 * `overrides`/`resolutions` are the project's own explicit, unambiguous
+	 * signal that the package is deliberately present — the same class of
+	 * signal `hardcoded-url`'s `SCREAMING_SNAKE_CASE` constant-name carve-out
+	 * and `ts-ssrf`'s constant-identifier carve-out lean on elsewhere in this
+	 * codebase — so this narrows the finding rather than suppressing
+	 * `dependency`/`devDependency` issues wholesale: a devDependency that
+	 * ISN'T also an overrides/resolutions key is still reported.
+	 */
+	private dropOverridePinnedDeps(
+		result: KnipResult,
+		targetDir: string,
+	): KnipResult {
+		if (result.unusedDeps.length === 0) return result;
+		const pinned = readOverridePinnedPackageNames(targetDir);
+		if (pinned.size === 0) return result;
 
-		return {
-			...env,
-			PATH: augmentedPath,
-			...(process.platform === "win32" ? { Path: augmentedPath } : {}),
-		};
+		const isPinnedDepIssue = (issue: KnipIssue): boolean =>
+			(issue.type === "dependency" || issue.type === "devDependency") &&
+			(pinned.has(issue.name) || (!!issue.package && pinned.has(issue.package)));
+
+		const issues = result.issues.filter((issue) => !isPinnedDepIssue(issue));
+		const unusedDeps = result.unusedDeps.filter(
+			(issue) => !isPinnedDepIssue(issue),
+		);
+		return unusedDeps.length === result.unusedDeps.length
+			? result
+			: { ...result, issues, unusedDeps };
 	}
 
 	/**

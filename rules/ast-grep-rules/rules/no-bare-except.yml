@@ -12,20 +12,8 @@ note: |
   identifier, making it fire only for empty bodies or `pass`/`raise`
   (where there are no function-call identifiers).
 
-  The fixed rule checks the except_clause's direct children for ANY of
-  the three exception-spec shapes (bare identifier `except E`, tuple
-  `except (E, F)`, or `as` pattern `except E as e`). The original missed
-  the tuple and `as_pattern` forms — a tuple like `(ValueError, KeyError)`
-  has no direct `identifier` child (the identifiers are inside the
-  tuple), and `except Exception as e` has `e` as an identifier child
-  even though the type is specified.
+  The rule now matches the grammar's bare `except:` syntax directly, so
+  newly introduced exception-spec node kinds cannot become false positives.
 rule:
   kind: except_clause
-  not:
-    any:
-      - has:
-          kind: identifier
-      - has:
-          kind: tuple
-      - has:
-          kind: as_pattern
+  pattern: "except:"

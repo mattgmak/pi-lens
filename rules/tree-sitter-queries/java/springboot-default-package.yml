@@ -30,9 +30,12 @@ description: |
 query: |
   (class_declaration
     (modifiers
-      (annotation
-        name: (identifier) @ANNOT (#match? @ANNOT "^(SpringBootApplication|ComponentScan)$")))
-    name: (_) @CLASS)
+      [(marker_annotation
+        name: (identifier) @ANNOT)
+       (annotation
+        name: (identifier) @ANNOT)])
+    name: (_) @CLASS
+    (#match? @ANNOT "^(SpringBootApplication|ComponentScan)$"))
 
 metavars:
   - ANNOT

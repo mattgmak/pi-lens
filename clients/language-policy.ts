@@ -76,11 +76,13 @@ export const LANGUAGE_POLICY: Record<FileKind, LanguagePolicy> = {
 	lua: { lspCapable: true },
 	zig: { lspCapable: true },
 	haskell: { lspCapable: true },
+	"helm-template": { lspCapable: false },
 	elixir: { lspCapable: true },
 	gleam: { lspCapable: true },
 	ocaml: { lspCapable: true },
 	clojure: { lspCapable: true },
 	terraform: { lspCapable: true },
+	terragrunt: { lspCapable: false },
 	nix: { lspCapable: true },
 	toml: { lspCapable: true, startup: { defaults: ["taplo"] } },
 };
@@ -138,7 +140,7 @@ const PRIMARY_DISPATCH_GROUPS: Partial<Record<FileKind, RunnerGroup>> = {
 	},
 	yaml: {
 		mode: "all",
-		runnerIds: ["lsp", "yamllint", "trivy-config"],
+		runnerIds: ["lsp", "yamllint", "trivy-config", "helm-lint"],
 		filterKinds: ["yaml"],
 	},
 	sql: {
@@ -200,6 +202,11 @@ const PRIMARY_DISPATCH_GROUPS: Partial<Record<FileKind, RunnerGroup>> = {
 	lua: { mode: "fallback", runnerIds: ["lsp"], filterKinds: ["lua"] },
 	zig: { mode: "all", runnerIds: ["lsp", "zig-check"], filterKinds: ["zig"] },
 	haskell: { mode: "fallback", runnerIds: ["lsp"], filterKinds: ["haskell"] },
+	"helm-template": {
+		mode: "all",
+		runnerIds: ["helm-lint"],
+		filterKinds: ["helm-template"],
+	},
 	elixir: {
 		mode: "all",
 		runnerIds: ["lsp", "elixir-check", "credo"],
@@ -214,8 +221,13 @@ const PRIMARY_DISPATCH_GROUPS: Partial<Record<FileKind, RunnerGroup>> = {
 	clojure: { mode: "fallback", runnerIds: ["lsp"], filterKinds: ["clojure"] },
 	terraform: {
 		mode: "all",
-		runnerIds: ["lsp", "tflint"],
+		runnerIds: ["lsp", "tflint", "trivy-config"],
 		filterKinds: ["terraform"],
+	},
+	terragrunt: {
+		mode: "all",
+		runnerIds: ["terragrunt"],
+		filterKinds: ["terragrunt"],
 	},
 	nix: { mode: "fallback", runnerIds: ["lsp"], filterKinds: ["nix"] },
 	toml: {

@@ -8,6 +8,16 @@ valid:
       }
     }
   - |
+    switch (x) {
+      case 1: {
+        if (x) {
+          const y = 1;
+          consume(y);
+        }
+        break;
+      }
+    }
+  - |
     var z = 1; switch (x) { case 1: break; }
 invalid:
   - |

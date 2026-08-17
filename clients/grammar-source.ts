@@ -12,6 +12,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { writeFileAtomic } from "./atomic-write.js";
 
 /** tree-sitter-wasms release the grammars are pulled from. */
 export const TREE_SITTER_WASMS_VERSION = "0.1.13";
@@ -161,11 +162,18 @@ export function grammarBlockReason(
 }
 
 /**
- * Fetch one grammar wasm into `destDir` (atomic via a temp file). Returns true
+ * Fetch one grammar wasm into `destDir`, staged and renamed via
+ * `atomic-write.ts` so a reader never sees a half-written wasm. Returns true
  * on success. Never throws — a failed fetch (offline, 4xx) degrades to "grammar
  * unavailable" so callers can decide how to handle it. A grammar that crashes the
  * runtime is protected at LOAD time (BLOCKED_GRAMMARS / grammarBlockReason), not
  * by refusing to download it.
+ *
+ * #1217: the staging name used to be hand-rolled `.${filename}.${pid}.tmp` —
+ * per-process, so two concurrent fetches of one grammar shared a staging inode
+ * (#1205). `tree-sitter-client.ts` de-dupes in-flight fetches per grammar file,
+ * which made that hard to reach through the runtime path but did not cover
+ * direct callers.
  */
 export async function downloadGrammar(
 	destDir: string,
@@ -176,9 +184,9 @@ export async function downloadGrammar(
 		const res = await fetch(grammarSourceUrl(filename));
 		if (!res.ok) throw new Error(`HTTP ${res.status}`);
 		const data = Buffer.from(await res.arrayBuffer());
-		const tmp = path.join(destDir, `.${filename}.${process.pid}.tmp`);
-		fs.writeFileSync(tmp, data);
-		fs.renameSync(tmp, path.join(destDir, filename));
+		// bestEffort: false — a swallowed write failure would return true for a
+		// grammar that never landed.
+		writeFileAtomic(path.join(destDir, filename), data, { bestEffort: false });
 		return true;
 	} catch {
 		return false;

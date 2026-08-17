@@ -1,21 +1,30 @@
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	__testing,
 	clearWidgetState,
+	exportWidgetState,
 	getFailedLspServerIds,
 	getFileDiagnostics,
 	getFileDiagnosticSummaries,
 	getSessionLanguages,
+	importWidgetState,
+	reconcileCascadeNeighborLspErrors,
 	reconcileScanDiagnostics,
+	reconcileStaleWidgetFiles,
 	recordDiagnostics,
 	recordFormatter,
 	recordLsp,
+	scheduleStaleReconcile,
+	STALE_RECONCILE_DEBOUNCE_MS,
 	recordRunner,
 	renderWidget,
 	setRenderCallback,
 	setSessionLanguages,
+	WIDGET_STATE_VERSION,
 } from "../../clients/widget-state.ts";
 
 const e = String.fromCharCode(27);
@@ -28,6 +37,11 @@ afterEach(() => {
 });
 
 describe("LSP failure accessors (#170)", () => {
+	it("folds equivalent root spellings into one server record", () => {
+		recordLsp("ruby", "C:\\Repo\\app", "spawn_failed");
+		recordLsp("ruby", "C:/Repo/app", "spawn_success");
+		expect(getFailedLspServerIds()).toEqual([]);
+	});
 	it("getFailedLspServerIds returns only failed records, deduped by serverId", () => {
 		recordLsp("ruby", "/a", "spawn_failed");
 		recordLsp("ruby", "/b", "spawn_failed"); // same server, two roots → one id
@@ -47,6 +61,35 @@ describe("LSP failure accessors (#170)", () => {
 		expect(getSessionLanguages()).toEqual([]);
 		setSessionLanguages(["python", "ruby"]);
 		expect(getSessionLanguages()).toEqual(["python", "ruby"]);
+	});
+});
+
+describe("inactive file-record eviction", () => {
+	it("keeps the oldest displayed diagnostic while evicting an inactive record", () => {
+		const old = Date.now() - 31 * 60_000;
+		const files = [
+			{
+				filePath: "displayed.ts",
+				runners: [], formatters: [],
+				diagnostics: [{ severity: "error", message: "live", observedAt: old }],
+				allDiagnostics: [{ severity: "error", message: "live", observedAt: old }],
+				diagnosticCounts: { blocking: 1, errors: 1, warnings: 0 },
+				hasFinalDiagnosticsSnapshot: true, touchedAt: old,
+			},
+			...Array.from({ length: 1024 }, (_, i) => ({
+				filePath: `inactive-${i}.ts`, runners: [], formatters: [],
+				diagnostics: [], allDiagnostics: [],
+				diagnosticCounts: { blocking: 0, errors: 0, warnings: 0 },
+				hasFinalDiagnosticsSnapshot: false, touchedAt: old + i,
+			})),
+		];
+		expect(importWidgetState({
+			version: WIDGET_STATE_VERSION, sessionLanguages: [], files,
+		} as Parameters<typeof importWidgetState>[0])).toBe(true);
+		const snapshot = __testing.getWidgetStateSnapshot();
+		expect(snapshot.files).toHaveLength(1024);
+		expect(snapshot.files.some((file) => file.filePath === "displayed.ts")).toBe(true);
+		expect(snapshot.files.some((file) => file.filePath === "inactive-0.ts")).toBe(false);
 	});
 });
 
@@ -401,6 +444,82 @@ describe("widget-state renderWidget", () => {
 		expect(allLines).not.toContain("fmt:biome");
 	});
 
+	it("renders formatter failures with an error indication", () => {
+		const filePath = `${process.cwd()}/broken.ts`;
+		recordFormatter(filePath, "prettier", false, false);
+
+		const allLines = renderWidget(60, theme).join("");
+		expect(allLines).toContain("broken.ts");
+		expect(allLines).toContain("prettier");
+		expect(allLines).toContain("fmt-failed:");
+		expect(allLines).toContain("x");
+	});
+
+	// #1348 review P1: diagnostic severity outranks formatter failure in BOTH
+	// renderers -- a file with blocking diagnostics AND a failed format shows
+	// the blocking dot, not the formatter x.
+	it("blocking diagnostics outrank a formatter failure (horizontal renderer)", () => {
+		const filePath = `${process.cwd()}/both-failed.ts`;
+		recordDiagnostics(filePath, [
+			{ severity: "error", semantic: "blocking", message: "bad", tool: "tsserver" },
+		]);
+		recordFormatter(filePath, "prettier", false, false);
+		// Pin the FILE ROW's leading glyph, not the whole render (the #1348
+		// delta review proved whole-output contains-assertions stay green under
+		// a broken precedence branch).
+		const row = renderWidget(120, theme).find((l) => l.includes("both-failed"));
+		expect(row).toBeDefined();
+		const plain = row!.replace(/\[[0-9;]*m/g, "").trimStart();
+		expect(plain.startsWith("●")).toBe(true);
+		expect(plain.startsWith("x")).toBe(false);
+	});
+
+	it("blocking diagnostics outrank a formatter failure (vertical renderer)", () => {
+		const filePath = `${process.cwd()}/both-failed-v.ts`;
+		recordDiagnostics(filePath, [
+			{ severity: "error", semantic: "blocking", message: "bad", tool: "tsserver" },
+		]);
+		recordFormatter(filePath, "prettier", false, false);
+		const row = renderWidget(40, theme).find((l) => l.includes("both-failed-v"));
+		expect(row).toBeDefined();
+		const plain = row!.replace(/\[[0-9;]*m/g, "").trimStart();
+		expect(plain.startsWith("●")).toBe(true);
+		expect(plain.startsWith("x")).toBe(false);
+	});
+
+	// #1348 review P2: failure entries are session-scoped advice -- they do
+	// NOT survive export/import; successes rehydrate as before.
+	it("formatter failures do not survive a session restore", () => {
+		const failPath = `${process.cwd()}/stale-fail.ts`;
+		const okPath = `${process.cwd()}/ok-changed.ts`;
+		recordFormatter(failPath, "prettier", false, false);
+		recordFormatter(okPath, "biome", true, true);
+		const snapshot = exportWidgetState();
+		clearWidgetState();
+		expect(importWidgetState(snapshot)).toBe(true);
+		const line = renderWidget(120, theme).join("");
+		expect(line).not.toContain("fmt-failed:");
+		expect(line).not.toContain("stale-fail.ts");
+	});
+
+	it("clears a formatter failure after a subsequent success", () => {
+		const filePath = `${process.cwd()}/recovered.ts`;
+		recordFormatter(filePath, "prettier", false, false);
+		expect(renderWidget(60, theme).join("")).toContain("fmt-failed:");
+
+		recordFormatter(filePath, "prettier", false, true);
+		const allLines = renderWidget(60, theme).join("");
+		expect(allLines).not.toContain("recovered.ts");
+		expect(allLines).not.toContain("fmt-failed:");
+	});
+
+	it("does not render an unchanged successful formatter", () => {
+		const filePath = `${process.cwd()}/unchanged.ts`;
+		recordFormatter(filePath, "prettier", false, true);
+
+		expect(renderWidget(60, theme).join("")).not.toContain("unchanged.ts");
+	});
+
 	it("packs multiple files into a single row at horizontal widths", () => {
 		const a = `${process.cwd()}/alpha.ts`;
 		const b = `${process.cwd()}/beta.ts`;
@@ -634,6 +753,35 @@ describe("recordDiagnostics — superseded write guard (same race class as #555)
 		expect(result?.[0]?.message).toBe("untokened write");
 	});
 
+	it("keeps a newer confirmed clean snapshot final when an older pipeline settles late (#1198)", () => {
+		const filePath = `${process.cwd()}/late-typescript.ts`;
+		const old = [
+			{
+				severity: "error",
+				semantic: "blocking",
+				tool: "lsp",
+				message: "old TypeScript blocker",
+				rule: "TS2322",
+			},
+		];
+
+		// The old pipeline admitted first (token 1), while the newer primary
+		// check admitted second (token 2) and confirmed clean before token 1
+		// settled. Both widget write verbs share the admission order.
+		recordRunner(filePath, "typescript", "failed", 1, undefined, 1);
+		recordDiagnostics(filePath, old, 1);
+		reconcileScanDiagnostics(filePath, [], true, 2);
+		recordRunner(filePath, "typescript", "failed", 1, undefined, 1);
+		recordDiagnostics(filePath, old, 1);
+
+		const summary = getFileDiagnosticSummaries().find(
+			(entry) => entry.filePath === filePath,
+		);
+		expect(summary?.diagnostics).toEqual([]);
+		expect(summary?.blocking).toBe(0);
+		expect(summary?.hasFinalSnapshot).toBe(true);
+	});
+
 	it("clearWidgetState resets tracked writeIndex ordering so a later low index is not treated as stale", () => {
 		const filePath = `${process.cwd()}/reset.ts`;
 
@@ -758,5 +906,452 @@ describe("reconcileScanDiagnostics — full-scan/on-demand footer reconciliation
 		const result = getFileDiagnostics(filePath);
 		expect(result).toHaveLength(1);
 		expect(result?.[0]?.message).toBe("untokened confirmed scan");
+	});
+});
+
+describe("reconcileScanDiagnostics observation timestamp — cache-hit replays must not re-arm staleness (#1093/#1092)", () => {
+	it("stamps touchedAt at the OBSERVED time, so the entry drops once the file's mtime passes that observation", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "obs-stamp-"));
+		const filePath = path.join(tmpDir, `cached-${Date.now()}.ts`);
+		try {
+			await fs.writeFile(filePath, "const x = 1;\n");
+
+			// A workspace-diagnostics cache HIT replays a finding OBSERVED 20s ago
+			// (the cache entry's own `scannedAt`). The reconcile must stamp
+			// `touchedAt` with THAT observation time, not now().
+			const observedAt = Date.now() - 20_000;
+			reconcileScanDiagnostics(
+				filePath,
+				[{ severity: "error", message: "cached finding", rule: "X" }],
+				true,
+				1,
+				observedAt,
+			);
+			expect(getFileDiagnostics(filePath)).toHaveLength(1);
+
+			// The file itself was edited 10s ago — AFTER the cached observation — so
+			// the replayed finding is stale. mtime(now-10s) > touchedAt(now-20s), so
+			// the mtime-staleness gate must drop it. Pre-fix (`touchedAt = now()`
+			// on every reconcile) the entry survives forever: the #1092 defect.
+			const mtime = new Date(Date.now() - 10_000);
+			await fs.utimes(filePath, mtime, mtime);
+
+			expect(await reconcileStaleWidgetFiles()).toBe(1);
+			expect(getFileDiagnostics(filePath)).toBeUndefined();
+		} finally {
+			await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+		}
+	});
+
+	it("a fresh reconcile (no observation stamp) is observed now and survives an older mtime (control)", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "obs-stamp-fresh-"));
+		const filePath = path.join(tmpDir, `fresh-${Date.now()}.ts`);
+		try {
+			await fs.writeFile(filePath, "const y = 2;\n");
+			// No observedAt: a genuinely fresh touch, observed now.
+			reconcileScanDiagnostics(
+				filePath,
+				[{ severity: "error", message: "fresh finding", rule: "X" }],
+				true,
+				1,
+			);
+			// The file's mtime is in the PAST relative to this fresh observation, so
+			// the finding is current and must NOT be dropped.
+			const past = new Date(Date.now() - 10_000);
+			await fs.utimes(filePath, past, past);
+
+			expect(await reconcileStaleWidgetFiles()).toBe(0);
+			expect(getFileDiagnostics(filePath)).toHaveLength(1);
+		} finally {
+			await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+		}
+	});
+});
+
+describe("path-key normalization — same file under mixed separators collapses to one entry (#1020)", () => {
+	// The two forms differ ONLY in separator direction, so they fold to the same
+	// key on every platform (`normalizeEphemeralMapKey` converts `\`→`/` always,
+	// and additionally lowercases on win32). This is the exact split that made a
+	// resolved blocker replay on mode=all: the LSP/cascade fold records the
+	// forward-slash form, while mode=full's clean reconcile writes the backslash
+	// form (path.resolve / result.filePath on Windows).
+	const fwd = "C:/proj/dup.ts";
+	const back = "C:\\proj\\dup.ts";
+
+	it("a clean backslash-key reconcile overwrites a stale forward-slash-key blocker → one entry, blocking:0", () => {
+		recordDiagnostics(
+			fwd,
+			[
+				{
+					severity: "error",
+					semantic: "blocking",
+					message: "stale blocker",
+					rule: "X",
+				},
+			],
+			1,
+		);
+		reconcileScanDiagnostics(back, [], true, 2);
+
+		const summaries = getFileDiagnosticSummaries();
+		// Pre-fix: TWO entries (raw keys never collapsed) and the forward-slash one
+		// still reads blocking:1 — the #1020 replay.
+		expect(summaries).toHaveLength(1);
+		expect(summaries[0]?.blocking).toBe(0);
+		expect(summaries[0]?.diagnostics).toEqual([]);
+	});
+
+	it("importWidgetState folds a persisted forward-slash key so a later backslash reconcile hits the same entry", () => {
+		importWidgetState({
+			version: WIDGET_STATE_VERSION,
+			sessionLanguages: [],
+			files: [
+				{
+					filePath: fwd,
+					runners: [],
+					formatters: [],
+					diagnostics: [
+						{
+							severity: "error",
+							semantic: "blocking",
+							message: "persisted blocker",
+							rule: "X",
+						},
+					],
+					allDiagnostics: [
+						{
+							severity: "error",
+							semantic: "blocking",
+							message: "persisted blocker",
+							rule: "X",
+						},
+					],
+					diagnosticCounts: { blocking: 1, errors: 1, warnings: 0 },
+					hasFinalDiagnosticsSnapshot: true,
+					touchedAt: Date.now(),
+				},
+			],
+		});
+
+		// After resume, the clean full-scan reconcile arrives under the backslash
+		// form. Without the rehydrate fold, the persisted `/`-key stays split from
+		// this `\`-key and the blocker survives.
+		reconcileScanDiagnostics(back, [], true, 5);
+
+		const summaries = getFileDiagnosticSummaries();
+		expect(summaries).toHaveLength(1);
+		expect(summaries[0]?.blocking).toBe(0);
+	});
+});
+
+describe("scheduleStaleReconcile — widget self-corrects fixed files (#298 follow-up)", () => {
+	it("drops a widget entry once its file is edited on disk after the last record", async () => {
+		vi.useFakeTimers();
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "stale-reconcile-"));
+		const filePath = path.join(tmpDir, `stale-reconcile-${Date.now()}.ts`);
+		try {
+			await fs.writeFile(filePath, "const x = 1;\n");
+			// Pipeline records a real error for the file.
+			recordDiagnostics(
+				filePath,
+				[{ severity: "error", message: "real error", rule: "X" }],
+				1,
+			);
+			expect(getFileDiagnostics(filePath)).toHaveLength(1);
+
+			// Agent fixes the file on disk, but the pipeline never re-confirms it
+			// (cross-file fix / external edit / missed write event). mtime is now
+			// newer than the record's touchedAt, so the entry is stale.
+			const fixed = new Date(Date.now() + 10_000);
+			await fs.utimes(filePath, fixed, fixed);
+
+			// The render path now schedules a reconcile (as mountLensWidget does).
+			scheduleStaleReconcile();
+			await vi.advanceTimersByTimeAsync(STALE_RECONCILE_DEBOUNCE_MS);
+
+			// The sweep's fs.stat I/O settles on the REAL event loop — fake-timer
+			// flushes can't await it, so poll for the observable outcome instead
+			// of racing it (flaked on CI: entry not yet dropped at assert time).
+			vi.useRealTimers();
+			// Stale entry is gone — the TUI stops showing the fixed error.
+			await vi.waitFor(
+				() => expect(getFileDiagnostics(filePath)).toBeUndefined(),
+				{ timeout: 5000 },
+			);
+		} finally {
+			await vi.useRealTimers();
+			await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+		}
+	});
+
+	it("keeps a widget entry whose file has NOT changed since the last record (no false-positive drops)", async () => {
+		vi.useFakeTimers();
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "stale-reconcile-keep-"));
+		const filePath = path.join(tmpDir, `stale-reconcile-keep-${Date.now()}.ts`);
+		try {
+			await fs.writeFile(filePath, "const y = 2;\n");
+			// Force the file's mtime into the PAST relative to the record's touchedAt
+			// (deterministic regardless of fake-timer/real-fs clock skew): the entry
+			// is fresh, so reconcile must NOT drop it.
+			const past = new Date(Date.now() - 10_000);
+			await fs.utimes(filePath, past, past);
+			recordDiagnostics(
+				filePath,
+				[{ severity: "error", message: "real error", rule: "X" }],
+				1,
+			);
+			expect(getFileDiagnostics(filePath)).toHaveLength(1);
+
+			// Sentinel: a second, genuinely STALE entry in the same sweep. When it
+			// drops we KNOW the sweep completed — only then is asserting the fresh
+			// entry still present meaningful (otherwise a not-yet-finished sweep
+			// would false-pass this test).
+			const sentinelPath = path.join(tmpDir, "sentinel-stale.ts");
+			await fs.writeFile(sentinelPath, "const s = 3;\n");
+			recordDiagnostics(
+				sentinelPath,
+				[{ severity: "error", message: "stale error", rule: "X" }],
+				1,
+			);
+			const future = new Date(Date.now() + 10_000);
+			await fs.utimes(sentinelPath, future, future);
+
+			// The render path schedules a reconcile, but the file is not stale.
+			scheduleStaleReconcile();
+			await vi.advanceTimersByTimeAsync(STALE_RECONCILE_DEBOUNCE_MS);
+
+			// Same real-I/O caveat as above: wait for the sweep to observably
+			// finish (sentinel dropped) on real timers.
+			vi.useRealTimers();
+			await vi.waitFor(
+				() => expect(getFileDiagnostics(sentinelPath)).toBeUndefined(),
+				{ timeout: 5000 },
+			);
+
+			// Valid entry preserved — the fix must not drop current diagnostics.
+			expect(getFileDiagnostics(filePath)).toHaveLength(1);
+		} finally {
+			await vi.useRealTimers();
+			await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+		}
+	});
+});
+
+describe("per-entry observation timestamps — the stale gate drops entries, not whole records (#1186)", () => {
+	it("HEADLINE: a merged record keeps a fresher PRESERVED entry when only the older incoming entry is stale", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "per-entry-"));
+		const filePath = path.join(tmpDir, `neighbor-${Date.now()}.ts`);
+		try {
+			await fs.writeFile(filePath, "import { x } from './primary';\n");
+
+			// A live per-edit biome finding, observed NOW (the fresh, preserved
+			// entry). It is NOT an LSP-error entry, so the errors-only cascade merge
+			// below preserves it verbatim.
+			const freshTs = Date.now();
+			recordDiagnostics(
+				filePath,
+				[
+					{
+						severity: "warning",
+						tool: "biome",
+						message: "live biome finding",
+						rule: "lint/style",
+					},
+				],
+				1,
+				freshTs,
+			);
+
+			// A cascade passive-snapshot re-check replays an aging cross-file LSP
+			// error (observed ~200s ago — the snapshot's own publish time). The merge
+			// stamps ONLY this incoming entry with the old observation time; the
+			// preserved biome entry keeps its fresh stamp.
+			const staleTs = freshTs - 200_000;
+			reconcileCascadeNeighborLspErrors(
+				filePath,
+				[
+					{
+						severity: "error",
+						tool: "lsp",
+						message: "stale cross-file error",
+						rule: "TS2304",
+					},
+				],
+				2,
+				staleTs,
+			);
+
+			// Both entries are present, each with its own observation stamp.
+			const merged = getFileDiagnostics(filePath);
+			expect(merged).toHaveLength(2);
+			expect(merged?.find((d) => d.tool === "biome")?.observedAt).toBe(freshTs);
+			expect(merged?.find((d) => d.tool === "lsp")?.observedAt).toBe(staleTs);
+
+			// The neighbor's mtime advances to BETWEEN the two observations: newer
+			// than the stale LSP error (staleTs), older than the fresh biome finding
+			// (freshTs). Pinned via utimes so it's deterministic on Linux CI (#1024).
+			const between = new Date(freshTs - 100_000);
+			await fs.utimes(filePath, between, between);
+
+			// Per-ENTRY gate: the stale LSP error drops, the fresher biome finding
+			// SURVIVES, and the record is kept. Pre-fix (per-RECORD gate, whole record
+			// stamped at staleTs) the ENTIRE record was dropped, losing the biome
+			// finding — the #1186 over-clearing defect.
+			expect(await reconcileStaleWidgetFiles()).toBe(1);
+			const survivors = getFileDiagnostics(filePath);
+			expect(survivors).toHaveLength(1);
+			expect(survivors?.[0]?.tool).toBe("biome");
+			expect(survivors?.[0]?.message).toBe("live biome finding");
+		} finally {
+			await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+		}
+	});
+
+	it("no-regression: a fully-stale record (every entry older than mtime) still drops entirely", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "per-entry-allstale-"));
+		const filePath = path.join(tmpDir, `all-stale-${Date.now()}.ts`);
+		try {
+			await fs.writeFile(filePath, "const z = 3;\n");
+			const oldTs = Date.now() - 200_000;
+			// Two entries, both observed at the same old time.
+			recordDiagnostics(
+				filePath,
+				[
+					{ severity: "error", tool: "lsp", message: "err A", rule: "A" },
+					{ severity: "warning", tool: "biome", message: "warn B", rule: "B" },
+				],
+				1,
+				oldTs,
+			);
+			expect(getFileDiagnostics(filePath)).toHaveLength(2);
+
+			// The file changed AFTER both observations → every entry is stale.
+			const newer = new Date(oldTs + 100_000);
+			await fs.utimes(filePath, newer, newer);
+
+			// Every entry stale → the whole record drops (survivors empty).
+			expect(await reconcileStaleWidgetFiles()).toBe(1);
+			expect(getFileDiagnostics(filePath)).toBeUndefined();
+		} finally {
+			await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+		}
+	});
+});
+
+describe("PersistedWidgetState v1→v2 migration — per-entry stamps inherit the record touchedAt (#1186)", () => {
+	it("accepts a v1 (pre-per-entry-stamp) snapshot and inherits observedAt from the record touchedAt", () => {
+		const filePath = "C:/proj/legacy.ts";
+		const touchedAt = Date.now() - 50_000;
+		// A v1 on-disk record: version 1, entries carry NO per-entry `observedAt`.
+		const accepted = importWidgetState({
+			version: 1,
+			sessionLanguages: [],
+			files: [
+				{
+					filePath,
+					runners: [],
+					formatters: [],
+					diagnostics: [
+						{ severity: "error", message: "legacy error", rule: "X" },
+					],
+					allDiagnostics: [
+						{ severity: "error", message: "legacy error", rule: "X" },
+					],
+					diagnosticCounts: { blocking: 0, errors: 1, warnings: 0 },
+					hasFinalDiagnosticsSnapshot: true,
+					touchedAt,
+				},
+			],
+		});
+
+		// A v1 file must be ACCEPTED (not rejected — that would silently drop all
+		// resume diagnostics) and must not crash.
+		expect(accepted).toBe(true);
+		const result = getFileDiagnostics(filePath);
+		expect(result).toHaveLength(1);
+		// The migrated entry inherits the record's touchedAt as its observedAt.
+		expect(result?.[0]?.observedAt).toBe(touchedAt);
+	});
+
+	it("rejects a FUTURE version this build can't understand (guard, no crash)", () => {
+		const rejected = importWidgetState({
+			version: WIDGET_STATE_VERSION + 1,
+			sessionLanguages: [],
+			files: [],
+		});
+		expect(rejected).toBe(false);
+	});
+
+	it("REJECTS a snapshot with a missing / non-numeric version (preserves pre-#1186 strictness — a malformed or foreign snapshot must not fall through into the migrate path)", () => {
+		const filePath = "C:/proj/no-version.ts";
+		// A malformed on-disk snapshot whose `version` is absent. The pre-#1186
+		// guard (`version !== WIDGET_STATE_VERSION`) rejected this; the naive
+		// range guard (`version < 1 || > MAX`) let `undefined` slip through
+		// (both comparisons are false) and silently migrated it. It must be
+		// rejected: return false and populate nothing.
+		const malformed = {
+			sessionLanguages: [],
+			files: [
+				{
+					filePath,
+					runners: [],
+					formatters: [],
+					diagnostics: [{ severity: "error", message: "orphan", rule: "X" }],
+					allDiagnostics: [
+						{ severity: "error", message: "orphan", rule: "X" },
+					],
+					diagnosticCounts: { blocking: 0, errors: 1, warnings: 0 },
+					hasFinalDiagnosticsSnapshot: true,
+					touchedAt: Date.now(),
+				},
+			],
+		} as unknown as Parameters<typeof importWidgetState>[0];
+
+		expect(importWidgetState(malformed)).toBe(false);
+		expect(getFileDiagnostics(filePath)).toBeUndefined();
+	});
+
+	it("a migrated v1 entry gates correctly: stale once the file's mtime passes the inherited stamp", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "v1-migrate-gate-"));
+		const filePath = path.join(tmpDir, `legacy-${Date.now()}.ts`);
+		try {
+			await fs.writeFile(filePath, "const q = 4;\n");
+			const touchedAt = Date.now() - 30_000;
+			importWidgetState({
+				version: 1,
+				sessionLanguages: [],
+				files: [
+					{
+						filePath,
+						runners: [],
+						formatters: [],
+						diagnostics: [
+							{ severity: "error", message: "legacy stale", rule: "X" },
+						],
+						allDiagnostics: [
+							{ severity: "error", message: "legacy stale", rule: "X" },
+						],
+						diagnosticCounts: { blocking: 0, errors: 1, warnings: 0 },
+						hasFinalDiagnosticsSnapshot: true,
+						touchedAt,
+					},
+				],
+			});
+			// The v1 snapshot must be ACCEPTED and its entry present before we test
+			// gating — this intermediate assertion makes the test discriminate
+			// against pre-fix code (which rejected v1 outright, leaving nothing to
+			// gate and passing the final `toBeUndefined` for the wrong reason).
+			expect(getFileDiagnostics(filePath)).toHaveLength(1);
+
+			// File changed after the inherited observation → the migrated entry is
+			// stale and drops (proves the inherited stamp actually gates — not stored
+			// but ignored).
+			const newer = new Date(touchedAt + 10_000);
+			await fs.utimes(filePath, newer, newer);
+			expect(await reconcileStaleWidgetFiles()).toBe(1);
+			expect(getFileDiagnostics(filePath)).toBeUndefined();
+		} finally {
+			await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+		}
 	});
 });

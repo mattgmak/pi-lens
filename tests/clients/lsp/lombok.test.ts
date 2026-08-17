@@ -9,6 +9,7 @@ import {
 	hasLombokProject,
 	resolveLombokJar,
 } from "../../../clients/lsp/lombok.js";
+import { removeTempDirSync } from "../test-utils.js";
 
 let tmpDir: string;
 
@@ -17,7 +18,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-	fs.rmSync(tmpDir, { recursive: true, force: true });
+	removeTempDirSync(tmpDir);
 	vi.restoreAllMocks();
 });
 

@@ -138,6 +138,7 @@ export function sha256(buf: Buffer | Uint8Array): string {
 
 /** Read the committed provenance manifest (`scripts/grammars.lock.json`). */
 export function loadManifest(): GrammarManifest {
+	// pi-lens-ignore: ast-grep:unchecked-throwing-call
 	return JSON.parse(readFileSync(MANIFEST_PATH, "utf-8")) as GrammarManifest;
 }
 

@@ -1,9 +1,11 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { TERRAGRUNT_FILENAMES } from "./file-kinds.js";
 import { logLatency } from "./latency-logger.js";
+import { resolvePackagePath } from "./package-root.js";
 import { findNearestContaining, walkUpDirs } from "./path-utils.js";
 import type { ProjectConventions } from "./project-conventions.js";
-import { loadProjectSnapshot } from "./project-snapshot.js";
+import { loadProjectSnapshotWithoutWordIndex } from "./project-snapshot.js";
 
 export type ToolGate = "config-first" | "smart-default" | "mixed";
 
@@ -14,6 +16,26 @@ export interface FormatterPolicy {
 	gate: ToolGate;
 }
 
+// Extension → formatter policy. This map, `FORMATTER_POLICY_BY_FILENAME`, and
+// `AUTO_INSTALLABLE_DEFAULT_FORMATTERS` are the inverse of the formatter
+// definitions in `clients/formatters.ts` (formatter → extensions). The two are
+// bound by `tests/clients/formatter-policy-consistency.test.ts` (#1135, the
+// #883/#209 single-source-of-truth class) so they cannot drift silently. All
+// three are re-exported (read-only intent) via a single `export {}` below —
+// deliberately NOT inline on these declarations, to keep the pre-existing,
+// structural lookup-table duplication out of the PR's "new code" (SonarCloud).
+//
+// Two deliberate #1135 decisions live in the entries below, documented here so
+// the rationale sits outside the duplicated run:
+//   - `.sass` offers ["biome", "prettier"] only — NOT oxfmt: oxfmt is absent
+//     from OXFMT_SUPPORTED_EXTENSIONS (oxfmt/prettier handle .css/.scss/.less,
+//     not the indented `.sass` syntax). It was previously hand-listed here,
+//     diverging from the oxfmt definition (inert, because `matching` filtered
+//     it out); dropped to bind the two.
+//   - `.fish` intentionally has NO entry. `fish-indent` is a LINT runner
+//     (getLinterPolicyForFile), not a FormatterInfo — a formatter policy naming
+//     it was a dead, unsatisfiable entry; fish reformatting runs via the
+//     linter/autofix path. Removed to keep extension→formatter consistent.
 const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 	[
 		".js",
@@ -144,7 +166,8 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 	[
 		".sass",
 		{
-			formatterNames: ["biome", "prettier", "oxfmt"],
+			// #1135: no oxfmt (see map header comment).
+			formatterNames: ["biome", "prettier"],
 			defaultFormatter: "biome",
 			defaultWhenUnconfigured: true,
 			gate: "smart-default",
@@ -241,7 +264,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		{
 			formatterNames: ["ktfmt", "ktlint"],
 			defaultFormatter: "ktlint",
-			defaultWhenUnconfigured: true,
+			defaultWhenUnconfigured: false,
 			gate: "smart-default",
 		},
 	],
@@ -250,7 +273,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		{
 			formatterNames: ["ktfmt", "ktlint"],
 			defaultFormatter: "ktlint",
-			defaultWhenUnconfigured: true,
+			defaultWhenUnconfigured: false,
 			gate: "smart-default",
 		},
 	],
@@ -259,7 +282,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		{
 			formatterNames: ["swiftformat"],
 			defaultFormatter: "swiftformat",
-			defaultWhenUnconfigured: true,
+			defaultWhenUnconfigured: false,
 			gate: "smart-default",
 		},
 	],
@@ -268,7 +291,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		{
 			formatterNames: ["fantomas"],
 			defaultFormatter: "fantomas",
-			defaultWhenUnconfigured: true,
+			defaultWhenUnconfigured: false,
 			gate: "smart-default",
 		},
 	],
@@ -277,7 +300,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		{
 			formatterNames: ["fantomas"],
 			defaultFormatter: "fantomas",
-			defaultWhenUnconfigured: true,
+			defaultWhenUnconfigured: false,
 			gate: "smart-default",
 		},
 	],
@@ -286,7 +309,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		{
 			formatterNames: ["fantomas"],
 			defaultFormatter: "fantomas",
-			defaultWhenUnconfigured: true,
+			defaultWhenUnconfigured: false,
 			gate: "smart-default",
 		},
 	],
@@ -295,7 +318,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		{
 			formatterNames: ["nixfmt"],
 			defaultFormatter: "nixfmt",
-			defaultWhenUnconfigured: true,
+			defaultWhenUnconfigured: false,
 			gate: "smart-default",
 		},
 	],
@@ -304,7 +327,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		{
 			formatterNames: ["mix"],
 			defaultFormatter: "mix",
-			defaultWhenUnconfigured: true,
+			defaultWhenUnconfigured: false,
 			gate: "smart-default",
 		},
 	],
@@ -313,7 +336,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		{
 			formatterNames: ["mix"],
 			defaultFormatter: "mix",
-			defaultWhenUnconfigured: true,
+			defaultWhenUnconfigured: false,
 			gate: "smart-default",
 		},
 	],
@@ -322,7 +345,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		{
 			formatterNames: ["mix"],
 			defaultFormatter: "mix",
-			defaultWhenUnconfigured: true,
+			defaultWhenUnconfigured: false,
 			gate: "smart-default",
 		},
 	],
@@ -331,7 +354,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		{
 			formatterNames: ["mix"],
 			defaultFormatter: "mix",
-			defaultWhenUnconfigured: true,
+			defaultWhenUnconfigured: false,
 			gate: "smart-default",
 		},
 	],
@@ -340,7 +363,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		{
 			formatterNames: ["mix"],
 			defaultFormatter: "mix",
-			defaultWhenUnconfigured: true,
+			defaultWhenUnconfigured: false,
 			gate: "smart-default",
 		},
 	],
@@ -430,7 +453,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		{
 			formatterNames: ["csharpier"],
 			defaultFormatter: "csharpier",
-			defaultWhenUnconfigured: true,
+			defaultWhenUnconfigured: false,
 			gate: "smart-default",
 		},
 	],
@@ -448,7 +471,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		{
 			formatterNames: ["ormolu"],
 			defaultFormatter: "ormolu",
-			defaultWhenUnconfigured: true,
+			defaultWhenUnconfigured: false,
 			gate: "smart-default",
 		},
 	],
@@ -457,7 +480,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		{
 			formatterNames: ["ormolu"],
 			defaultFormatter: "ormolu",
-			defaultWhenUnconfigured: true,
+			defaultWhenUnconfigured: false,
 			gate: "smart-default",
 		},
 	],
@@ -516,20 +539,11 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		},
 	],
 	[
-		".fish",
-		{
-			formatterNames: ["fish-indent"],
-			defaultFormatter: "fish-indent",
-			defaultWhenUnconfigured: true,
-			gate: "smart-default",
-		},
-	],
-	[
 		".toml",
 		{
 			formatterNames: ["taplo"],
 			defaultFormatter: "taplo",
-			defaultWhenUnconfigured: true,
+			defaultWhenUnconfigured: false,
 			gate: "smart-default",
 		},
 	],
@@ -538,7 +552,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		{
 			formatterNames: ["terraform"],
 			defaultFormatter: "terraform",
-			defaultWhenUnconfigured: true,
+			defaultWhenUnconfigured: false,
 			gate: "smart-default",
 		},
 	],
@@ -547,7 +561,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		{
 			formatterNames: ["terraform"],
 			defaultFormatter: "terraform",
-			defaultWhenUnconfigured: true,
+			defaultWhenUnconfigured: false,
 			gate: "smart-default",
 		},
 	],
@@ -628,7 +642,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		{
 			formatterNames: ["psscriptanalyzer-format"],
 			defaultFormatter: "psscriptanalyzer-format",
-			defaultWhenUnconfigured: true,
+			defaultWhenUnconfigured: false,
 			gate: "smart-default",
 		},
 	],
@@ -637,7 +651,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		{
 			formatterNames: ["psscriptanalyzer-format"],
 			defaultFormatter: "psscriptanalyzer-format",
-			defaultWhenUnconfigured: true,
+			defaultWhenUnconfigured: false,
 			gate: "smart-default",
 		},
 	],
@@ -646,7 +660,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		{
 			formatterNames: ["psscriptanalyzer-format"],
 			defaultFormatter: "psscriptanalyzer-format",
-			defaultWhenUnconfigured: true,
+			defaultWhenUnconfigured: false,
 			gate: "smart-default",
 		},
 	],
@@ -655,10 +669,15 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 // oxfmt supports these extensions — registered as a candidate formatter for each.
 // Using a post-processing pass avoids repeating the same modification across
 // many map entries (and keeps SonarCloud's duplication gate happy).
-const OXFMT_SUPPORTED_EXTENSIONS = new Set([
+// This is the SINGLE SOURCE OF TRUTH for oxfmt's supported extensions — do not
+// hand-maintain a second copy; `clients/formatters.ts`'s `oxfmtFormatter.extensions`
+// imports and spreads this same Set (#1134; previously two parallel hand-maintained
+// lists, the #883 single-source-of-truth class).
+export const OXFMT_SUPPORTED_EXTENSIONS = new Set([
 	".js", ".jsx", ".mjs", ".cjs",
 	".ts", ".tsx", ".mts", ".cts",
 	".vue",
+	".svelte",
 	".css", ".scss", ".less",
 	".html", ".htm",
 	".json", ".jsonc",
@@ -672,6 +691,23 @@ const OXFMT_SUPPORTED_EXTENSIONS = new Set([
 FORMATTER_POLICY_BY_EXTENSION.set(".vue", {
 	formatterNames: ["prettier"],
 	defaultFormatter: "prettier",
+	defaultWhenUnconfigured: false,
+	gate: "config-first",
+});
+
+// Add .svelte entry (no prior formatter policy existed for this extension —
+// docs/language-coverage.md previously listed no formatter). oxfmt is the only
+// candidate; the loop below appends it since ".svelte" is in
+// OXFMT_SUPPORTED_EXTENSIONS. Unlike the other oxfmt extensions, oxfmt's
+// .svelte support is conditional on more than "a config file exists" — see
+// `hasOxfmtSvelteConfig` below, gated in `formatters.ts`'s
+// `hasExplicitFormatterConfig` (verified empirically against the real oxfmt
+// npm binary; oxfmt exits non-zero on .svelte without BOTH the `svelte`
+// package installed and the config's `svelte` flag enabled — an unconditional
+// offer would guarantee a formatter failure, not a no-op).
+FORMATTER_POLICY_BY_EXTENSION.set(".svelte", {
+	formatterNames: [],
+	defaultFormatter: "oxfmt",
 	defaultWhenUnconfigured: false,
 	gate: "config-first",
 });
@@ -691,6 +727,32 @@ const AUTO_INSTALLABLE_DEFAULT_FORMATTERS = new Map<string, string>([
 	["ktlint", "ktlint"],
 ]);
 
+// `gate: "smart-default"` so a matched file is formatted only when nothing else
+// claims it. Misdetection edge: `root.hcl` is filename-detected as terragrunt, so
+// a non-terragrunt `root.hcl` gets smart-default formatted with `terragrunt hcl
+// fmt`'s generic HCL canonicalization — a soft outcome (canonical HCL, no config
+// semantics assumed), not a hard failure.
+const TERRAGRUNT_FORMATTER_POLICY: FormatterPolicy = {
+	formatterNames: ["terragrunt-hcl"],
+	defaultFormatter: "terragrunt-hcl",
+	defaultWhenUnconfigured: true,
+	gate: "smart-default",
+};
+
+const FORMATTER_POLICY_BY_FILENAME = new Map<string, FormatterPolicy>(
+	TERRAGRUNT_FILENAMES.map((name) => [name, TERRAGRUNT_FORMATTER_POLICY]),
+);
+
+// Re-exported (read-only intent) for the #1135 drift guard. Kept as a single
+// separate statement — NOT inline on the declarations above — so the touched
+// lines don't fall at the head of the pre-existing lookup-table duplication and
+// get counted as new duplicated code. Bindings are live, so position is safe.
+export {
+	AUTO_INSTALLABLE_DEFAULT_FORMATTERS,
+	FORMATTER_POLICY_BY_EXTENSION,
+	FORMATTER_POLICY_BY_FILENAME,
+};
+
 export function getFormatterPolicyForExtension(
 	ext: string,
 ): FormatterPolicy | undefined {
@@ -700,6 +762,10 @@ export function getFormatterPolicyForExtension(
 export function getFormatterPolicyForFile(
 	filePath: string,
 ): FormatterPolicy | undefined {
+	const byFilename = FORMATTER_POLICY_BY_FILENAME.get(
+		path.basename(filePath).toLowerCase(),
+	);
+	if (byFilename) return byFilename;
 	return getFormatterPolicyForExtension(path.extname(filePath));
 }
 
@@ -781,6 +847,7 @@ export type LintRunnerName =
 	| "markdownlint"
 	| "htmlhint"
 	| "hadolint"
+	| "helm-lint"
 	| "golangci-lint"
 	| "phpstan"
 	| "ktlint"
@@ -789,6 +856,7 @@ export type LintRunnerName =
 	| "shellcheck"
 	| "fish-indent"
 	| "tflint"
+	| "terragrunt"
 	| "credo"
 	| "cpp-check"
 	| "dart-analyze"
@@ -824,6 +892,8 @@ export interface AutofixPolicy {
 	defaultWhenUnconfigured: boolean;
 	gate: ToolGate;
 	safe: boolean;
+	/** Execution/deduplication boundary for mutating tools. */
+	scope?: "file" | "cargo-project" | "dart-project";
 }
 
 export interface AutofixCapability {
@@ -904,8 +974,21 @@ const AUTOFIX_CAPABILITIES = new Map<string, AutofixCapability>([
 ]);
 
 const TOOL_EXECUTION_POLICY = new Map<string, ToolExecutionPolicy>([
+	// Dispatch/LSP runners use the shared availability/install seam. These
+	// managed tools are missing-command repair candidates; probe failures still
+	// fail closed before this policy is consulted.
+	["pyright", { gate: "smart-default", autoInstall: true }],
+	["shellcheck", { gate: "smart-default", autoInstall: true }],
+	["shfmt", { gate: "smart-default", autoInstall: true }],
+	["tflint", { gate: "smart-default", autoInstall: true }],
+	["terragrunt", { gate: "smart-default", autoInstall: true }],
+	["trivy", { gate: "config-first", autoInstall: true }],
 	["biome", { gate: "smart-default", autoInstall: true }],
 	["ruff", { gate: "smart-default", autoInstall: true }],
+	["jscpd", { gate: "smart-default", autoInstall: true }],
+	["madge", { gate: "smart-default", autoInstall: true }],
+	["knip", { gate: "smart-default", autoInstall: true }],
+	["ast-grep", { gate: "smart-default", autoInstall: true }],
 	["oxlint", { gate: "smart-default", autoInstall: true }],
 	["stylelint", { gate: "smart-default", autoInstall: true }],
 	["sqlfluff", { gate: "smart-default", autoInstall: true }],
@@ -916,6 +999,7 @@ const TOOL_EXECUTION_POLICY = new Map<string, ToolExecutionPolicy>([
 	["mypy", { gate: "config-first", autoInstall: true }],
 	["taplo", { gate: "smart-default", autoInstall: true }],
 	["hadolint", { gate: "smart-default", autoInstall: true }],
+	["helm", { gate: "smart-default", autoInstall: true }],
 	["htmlhint", { gate: "smart-default", autoInstall: true }],
 	["ktlint", { gate: "smart-default", autoInstall: true }],
 	// ktfmt is opt-in (a project's explicit formatting choice), so it only runs
@@ -1142,10 +1226,21 @@ const YAMLLINT_CONFIGS = [
 ];
 
 const MARKDOWNLINT_CONFIGS = [
-	".markdownlint.json",
+	// markdownlint-cli2's built-in config names (keep this list in sync with
+	// the installed CLI's supported configuration file names).
+	".markdownlint-cli2.jsonc",
+	".markdownlint-cli2.yaml",
+	".markdownlint-cli2.yml",
+	".markdownlint-cli2.cjs",
+	".markdownlint-cli2.mjs",
 	".markdownlint.jsonc",
+	".markdownlint.json",
 	".markdownlint.yaml",
 	".markdownlint.yml",
+	".markdownlint.cjs",
+	".markdownlint.mjs",
+	// Retain the legacy detector name for compatibility with existing policy
+	// behavior, even though current markdownlint-cli2 versions do not prefer it.
 	".markdownlintrc",
 ];
 
@@ -1214,6 +1309,8 @@ export interface LinterPolicyContext {
 	hasMypyConfig?: boolean;
 	hasDetektConfig?: boolean;
 	hasKtfmtConfig?: boolean;
+	hasKtlintConfig?: boolean;
+	hasTflintConfig?: boolean;
 }
 
 export interface AutofixPolicyContext {
@@ -1226,6 +1323,7 @@ export interface AutofixPolicyContext {
 	hasDetektConfig?: boolean;
 	hasOxlintConfig?: boolean;
 	hasKtfmtConfig?: boolean;
+	hasKtlintConfig?: boolean;
 }
 
 export function getLinterPolicyForFile(
@@ -1277,8 +1375,8 @@ export function getLinterPolicyForFile(
 			runnerNames: ["sqlfluff"],
 			preferredRunners: ["sqlfluff"],
 			defaultRunner: "sqlfluff",
-			defaultWhenUnconfigured: true,
-			gate: "smart-default",
+			defaultWhenUnconfigured: false,
+			gate: "config-first",
 		};
 	}
 
@@ -1327,6 +1425,16 @@ export function getLinterPolicyForFile(
 			runnerNames: ["hadolint"],
 			preferredRunners: ["hadolint"],
 			defaultRunner: "hadolint",
+			defaultWhenUnconfigured: true,
+			gate: "smart-default",
+		};
+	}
+
+	if (TERRAGRUNT_FILENAMES.includes(path.basename(filePath).toLowerCase())) {
+		return {
+			runnerNames: ["terragrunt"],
+			preferredRunners: ["terragrunt"],
+			defaultRunner: "terragrunt",
 			defaultWhenUnconfigured: true,
 			gate: "smart-default",
 		};
@@ -1419,7 +1527,7 @@ export function getLinterPolicyForFile(
 			preferredRunners: ["tflint"],
 			defaultRunner: "tflint",
 			defaultWhenUnconfigured: true,
-			gate: "smart-default",
+			gate: context.hasTflintConfig ? "config-first" : "smart-default",
 		};
 	}
 
@@ -1498,7 +1606,7 @@ export function getLinterPolicyForFile(
 export function getCachedProjectConventions(
 	cwd: string,
 ): ProjectConventions | undefined {
-	const snapshot = loadProjectSnapshot(cwd);
+	const snapshot = loadProjectSnapshotWithoutWordIndex(cwd);
 	return snapshot?.conventions;
 }
 
@@ -1520,6 +1628,9 @@ export function getLinterPolicyForCwd(
 		hasMypyConfig: hasMypyConfig(cwd),
 		hasDetektConfig: hasDetektConfig(cwd),
 		hasKtfmtConfig: hasKtfmtConfig(cwd),
+		// From the file's directory, not cwd: a `.tflint.hcl` in a terraform
+		// subdirectory is invisible to an upward walk that starts at the repo root.
+		hasTflintConfig: hasTflintConfig(path.dirname(path.resolve(cwd, filePath))),
 	};
 	const policy = getLinterPolicyForFile(filePath, context);
 	if (policy) {
@@ -1583,6 +1694,7 @@ export function getAutofixPolicyForFile(
 			defaultWhenUnconfigured: true,
 			gate: "smart-default",
 			safe: true,
+			scope: "cargo-project",
 		};
 	}
 
@@ -1627,8 +1739,8 @@ export function getAutofixPolicyForFile(
 			toolNames: ["sqlfluff"],
 			preferredTools: ["sqlfluff"],
 			defaultTool: "sqlfluff",
-			defaultWhenUnconfigured: true,
-			gate: "smart-default",
+			defaultWhenUnconfigured: false,
+			gate: "config-first",
 			safe: true,
 		};
 	}
@@ -1645,6 +1757,16 @@ export function getAutofixPolicyForFile(
 	}
 
 	if ([".kt", ".kts"].includes(ext)) {
+		if (context.hasKtlintConfig) {
+			return {
+				toolNames: ["ktlint", "ktfmt", "detekt"],
+				preferredTools: ["ktlint"],
+				defaultTool: "ktlint",
+				defaultWhenUnconfigured: false,
+				gate: "config-first",
+				safe: true,
+			};
+		}
 		// ktfmt is config-first and the project's explicit formatting choice, so it
 		// wins over both detekt and the ktlint smart-default when opted in (#129).
 		if (context.hasKtfmtConfig) {
@@ -1725,6 +1847,7 @@ export function getAutofixPolicyForFile(
 			defaultWhenUnconfigured: true,
 			gate: "smart-default",
 			safe: true,
+			scope: "dart-project",
 		};
 	}
 
@@ -1855,6 +1978,70 @@ export function hasOxfmtConfig(cwd: string): boolean {
 				};
 				// Published package is `oxfmt`; the scoped name does not exist on npm.
 				if (deps["oxfmt"] || deps["@oxc-project/oxfmt"]) return true;
+			} catch {}
+		}
+	}
+	return false;
+}
+
+// Empirically verified against the real `oxfmt` npm package (0.62.0), a
+// scratch fixture, and a plain `Component.svelte` — see PR body for the full
+// four-cell matrix. Both conditions are required; either alone always fails:
+//   - no `svelte` package, no config flag  -> exit 2 ("excluded by ignore rules")
+//   - no `svelte` package, config flag on  -> exit 2 ("Cannot find module 'svelte/compiler'")
+//   - `svelte` package installed, no flag  -> exit 2 ("excluded by ignore rules")
+//   - `svelte` package installed, flag on  -> exit 0, formats the file
+// Per https://oxc.rs/docs/guide/usage/formatter/language-support.html, oxfmt
+// also requires the npm-distributed binary (not the standalone GitHub-release
+// binary) for `.svelte` — pi-lens already resolves oxfmt via `findInNodeModules`/
+// `which`, which favors the npm-installed binary, so that requirement is not
+// separately re-checked here.
+//
+// Known limits of this line-match heuristic (#1134 P3 tail 1): it tolerates a
+// trailing `#`-comment after the value (`svelte = true  # enable`), but it is
+// NOT a real TOML parser — a `svelte = true` occurrence nested under a
+// `[table]` section, or one embedded inside a multi-line/triple-quoted string
+// value, would still match and false-positive. Both are considered acceptable
+// risk: an oxfmt.toml sectioning `svelte` under a table is not a realistic
+// config shape for this single top-level boolean key, and a false positive
+// here only causes oxfmt to be OFFERED (still gated by oxfmt actually running
+// and the `svelte` package check above), never a silent formatter failure.
+const OXFMT_SVELTE_TOML_TRUE =
+	/(^|\n)\s*svelte\s*=\s*true\s*(\s*#.*)?(\r?\n|$)/;
+
+export function hasOxfmtSvelteConfig(cwd: string): boolean {
+	// Monorepo asymmetry (#1134 P3 tail 2): this dependency check stops at the
+	// NEAREST package.json (`hasNearestPackageJsonDependency`), while the
+	// config walk below (`walkUpDirs`) continues all the way to the repo root.
+	// A root-level `svelte` dependency combined with an oxfmt config at the
+	// root, but invoked with a sub-package `cwd` that has its own
+	// (svelte-less) package.json, under-offers oxfmt for that sub-package —
+	// the same nearest-vs-root-walk asymmetry as the `.tflint.hcl` note in
+	// `getLinterPolicyForCwd` above. This is untested/deliberately unfixed:
+	// failing to offer a valid formatter is safe (never mis-offers one that
+	// then fails at runtime), unlike the inverse.
+	if (!hasNearestPackageJsonDependency(cwd, "svelte")) return false;
+	for (const dir of walkUpDirs(cwd)) {
+		const rcPath = path.join(dir, ".oxfmtrc.json");
+		if (fs.existsSync(rcPath)) {
+			try {
+				const cfg = JSON.parse(fs.readFileSync(rcPath, "utf-8")) as Record<
+					string,
+					unknown
+				>;
+				if (cfg.svelte === true) return true;
+			} catch {}
+		}
+		// oxfmt.toml is TOML; pi-lens has no TOML parser dependency, so this is
+		// a targeted line match for the single boolean key rather than a full
+		// parse (same pragmatic style as hasVitePlusConfig's content.includes
+		// check above) — presence of the file alone is NOT sufficient, since a
+		// TOML config can omit `svelte` or set it false.
+		const tomlPath = path.join(dir, "oxfmt.toml");
+		if (fs.existsSync(tomlPath)) {
+			try {
+				const content = fs.readFileSync(tomlPath, "utf-8");
+				if (OXFMT_SVELTE_TOML_TRUE.test(content)) return true;
 			} catch {}
 		}
 	}
@@ -2051,8 +2238,77 @@ export function hasRuffConfig(cwd: string): boolean {
 	return false;
 }
 
+/**
+ * Shared config-args seam for the markdownlint lint AND autofix surfaces
+ * (#1247). The lint runner (`markdownlint.ts`) and the autofix path
+ * (`pipeline.ts` `tryMarkdownlintFix`) MUST both consume this builder so the
+ * package-owned sensible-defaults config (`config/markdownlint/core.json`) can
+ * never drift apart from the bare `--fix` invocation again.
+ */
+/**
+ * Shared fallback shape for the config-args builders (#1247): when the
+ * project has its own config the lint/autofix surfaces pass NO args (the
+ * tool discovers it); otherwise both surfaces point at the package-owned
+ * fallback so the tool never silently runs its default ruleset. One shape
+ * here means the per-tool builders cannot drift from each other.
+ */
+function configArgsWithFallback(
+	hasConfig: boolean,
+	toolArgs: string[],
+	packageConfigPath: string,
+): string[] {
+	return hasConfig
+		? []
+		: [...toolArgs, resolvePackagePath(import.meta.url, packageConfigPath)];
+}
+
+export function markdownlintConfigArgs(cwd: string): string[] {
+	return configArgsWithFallback(
+		hasMarkdownlintConfig(cwd),
+		["--config"],
+		"config/markdownlint/core.json",
+	);
+}
+
+/**
+ * Shared config-args seam for the ruff lint AND autofix surfaces (#1247).
+ * The lint runner (`ruff.ts`) and `ruffClient.fixFileAsync` MUST both consume
+ * this builder so `config/ruff/core.toml` applies on `--fix` too.
+ */
+export function ruffConfigArgs(cwd: string): string[] {
+	return configArgsWithFallback(
+		hasRuffConfig(cwd),
+		["--config"],
+		"config/ruff/core.toml",
+	);
+}
+
+/**
+ * Shared config-args seam for the biome lint AND autofix surfaces (#1247).
+ * The lint runner (`biome-check.ts`) and `biomeClient.fixFileAsync` MUST both
+ * consume this builder so the user's `biome.json(c)` — or the package-owned
+ * `config/biome/core.jsonc` fallback — applies on `lint --write` too.
+ */
+export function biomeConfigArgs(cwd: string): string[] {
+	return [
+		"--config-path=" +
+			(getBiomeConfigPath(cwd) ??
+				resolvePackagePath(import.meta.url, "config/biome/core.jsonc")),
+	];
+}
+
 export function hasGolangciConfig(cwd: string): boolean {
 	return findNearestContaining(cwd, GOLANGCI_CONFIGS) !== undefined;
+}
+
+// tflint ships built-in rules and runs without config, so `.tflint.hcl` is not
+// a prerequisite — it is the project electing tflint as its terraform linter,
+// which promotes the policy from smart-default to config-first. Takes a start
+// directory rather than the project cwd because tflint resolves config
+// per-directory: callers pass the EDITED FILE's directory so this agrees with
+// what the runner will actually hand tflint via `--config`.
+export function hasTflintConfig(startDir: string): boolean {
+	return findNearestContaining(startDir, [".tflint.hcl"]) !== undefined;
 }
 
 export function hasClangFormatConfig(cwd: string): boolean {
@@ -2140,7 +2396,163 @@ const KTFMT_GRADLE_FILES = [
 	"settings.gradle",
 ];
 
+const KOTLIN_GRADLE_FILES = [
+	"build.gradle.kts",
+	"build.gradle",
+	"settings.gradle.kts",
+	"settings.gradle",
+];
+
+interface SpotlessKotlinConfigCacheEntry {
+	mtime: number;
+	ktlintConfig: boolean;
+	ktfmtConfig: boolean;
+}
+
+const spotlessKotlinConfigCache = new Map<
+	string,
+	SpotlessKotlinConfigCacheEntry
+>();
+let spotlessGradleReadCount = 0;
+
+/** Test-only observability for asserting the hot-path I/O bound. */
+export function _getSpotlessGradleReadCountForTests(): number {
+	return spotlessGradleReadCount;
+}
+
+/**
+ * Blank comments and quoted strings while preserving braces and newlines in
+ * executable Gradle source. This is deliberately a small lexical pre-pass,
+ * not a Groovy/Kotlin parser. In particular, statically disabled constructs
+ * such as `if (false) { ktlint() }` remain a documented false-positive.
+ */
+function stripGradleCommentsAndStrings(source: string): string {
+	let result = "";
+	let state: "code" | "line-comment" | "block-comment" | "string" = "code";
+	let quote = "";
+	for (let index = 0; index < source.length; index += 1) {
+		const char = source[index];
+		const next = source[index + 1];
+		if (state === "code") {
+			if (char === "/" && next === "/") {
+				result += "  ";
+				index += 1;
+				state = "line-comment";
+			} else if (char === "/" && next === "*") {
+				result += "  ";
+				index += 1;
+				state = "block-comment";
+			} else if (char === '"' || char === "'") {
+				result += " ";
+				quote = char;
+				state = "string";
+			} else {
+				result += char;
+			}
+			continue;
+		}
+
+		if (state === "line-comment") {
+			if (char === "\n" || char === "\r") {
+				result += char;
+				state = "code";
+			} else {
+				result += " ";
+			}
+			continue;
+		}
+
+		if (state === "block-comment") {
+			if (char === "*" && next === "/") {
+				result += "  ";
+				index += 1;
+				state = "code";
+			} else {
+				result += char === "\n" || char === "\r" ? char : " ";
+			}
+			continue;
+		}
+
+		if (char === "\\") {
+			result += " ";
+			if (index + 1 < source.length) {
+				result += source[index + 1] === "\n" ? "\n" : " ";
+				index += 1;
+			}
+		} else if (char === quote) {
+			result += " ";
+			state = "code";
+		} else {
+			result += char === "\n" || char === "\r" ? char : " ";
+		}
+	}
+	return result;
+}
+
+function namedGradleBlockBodies(source: string, name: string): string[] {
+	const bodies: string[] = [];
+	const startPattern = new RegExp(`\\b${name}\\s*\\{`, "g");
+	for (const match of source.matchAll(startPattern)) {
+		const open = source.indexOf("{", match.index);
+		let depth = 1;
+		for (let index = open + 1; index < source.length; index += 1) {
+			if (source[index] === "{") depth += 1;
+			if (source[index] === "}") depth -= 1;
+			if (depth === 0) {
+				bodies.push(source.slice(open + 1, index));
+				break;
+			}
+		}
+	}
+	return bodies;
+}
+
+export type SpotlessKotlinFormatter = "ktlint" | "ktfmt";
+
+/**
+ * Resolve the formatter elected by a Spotless `kotlin { ... }` block.
+ * ktlint is the deterministic tie-break if a malformed project names both.
+ */
+export function getSpotlessKotlinFormatter(
+	cwd: string,
+): SpotlessKotlinFormatter | undefined {
+	for (const dir of walkUpDirs(cwd)) {
+		for (const gradle of KOTLIN_GRADLE_FILES) {
+			const filePath = path.join(dir, gradle);
+			if (!fs.existsSync(filePath)) continue;
+			try {
+				const mtime = fs.statSync(filePath).mtimeMs;
+				let config = spotlessKotlinConfigCache.get(filePath);
+				if (!config || config.mtime !== mtime) {
+					const source = stripGradleCommentsAndStrings(
+						fs.readFileSync(filePath, "utf-8"),
+					);
+					spotlessGradleReadCount += 1;
+					const kotlinBodies = namedGradleBlockBodies(source, "spotless").flatMap(
+						(spotless) => namedGradleBlockBodies(spotless, "kotlin"),
+					);
+					config = {
+						mtime,
+						ktlintConfig: kotlinBodies.some((body) => /\bktlint\s*\(/.test(body)),
+						ktfmtConfig: kotlinBodies.some((body) => /\bktfmt\s*\(/.test(body)),
+					};
+					spotlessKotlinConfigCache.set(filePath, config);
+				}
+				if (config.ktlintConfig) return "ktlint";
+				if (config.ktfmtConfig) return "ktfmt";
+			} catch {}
+		}
+	}
+	return undefined;
+}
+
+export function hasKtlintConfig(cwd: string): boolean {
+	return getSpotlessKotlinFormatter(cwd) === "ktlint";
+}
+
 export function hasKtfmtConfig(cwd: string): boolean {
+	const spotlessFormatter = getSpotlessKotlinFormatter(cwd);
+	if (spotlessFormatter) return spotlessFormatter === "ktfmt";
 	for (const dir of walkUpDirs(cwd)) {
 		if (KTFMT_CONFIG_FILES.some((cfg) => fs.existsSync(path.join(dir, cfg))))
 			return true;
@@ -2252,13 +2664,22 @@ export function hasVitePlusConfig(cwd: string): boolean {
 	return false;
 }
 
+// Per https://oxc.rs/docs/guide/usage/linter/config.html, oxlint auto-discovers
+// `.oxlintrc.json`, `.oxlintrc.jsonc`, `oxlint.config.ts`, and `oxlint.config.mts`
+// (in addition to the legacy `oxlint.json` name pi-lens already recognized).
+const OXLINT_CONFIGS = [
+	".oxlintrc.json",
+	".oxlintrc.jsonc",
+	"oxlint.json",
+	"oxlint.config.ts",
+	"oxlint.config.mts",
+];
+
 export function hasOxlintConfig(cwd: string): boolean {
 	for (const dir of walkUpDirsUntilPackageJson(cwd)) {
-		if (
-			fs.existsSync(path.join(dir, ".oxlintrc.json")) ||
-			fs.existsSync(path.join(dir, "oxlint.json"))
-		)
-			return true;
+		for (const cfg of OXLINT_CONFIGS) {
+			if (fs.existsSync(path.join(dir, cfg))) return true;
+		}
 	}
 	return hasVitePlusConfig(cwd);
 }

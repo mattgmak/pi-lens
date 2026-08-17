@@ -17,12 +17,12 @@ description: |
 
 query: |
   (go_statement
-    expression: (call_expression
+    (call_expression
       function: (func_literal
         body: (block
           (assignment_statement
-            left: (index_expression) @MAPWRITE
-            right: (_) @VALUE)))
+            left: (expression_list (index_expression) @MAPWRITE)
+            right: (expression_list (_) @VALUE))))
       arguments: (argument_list) @ARGS))
 
 metavars:

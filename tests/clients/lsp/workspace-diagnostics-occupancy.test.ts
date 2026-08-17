@@ -24,6 +24,7 @@ import {
 	generateSourceTree,
 	measureMaxSyncBlockMs,
 } from "../../support/perf-harness.js";
+import { removeTempDirSync } from "../test-utils.js";
 
 // Same budget the source-walk occupancy guards use: the async walk yields in a
 // few ms; the regression we guard against (a sync walk) is hundreds of ms at
@@ -42,7 +43,7 @@ beforeAll(() => {
 }, 60_000);
 
 afterAll(() => {
-	fs.rmSync(tmpDir, { recursive: true, force: true });
+	removeTempDirSync(tmpDir);
 });
 
 describe(`LSP workspace-diagnostics walk occupancy (~${TREE_SIZE} files)`, () => {

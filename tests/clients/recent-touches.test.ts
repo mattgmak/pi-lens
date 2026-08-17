@@ -13,6 +13,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { removeTempDirSync } from "./test-utils.js";
 
 let dir: string;
 const FAKE_CWD = "/fake/project";
@@ -34,7 +35,7 @@ describe("recent-touches (#492 cross-process touched-files record)", () => {
 	});
 
 	afterEach(() => {
-		fs.rmSync(dir, { recursive: true, force: true });
+		removeTempDirSync(dir);
 		if (originalEnv === undefined) {
 			delete process.env.PI_LENS_AGENT_NUDGE;
 		} else {

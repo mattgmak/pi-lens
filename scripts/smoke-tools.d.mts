@@ -41,6 +41,12 @@ export interface FormatFixture {
 	file: string;
 	formatter: string;
 	tools?: string[];
+	/**
+	 * "reformat" (default) — the formatter must rewrite the mis-formatted file.
+	 * "preserve" — #1144's style-preserving refusal: the formatter is selected
+	 * but must leave an unconfigured, style-less file byte-identical.
+	 */
+	expect?: "reformat" | "preserve";
 }
 export interface AutofixFixture {
 	lang: string;

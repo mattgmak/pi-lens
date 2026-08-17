@@ -25,22 +25,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { getGlobalPiLensDir } from "./file-utils.js";
 import { getRegisteredLogFiles } from "./ndjson-logger.js";
+import { pathsEqual } from "./path-utils.js";
 
 const LOG_DIR = getGlobalPiLensDir();
 const LOGS_SUBDIR = path.join(LOG_DIR, "logs");
-
-/**
- * Logs that write via some mechanism OTHER than the shared
- * `createNdjsonLogger` (clients/ndjson-logger.ts), so they can't self-register
- * into its file registry. Keep this list as small as possible — anything that
- * can reasonably move onto the shared writer should, so there's only one
- * place left to remember by hand.
- *
- *   - sessionstart.log — written by a handful of modules (installer/index.ts,
- *     lsp/index.ts, lsp/launch.ts, lsp/server.ts, index.ts) via a bespoke
- *     `fs.appendFile`, predating ndjson-logger.
- */
-const UNMANAGED_STRAGGLER_LOG_FILES = ["sessionstart.log"];
 
 /**
  * Every global `.log` pi-lens writes under ~/.pi-lens, resolved dynamically so
@@ -62,17 +50,14 @@ const UNMANAGED_STRAGGLER_LOG_FILES = ["sessionstart.log"];
  *      a file has content on disk, this catches it regardless of import
  *      timing; an unregistered file that doesn't exist yet has nothing to
  *      clean up anyway.
- *   3. `UNMANAGED_STRAGGLER_LOG_FILES` — the handful of logs that don't go
- *      through `createNdjsonLogger` at all and so can never self-register.
- *
  * `dir` is overridable for tests; production callers use the default
  * (real `~/.pi-lens`).
  */
 export function getManagedLogFiles(dir: string = LOG_DIR): string[] {
-	const names = new Set<string>(UNMANAGED_STRAGGLER_LOG_FILES);
+	const names = new Set<string>();
 
 	for (const absPath of getRegisteredLogFiles()) {
-		if (path.dirname(absPath) === dir) {
+		if (pathsEqual(path.dirname(absPath), dir)) {
 			names.add(path.basename(absPath));
 		}
 	}
@@ -106,16 +91,21 @@ export interface LogCleanupConfig {
 	maxSizeMB: number;
 }
 
+/** Rotation threshold for every active `~/.pi-lens/*.log`, in MB. */
+export function getMaxLogSizeMB(): number {
+	return Math.max(
+		1,
+		Number.parseInt(process.env.PI_LENS_MAX_LOG_SIZE_MB ?? "10", 10) || 10,
+	);
+}
+
 function getConfig(): LogCleanupConfig {
 	return {
 		retentionDays: Math.max(
 			1,
 			Number.parseInt(process.env.PI_LENS_LOG_RETENTION_DAYS ?? "7", 10) || 7,
 		),
-		maxSizeMB: Math.max(
-			1,
-			Number.parseInt(process.env.PI_LENS_MAX_LOG_SIZE_MB ?? "10", 10) || 10,
-		),
+		maxSizeMB: getMaxLogSizeMB(),
 	};
 }
 

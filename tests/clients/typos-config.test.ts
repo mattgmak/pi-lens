@@ -7,6 +7,7 @@ import {
 	findLocalTyposConfig,
 	LOCAL_TYPOS_CONFIG_NAMES,
 } from "../../clients/typos-config.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 describe("findLocalTyposConfig (#283)", () => {
 	let root: string;
@@ -14,7 +15,7 @@ describe("findLocalTyposConfig (#283)", () => {
 		root = fs.mkdtempSync(path.join(os.tmpdir(), "typos-cfg-"));
 	});
 	afterEach(() => {
-		fs.rmSync(root, { recursive: true, force: true });
+		removeTempDirSync(root);
 	});
 
 	it("finds a root-level typos.toml", () => {

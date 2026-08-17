@@ -8,9 +8,11 @@
  *   ~/.pi-lens/cascade*.log          JSONL impact-cascade logs
  *   ~/.pi-lens/read-guard*.log       JSONL read-guard friction logs
  *   ~/.pi-lens/tree-sitter*.log      JSONL structural runner logs
+ *   ~/.pi-lens/extension*.log        JSONL extension diagnostics and console-guard telemetry
  *   ~/.pi-lens/actionable-warnings*.log  JSONL advisory pipeline (inject/suppress)
  *   ~/.pi-lens/ast-grep-tools*.log   JSONL MCP ast-grep search/replace telemetry
  *   ~/.pi-lens/logs/*.jsonl          JSONL diagnostic findings
+ *   ~/.pi-lens/projects/<slug>/worklog.jsonl  JSONL fix worklog (rule/tool/model/provider, #1448)
  */
 
 import fs from "node:fs";
@@ -18,10 +20,12 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
+import { minimatch } from "minimatch";
 
 const DEFAULT_ROOT = path.join(os.homedir(), ".pi-lens");
 const DEFAULT_SINCE = "2d";
 const DEFAULT_LIMIT = 12;
+const DEFAULT_EXCLUDE_GLOBS = ["**/AppData/Local/Temp/claude/**", "**/heap-corpus*/**", "**/.plegma/work/**"];
 
 const args = parseArgs(process.argv.slice(2));
 const root = path.resolve(expandHome(args.root ?? DEFAULT_ROOT));
@@ -30,6 +34,10 @@ const limit =
 	Number.parseInt(args.limit ?? `${DEFAULT_LIMIT}`, 10) || DEFAULT_LIMIT;
 const outputJson = Boolean(args.json);
 const includeArchived = Boolean(args.archived);
+const excludeGlobs = [
+	...DEFAULT_EXCLUDE_GLOBS,
+	...(Array.isArray(args.exclude) ? args.exclude : args.exclude ? [args.exclude] : []),
+];
 
 const thresholds = {
 	startupSlowMs: Number.parseInt(args.startupSlowMs ?? "500", 10),
@@ -62,6 +70,7 @@ async function main() {
 		analyzeSessionStart(files.sessionStart, state),
 		analyzeActionableWarnings(files.actionableWarnings, state),
 		analyzeAstGrepTools(files.astGrepTools, state),
+		analyzeWorklog(files.worklog, state),
 	]);
 
 	const report = buildReport(state);
@@ -83,7 +92,14 @@ function parseArgs(argv) {
 			const key = arg.slice(2);
 			const next = argv[i + 1];
 			if (!next || next.startsWith("--")) out[key] = "true";
-			else out[key] = argv[++i];
+			else if (key === "exclude") {
+				const value = argv[++i];
+				out.exclude = out.exclude
+					? Array.isArray(out.exclude)
+						? [...out.exclude, value]
+						: [out.exclude, value]
+					: value;
+			} else out[key] = argv[++i];
 		}
 	}
 	return out;
@@ -125,6 +141,13 @@ function discoverLogFiles(logRoot, archived) {
 		.filter((name) => name.endsWith(".jsonl"))
 		.map((name) => path.join(logsDir, name));
 
+	// worklog.jsonl lives per-project under projects/<slug>/ (getProjectDataDir),
+	// not at the log root — walk one level to find every project's file (#1448).
+	const projectsDir = path.join(logRoot, "projects");
+	const worklogs = safeReaddir(projectsDir)
+		.map((slug) => path.join(projectsDir, slug, "worklog.jsonl"))
+		.filter((file) => fs.existsSync(file));
+
 	const byPrefix = (prefix) =>
 		allRootFiles.filter((file) => {
 			const base = path.basename(file);
@@ -142,6 +165,7 @@ function discoverLogFiles(logRoot, archived) {
 		actionableWarnings: byPrefix("actionable-warnings"),
 		astGrepTools: byPrefix("ast-grep-tools"),
 		diagnostics: dailyLogs,
+		worklog: worklogs,
 	};
 }
 
@@ -158,6 +182,7 @@ function createState(files) {
 		window: { since: since?.toISOString() ?? "all", root },
 		files,
 		parseErrors: counter(),
+		excludedRows: 0,
 		seen: counter(),
 		projects: counter(),
 		smellTotals: counter(),
@@ -247,6 +272,14 @@ function createState(files) {
 			calls: 0,
 			errors: [],
 			slow: [],
+		},
+		worklog: {
+			// key: "<rule>||<model>" (model "" when the entry predates #1448 or the
+			// runtime didn't know it) -> { total, autoFixed }
+			byRuleModel: new Map(),
+			byModel: counter(),
+			byModelAutoFixed: counter(),
+			byProvider: counter(),
 		},
 	};
 }
@@ -557,6 +590,10 @@ async function analyzeSessionStart(files, state) {
 			const ts = dateOf(match[1]);
 			if (!inWindow(ts)) return;
 			const message = match[2];
+			if (isExcludedText(message)) {
+				state.excludedRows++;
+				return;
+			}
 			state.seen.inc("sessionstart");
 
 			const cwd = /session_start cwd:\s*(.*)$/.exec(message)?.[1];
@@ -718,15 +755,80 @@ async function analyzeAstGrepTools(files, state) {
 	}
 }
 
+/**
+ * Per-model rollup (#1448): rule × model counts and auto-fixed vs
+ * agent-required rates, from worklog.jsonl's optional `model`/`provider`
+ * fields. Entries predating #1448 (or written outside a live agent turn)
+ * have neither field — bucketed under the empty-string model/provider key so
+ * "unattributed" volume stays visible rather than silently dropped.
+ */
+async function analyzeWorklog(files, state) {
+	for (const file of files) {
+		await forEachJsonLine(file, "worklog", state, (entry) => {
+			const ts = dateOf(entry.timestamp);
+			if (!inWindow(ts)) return;
+			state.seen.inc("worklog");
+			const rule = entry.rule ?? "unknown";
+			const model = entry.model ?? "";
+			const provider = entry.provider ?? "";
+			const key = `${rule}||${model}`;
+			const row = state.worklog.byRuleModel.get(key) ?? {
+				rule,
+				model,
+				total: 0,
+				autoFixed: 0,
+			};
+			row.total += 1;
+			if (entry.autoFixed) row.autoFixed += 1;
+			state.worklog.byRuleModel.set(key, row);
+			state.worklog.byModel.inc(model || "(unknown)");
+			if (entry.autoFixed) state.worklog.byModelAutoFixed.inc(model || "(unknown)");
+			state.worklog.byProvider.inc(provider || "(unknown)");
+		});
+	}
+}
+
 async function forEachJsonLine(file, bucket, state, visitor) {
 	await forEachLine(file, async (line) => {
 		if (!line.trim()) return;
 		try {
-			visitor(JSON.parse(line));
+			const entry = JSON.parse(line);
+			if (isExcludedEntry(entry)) {
+				state.excludedRows++;
+				return;
+			}
+			visitor(entry);
 		} catch {
 			state.parseErrors.inc(`${bucket}:${path.basename(file)}`);
 		}
 	});
+}
+
+function isExcludedEntry(entry) {
+	return pathValues(entry).some((value) =>
+		excludeGlobs.some((glob) =>
+			minimatch(value, glob, { nocase: true, dot: true }),
+		),
+	);
+}
+
+function pathValues(value, key = "") {
+	if (typeof value === "string") {
+		return /(file|path|cwd|root|project)/i.test(key) ? [normalizePath(value)] : [];
+	}
+	if (!value || typeof value !== "object") return [];
+	return Object.entries(value).flatMap(([childKey, child]) =>
+		pathValues(child, childKey),
+	);
+}
+
+function isExcludedText(text) {
+	const cwd = /session_start cwd:\s*(.*)$/.exec(text)?.[1];
+	return cwd
+		? excludeGlobs.some((glob) =>
+				minimatch(normalizePath(cwd), glob, { nocase: true, dot: true }),
+			)
+		: false;
 }
 
 async function forEachLine(file, visitor) {
@@ -1129,6 +1231,7 @@ function buildReport(state) {
 			Object.entries(state.files).map(([key, list]) => [key, list.length]),
 		),
 		rowsSeen: state.seen.toJSON(),
+		rowsExcluded: state.excludedRows,
 		parseErrors: state.parseErrors.toJSON(),
 		projects: state.projects.top(limit),
 		smells,
@@ -1207,6 +1310,17 @@ function buildReport(state) {
 			errors: state.astGrep.errors.slice(0, limit),
 			slow: state.astGrep.slow.slice(0, limit),
 		},
+		worklog: {
+			byModel: state.worklog.byModel.top(limit * 2),
+			byProvider: state.worklog.byProvider.top(limit * 2),
+			byRuleModel: [...state.worklog.byRuleModel.values()]
+				.map((row) => ({
+					...row,
+					autoFixedRate: row.total ? row.autoFixed / row.total : 0,
+				}))
+				.sort((a, b) => b.total - a.total)
+				.slice(0, limit * 3),
+		},
 	};
 }
 
@@ -1232,6 +1346,7 @@ function printReport(report) {
 			.map(([k, v]) => `${k}=${v}`)
 			.join(", ")}`,
 	);
+	console.log(`${report.rowsExcluded} rows excluded (synthetic corpora)`);
 	if (Object.keys(report.parseErrors).length)
 		console.log(`parse errors: ${JSON.stringify(report.parseErrors)}`);
 
@@ -1344,6 +1459,23 @@ function printReport(report) {
 			`  started=${ws.started} completed=${ws.completed} incomplete=${ws.incomplete} aborted=${ws.aborted} fileTimeouts=${ws.timedOutFilesTotal} (in ${ws.timedOutSweeps} sweeps)`,
 		);
 	}
+	const wl = report.worklog;
+	if (wl && (wl.byModel.length || wl.byRuleModel.length)) {
+		console.log("\nWorklog per-model rollup (#1448)");
+		console.log(
+			`  by model: ${wl.byModel.map((x) => `${x.key}=${x.count}`).join(", ")}`,
+		);
+		if (wl.byProvider.length)
+			console.log(
+				`  by provider: ${wl.byProvider.map((x) => `${x.key}=${x.count}`).join(", ")}`,
+			);
+		console.log("  rule × model (auto-fixed vs agent-required):");
+		for (const row of wl.byRuleModel.slice(0, limit))
+			console.log(
+				`    ${String(row.total).padStart(5)}  ${row.rule} [${row.model || "(unknown)"}]  autoFixed=${row.autoFixed} (${(row.autoFixedRate * 100).toFixed(0)}%)`,
+			);
+	}
+
 	const timeouts = Object.entries(report.latency.phaseTimeouts ?? {});
 	if (timeouts.length) {
 		console.log("\nPhase timeouts");

@@ -7,13 +7,12 @@
  * Supports venv-local installations.
  */
 
-import { resolvePackagePath } from "../../package-root.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { stripAnsi } from "../../sanitize.js";
 import {
 	getAutofixCapability,
 	getLinterPolicyForCwd,
-	hasRuffConfig,
+	ruffConfigArgs,
 } from "../../tool-policy.js";
 import { PRIORITY } from "../priorities.js";
 import type {
@@ -88,12 +87,9 @@ const ruffRunner: RunnerDefinition = {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
-		const configArgs: string[] = hasRuffConfig(cwd)
-			? []
-			: [
-					"--config",
-					resolvePackagePath(import.meta.url, "config/ruff/core.toml"),
-				];
+		// Shared config-args seam (#1247): the autofix path consumes the same
+		// builder, so the package-owned fallback config can never drift.
+		const configArgs = ruffConfigArgs(cwd);
 
 		// Step 1: Capture diagnostics (before fixing) — teaching signal for the agent
 		const checkResult = await safeSpawnAsync(

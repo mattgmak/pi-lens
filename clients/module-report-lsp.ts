@@ -15,6 +15,11 @@
  *     remaining wall-clock budget.
  *   - OPT-IN: disabled by default (budget 0) until validated in a real pi session;
  *     enable with PI_LENS_MODULE_REPORT_LSP_BUDGET_MS.
+ *
+ * PARKED BY DECISION (#1090, 2026-08-12): zero live importers by design —
+ * efe3d2a5 unwired module_report's LSP path (#256) and re-homed live
+ * enrichment to #236 (LSP-confirmed graph edges). Kept for that future
+ * implementation; do not re-flag in dead-code sweeps while #236 is open.
  */
 
 import { withinRemaining } from "./deadline-utils.js";

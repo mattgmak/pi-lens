@@ -6,7 +6,8 @@ import { setupTestEnvironment } from "../../test-utils.js";
 
 const safeSpawn = vi.fn();
 const safeSpawnAsync = vi.fn();
-const ensureTool = vi.fn(async () => "ruff");
+const ensureTool = vi.fn(async (_toolId: string) => "ruff");
+const resolveAvailableOrInstall = vi.fn(async () => ensureTool("ruff"));
 
 vi.mock("../../../../clients/safe-spawn.js", () => ({
 	safeSpawn,
@@ -15,6 +16,14 @@ vi.mock("../../../../clients/safe-spawn.js", () => ({
 
 vi.mock("../../../../clients/installer/index.js", () => ({
 	ensureTool,
+}));
+
+vi.mock("../../../../clients/dispatch/runners/utils/runner-helpers.js", () => ({
+	createAvailabilityChecker: vi.fn(() => ({
+		isAvailableAsync: vi.fn(async () => false),
+		getCommand: vi.fn(() => null),
+	})),
+	resolveAvailableOrInstall,
 }));
 
 function createCtx(filePath: string, cwd: string) {

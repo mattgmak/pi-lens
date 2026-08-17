@@ -10,12 +10,13 @@ import {
 	resolveLanguageRootForFile,
 } from "../../clients/language-profile.js";
 import { normalizeMapKey } from "../../clients/path-utils.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 const dirs: string[] = [];
 
 afterEach(() => {
 	for (const dir of dirs.splice(0)) {
-		fs.rmSync(dir, { recursive: true, force: true });
+		removeTempDirSync(dir);
 	}
 });
 
@@ -90,6 +91,98 @@ describe("language-profile roots", () => {
 
 		const root = resolveLanguageRootForFile(file, workspace);
 		expect(root).toBe(projectRoot);
+	});
+
+	it.each([
+		["csharp", "App.csproj", "Program.cs"],
+		["csharp", "App.sln", "Program.cs"],
+		["fsharp", "App.fsproj", "Program.fs"],
+		["fsharp", "App.sln", "Program.fs"],
+	])("resolves %s file root to nearest .NET marker", (_kind, marker, source) => {
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lang-root-"));
+		dirs.push(tmp);
+
+		const workspace = path.join(tmp, "repo");
+		const projectRoot = path.join(workspace, "services", "dotnet");
+		const file = path.join(projectRoot, "src", source);
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(path.join(projectRoot, marker), "\n");
+		fs.writeFileSync(file, "// test\n");
+
+		expect(resolveLanguageRootForFile(file, workspace)).toBe(projectRoot);
+	});
+
+	it("resolves a nested C# file to the nearest .csproj, not the solution root (#895)", () => {
+		// The actual #895 monorepo shape: solution file at the workspace root,
+		// project file in a nested service. A file under the service must resolve
+		// to the service (nearest marker), NOT the solution root above it.
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lang-root-"));
+		dirs.push(tmp);
+
+		const workspace = path.join(tmp, "repo");
+		const project = path.join(workspace, "services", "api");
+		const file = path.join(project, "src", "Handler.cs");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(path.join(workspace, "App.sln"), "\n");
+		fs.writeFileSync(path.join(project, "Api.csproj"), "<Project />\n");
+		fs.writeFileSync(file, "// test\n");
+
+		expect(resolveLanguageRootForFile(file, workspace)).toBe(project);
+	});
+
+	it("detects an XML solution file (*.slnx) as a csharp root marker (#895)", () => {
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lang-root-"));
+		dirs.push(tmp);
+
+		const workspace = path.join(tmp, "repo");
+		const solutionRoot = path.join(workspace, "solution");
+		const file = path.join(solutionRoot, "src", "Program.cs");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(path.join(solutionRoot, "App.slnx"), "<Solution />\n");
+		fs.writeFileSync(file, "// test\n");
+
+		expect(resolveLanguageRootForFile(file, workspace)).toBe(solutionRoot);
+	});
+
+	it("marks .NET languages configured via glob project markers (#895)", () => {
+		// Exercises detectProjectLanguageProfile's hasProjectMarker glob path:
+		// `*.csproj` / `*.fsproj` are patterns, not literal basenames, so the
+		// readdir+minimatch branch must find the real project filenames.
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lang-root-"));
+		dirs.push(tmp);
+
+		const csharpProject = path.join(tmp, "csharp-project");
+		fs.mkdirSync(csharpProject, { recursive: true });
+		fs.writeFileSync(path.join(csharpProject, "App.csproj"), "<Project />\n");
+		fs.writeFileSync(path.join(csharpProject, "Program.cs"), "// test\n");
+
+		const csharpProfile = detectProjectLanguageProfile(csharpProject);
+		expect(csharpProfile.present.csharp).toBe(true);
+		expect(csharpProfile.configured.csharp).toBe(true);
+
+		const fsharpProject = path.join(tmp, "fsharp-project");
+		fs.mkdirSync(fsharpProject, { recursive: true });
+		fs.writeFileSync(path.join(fsharpProject, "App.fsproj"), "<Project />\n");
+
+		const fsharpProfile = detectProjectLanguageProfile(fsharpProject);
+		expect(fsharpProfile.configured.fsharp).toBe(true);
+		// No glob marker present → the glob branch must also say "no", not
+		// false-positive on unrelated files.
+		expect(fsharpProfile.configured.csharp).toBeUndefined();
+	});
+
+	it("falls back to workspace root for nested C# and F# files without a marker", () => {
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lang-root-"));
+		dirs.push(tmp);
+		const workspace = path.join(tmp, "repo");
+		const csharpFile = path.join(workspace, "src", "Program.cs");
+		const fsharpFile = path.join(workspace, "src", "Program.fs");
+		fs.mkdirSync(path.dirname(csharpFile), { recursive: true });
+		fs.writeFileSync(csharpFile, "// test\n");
+		fs.writeFileSync(fsharpFile, "// test\n");
+
+		expect(resolveLanguageRootForFile(csharpFile, workspace)).toBe(workspace);
+		expect(resolveLanguageRootForFile(fsharpFile, workspace)).toBe(workspace);
 	});
 
 	it("falls back to workspace root for files outside workspace", () => {

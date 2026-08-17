@@ -9,6 +9,11 @@ import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Type } from "../clients/deps/typebox.js";
 import { logLatency } from "../clients/latency-logger.js";
+import {
+	newLspMutationCorrelationId,
+	recordLspMutationOutcome,
+	type LspMutationContext,
+} from "../clients/lsp-mutation.js";
 import type { LSPCallHierarchyItem } from "../clients/lsp/client.js";
 import { compactRenderResult } from "./render-compact.js";
 import {
@@ -18,6 +23,7 @@ import {
 import { getLSPService } from "../clients/lsp/index.js";
 import type { SearchReadLocation } from "../clients/search-read-registration.js";
 import { buildLspNavigationEnvelope } from "./lsp-structured-output.js";
+import { SYMBOL_KIND_NAMES } from "../clients/lsp-document-symbols.js";
 
 const VALID_OPERATIONS = [
 	"definition",
@@ -310,36 +316,12 @@ type SymbolMatch = {
 	range?: Record<string, unknown>;
 };
 
-const SYMBOL_KIND_LABELS: Record<number, string> = {
-	2: "module",
-	3: "namespace",
-	4: "package",
-	5: "class",
-	6: "method",
-	7: "property",
-	8: "field",
-	9: "constructor",
-	10: "enum",
-	11: "interface",
-	12: "function",
-	13: "variable",
-	14: "constant",
-	15: "string",
-	16: "number",
-	17: "boolean",
-	18: "array",
-	19: "object",
-	20: "key",
-	21: "null",
-	22: "enumMember",
-	23: "struct",
-	24: "event",
-	25: "operator",
-	26: "typeParameter",
-};
 
 function symbolKindLabel(kind: number | undefined): string {
-	return kind == null ? "symbol" : (SYMBOL_KIND_LABELS[kind] ?? "symbol");
+	// Single source of truth for LSP SymbolKind names (#883 doctrine; the
+	// Sonar-flagged duplicate table lived here). Navigation keeps its own
+	// "symbol" fallback for unknown kinds instead of the lsp-symbol-<n> form.
+	return kind == null ? "symbol" : (SYMBOL_KIND_NAMES[kind] ?? "symbol");
 }
 
 function rangeStart(range: Record<string, unknown> | undefined): {
@@ -731,7 +713,19 @@ async function openFileBestEffort(
 }
 
 export function createLspNavigationTool(
-	getFlag: (name: string) => boolean | string | undefined,
+	/**
+	 * Resolves a flag, optionally scoped to a call's `cwd` (#792). Callers that
+	 * need per-request project config (e.g. the MCP host, which has no single
+	 * "current project root" the way an in-pi session does) can rebuild their
+	 * flag resolver against `cwd` instead of whatever directory the tool was
+	 * constructed in; callers that only have a single fixed project root (e.g.
+	 * pi's own `getLensFlag`) may ignore the second argument.
+	 */
+	getFlag: (name: string, cwd?: string) => boolean | string | undefined,
+	mutationDeps?: Pick<
+		LspMutationContext,
+		"runtime" | "cacheManager" | "readGuard" | "dbg"
+	>,
 ) {
 	return {
 		name: "lsp_navigation" as const,
@@ -922,6 +916,8 @@ export function createLspNavigationTool(
 			let supported: boolean | null = null;
 			let diagnosticsMode: "pull" | "push-only" | "unknown" = "unknown";
 			let columnResolution: SymbolColumnResolution | undefined;
+			let mutationContext: LspMutationContext | undefined;
+			let requestedApply = false;
 
 			const finalize = (
 				payload: {
@@ -940,6 +936,14 @@ export function createLspNavigationTool(
 					failureKind: string;
 				};
 			} => {
+				if (
+					payload.isError &&
+					requestedApply &&
+					mutationContext &&
+					["rename", "rename_file", "executeCommand"].includes(meta.operation)
+				) {
+					recordLspMutationOutcome(mutationContext, "failed");
+				}
 				const normalizedFilePath = meta.filePath.replace(/\\/g, "/");
 				logLatency({
 					type: "phase",
@@ -985,7 +989,7 @@ export function createLspNavigationTool(
 				};
 			};
 
-			if (getFlag("no-lsp")) {
+			if (getFlag("no-lsp", ctx.cwd)) {
 				return finalize(
 					{
 						content: [
@@ -1072,6 +1076,23 @@ export function createLspNavigationTool(
 				);
 			}
 			const operation = normalizedOperation;
+			requestedApply = apply === true;
+			if (
+				requestedApply &&
+				["rename", "rename_file", "executeCommand"].includes(operation)
+			) {
+				const cwd = ctx.cwd || ".";
+				mutationContext = {
+					cwd,
+					correlationId: newLspMutationCorrelationId(_toolCallId),
+					tool: "lsp_navigation",
+					source: "lsp-edit",
+					...mutationDeps,
+					readGuard: getFlag("no-read-guard", cwd)
+						? undefined
+						: mutationDeps?.readGuard,
+				};
+			}
 
 			const isCallHierarchyTraversal =
 				operation === "incomingCalls" || operation === "outgoingCalls";
@@ -1470,7 +1491,11 @@ export function createLspNavigationTool(
 								edit,
 							};
 						}
-						const applied = await applyWorkspaceEdit(edit, ctx.cwd || ".");
+						const applied = await applyWorkspaceEdit(
+							edit,
+							ctx.cwd || ".",
+							{ mutationContext },
+						);
 						for (const touchedFile of applied.files) {
 							try {
 								await openFileBestEffort(lspService, touchedFile, false);
@@ -1495,6 +1520,7 @@ export function createLspNavigationTool(
 							{
 								cwd: ctx.cwd || ".",
 								apply: apply ?? false,
+								...(mutationContext ? { mutationContext } : {}),
 							},
 						);
 						if (result.applied) {
@@ -1546,6 +1572,7 @@ export function createLspNavigationTool(
 							rawPath ? filePath : undefined,
 							command,
 							commandArguments,
+							mutationContext,
 						);
 					}
 					case "incomingCalls": {
@@ -1616,6 +1643,27 @@ export function createLspNavigationTool(
 							usedDocumentSymbolFallback = true;
 						}
 					}
+				}
+				if (
+					mutationContext &&
+					requestedApply &&
+					!mutationContext.summaryEmitted
+				) {
+					const outcome =
+						operation === "rename_file" &&
+						result &&
+						typeof result === "object" &&
+						"applied" in result &&
+						(result as { applied?: unknown }).applied === false
+							? "failed"
+							: operation === "executeCommand" &&
+								result &&
+								typeof result === "object" &&
+								"executed" in result &&
+								(result as { executed?: unknown }).executed === false
+								? "failed"
+								: "skipped";
+					recordLspMutationOutcome(mutationContext, outcome);
 				}
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err);

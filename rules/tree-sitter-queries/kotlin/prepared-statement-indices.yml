@@ -21,16 +21,20 @@ description: |
 
 query: |
   (call_expression
-    (simple_identifier) @METHOD (#match? @METHOD "^(setString|setInt|setLong|getString|getInt|getLong)$")
-    (value_arguments
-      (integer_literal) @INDEX) @ARGS)
+    (navigation_expression
+      (simple_identifier)
+      (navigation_suffix
+        (simple_identifier) @METHOD))
+    (call_suffix
+      (value_arguments
+        (value_argument (integer_literal) @INDEX) @ARGS))
+    (#match? @METHOD "^(setString|setInt|setLong|getString|getInt|getLong)$")
+    (#eq? @INDEX "0"))
 
 metavars:
   - METHOD
   - INDEX
   - ARGS
-
-post_filter: invalid_jdbc_index
 
 tags:
   - reliability

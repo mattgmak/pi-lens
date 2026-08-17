@@ -19,10 +19,11 @@
 // dep). The probe runs synchronously at module load.
 
 import { describe, expect, it } from "vitest";
-import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { safeSpawn } from "../../../../clients/safe-spawn.js";
+import { removeTempDirSync } from "../../test-utils.js";
 
 const RULES_DIR = path.join(process.cwd(), "rules", "ast-grep-rules", "rules");
 
@@ -40,6 +41,49 @@ interface CatalogRule {
 }
 
 const CATALOG_RULES: CatalogRule[] = [
+	{
+		id: "no-win32-isabsolute-for-qualification",
+		file: "no-win32-isabsolute-for-qualification.yml",
+		language: "typescript",
+		ext: "ts",
+		positive: `import * as path from "node:path";
+function f(filePath: string) { return path.win32.isAbsolute(filePath); }
+`,
+		negative: `import { isFullyQualified } from "./path-utils.js";
+function f(filePath: string) { return isFullyQualified(filePath); }
+`,
+	},
+	{
+		id: "no-raw-json-store-write",
+		file: "no-raw-json-store-write.yml",
+		language: "typescript",
+		ext: "ts",
+		positive: `import { writeFileSync } from "node:fs";
+function f(file: string, data: unknown) { writeFileSync(file, JSON.stringify(data)); }
+`,
+		negative: `import { writeFileAtomic } from "./atomic-write.js";
+function f(file: string, data: unknown) { writeFileAtomic(file, JSON.stringify(data)); }
+`,
+	},
+	{
+		id: "no-bare-host-path-in-win32-branch",
+		file: "no-bare-host-path-in-win32-branch.yml",
+		language: "typescript",
+		ext: "ts",
+		positive: `import * as path from "node:path";
+import { isWindowsPath } from "./path-utils.js";
+function f(filePath: string) {
+  if (isWindowsPath(filePath)) return path.dirname(filePath);
+}
+`,
+		negative: `import * as path from "node:path";
+import { isWindowsPath } from "./path-utils.js";
+function f(filePath: string) {
+  if (isWindowsPath(filePath)) return path.win32.dirname(filePath);
+  return path.dirname(filePath);
+}
+`,
+	},
 	{
 		id: "unmarshal-tag-is-dash",
 		file: "unmarshal-tag-is-dash.yml",
@@ -179,20 +223,19 @@ import {y} from "package";
 ];
 
 function probeCli(): boolean {
-	try {
-		// Windows: `ast-grep` ships as a .cmd shim, which `execFile` can't
-		// resolve directly. `shell: true` lets the OS shell (cmd.exe on
-		// Windows) find the shim through PATHEXT. CI on linux/macOS works
-		// the same way — Node's execFile would still bypass PATHEXT there
-		// only for .cmd-style shims, and shell: true is harmless.
-		execFileSync("ast-grep", ["--version"], {
-			stdio: ["ignore", "ignore", "ignore"],
-			shell: true,
-		});
-		return true;
-	} catch {
-		return false;
-	}
+	// #902: was `execFileSync("ast-grep", ..., { shell: true })`. On Windows
+	// that spawns a FRESH cmd.exe wrapper per call with no PATH/PATHEXT
+	// resolution caching, and the wrapper's own exit code can mask the real
+	// child's — intermittent ENOENT/false-positive-exit-0 under the process-
+	// creation pressure of a full parallel test-suite run (windows-latest
+	// CI), not a real "ast-grep unavailable" signal. `safeSpawn` (shared with
+	// production, `clients/safe-spawn.ts`) resolves the command via a cached
+	// PATH+PATHEXT walk and only falls back to a (pinned, validated) cmd.exe
+	// wrapper for genuine `.cmd`/`.bat` shims — same hardening #817 already
+	// gave the real dispatch spawn path, reused here instead of duplicating
+	// a second, less careful spawn strategy (single source of truth, #883).
+	const result = safeSpawn("ast-grep", ["--version"]);
+	return result.status === 0 && !result.error;
 }
 
 function runAstGrep(
@@ -208,39 +251,39 @@ function runAstGrep(
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pilens-sg-"));
 	const snippet = path.join(dir, `fixture.${ext}`);
 	fs.writeFileSync(snippet, code, "utf-8");
-	// shell: true so the Windows .cmd shim resolves through PATHEXT (see
-	// probeCli comment for context).
+	// #902: `safeSpawn` (see probeCli comment) instead of a raw
+	// `execFileSync(..., { shell: true })` — deterministic PATH+PATHEXT
+	// resolution + direct spawn for the common .exe/.com case, no extra
+	// cmd.exe layer to intermittently fail to spawn under load.
 	try {
-		const stdout = execFileSync(
-			"ast-grep",
-			["scan", "-r", ruleFile, snippet, "--report-style", "short"],
-			{ encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], shell: true },
-		);
-		return { stdout, stderr: "", exitCode: 0, fired: stdout.length > 0 };
-	} catch (err) {
-		const e = err as { stdout?: string; stderr?: string; status?: number };
-		const stdout = e.stdout ?? "";
-		// With shell: true on Windows the wrapper exit may be 0 even when
-		// the underlying process exited 1. The actual diagnostic is in
-		// stdout, so "fired" means "stdout is non-empty" — exit code alone
-		// is unreliable here. We still capture it for the assertion message.
+		const result = safeSpawn("ast-grep", [
+			"scan",
+			"-r",
+			ruleFile,
+			snippet,
+			"--report-style",
+			"short",
+		]);
+		if (result.error) throw result.error;
 		return {
-			stdout,
-			stderr: e.stderr ?? "",
-			exitCode: e.status ?? -1,
-			fired: stdout.length > 0,
+			stdout: result.stdout,
+			stderr: result.stderr,
+			exitCode: result.status ?? 0,
+			fired: result.stdout.length > 0,
 		};
 	} finally {
-		try {
-			fs.rmSync(dir, { recursive: true, force: true });
-		} catch {
-			// best-effort cleanup
-		}
+		removeTempDirSync(dir);
 	}
 }
 
 const cliAvailable = probeCli();
 const d = cliAvailable ? describe : describe.skip;
+
+// #448: a describe.skip on a missing CLI silently vanishes this whole
+// real-engine harness. Locally that's fine; in CI it must fail loud.
+it("ast-grep CLI is installed in CI", () => {
+	if (process.env.CI) expect(cliAvailable).toBe(true);
+});
 
 // A subset of the catalog rules have a non-trivial `fix:` field that the
 // ast-grep LSP surfaces as a codeAction. These are the rules where the
@@ -337,30 +380,22 @@ d("catalog rules with `fix:` field — CLI rewrite end-to-end", () => {
 				const snippet = path.join(dir, `fixture.${rule.ext}`);
 				fs.writeFileSync(snippet, rule.before, "utf-8");
 				// The CLI exits non-zero when the rule fires (a finding
-				// counts as an error severity by default). The JSON
-				// payload is on stdout regardless — catch the error
-				// and just inspect stdout. With `shell: true` on Windows
-				// the wrapper may collapse to exit 0, so this is belt-
-				// and-suspenders against either shape.
+				// counts as an error severity by default). The JSON payload
+				// is on stdout regardless of exit code, so just read stdout.
+				// #902: `safeSpawn` (see probeCli comment) instead of a raw
+				// `execFileSync(..., { shell: true })` — no extra cmd.exe
+				// wrapper layer whose own exit code could mask the real one.
 				let stdout = "";
 				try {
-					stdout = execFileSync(
-						"ast-grep",
-						["scan", "-r", rulePath, snippet, "--json=compact"],
-						{
-							encoding: "utf-8",
-							stdio: ["ignore", "pipe", "pipe"],
-							shell: true,
-						},
-					);
-				} catch (err) {
-					stdout = (err as { stdout?: string }).stdout ?? "";
+					stdout = safeSpawn("ast-grep", [
+						"scan",
+						"-r",
+						rulePath,
+						snippet,
+						"--json=compact",
+					]).stdout;
 				} finally {
-					try {
-						fs.rmSync(dir, { recursive: true, force: true });
-					} catch {
-						// best-effort
-					}
+					removeTempDirSync(dir);
 				}
 				// `--json=compact` emits a single JSON array of findings.
 				// The first finding carries the `replacement` we want to

@@ -21,6 +21,7 @@ import {
 	SLOW_FS_REDUCED_MAX_FILES,
 	slowFsDegradationNotice,
 } from "../../clients/slow-fs.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 const tmpDirs: string[] = [];
 const envKeys = [
@@ -55,7 +56,7 @@ afterEach(() => {
 	}
 	_resetSlowFsForTests();
 	for (const dir of tmpDirs.splice(0)) {
-		fs.rmSync(dir, { recursive: true, force: true });
+		removeTempDirSync(dir);
 	}
 });
 

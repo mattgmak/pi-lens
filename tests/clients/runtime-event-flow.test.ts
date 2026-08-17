@@ -9,6 +9,12 @@ import { handleToolResult } from "../../clients/runtime-tool-result.js";
 import { handleTurnEnd } from "../../clients/runtime-turn.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
+const latencyEntries: Array<Record<string, unknown>> = [];
+vi.mock("../../clients/latency-logger.js", async (importActual) => {
+	const actual = await importActual<typeof import("../../clients/latency-logger.js")>();
+	return { ...actual, logLatency: (entry: Record<string, unknown>) => latencyEntries.push(entry) };
+});
+
 const EMPTY_KNIP_RESULT = {
 	success: true,
 	issues: [],
@@ -30,6 +36,49 @@ vi.mock("../../clients/pipeline.js", () => ({
 }));
 
 describe("runtime event flow", () => {
+	it("runs the real turn-end madge batch and carries its result metadata (#1251)", async () => {
+		const env = setupTestEnvironment("pi-lens-madge-turn-end-");
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		const filePath = path.join(env.tmpDir, "src", "cycle.ts");
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+		fs.writeFileSync(filePath, "export const value = 1;\n");
+		const dbg = vi.fn();
+		latencyEntries.length = 0;
+		try {
+			cacheManager.addModifiedRange(filePath, { start: 1, end: 1 }, true, env.tmpDir);
+			const stats = {
+				requested: 1, missing: 0, cacheHits: 0, spawned: 1, failed: 0,
+				commandKind: "npx", resolveMs: 3,
+				targets: [{ file: "src/cycle.ts", durationMs: 125, ok: true }],
+				targetsTruncated: false,
+			};
+			const checkFilesBatch = vi.fn(async () => ({
+				results: new Map([[path.resolve(filePath), {
+					hasCircular: true, circular: [{ file: path.resolve(filePath), path: path.resolve(filePath) }],
+					checked: true, cacheHit: false,
+				}]]),
+				stats,
+			}));
+
+			await handleTurnEnd({
+				ctxCwd: env.tmpDir, getFlag: () => false, dbg, runtime, cacheManager,
+				knipClient: { ensureAvailable: async () => false, analyze: async () => EMPTY_KNIP_RESULT },
+				deadCodeClients: [],
+				depChecker: { ensureAvailable: async () => true, checkFilesBatch } as any,
+				testRunnerClient: { getTestRunTarget: () => null },
+				resetLSPService: () => {}, resetFormatService: () => {},
+			} as any);
+
+			expect(checkFilesBatch).toHaveBeenCalledWith([path.resolve(filePath)], env.tmpDir);
+			expect(dbg).toHaveBeenCalledWith(expect.stringContaining("circular dependency note"));
+			const madge = latencyEntries.find((entry) => entry.phase === "madge");
+			expect(madge?.metadata).toEqual(stats);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("flows session_start -> tool_result -> turn_end -> context", async () => {
 		const env = setupTestEnvironment("pi-lens-event-flow-");
 		const runtime = new RuntimeCoordinator();
@@ -73,6 +122,7 @@ describe("runtime event flow", () => {
 					isAvailable: () => false,
 					ensureAvailable: async () => false,
 				},
+				deadCodeClients: [],
 				depChecker: {
 					isAvailable: () => false,
 					ensureAvailable: async () => false,
@@ -126,6 +176,7 @@ describe("runtime event flow", () => {
 					ensureAvailable: async () => false,
 					analyze: async () => EMPTY_KNIP_RESULT,
 				},
+				deadCodeClients: [],
 				depChecker: { ensureAvailable: async () => false },
 				testRunnerClient: { getTestRunTarget: () => null },
 				resetLSPService: () => {},

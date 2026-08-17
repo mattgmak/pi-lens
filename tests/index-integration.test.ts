@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CacheManager } from "../clients/cache-manager.js";
 import { createPiMock } from "./support/pi-mock.js";
+import { removeTempDirSync } from "./clients/test-utils.js";
 
 // This suite predates the consolidated harness and is written against the
 // legacy `{ pi, handlers, commands }` shape. Adapt the canonical createPiMock
@@ -134,7 +135,7 @@ describe("index.ts integration", () => {
 	});
 
 	afterEach(() => {
-		fs.rmSync(tmpDir, { recursive: true, force: true });
+		removeTempDirSync(tmpDir);
 		if (originalStartupMode === undefined)
 			delete process.env.PI_LENS_STARTUP_MODE;
 		else process.env.PI_LENS_STARTUP_MODE = originalStartupMode;
@@ -222,7 +223,108 @@ describe("index.ts integration", () => {
 		expect(resetLSPService).toHaveBeenCalledWith({
 			fast: true,
 			processExiting: true,
+			reason: "session_shutdown",
 		});
+	}, INTEGRATION_TIMEOUT_MS);
+
+	it("session_shutdown dumps active handles AFTER LSP teardown (#1123 item 4)", async () => {
+		// #1097 lesson: "what survives IS the leak" — the dump must run after
+		// resetLSPService, not before, or it would report handles teardown was
+		// about to close as still-alive noise.
+		const order: string[] = [];
+		const resetLSPService = vi.fn(() => {
+			order.push("reset_lsp_service");
+		});
+		vi.doMock("../clients/lsp/index.js", () => ({
+			getLSPService: () => ({
+				touchFile: vi.fn(),
+				getAliveClientCount: () => 0,
+				getAliveServerIds: () => [],
+			}),
+			resetLSPService,
+		}));
+		vi.doMock("../clients/debug-handles.js", () => ({
+			dumpActiveHandles: (label: string) => {
+				order.push(`dump:${label}`);
+			},
+		}));
+
+		const { default: registerExtension } = await import("../index.ts");
+		const { pi, handlers } = createMockPi();
+		registerExtension(pi as any);
+
+		const shutdown = handlers.session_shutdown?.[0];
+		expect(shutdown).toBeTypeOf("function");
+		shutdown?.({ reason: "quit" }, { cwd: tmpDir });
+
+		expect(order).toEqual(["reset_lsp_service", "dump:session_shutdown"]);
+	}, INTEGRATION_TIMEOUT_MS);
+
+	it("session_shutdown emits the bus-event session-end rollup (S2d gap 5, #1432 review)", async () => {
+		vi.doMock("../clients/lsp/index.js", () => ({
+			getLSPService: () => ({
+				touchFile: vi.fn(),
+				getAliveClientCount: () => 0,
+				getAliveServerIds: () => [],
+			}),
+			resetLSPService: vi.fn(),
+		}));
+		const emitBusEventRollupAtSessionEnd = vi.fn();
+		vi.doMock("../clients/bus-events-logger.js", async (importActual) => {
+			const actual =
+				await importActual<typeof import("../clients/bus-events-logger.js")>();
+			return { ...actual, emitBusEventRollupAtSessionEnd };
+		});
+
+		const { default: registerExtension } = await import("../index.ts");
+		const { pi, handlers } = createMockPi();
+		registerExtension(pi as any);
+
+		const shutdown = handlers.session_shutdown?.[0];
+		expect(shutdown).toBeTypeOf("function");
+		shutdown?.({ reason: "quit" }, { cwd: tmpDir });
+
+		expect(emitBusEventRollupAtSessionEnd).toHaveBeenCalledTimes(1);
+	}, INTEGRATION_TIMEOUT_MS);
+
+	it("agent_settled dumps active handles AFTER quiet-window work is scheduled (#1123 item 4)", async () => {
+		// #1097's leak (a stray ref'd timer) only surfaces once whatever
+		// agent_settled itself queues is already in flight, so the dump must
+		// fire after runQuietWindow is invoked, not before.
+		const order: string[] = [];
+		vi.doMock("../clients/lsp/index.js", () => ({
+			getLSPService: () => ({
+				touchFile: vi.fn(),
+				getAliveClientCount: () => 0,
+				getAliveServerIds: () => [],
+			}),
+			resetLSPService: vi.fn(),
+		}));
+		vi.doMock("../clients/quiet-window.js", () => ({
+			registerQuietWindowTask: () => {},
+			registerBuiltinQuietWindowTasks: () => {},
+			runQuietWindow: async () => {
+				order.push("quiet_window_scheduled");
+			},
+		}));
+		vi.doMock("../clients/debug-handles.js", () => ({
+			dumpActiveHandles: (label: string) => {
+				order.push(`dump:${label}`);
+			},
+		}));
+
+		const { default: registerExtension } = await import("../index.ts");
+		const { pi, handlers } = createMockPi();
+		registerExtension(pi as any);
+
+		const settled = handlers.agent_settled?.[0];
+		expect(settled).toBeTypeOf("function");
+		await settled?.({}, { cwd: tmpDir });
+		// runQuietWindow is kicked off unawaited (fire-and-forget by design);
+		// drain the microtask queue before asserting.
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(order).toEqual(["quiet_window_scheduled", "dump:agent_settled"]);
 	}, INTEGRATION_TIMEOUT_MS);
 
 	it("idle LSP reset repaints the footer to Inactive (detached 240s timer)", async () => {
@@ -291,10 +393,29 @@ describe("index.ts integration", () => {
 		}
 	}, INTEGRATION_TIMEOUT_MS);
 
-	it("context handler prepends injected guidance before the user prompt", async () => {
+	// #1016: pi-lens injects ephemeral turn-end findings via the `context` event.
+	// The findings are spliced in IMMEDIATELY BEFORE the final message rather than
+	// prepended at index 0, so messages[0] stays byte-stable across turns and the
+	// prompt-cache prefix on prefix-caching providers (Anthropic/Bedrock) survives.
+	// The real user prompt stays as the trailing message (cache breakpoint), and the
+	// existing transcript is never dropped (fe0ed5da: never emit empty input).
+	async function loadContextHandler() {
 		const { default: registerExtension } = await import("../index.ts");
 		const { pi, handlers } = createMockPi();
 		registerExtension(pi as any);
+		const context = handlers.context?.[0];
+		expect(context).toBeTypeOf("function");
+		return context as IntegrationHook;
+	}
+	const injectedMatcher = expect.objectContaining({
+		role: "user",
+		content: expect.stringContaining(
+			"[pi-lens automated context — not a user request]",
+		),
+	});
+
+	it("context handler injects guidance immediately before the final user prompt", async () => {
+		const context = await loadContextHandler();
 
 		const cacheManager = new CacheManager(false);
 		cacheManager.writeCache(
@@ -303,26 +424,170 @@ describe("index.ts integration", () => {
 			tmpDir,
 		);
 
-		const context = handlers.context?.[0];
-		expect(context).toBeTypeOf("function");
+		// A realistic multi-turn transcript: assistant + prior user turns precede
+		// the current user prompt. (With a single-message transcript the old
+		// prepend and the new before-final placement coincide, so a multi-message
+		// transcript is required to actually exercise the #1016 change.)
+		const firstUser = { role: "user", content: "Start the task" };
+		const assistant = { role: "assistant", content: "On it." };
+		const finalUser = { role: "user", content: "Fix the bug" };
+		const existing = [firstUser, assistant, finalUser];
 
-		const userMessage = { role: "user", content: "Fix the bug" };
-		const result = await context?.(
-			{ messages: [userMessage] },
+		const result = (await context(
+			{ messages: existing },
 			{ cwd: tmpDir },
+		)) as { messages: Array<{ role: string; content: unknown }> };
+
+		// Full expected ordering: prior turns, then injected block, then the final
+		// user prompt — [firstUser, assistant, <injected>, finalUser].
+		expect(result).toEqual({
+			messages: [firstUser, assistant, injectedMatcher, finalUser],
+		});
+
+		// (1) #1016 index-0 stability: messages[0] is untouched. This is the
+		// property that FAILS on the old prepend code (injected findings landed at
+		// index 0), and it is the actual prompt-cache win.
+		expect(result.messages[0]).toEqual(firstUser);
+
+		// (2) Final message unchanged: same role + content as the incoming prompt.
+		const last = result.messages[result.messages.length - 1];
+		expect(last).toEqual(finalUser);
+		expect(last.role).toBe("user");
+
+		// (3) Injected block sits at length - 2, immediately before the final msg.
+		expect(result.messages[result.messages.length - 2]).toEqual(injectedMatcher);
+
+		// (5) Non-empty input preserved (fe0ed5da): every existing message survives.
+		expect(result.messages).toHaveLength(existing.length + 1);
+		for (const msg of existing) {
+			expect(result.messages).toContainEqual(msg);
+		}
+	}, INTEGRATION_TIMEOUT_MS);
+
+	it("context injection keeps the prior-conversation prefix byte-identical across turns (#1016 cache win)", async () => {
+		const firstUser = { role: "user", content: "Start the task" };
+		const assistant = { role: "assistant", content: "On it." };
+		const finalUser = { role: "user", content: "Fix the bug" };
+		const baseTranscript = () => [
+			{ ...firstUser },
+			{ ...assistant },
+			{ ...finalUser },
+		];
+
+		// Turn A
+		const contextA = await loadContextHandler();
+		new CacheManager(false).writeCache(
+			"session-start-guidance",
+			{ content: "Finding A" },
+			tmpDir,
+		);
+		const resultA = (await contextA(
+			{ messages: baseTranscript() },
+			{ cwd: tmpDir },
+		)) as { messages: Array<{ role: string; content: unknown }> };
+
+		// Turn B — same base transcript, different injected finding. Fresh module
+		// registration to mirror a second independent turn.
+		vi.resetModules();
+		const contextB = await loadContextHandler();
+		new CacheManager(false).writeCache(
+			"session-start-guidance",
+			{ content: "Completely different Finding B" },
+			tmpDir,
+		);
+		const resultB = (await contextB(
+			{ messages: baseTranscript() },
+			{ cwd: tmpDir },
+		)) as { messages: Array<{ role: string; content: unknown }> };
+
+		// The prior conversation prefix (everything up to but excluding the
+		// injection point at length - 2) is identical between the two turns — this
+		// is exactly what a prefix-caching provider reuses.
+		const prefixA = resultA.messages.slice(0, resultA.messages.length - 2);
+		const prefixB = resultB.messages.slice(0, resultB.messages.length - 2);
+		expect(prefixA).toEqual(prefixB);
+		expect(prefixA).toEqual([firstUser, assistant]);
+
+		// They diverge only at the injection slot.
+		expect(resultA.messages[resultA.messages.length - 2]).not.toEqual(
+			resultB.messages[resultB.messages.length - 2],
+		);
+		// ...and reconverge on the trailing user prompt.
+		expect(resultA.messages[resultA.messages.length - 1]).toEqual(finalUser);
+		expect(resultB.messages[resultB.messages.length - 1]).toEqual(finalUser);
+	}, INTEGRATION_TIMEOUT_MS);
+
+	it("context handler falls back to prepend for an empty transcript (fe0ed5da: never empty input)", async () => {
+		const context = await loadContextHandler();
+		new CacheManager(false).writeCache(
+			"session-start-guidance",
+			{ content: "Use pi-lens tools when useful." },
+			tmpDir,
 		);
 
-		expect(result).toEqual({
-			messages: [
-				expect.objectContaining({
-					role: "user",
-					content: expect.stringContaining(
-						"[pi-lens automated context — not a user request]",
-					),
-				}),
-				userMessage,
-			],
-		});
+		const result = (await context({ messages: [] }, { cwd: tmpDir })) as {
+			messages: Array<{ role: string; content: unknown }>;
+		};
+
+		// Degenerate case: no trailing message to sit before, so we emit just the
+		// injected block (identical to pre-#1016 behavior) — never empty input.
+		expect(result.messages.length).toBeGreaterThan(0);
+		expect(result.messages[0]).toEqual(injectedMatcher);
+	}, INTEGRATION_TIMEOUT_MS);
+
+	it("context handler appends (does NOT splice before) a trailing tool_result so tool_use/tool_result adjacency survives mid-loop (#1016 guard)", async () => {
+		const context = await loadContextHandler();
+		new CacheManager(false).writeCache(
+			"session-start-guidance",
+			{ content: "Use pi-lens tools when useful." },
+			tmpDir,
+		);
+
+		// Mid-agentic-loop continuation: the tail is an assistant `tool_use` block
+		// immediately followed by the matching `user` `tool_result`. The `context`
+		// event fires on this call too, and splicing an injected `user` message
+		// BETWEEN them yields a 400 ("tool_use ids were found without tool_result
+		// blocks") on Anthropic/Bedrock/OpenAI. The injected findings must therefore
+		// be APPENDED after the tool_result, never inserted before it.
+		const firstUser = { role: "user", content: "Start the task" };
+		const toolUse = {
+			role: "assistant",
+			content: [{ type: "tool_use", id: "tu_1", name: "read", input: {} }],
+		};
+		const toolResult = {
+			role: "user",
+			content: [{ type: "tool_result", tool_use_id: "tu_1", content: "ok" }],
+		};
+		const existing = [firstUser, toolUse, toolResult];
+
+		const result = (await context(
+			{ messages: existing },
+			{ cwd: tmpDir },
+		)) as { messages: Array<{ role: string; content: unknown }> };
+
+		// tool_result stays IMMEDIATELY after its tool_use — nothing spliced between.
+		const toolUseIdx = result.messages.findIndex((m) => m === toolUse);
+		expect(toolUseIdx).toBeGreaterThanOrEqual(0);
+		expect(result.messages[toolUseIdx + 1]).toBe(toolResult);
+
+		// The findings are appended AFTER the whole transcript, not before the tail.
+		expect(result.messages.slice(0, existing.length)).toEqual(existing);
+		expect(result.messages[result.messages.length - 1]).toEqual(injectedMatcher);
+
+		// index-0 stability still holds (cache prefix preserved).
+		expect(result.messages[0]).toEqual(firstUser);
+	}, INTEGRATION_TIMEOUT_MS);
+
+	it("context handler is a no-op when there is nothing to inject", async () => {
+		const context = await loadContextHandler();
+		// No cache written → nothing to inject → handler returns undefined (no
+		// override), so a non-injecting turn is byte-identical to no handler.
+		const finalUser = { role: "user", content: "Fix the bug" };
+		const result = await context(
+			{ messages: [finalUser] },
+			{ cwd: tmpDir },
+		);
+		expect(result).toBeUndefined();
 	}, INTEGRATION_TIMEOUT_MS);
 
 	it("tool_call records full-file reads from read.path with full line coverage", async () => {
@@ -693,6 +958,7 @@ describe("index.ts integration", () => {
 		}));
 		vi.doMock("../clients/lsp/index.js", async () => ({
 			getLSPService: () => ({ touchFile: touchFileMock }),
+			resetLSPService: () => {},
 		}));
 
 		const { default: registerExtension } = await import("../index.ts");
@@ -786,6 +1052,7 @@ describe("index.ts integration", () => {
 		}));
 		vi.doMock("../clients/lsp/index.js", async () => ({
 			getLSPService: () => ({ touchFile: touchFileMock }),
+			resetLSPService: () => {},
 		}));
 
 		const { default: registerExtension } = await import("../index.ts");
@@ -874,6 +1141,7 @@ describe("index.ts integration", () => {
 		}));
 		vi.doMock("../clients/lsp/index.js", async () => ({
 			getLSPService: () => ({ touchFile: touchFileMock }),
+			resetLSPService: () => {},
 		}));
 
 		const { default: registerExtension } = await import("../index.ts");
@@ -1072,7 +1340,7 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 	});
 
 	afterEach(() => {
-		fs.rmSync(tmpDir, { recursive: true, force: true });
+		removeTempDirSync(tmpDir);
 		if (originalStartupMode === undefined)
 			delete process.env.PI_LENS_STARTUP_MODE;
 		else process.env.PI_LENS_STARTUP_MODE = originalStartupMode;
@@ -1377,5 +1645,52 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 
 		await driveEditThenTurnEnd(handlers, filePath);
 		await expect(fireAgentSettled(handlers)).resolves.not.toThrow();
+	}, INTEGRATION_TIMEOUT_MS);
+
+	it("no-ops (does not fail the quiet-window task) when the captured pi ctx has gone stale", async () => {
+		vi.doMock("../clients/pipeline.js", () => ({
+			runPipeline: vi.fn(async () => workingPipelineResult()),
+		}));
+		mockSuiteDeps();
+
+		const filePath = path.join(tmpDir, "src", "app.ts");
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+		fs.writeFileSync(filePath, "export const x = 1;\n");
+
+		const { default: registerExtension } = await import("../index.ts");
+		const { pi, handlers, sentMessages } = createMockPi({
+			"lens-turn-summary": true,
+		});
+		registerExtension(pi as any);
+
+		// Populate the run's collector so the task would proceed past isEmpty()
+		// on a live ctx — proving the guard added by the fix, not an empty-run
+		// early return, is what makes this a no-op.
+		await driveEditThenTurnEnd(handlers, filePath);
+
+		// Simulate the SDK invalidating the captured pi after a session
+		// replacement/reload (newSession/fork/switchSession/reload): from then on
+		// every `pi.*` call throws the stale-ctx guard. The turn_summary_emit task
+		// hits pi.getFlag (via getLensFlag) FIRST — outside the sendMessage
+		// try/catch — so pre-fix that throw propagated out of the task and the
+		// real scheduler logged it 55× in live dogfood as `task
+		// "turn_summary_emit" failed` (the log's most frequent error).
+		const STALE_MSG =
+			"This extension ctx is stale after session replacement or reload. " +
+			"Do not use a captured pi or command ctx after ctx.newSession(), " +
+			"ctx.fork(), ctx.switchSession(), or ctx.reload().";
+		(pi as unknown as Record<string, unknown>).getFlag = () => {
+			throw new Error(STALE_MSG);
+		};
+
+		const task = quietTasks.find((t) => t.name === "turn_summary_emit");
+		expect(task).toBeDefined();
+		// Run the task directly: the suite's runQuietWindow stub swallows task
+		// throws (mirroring the real scheduler), so driving fireAgentSettled would
+		// hide the regression. Awaiting the task itself surfaces it — pre-fix this
+		// rejects with the stale-ctx Error; post-fix it resolves to a no-op.
+		await expect((async () => task?.fn())()).resolves.toBeUndefined();
+		// Nothing is emitted into the replaced session.
+		expect(sentMessages).toHaveLength(0);
 	}, INTEGRATION_TIMEOUT_MS);
 });

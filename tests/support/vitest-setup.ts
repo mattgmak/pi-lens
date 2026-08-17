@@ -9,12 +9,17 @@ import * as path from "node:path";
 // behaviour). Tests that exercise the throttle override this in their own body
 // and call `flushReviewGraphPersistsForTests()`.
 process.env.PI_LENS_GRAPH_PERSIST_DEBOUNCE_MS = "0";
+process.env.PI_LENS_DISABLE_TOOL_INSTALL = "1";
 
 // Same rationale, word index (#348 phase 2): per-edit updates schedule a
 // debounced persist through the shared project-snapshot file. Default to a
 // synchronous write in tests; tests exercising the throttle itself override
 // this in their own body and call `flushWordIndexPersistsForTests()`.
 process.env.PI_LENS_WORD_INDEX_PERSIST_DEBOUNCE_MS = "0";
+
+// Pin the log rotation threshold to its default. It also bounds /lens-perf's
+// read window, so an ambient value would resize what the perf tests parse.
+process.env.PI_LENS_MAX_LOG_SIZE_MB = "10";
 
 // Hermeticity: never let the developer's PERSONAL ~/.pi-lens/config.json leak
 // into test behavior. Seen live 2026-07-11: opting into `turnSummary.enabled`
@@ -42,3 +47,20 @@ process.env.PI_LENS_CONFIG_PATH = "/nonexistent-pi-lens-tests/config.json";
 process.env.PI_LENS_HOME = fs.mkdtempSync(
 	path.join(os.tmpdir(), "pi-lens-test-home-"),
 );
+
+// Hand this worker the suite-wide tool template's probe cache (built once by
+// prewarm-tool-home.ts globalSetup). ensureTool's probe-cache fast path then
+// resolves the template's already-installed binaries instead of paying a cold
+// npm install per worker. Entries point INTO the template dir — validated by
+// path+mtime on every read, and executed read-only, so sharing is safe.
+const toolTemplate = process.env.PI_LENS_TEST_TOOLS_TEMPLATE;
+if (toolTemplate) {
+	try {
+		fs.copyFileSync(
+			path.join(toolTemplate, "probe-cache.json"),
+			path.join(process.env.PI_LENS_HOME, "probe-cache.json"),
+		);
+	} catch {
+		// missing template file — worker simply runs cold, as before
+	}
+}

@@ -28,13 +28,9 @@ query: |
     condition: (identifier) @COND (#eq? @COND "NotImplemented"))
   (while_statement
     condition: (identifier) @COND (#eq? @COND "NotImplemented"))
-  (binary_operator
-    (identifier) @COND (#eq? @COND "NotImplemented")
-    ("and" | "or"))
   (boolean_operator
     (identifier) @COND (#eq? @COND "NotImplemented"))
-  (unary_operator
-    operator: ("not")
+  (not_operator
     argument: (identifier) @COND (#eq? @COND "NotImplemented"))
 
 metavars:

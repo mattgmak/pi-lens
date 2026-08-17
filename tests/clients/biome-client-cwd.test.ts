@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BiomeClient } from "../../clients/biome-client.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 const tmpDirs: string[] = [];
 
@@ -10,7 +11,7 @@ afterEach(() => {
 	while (tmpDirs.length > 0) {
 		const dir = tmpDirs.pop();
 		if (dir && fs.existsSync(dir)) {
-			fs.rmSync(dir, { recursive: true, force: true });
+			removeTempDirSync(dir);
 		}
 	}
 	vi.restoreAllMocks();

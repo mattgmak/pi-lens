@@ -29,6 +29,17 @@ export interface TodoScanResult {
 
 // --- Scanner ---
 
+/**
+ * Per-file size cap (#894 review, defense in depth): broadened enumeration can
+ * surface large data files that slip past generated-artifact filtering, and a
+ * multi-MB read + regex sweep per file on session start is exactly the stall
+ * this scanner must avoid. 512 KiB matches word-index's WORD_INDEX_MAX_BYTES
+ * precedent — hand-written source is essentially never larger.
+ */
+const MAX_SCAN_FILE_BYTES = 512 * 1024;
+
+const MARKDOWN_FILE_RE = /\.(?:md|mdx|markdown)$/i;
+
 export class TodoScanner {
 	/**
 	 * Pattern matches actionable annotations only.
@@ -41,7 +52,20 @@ export class TodoScanner {
 	 * Check if a match position is inside a comment context.
 	 * Handles: // line comments, star-slash block comments, * JSDoc lines, # Python comments
 	 */
-	private isInComment(line: string, matchIndex: number): boolean {
+	private isInComment(
+		line: string,
+		matchIndex: number,
+		markdown = false,
+	): boolean {
+		if (markdown) {
+			// Markdown has no '#'/'//' comments — '# TODO refactor' is a section
+			// heading, not a flagged work item (#894 review: .md files are now
+			// enumerated). Only HTML comments (<!-- TODO: … -->) count.
+			const beforeMatch = line.slice(0, matchIndex);
+			const open = beforeMatch.lastIndexOf("<!--");
+			return open !== -1 && beforeMatch.lastIndexOf("-->") < open;
+		}
+
 		const trimmed = line.trimStart();
 
 		// Line starts with comment markers — entire line is a comment
@@ -89,7 +113,16 @@ export class TodoScanner {
 	 */
 	scanFile(filePath: string): TodoItem[] {
 		const absolutePath = path.resolve(filePath);
-		if (!fs.existsSync(absolutePath)) return [];
+
+		// Size gate before the read (#894 review): a lockfile-sized data file
+		// must never pay a full read + per-line regex sweep. statSync doubles as
+		// the existence check.
+		try {
+			const stat = fs.statSync(absolutePath);
+			if (!stat.isFile() || stat.size > MAX_SCAN_FILE_BYTES) return [];
+		} catch {
+			return [];
+		}
 
 		let content: string;
 		try {
@@ -97,6 +130,7 @@ export class TodoScanner {
 		} catch {
 			return [];
 		}
+		const markdown = MARKDOWN_FILE_RE.test(absolutePath);
 		const lines = content.split("\n");
 		const items: TodoItem[] = [];
 
@@ -106,7 +140,7 @@ export class TodoScanner {
 
 			for (const match of matches) {
 				// Skip matches that aren't inside comments
-				if (!this.isInComment(line, match.index ?? 0)) continue;
+				if (!this.isInComment(line, match.index ?? 0, markdown)) continue;
 
 				const type = match[1] as TodoItem["type"];
 				const message = (match[2] || "").trim().replace(/\s*\*\/\s*$/, ""); // Strip closing comment
@@ -152,7 +186,11 @@ export class TodoScanner {
 	 * This is the preferred entry point for new callers.
 	 */
 	scanDirectory(dirPath: string): TodoScanResult {
-		// Use source-filter to collect only source files (no build artifacts)
+		// Use source-filter to collect only source files (no build artifacts).
+		// #760: the walk is bounded by source-filter's default visited-entry
+		// budget (DEFAULT_MAX_SCAN_ENTRIES) — on a pathological mixed tree this
+		// sync call gets a truncated best-effort list instead of blocking its
+		// caller for a full-tree walk; a partial TODO sweep is acceptable here.
 		const sourceFiles = collectSourceFiles(dirPath);
 		return this.scanFiles(sourceFiles);
 	}

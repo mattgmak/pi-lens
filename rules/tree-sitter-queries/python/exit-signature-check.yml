@@ -28,18 +28,11 @@ description: |
 query: |
   (function_definition
     name: (identifier) @NAME (#eq? @NAME "__exit__")
-    parameters: (parameters
-      (_) @SELF
-      . (_) @PARAM1?
-      . (_) @PARAM2?
-      . (_) @PARAM3?))
+    parameters: (parameters) @PARAMS)
 
 metavars:
   - NAME
-  - SELF
-  - PARAM1
-  - PARAM2
-  - PARAM3
+  - PARAMS
 
 post_filter: exit_params_insufficient
 

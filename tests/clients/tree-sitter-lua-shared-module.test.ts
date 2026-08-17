@@ -10,7 +10,8 @@
  * cleanly and extracts symbols + imports.
  */
 import { beforeAll, describe, expect, it } from "vitest";
-import { TreeSitterClient } from "../../clients/tree-sitter-client.js";
+import { getSharedTreeSitterClient } from "../../clients/tree-sitter-shared.js";
+import type { TreeSitterClient } from "../../clients/tree-sitter-client.js";
 import { TreeSitterSymbolExtractor } from "../../clients/tree-sitter-symbol-extractor.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
@@ -30,7 +31,7 @@ function countErrorNodes(node: { type: string; children?: unknown[] }): number {
 describe("lua survives the shared WASM Module (#255)", () => {
 	let client: TreeSitterClient;
 	beforeAll(async () => {
-		client = new TreeSitterClient();
+		client = getSharedTreeSitterClient()!;
 		await client.init();
 	});
 
@@ -74,7 +75,7 @@ describe("overridden yaml grammar loads (#427)", () => {
 	it("parses yaml cleanly (aggregator wasm was ABI-unloadable)", async () => {
 		const env = setupTestEnvironment("pi-lens-yaml427-");
 		try {
-			const client = new TreeSitterClient();
+			const client = getSharedTreeSitterClient()!;
 			await client.init();
 			// Load a second grammar first, mirroring a real multi-language session.
 			const py = createTempFile(env.tmpDir, "a.py", "import os\n");

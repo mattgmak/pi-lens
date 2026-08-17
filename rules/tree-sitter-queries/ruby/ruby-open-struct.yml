@@ -17,7 +17,7 @@ description: |
   ✅ FIX: Use Struct.new or a plain class with attr_accessor.
 
 query: |
-  (call_expression
+  (call
     receiver: (constant) @RECV
     (#eq? @RECV "OpenStruct")
     method: (identifier) @METHOD

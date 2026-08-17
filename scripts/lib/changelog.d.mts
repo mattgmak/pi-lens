@@ -14,9 +14,13 @@ export function summarizeSection(
 export function normalizeVersion(version: string): string;
 export function extractSection(text: string, version: string): string | null;
 export function hasSection(text: string, version: string): boolean;
-export function unreleasedHasEntries(text: string): boolean;
-export function promoteUnreleased(
-  text: string,
-  version: string,
-  date: string,
-): string;
+
+export interface ChangelogLintProblem {
+  kind: "orphan" | "wrapped-title";
+  line: number;
+  text: string;
+}
+
+export function lintSectionBody(body: string | null): ChangelogLintProblem[];
+export function lintUnreleased(text: string): ChangelogLintProblem[];
+export const EMPTY_UNRELEASED: string;

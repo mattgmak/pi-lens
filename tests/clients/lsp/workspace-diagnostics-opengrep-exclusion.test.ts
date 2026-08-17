@@ -14,6 +14,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { removeTempDirSync } from "../test-utils.js";
 
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
@@ -60,7 +61,7 @@ describe("runWorkspaceDiagnostics — opengrep excluded from the bulk sweep (#58
 		createLSPClient.mockReset();
 		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "wsd-opengrep-exclude-"));
 	});
-	afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
+	afterEach(() => removeTempDirSync(tmp));
 
 	it("touches the primary server but never spawns/opens opengrep for a file it also covers", async () => {
 		fs.writeFileSync(path.join(tmp, "a.py"), "x\n");

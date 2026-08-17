@@ -22,15 +22,15 @@ description: |
   ```
 
 query: |
-  (declaration
-    type: (template_type
-      name: (type_identifier) @TYPE (#eq? @TYPE "scoped_lock"))
-    declarator: (init_declarator
-      initializer: (argument_list) @ARGS))
+  ((declaration
+    type: (qualified_identifier
+      name: (type_identifier) @TYPE)
+    declarator: (identifier) @DECL)
+    (#eq? @TYPE "scoped_lock"))
 
 metavars:
   - TYPE
-  - ARGS
+  - DECL
 
 post_filter: scoped_lock_empty_args
 

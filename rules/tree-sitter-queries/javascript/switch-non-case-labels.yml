@@ -19,8 +19,9 @@ description: |
 query: |
   (switch_statement
     body: (switch_body
-      (labeled_statement
-        (statement_identifier) @LABEL) @LABELED))
+      (switch_case
+        (labeled_statement
+          (statement_identifier) @LABEL) @LABELED)))
 
 metavars:
   - LABEL

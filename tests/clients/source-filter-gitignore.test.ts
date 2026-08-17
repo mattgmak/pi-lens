@@ -7,6 +7,7 @@ import {
 	readGitignoreDirs,
 } from "../../clients/file-utils.js";
 import { collectSourceFiles } from "../../clients/source-filter.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 let tmpDir: string;
 
@@ -15,7 +16,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-	fs.rmSync(tmpDir, { recursive: true, force: true });
+	removeTempDirSync(tmpDir);
 });
 
 describe("readGitignoreDirs", () => {

@@ -79,7 +79,11 @@ export const LANGUAGE_EXTENSIONS: Record<string, string> = {
 	".sh": "shellscript",
 	".bash": "shellscript",
 	".zsh": "shellscript",
-	".fish": "shellscript",
+	".fish": "fish",
+
+	// CMake
+	".cmake": "cmake",
+	"CMakeLists.txt": "cmake",
 
 	// JSON/YAML
 	".json": "json",

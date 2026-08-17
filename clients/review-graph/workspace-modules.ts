@@ -7,8 +7,13 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getProjectIgnoreMatcher, isExcludedDirName } from "../file-utils.js";
+import {
+	getProjectIgnoreMatcher,
+	isExcludedDirName,
+	type ProjectIgnoreMatcher,
+} from "../file-utils.js";
 import { normalizeMapKey } from "../path-utils.js";
+import { getWorkspaceManifestMarkers } from "../workspace-topology.js";
 
 export interface WorkspaceModule {
 	name: string;
@@ -64,21 +69,32 @@ function readJsonSafe(filePath: string): unknown {
 	}
 }
 
+/**
+ * Presence checks for the four workspace-manifest markers are sourced from
+ * the shared workspace-topology marker index (#806) — one `readdir` pass at
+ * `cwd` collects them alongside `.pi-lens.json`/`tsconfig.json` other
+ * consumers need for the SAME directory, instead of four independent
+ * `existsSync` probes. Manifest CONTENT (workspace globs, the `[workspace]`
+ * TOML section, the `workspaces` package.json field) is still read and
+ * parsed here — the topology index only answers "is the marker present".
+ */
 function detectWorkspaceType(cwd: string): WorkspaceType | null {
-	if (fs.existsSync(path.join(cwd, "pnpm-workspace.yaml"))) return "pnpm";
-	if (fs.existsSync(path.join(cwd, "go.work"))) return "go";
-	const cargoToml = path.join(cwd, "Cargo.toml");
-	if (fs.existsSync(cargoToml)) {
+	const markers = getWorkspaceManifestMarkers(cwd);
+	if (markers.hasPnpmWorkspaceYaml) return "pnpm";
+	if (markers.hasGoWork) return "go";
+	if (markers.hasCargoToml) {
 		try {
-			const content = fs.readFileSync(cargoToml, "utf-8");
+			const content = fs.readFileSync(path.join(cwd, "Cargo.toml"), "utf-8");
 			if (content.includes("[workspace]")) return "cargo";
 		} catch {}
 	}
-	const pkgJson = readJsonSafe(path.join(cwd, "package.json")) as
-		| PackageJson
-		| undefined;
-	const workspaces = normalizeWorkspacePatterns(pkgJson?.workspaces);
-	if (workspaces.length > 0) return "npm";
+	if (markers.hasPackageJson) {
+		const pkgJson = readJsonSafe(path.join(cwd, "package.json")) as
+			| PackageJson
+			| undefined;
+		const workspaces = normalizeWorkspacePatterns(pkgJson?.workspaces);
+		if (workspaces.length > 0) return "npm";
+	}
 	return null;
 }
 
@@ -420,6 +436,7 @@ export function buildModuleGraph(cwd: string): ModuleGraph | null {
 
 export function clearModuleGraphCache(): void {
 	_moduleGraphCache = null;
+	_moduleSourceFilesMemo.clear();
 }
 
 /**
@@ -461,15 +478,71 @@ export function getDownstreamModules(
 }
 
 /**
- * Get representative source files in a module.
+ * Memo for {@link getModuleSourceFiles} (#1137 remnant, #1318 slice 2). The
+ * sole caller is the cascade's per-downstream-module loop
+ * (`review-graph/query.ts`), which runs on EVERY edited file — so a monorepo
+ * edit re-walked every downstream module's directory tree (recursive
+ * `readdirSync`, depth ≤4) even though module file lists almost never change.
+ * Keyed by normalized module root; bounded by the workspace's module count
+ * (itself bounded by the glob-expansion caps above). Invalidation rides
+ * existing freshness seams, no new scheme:
+ * - every directory the walk VISITED is re-stat'd by mtimeMs (the repo's
+ *   cheap freshness tier, same class as the ancestor-directory-mtime
+ *   validation in project-config discovery) — a file add/remove/rename in any
+ *   directory that contributed to the result changes that dir's mtime. Recent
+ *   stamps are treated as unverifiable because filesystem mtime granularity
+ *   can alias a write with the preceding walk;
+ * - the ignore matcher is compared by object identity —
+ *   `getProjectIgnoreMatcher` returns a fresh object whenever a
+ *   `.gitignore`/`.pi-lens.json`/global-config input's size:mtimeMs changes,
+ *   so ignore-rule edits re-walk too.
+ * Cleared with the module-graph cache (`clearModuleGraphCache`).
+ */
+interface ModuleSourceFilesMemoEntry {
+	files: string[];
+	maxFiles: number;
+	dirs: Array<{ dir: string; mtimeMs: number; stampedAt: number }>;
+	matcher: ProjectIgnoreMatcher;
+}
+const _moduleSourceFilesMemo = new Map<string, ModuleSourceFilesMemoEntry>();
+const MTIME_GRANULARITY_GUARD_MS = 2_000;
+
+function isMemoEntryFresh(entry: ModuleSourceFilesMemoEntry): boolean {
+	const validatedAt = Date.now();
+	for (const { dir, mtimeMs, stampedAt } of entry.dirs) {
+		if (validatedAt - stampedAt < MTIME_GRANULARITY_GUARD_MS) return false;
+		try {
+			if (fs.statSync(dir).mtimeMs !== mtimeMs) return false;
+		} catch {
+			return false;
+		}
+	}
+	return true;
+}
+
+/**
+ * Get representative source files in a module. Memoized per module root (see
+ * above) — the returned array is a copy; mutating it does not affect the memo.
  */
 export function getModuleSourceFiles(
 	moduleRoot: string,
 	maxFiles = 20,
 ): string[] {
-	const files: string[] = [];
 	const root = normalizeMapKey(moduleRoot);
 	const ignoreMatcher = getProjectIgnoreMatcher(root);
+	const cached = _moduleSourceFilesMemo.get(root);
+	if (
+		cached &&
+		cached.maxFiles === maxFiles &&
+		cached.matcher === ignoreMatcher &&
+		isMemoEntryFresh(cached)
+	) {
+		return [...cached.files];
+	}
+
+	const files: string[] = [];
+	const dirs: Array<{ dir: string; mtimeMs: number; stampedAt: number }> = [];
+	let allDirsStamped = true;
 	const visit = (dir: string, depth: number): void => {
 		if (files.length >= maxFiles || depth > 4) return;
 		let entries: fs.Dirent[] = [];
@@ -477,6 +550,17 @@ export function getModuleSourceFiles(
 			entries = fs.readdirSync(dir, { withFileTypes: true });
 		} catch {
 			return;
+		}
+		// Stamp AFTER the readdir: a change landing between readdir and stat
+		// records the newer mtime, so validation re-walks (fail-safe direction).
+		try {
+			dirs.push({
+				dir,
+				mtimeMs: fs.statSync(dir).mtimeMs,
+				stampedAt: Date.now(),
+			});
+		} catch {
+			allDirsStamped = false;
 		}
 		entries.sort((a, b) => a.name.localeCompare(b.name));
 		for (const entry of entries) {
@@ -499,5 +583,13 @@ export function getModuleSourceFiles(
 		}
 	};
 	visit(root, 0);
+	if (allDirsStamped) {
+		_moduleSourceFilesMemo.set(root, {
+			files: [...files],
+			maxFiles,
+			dirs,
+			matcher: ignoreMatcher,
+		});
+	}
 	return files;
 }

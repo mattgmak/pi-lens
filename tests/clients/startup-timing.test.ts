@@ -34,4 +34,13 @@ describe("startup-timing", () => {
 		const m = await freshModule();
 		expect(["dist", "source"]).toContain(m.PI_LENS_LOADED_FROM);
 	});
+
+	it("splits host boot from extension evaluation", async () => {
+		const m = await freshModule();
+		const total = m.markPiLensLoaded();
+		const evaluation = m.getPiLensEvalMs();
+		expect(m.PI_LENS_HOST_BOOT_MS).toBeGreaterThanOrEqual(0);
+		expect(evaluation).toBeGreaterThanOrEqual(0);
+		expect(m.PI_LENS_HOST_BOOT_MS + (evaluation ?? 0)).toBe(total);
+	});
 });

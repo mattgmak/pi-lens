@@ -3,6 +3,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { removeTempDirSync } from "../test-utils.js";
+
+// These launch tests use fake timers and don't exercise Windows Ruby drive-root
+// discovery. Stub the #1137 drive-root readers so `buildAugmentedPath`'s async
+// `fs.promises.readdir("C:\\")` (real threadpool I/O, not fake-timer driven)
+// can't stall the spawn sequence under `vi.useFakeTimers()`. Ruby-dir behavior
+// is covered by tests/clients/lsp/ruby-drive-dirs.test.ts.
+vi.mock("../../../clients/lsp/ruby-drive-dirs.js", () => ({
+	getRubyVersionDirNamesSync: () => [],
+	getRubyVersionDirNamesAsync: async () => [],
+}));
 
 describe("lsp launch", () => {
 	afterEach(() => {
@@ -44,6 +55,57 @@ describe("lsp launch", () => {
 			);
 		},
 	);
+
+	it("redacts secrets in crash-adjacent session-start writes", async () => {
+		const tempDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-launch-log-"),
+		);
+		const token = `ghp_${"a".repeat(36)}`;
+		const command = path.join(
+			tempDir,
+			process.platform === "win32" ? "server.exe" : "server",
+		);
+
+		class MockStream extends EventEmitter {}
+		class MockChildProcess extends EventEmitter {
+			stdin = new MockStream();
+			stdout = new MockStream();
+			stderr = new MockStream();
+			pid = 8642;
+			exitCode: number | null = null;
+			killed = false;
+		}
+
+		vi.doMock("node:child_process", () => ({
+			execFileSync: vi.fn(() => ""),
+			spawn: vi.fn(() => new MockChildProcess()),
+		}));
+		vi.doMock("../../../clients/env-utils.js", () => ({
+			isTestMode: () => false,
+		}));
+		vi.doMock("../../../clients/file-utils.js", () => ({
+			getGlobalPiLensDir: () => tempDir,
+		}));
+
+		try {
+			const { launchLSP } = await import("../../../clients/lsp/launch.js");
+			await launchLSP(command, [token], {
+				cwd: tempDir,
+				startupFailureWindowMs: 1,
+			});
+
+			const log = fs.readFileSync(
+				path.join(tempDir, "sessionstart.log"),
+				"utf8",
+			);
+			expect(log).not.toContain(token);
+			expect(log).toContain("[REDACTED:github-token]");
+		} finally {
+			vi.doUnmock("../../../clients/env-utils.js");
+			vi.doUnmock("../../../clients/file-utils.js");
+			removeTempDirSync(tempDir);
+		}
+	});
 
 	it.runIf(process.platform === "win32")(
 		"treats delayed shell-backed startup failure as launch failure",

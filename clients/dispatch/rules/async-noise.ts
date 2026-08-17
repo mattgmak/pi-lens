@@ -27,6 +27,7 @@ export const asyncNoiseRule: FactRule = {
         !fn.hasAwait &&
         !fn.hasReturnAwaitCall &&
         !fn.isPassThroughWrapper &&
+        !fn.hasExplicitPromiseReturnType &&
         !ASYNC_INTERFACE_PATTERN.test(fn.name) &&
         // Skip single-statement functions — likely interface stubs or thin wrappers
         fn.statementCount > 1

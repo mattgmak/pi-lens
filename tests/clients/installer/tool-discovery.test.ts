@@ -81,6 +81,13 @@ const mockFsStat = vi.hoisted(() => vi.fn());
 const mockFsWriteFile = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const mockFsMkdir = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const mockFsAppendFile = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const mockFsOpen = vi.hoisted(() =>
+	vi.fn().mockResolvedValue({
+		writeFile: vi.fn().mockResolvedValue(undefined),
+		close: vi.fn().mockResolvedValue(undefined),
+	}),
+);
+const mockFsRm = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 
 vi.mock("node:fs/promises", () => ({
 	default: {
@@ -90,6 +97,8 @@ vi.mock("node:fs/promises", () => ({
 		writeFile: mockFsWriteFile,
 		mkdir: mockFsMkdir,
 		appendFile: mockFsAppendFile,
+		open: mockFsOpen,
+		rm: mockFsRm,
 	},
 	readFile: mockFsReadFile,
 	access: mockFsAccess,
@@ -97,6 +106,8 @@ vi.mock("node:fs/promises", () => ({
 	writeFile: mockFsWriteFile,
 	mkdir: mockFsMkdir,
 	appendFile: mockFsAppendFile,
+	open: mockFsOpen,
+	rm: mockFsRm,
 }));
 
 // ── child_process spawn mock ────────────────────────────────────────────
@@ -155,8 +166,19 @@ const mockHttpsGet = vi.hoisted(() => (url: unknown) => {
 });
 vi.mock("node:https", () => ({ default: { get: mockHttpsGet }, get: mockHttpsGet }));
 
+// #1276: `finishInstallAttempt` calls this on a successful install, mirroring
+// `resetSafeSpawnWindowsCommandCache` right above it. Mocked so the wiring
+// test below can assert the call without pulling in DependencyChecker's own
+// dependencies (safe-spawn, package-manager) — that side is covered by
+// tests/clients/dependency-checker-madge-memo-reset.test.ts.
+const mockResetMadgeManagedPathMemo = vi.hoisted(() => vi.fn());
+vi.mock("../../../clients/dependency-checker.js", () => ({
+	resetMadgeManagedPathMemo: mockResetMadgeManagedPathMemo,
+}));
+
 import * as path from "node:path";
 import {
+	checkProbeCache,
 	ensureTool,
 	getToolPath,
 	resetProbeCacheStateForTesting,
@@ -206,6 +228,7 @@ async function withEmptyPath<T>(fn: () => Promise<T>): Promise<T> {
 const savedPiLensHome = process.env.PI_LENS_HOME;
 
 beforeEach(() => {
+	delete process.env.PI_LENS_DISABLE_TOOL_INSTALL;
 	delete process.env.PI_LENS_HOME;
 	vi.clearAllMocks();
 	spawnCalls.length = 0;
@@ -218,6 +241,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	process.env.PI_LENS_DISABLE_TOOL_INSTALL = "1";
+	delete process.env.PI_LENS_TEST_PLATFORM;
+	delete process.env.PI_LENS_TEST_MODE;
+	delete process.env.PI_LENS_TEST_NPM_SCRIPT;
 	if (savedPiLensHome === undefined) delete process.env.PI_LENS_HOME;
 	else process.env.PI_LENS_HOME = savedPiLensHome;
 	vi.useRealTimers();
@@ -267,6 +294,95 @@ describe("getToolPath ordering", () => {
 // ═════════════════════════════════════════════════════════════════════════
 // ensureTool force-reinstall
 // ═════════════════════════════════════════════════════════════════════════
+
+describe("managed npm executable paths", () => {
+	it("returns the stored Windows .cmd shim from the real npm install path", async () => {
+		process.env.PI_LENS_TEST_PLATFORM = "win32";
+		process.env.PI_LENS_TEST_MODE = "1";
+		process.env.PI_LENS_TEST_NPM_SCRIPT = "install";
+		await withEmptyPath(async () => {
+			const expected = path.join(
+				path.join(TEST_HOME, ".pi-lens", "tools"),
+				"node_modules",
+				".bin",
+				"stylelint.cmd",
+			);
+			fakeAccess(expected);
+			// updateProbeCache stats the resolved path before persisting it; without
+			// this the fire-and-forget `void updateProbeCache(...)` call in ensureTool
+			// silently no-ops (stat throws on the unconfigured mock, caught as
+			// best-effort) and the gap below would pass vacuously.
+			mockFsStat.mockResolvedValue({ mtimeMs: 1 });
+			const result = await ensureTool("stylelint", { forceReinstall: true });
+			expect(result).toBe(expected);
+			// The verifier is reached with the actual stored shim path, rather than
+			// an extensionless POSIX sibling that Windows cannot execute.
+			expect(spawnCalls.some(({ cmd }) => cmd.includes("stylelint.cmd"))).toBe(
+				true,
+			);
+			// #1266/#1223: assert the value actually PERSISTED by updateProbeCache,
+			// not just the value ensureTool happened to return this call. Give the
+			// fire-and-forget `void updateProbeCache(...)` a tick to complete.
+			await new Promise((resolve) => setImmediate(resolve));
+			await expect(checkProbeCache("stylelint")).resolves.toBe(expected);
+		});
+	});
+
+	it("clears the madge managed-path memo when a managed install succeeds (#1276)", async () => {
+		process.env.PI_LENS_TEST_PLATFORM = "win32";
+		process.env.PI_LENS_TEST_MODE = "1";
+		process.env.PI_LENS_TEST_NPM_SCRIPT = "install";
+		await withEmptyPath(async () => {
+			const expected = path.join(
+				path.join(TEST_HOME, ".pi-lens", "tools"),
+				"node_modules",
+				".bin",
+				"madge.cmd",
+			);
+			fakeAccess(expected);
+			mockFsStat.mockResolvedValue({ mtimeMs: 1 });
+
+			expect(mockResetMadgeManagedPathMemo).not.toHaveBeenCalled();
+			const result = await ensureTool("madge", { forceReinstall: true });
+			expect(result).toBe(expected);
+
+			// finishInstallAttempt AWAITS the reset before installTool()/ensureTool()
+			// resolve (P1 fix): a caller that starts the next madge resolution the
+			// instant `await ensureTool(...)` returns must observe the reset memo,
+			// never a stale pre-install one. No tick-wait needed — if the reset were
+			// still fire-and-forget (pre-fix), this assertion would be racy and
+			// fail intermittently since nothing here yields to the microtask queue.
+			expect(mockResetMadgeManagedPathMemo).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	it("does not let a rejected madge memo reset crash or silently swallow the install (#1276)", async () => {
+		process.env.PI_LENS_TEST_PLATFORM = "win32";
+		process.env.PI_LENS_TEST_MODE = "1";
+		process.env.PI_LENS_TEST_NPM_SCRIPT = "install";
+		mockResetMadgeManagedPathMemo.mockImplementationOnce(() => {
+			throw new Error("boom");
+		});
+		await withEmptyPath(async () => {
+			const expected = path.join(
+				path.join(TEST_HOME, ".pi-lens", "tools"),
+				"node_modules",
+				".bin",
+				"madge.cmd",
+			);
+			fakeAccess(expected);
+			mockFsStat.mockResolvedValue({ mtimeMs: 1 });
+
+			// A throwing reset must not turn into an unhandled rejection or make
+			// the (otherwise successful) install look like it failed — it's a
+			// best-effort cache invalidation, not the install outcome itself.
+			await expect(ensureTool("madge", { forceReinstall: true })).resolves.toBe(
+				expected,
+			);
+			expect(mockResetMadgeManagedPathMemo).toHaveBeenCalledTimes(1);
+		});
+	});
+});
 
 describe("ensureTool allowInstall policy", () => {
 	it("returns a discovered binary without attempting install when allowInstall is false", async () => {

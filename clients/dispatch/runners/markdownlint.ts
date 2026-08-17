@@ -1,7 +1,7 @@
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import {
 	getLinterPolicyForCwd,
-	hasMarkdownlintConfig,
+	markdownlintConfigArgs,
 } from "../../tool-policy.js";
 import { PRIORITY } from "../priorities.js";
 import type {
@@ -109,11 +109,6 @@ const markdownlintRunner: RunnerDefinition = {
 		if (policy && !policy.preferredRunners.includes("markdownlint")) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
-		const hasConfig = hasMarkdownlintConfig(cwd);
-		if (!hasConfig) {
-			// Run with sensible defaults even without explicit config
-		}
-
 		let cmd: string | null = null;
 		if (await (markdownlint.isAvailableAsync(cwd))) {
 			cmd = markdownlint.getCommand(cwd);
@@ -123,7 +118,9 @@ const markdownlintRunner: RunnerDefinition = {
 
 		if (!cmd) return { status: "skipped", diagnostics: [], semantic: "none" };
 
-		const configArgs = hasConfig ? [] : ["--disable", "MD013"];
+		// Shared config-args seam (#1247): the autofix path consumes the same
+		// builder, so the package-owned fallback config can never drift.
+		const configArgs = markdownlintConfigArgs(cwd);
 		const result = await safeSpawnAsync(cmd, [...configArgs, ctx.filePath], {
 			timeout: 15000,
 			cwd,

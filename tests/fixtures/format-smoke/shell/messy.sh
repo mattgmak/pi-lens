@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+greet() {
+  echo "hello"
+}
 if true; then
-echo "hi"
+greet
 fi

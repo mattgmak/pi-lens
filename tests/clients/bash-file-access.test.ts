@@ -8,6 +8,7 @@ import {
 	extractWrittenPathsFromCommand,
 	type ReadSpan,
 } from "../../clients/bash-file-access.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 let tmp: string;
 
@@ -36,7 +37,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-	fs.rmSync(tmp, { recursive: true, force: true });
+	removeTempDirSync(tmp);
 });
 
 // ── reads: full-file viewers ────────────────────────────────────────────────

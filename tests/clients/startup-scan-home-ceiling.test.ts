@@ -13,6 +13,7 @@ import {
 	resolveStartupScanContext,
 	resolveStartupScanContextAsync,
 } from "../../clients/startup-scan.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 let tmpDir: string;
 
@@ -21,7 +22,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-	fs.rmSync(tmpDir, { recursive: true, force: true });
+	removeTempDirSync(tmpDir);
 });
 
 describe("resolveStartupScanContext home ceiling (#253)", () => {

@@ -1,29 +1,80 @@
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import {
+	type ActionableWarningsReport,
 	applyConservativeActionableWarningFixes,
 	checkActionableWarningsReportFresh,
-	type ActionableWarningsReport,
 } from "./actionable-warnings.js";
+import { publishFilesTouched } from "./bus-publish.js";
 import type { CacheManager } from "./cache-manager.js";
+import type { BiomeClient } from "./biome-client.js";
+import type { RuffClient } from "./ruff-client.js";
+import {
+	publishAutofixStart,
+	publishFormatStart,
+} from "./format-events-publish.js";
 import type { FormatService } from "./format-service.js";
 import { logLatency } from "./latency-logger.js";
-import { resyncLspFile, runFormatPhase } from "./pipeline.js";
-import { publishFilesTouched } from "./bus-publish.js";
+import { isPathIgnoredByProject } from "./file-utils.js";
+import { newLspMutationCorrelationId, type LspMutationContext } from "./lsp-mutation.js";
+import {
+	getGlobalActionableWarningMaxFixes,
+	type PiLensFlagSource,
+} from "./lens-config.js";
+import { resyncLspFile, runAutofix, runFormatPhase } from "./pipeline.js";
+import { getAmbientAbortSignal } from "./safe-spawn.js";
 import {
 	appendProjectChange,
 	type ProjectChangeSource,
 } from "./project-changes.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
+import {
+	getAutofixPolicyForFile,
+	hasBiomeConfig,
+	hasDetektConfig,
+	hasEslintConfig,
+	hasGolangciConfig,
+	hasKtfmtConfig,
+	hasKtlintConfig,
+	hasOxlintConfig,
+	hasRubocopConfig,
+	hasSqlfluffConfig,
+	hasStylelintConfig,
+} from "./tool-policy.js";
+
+/**
+ * A queued file is claimed by any flush once it has sat unclaimed by its own
+ * owning session for this long — recovery for an orphaned record whose
+ * owner (e.g. a primary session that crashed mid-run) will never flush it
+ * itself. Generous on purpose: normal same-session flushes never hit this
+ * path at all (they match on `ownerSessionId`), so this only trades a little
+ * extra staleness for guaranteed eventual formatting. (#791)
+ */
+export const DEFERRED_FORMAT_STALE_AFTER_MS = 10 * 60_000;
+const DEFERRED_FORMAT_CONCURRENCY = 3;
 
 interface AgentEndDeps {
 	ctxCwd?: string;
-	getFlag: (name: string) => boolean | string | undefined;
+	getFlag: (name: string, filePath?: string) => boolean | string | undefined;
+	/** Optional: provenance for dbg/skip logs — see `PipelineContext["getFlagSource"]` (#792). */
+	getFlagSource?: (name: string, filePath?: string) => PiLensFlagSource;
 	notify: (msg: string, level: "info" | "warning" | "error") => void;
 	dbg: (msg: string) => void;
 	runtime: RuntimeCoordinator;
 	cacheManager: CacheManager;
 	getFormatService: () => FormatService;
+	biomeClient?: BiomeClient;
+	ruffClient?: RuffClient;
+	getAutofixClients?: () => Promise<{ biomeClient: BiomeClient; ruffClient: RuffClient }>;
+	/**
+	 * The STABLE pi session id for the ctx this `agent_end` fired on. Used to
+	 * scope the deferred-format drain to records this session actually
+	 * queued (#791) — omit (or leave `undefined`, e.g. in existing tests) to
+	 * fall back to today's "claim everything" behavior.
+	 */
+	currentSessionId?: string;
+	/** Test/override hook for {@link DEFERRED_FORMAT_STALE_AFTER_MS}. */
+	staleAfterMs?: number;
 }
 
 export interface AgentEndFormatSummary {
@@ -62,16 +113,109 @@ function recordProjectChange(args: {
 export async function handleAgentEnd({
 	ctxCwd,
 	getFlag,
+	getFlagSource,
 	notify,
 	dbg,
 	runtime,
 	cacheManager,
 	getFormatService,
+	biomeClient,
+	ruffClient,
+	getAutofixClients,
+	currentSessionId,
+	staleAfterMs = DEFERRED_FORMAT_STALE_AFTER_MS,
 }: AgentEndDeps): Promise<AgentEndFormatSummary | undefined> {
-	const records = runtime.consumeDeferredFormatFiles();
-	const actionableAutofixEnabled = !!getFlag("lens-actionable-warning-autofix");
-	if (records.length === 0 && !actionableAutofixEnabled) return undefined;
-
+	// #791: ownership-filtered drain — records queued by a DIFFERENT known
+	// session (e.g. a concurrent in-process secondary/subagent) stay queued
+	// for their owner's own agent_end, unless they've been stale long enough
+	// to fall back to "claim as orphaned" (see claimDeferredFormatFiles).
+	const { claimed, staleClaimed, deferredToOwner } =
+		runtime.claimDeferredMutations(
+			currentSessionId,
+			Date.now(),
+			staleAfterMs,
+		);
+	const records = [...claimed, ...staleClaimed];
+	const requeuedKinds = new Set<"autofix" | "format">();
+	// S2d (gap 4, #1432 review): the aggregate `agent_end_deferred_mutation_drain`
+	// row only carried a coalesced `requeuedKinds` set with no reason, per-call
+	// file count, or tool provenance — every requeue (abort mid-drain, missing
+	// autofix clients, an autofix/format failure) collapsed into one
+	// indistinguishable bucket. Log one bounded record PER requeue call instead,
+	// so a real incident can tell "aborted with N files still queued" apart
+	// from "M files failed to format".
+	const requeue = (
+		pending: Parameters<RuntimeCoordinator["requeueDeferredMutations"]>[0],
+		reason: "abort" | "autofix-failed" | "format-failed" | "clients-unavailable",
+	): void => {
+		if (pending.length === 0) return;
+		const kinds = new Set<"autofix" | "format">();
+		const toolNames = new Set<string>();
+		for (const record of pending) {
+			for (const kind of record.kinds) {
+				requeuedKinds.add(kind);
+				kinds.add(kind);
+			}
+			for (const toolName of record.toolNames) toolNames.add(toolName);
+		}
+		logLatency({
+			type: "phase",
+			toolName: "agent_end",
+			filePath: ctxCwd ?? runtime.projectRoot,
+			phase: "agent_end_deferred_mutation_requeue",
+			durationMs: 0,
+			metadata: {
+				reason,
+				kinds: [...kinds].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
+				fileCount: pending.length,
+				toolNames: [...toolNames].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
+			},
+		});
+		runtime.requeueDeferredMutations(pending);
+	};
+	const rootActionableAutofixEnabled = !!getFlag(
+		"lens-actionable-warning-autofix",
+	);
+	// A path-aware source resolver signals that nested configs may re-enable
+	// actionable autofix even when the root default is off. Legacy/test hosts
+	// without that resolver keep the old fast exit and avoid a cache read.
+	const inspectActionableReport =
+		rootActionableAutofixEnabled && typeof cacheManager.readCache === "function"
+			? true
+			: getFlagSource !== undefined &&
+				typeof cacheManager.readCache === "function";
+	if (records.length === 0 && !inspectActionableReport) return undefined;
+	if (deferredToOwner.length > 0) {
+		dbg(
+			`agent_end deferred_format: leaving ${deferredToOwner.length} file(s) queued for their owning session (${deferredToOwner
+				.map((r) => `${r.filePath} owner=${r.ownerSessionId}`)
+				.join(", ")})`,
+		);
+	}
+	if (staleClaimed.length > 0) {
+		dbg(
+			`agent_end deferred_format: staleness fallback claimed ${staleClaimed.length} orphaned file(s) (unclaimed >${staleAfterMs}ms): ${staleClaimed
+				.map((r) => r.filePath)
+				.join(", ")}`,
+		);
+		logLatency({
+			type: "phase",
+			toolName: "agent_end",
+			filePath: ctxCwd ?? runtime.projectRoot,
+			phase: "agent_end_deferred_format_stale_claim",
+			durationMs: 0,
+			metadata: {
+				fileCount: staleClaimed.length,
+				staleAfterMs,
+				files: staleClaimed.map((r) => ({
+					filePath: r.filePath,
+					ownerSessionId: r.ownerSessionId,
+					queuedTurnIndex: r.queuedTurnIndex,
+					ageMs: Date.now() - r.lastTouchedAt,
+				})),
+			},
+		});
+	}
 	const startedAt = Date.now();
 	const summary: AgentEndFormatSummary = {
 		queued: records.length,
@@ -89,6 +233,103 @@ export async function handleAgentEnd({
 		tool: string;
 		kind: "format";
 	}> = [];
+	const deferredAutofixFixes: Array<{
+		path: string;
+		tool: string;
+		kind: "autofix";
+	}> = [];
+	const deferredAutofixChanged = new Set<string>();
+
+	// Mutation ordering is intentional: lint --write may disturb wrapping, so
+	// autofix reaches the final edited state first and formatting stabilizes it.
+	const ambientSignal = getAmbientAbortSignal();
+	const executedAutofixScopes = new Set<string>();
+	const autofixRecords = records.filter((candidate) => candidate.kinds.has("autofix"));
+	if (autofixRecords.length > 0 && (!biomeClient || !ruffClient) && getAutofixClients) {
+		({ biomeClient, ruffClient } = await getAutofixClients());
+	}
+	for (let autofixIndex = 0; autofixIndex < autofixRecords.length; autofixIndex++) {
+		const record = autofixRecords[autofixIndex];
+		if (ambientSignal?.aborted) {
+			requeue(
+				autofixRecords.slice(autofixIndex).map((pending) => ({
+					...pending,
+					kinds: new Set(["autofix" as const]),
+					toolNames: new Set(pending.toolNames),
+				})),
+				"abort",
+			);
+			break;
+		}
+		const filePath = path.resolve(record.filePath);
+		if (!nodeFs.existsSync(filePath)) {
+			summary.skipped.push({ filePath, reason: "missing" });
+			continue;
+		}
+		if (!biomeClient || !ruffClient) {
+			dbg(`agent_end deferred_autofix: clients unavailable for ${filePath}`);
+			requeue([{ ...record, kinds: new Set(["autofix"]), toolNames: new Set(record.toolNames) }], "clients-unavailable");
+			continue;
+		}
+		const policy = getAutofixPolicyForFile(filePath, {
+			hasEslintConfig: hasEslintConfig(record.cwd),
+			hasStylelintConfig: hasStylelintConfig(record.cwd),
+			hasSqlfluffConfig: hasSqlfluffConfig(record.cwd),
+			hasRubocopConfig: hasRubocopConfig(record.cwd),
+			hasBiomeConfig: hasBiomeConfig(record.cwd),
+			hasGolangciConfig: hasGolangciConfig(record.cwd),
+			hasDetektConfig: hasDetektConfig(record.cwd),
+			hasOxlintConfig: hasOxlintConfig(record.cwd),
+			hasKtfmtConfig: hasKtfmtConfig(record.cwd),
+			hasKtlintConfig: hasKtlintConfig(record.cwd),
+		});
+		const scopeKey = policy?.scope && policy.scope !== "file"
+			? `${policy.defaultTool ?? "unknown"}:${path.resolve(record.cwd)}`
+			: `${policy?.defaultTool ?? "unknown"}:${filePath}`;
+		if (executedAutofixScopes.has(scopeKey)) continue;
+		executedAutofixScopes.add(scopeKey);
+		try {
+			const result = await runAutofix(
+				filePath,
+				record.cwd,
+				getFlag,
+				dbg,
+				{ biomeClient, ruffClient, fixedThisTurn: runtime.fixedThisTurn },
+				getFlagSource,
+			);
+			const tools = result.autofixTools.map((label) => label.split(":")[0]);
+			for (const changed of result.changedFiles) {
+				const changedPath = path.resolve(changed);
+				deferredAutofixChanged.add(changedPath);
+				for (const tool of tools) deferredAutofixFixes.push({ path: changedPath, tool, kind: "autofix" });
+				if (!nodeFs.existsSync(changedPath)) continue;
+				recordProjectChange({ runtime, cwd: record.turnStateCwd, filePath: changedPath, source: "autofix", dbg });
+				if (!getFlag("no-read-guard")) runtime.readGuard.recordWritten(changedPath);
+				const content = nodeFs.readFileSync(changedPath, "utf-8");
+				cacheManager.addModifiedRange(
+					changedPath,
+					{ start: 1, end: content.split("\n").length },
+					/^import\s/m.test(content),
+					record.turnStateCwd,
+					currentSessionId ?? runtime.telemetrySessionId,
+					"pi",
+				);
+			}
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			summary.failed.push({ filePath, errors: [message] });
+			requeue([{ ...record, kinds: new Set(["autofix"]), toolNames: new Set(record.toolNames) }], "autofix-failed");
+		}
+	}
+	if (deferredAutofixFixes.length > 0) {
+		publishFilesTouched({
+			reason: "autofix",
+			paths: [...new Set(deferredAutofixFixes.map((fix) => fix.path))],
+			cwd: ctxCwd ?? runtime.projectRoot,
+			dbg,
+			fixes: deferredAutofixFixes,
+		});
+	}
 
 	dbg(`agent_end deferred_format: ${records.length} file(s)`);
 	logLatency({
@@ -97,75 +338,134 @@ export async function handleAgentEnd({
 		filePath: ctxCwd ?? runtime.projectRoot,
 		phase: "agent_end_deferred_format_start",
 		durationMs: 0,
-		metadata: { fileCount: records.length },
+		metadata: {
+			fileCount: records.length,
+			currentSessionId,
+			// #791: per-record provenance so a future incident can be diagnosed
+			// straight from latency.log — which session/turn queued each file,
+			// and whether it was claimed via the staleness fallback.
+			records: records.map((r) => ({
+				filePath: r.filePath,
+				queuedTurnIndex: r.queuedTurnIndex,
+				ownerSessionId: r.ownerSessionId,
+				staleClaim: staleClaimed.includes(r),
+			})),
+			deferredToOwnerCount: deferredToOwner.length,
+		},
 	});
+	// #673: same moment as the latency phase above — a same-process listener
+	// (e.g. a review/snapshot controller) can use this to know the deferred-
+	// format phase is starting and these specific paths may still be mutated.
+	if (records.length > 0) {
+		publishFormatStart({
+			cwd: ctxCwd ?? runtime.projectRoot,
+			paths: records.map((r) => r.filePath),
+			dbg,
+			kinds: [...new Set(records.flatMap((record) => [...record.kinds]))],
+		});
+	}
 
-	const autoformatDisabled = !!getFlag("no-autoformat");
-	if (autoformatDisabled) {
-		for (const record of records) {
+	const formatRecords = records.filter((record) => record.kinds.has("format")).filter((record) => {
+		const disabled = !!getFlag("no-autoformat", record.filePath);
+		if (disabled) {
+			const source = getFlagSource?.("no-autoformat", record.filePath);
+			dbg(
+				`agent_end deferred_format: skipping ${record.filePath} (--no-autoformat${source ? `, source=${source}` : ""})`,
+			);
 			summary.skipped.push({
 				filePath: record.filePath,
 				reason: "no-autoformat",
 			});
 		}
-	}
+		return !disabled;
+	});
 
-	if (!autoformatDisabled) {
-		type FormatOutcome =
-			| { kind: "skipped"; filePath: string; reason: string }
-			| { kind: "failed"; filePath: string; message: string; fileStart: number }
-			| {
-					kind: "done";
-					record: (typeof records)[number];
-					filePath: string;
-					result: Awaited<ReturnType<typeof runFormatPhase>>;
-					fileStart: number;
-			  };
-
-		// Run all formatter subprocesses concurrently — no shared state touched here.
-		// bumpFileSeq / cacheManager mutations happen in the sequential pass below.
-		const outcomes = await Promise.all(
-			records.map(async (record): Promise<FormatOutcome> => {
+	if (formatRecords.length > 0) {
+		// Formatter subprocesses are independent across files, so retain bounded
+		// overlap here. Result application stays admission-ordered below because
+		// its synchronous file reads/bookkeeping are observable shared state.
+		type FormatWork = {
+			record: (typeof formatRecords)[number];
+			filePath: string;
+			fileStart: number;
+			result?: Awaited<ReturnType<typeof runFormatPhase>>;
+			error?: string;
+			missing?: boolean;
+		};
+		const work = new Array<FormatWork | undefined>(formatRecords.length);
+		const started = new Set<number>();
+		let nextIndex = 0;
+		const worker = async (): Promise<void> => {
+			while (nextIndex < formatRecords.length) {
+				const index = nextIndex++;
+				if (ambientSignal?.aborted) return;
+				const record = formatRecords[index];
 				const fileStart = Date.now();
 				const filePath = path.resolve(record.filePath);
+				started.add(index);
 				if (!nodeFs.existsSync(filePath)) {
-					dbg(`agent_end deferred_format skipped missing file: ${filePath}`);
-					return { kind: "skipped", filePath, reason: "missing" };
+					work[index] = { record, filePath, fileStart, missing: true };
+					continue;
 				}
 				try {
-					const result = await runFormatPhase(filePath, getFormatService, dbg);
-					return { kind: "done", record, filePath, result, fileStart };
+					work[index] = {
+						record,
+						filePath,
+						fileStart,
+						result: await runFormatPhase(filePath, getFormatService, dbg),
+					};
 				} catch (err) {
-					const message = err instanceof Error ? err.message : String(err);
-					dbg(`agent_end deferred_format failed for ${filePath}: ${message}`);
-					return { kind: "failed", filePath, message, fileStart };
+					work[index] = {
+						record,
+						filePath,
+						fileStart,
+						error: err instanceof Error ? err.message : String(err),
+					};
 				}
-			}),
+			}
+		};
+		await Promise.all(
+			Array.from(
+				{ length: Math.min(DEFERRED_FORMAT_CONCURRENCY, formatRecords.length) },
+				() => worker(),
+			),
 		);
+		if (ambientSignal?.aborted) {
+			requeue(
+				formatRecords.filter((_, index) => !started.has(index)).map((record) => ({
+					...record,
+					kinds: new Set(["format" as const]),
+					toolNames: new Set(record.toolNames),
+				})),
+				"abort",
+			);
+		}
 
-		// Process results sequentially — bumpFileSeq and cacheManager mutations
-		// must stay ordered to avoid sequence number races.
-		for (const outcome of outcomes) {
-			if (outcome.kind === "skipped") {
-				summary.skipped.push({
-					filePath: outcome.filePath,
-					reason: outcome.reason,
-				});
+		for (const entry of work) {
+			if (!entry) continue;
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			const { record, filePath, fileStart } = entry;
+			if (entry.missing) {
+				dbg(`agent_end deferred_format skipped missing file: ${filePath}`);
+				if (!summary.skipped.some((item) => item.filePath === filePath && item.reason === "missing")) {
+					summary.skipped.push({ filePath, reason: "missing" });
+				}
 				continue;
 			}
-			if (outcome.kind === "failed") {
-				summary.failed.push({
-					filePath: outcome.filePath,
-					errors: [outcome.message],
-				});
+			if (entry.error) {
+				dbg(`agent_end deferred_format failed for ${filePath}: ${entry.error}`);
+				summary.failed.push({ filePath, errors: [entry.error] });
+				requeue([{ ...record, kinds: new Set(["format"]), toolNames: new Set(record.toolNames) }], "format-failed");
 				continue;
 			}
+			const result = entry.result;
+			if (!result) continue;
 
-			const { record, filePath, result, fileStart } = outcome;
 			summary.formatted++;
 
 			if (result.formatFailures.length > 0) {
 				summary.failed.push({ filePath, errors: result.formatFailures });
+				requeue([{ ...record, kinds: new Set(["format"]), toolNames: new Set(record.toolNames) }], "format-failed");
 			}
 
 			if (result.formatChanged) {
@@ -196,6 +496,8 @@ export async function handleAgentEnd({
 						{ start: 1, end: lineCount },
 						hasImports,
 						bookkeepingCwd,
+						currentSessionId ?? runtime.telemetrySessionId,
+						"pi",
 					);
 				} catch (err) {
 					dbg(
@@ -253,7 +555,15 @@ export async function handleAgentEnd({
 		}
 	}
 
-	if (actionableAutofixEnabled) {
+	// LSP sees only authoritative content after both mutation phases. In
+	// particular, never publish the autofix intermediate state before format.
+	for (const changedPath of deferredAutofixChanged) {
+		if (!nodeFs.existsSync(changedPath)) continue;
+		const content = nodeFs.readFileSync(changedPath, "utf-8");
+		await resyncLspFile(changedPath, content, true, false, getFlag, dbg);
+	}
+
+	if (inspectActionableReport) {
 		const actionReport = cacheManager.readCache<ActionableWarningsReport>(
 			"actionable-warnings",
 			ctxCwd ?? runtime.projectRoot,
@@ -264,8 +574,62 @@ export async function handleAgentEnd({
 				"agent_end actionable_warnings_autofix: cache missing or expired, skipping fixes",
 			);
 		} else {
+			const enabledFiles = actionReport.data.files.filter((file) => {
+				// #1247: the per-edit dispatch surface gates ignored files before
+				// running; the turn-end autofix must apply the same filter or a
+				// `.pi-lens.json` `ignore` entry cannot protect a prose file
+				// (CHANGELOG.md / AGENTS.md) from being rewritten here.
+				if (
+					isPathIgnoredByProject(
+						file.filePath,
+						ctxCwd ?? runtime.projectRoot,
+					)
+				) {
+					dbg(
+						`agent_end actionable_warnings_autofix: skipped ${file.filePath} (ignored by project)`,
+					);
+					return false;
+				}
+				const enabled = !!getFlag(
+					"lens-actionable-warning-autofix",
+					file.filePath,
+				);
+				if (!enabled) {
+					const source = getFlagSource?.(
+						"lens-actionable-warning-autofix",
+						file.filePath,
+					);
+					dbg(
+						`agent_end actionable_warnings_autofix: skipped ${file.filePath} (disabled${source ? `, source=${source}` : ""})`,
+					);
+				}
+				return enabled;
+			});
+			const eligibleCount = enabledFiles.reduce(
+				(total, file) =>
+					total +
+					file.warnings.reduce(
+						(count, warning) =>
+							count +
+							(warning.suppressed
+								? 0
+								: warning.actions.filter((action) => action.autoFixEligible)
+										.length),
+						0,
+					),
+				0,
+			);
+			const eligibleReport: ActionableWarningsReport = {
+				...actionReport.data,
+				files: enabledFiles,
+				summary: {
+					...actionReport.data.summary,
+					files: enabledFiles.length,
+					autoFixEligible: eligibleCount,
+				},
+			};
 			const freshness = checkActionableWarningsReportFresh({
-				report: actionReport.data,
+				report: eligibleReport,
 				currentProjectSeq: runtime.projectSeq,
 				getFileSeq: (filePath) => runtime.getFileSeq(filePath),
 			});
@@ -273,38 +637,47 @@ export async function handleAgentEnd({
 				dbg(
 					`agent_end actionable_warnings_autofix: stale report (${freshness.reason}; reportProjectSeqEnd=${freshness.reportProjectSeqEnd ?? "missing"}; currentProjectSeq=${freshness.currentProjectSeq}${freshness.filePath ? `; file=${freshness.filePath}; reportFileSeq=${freshness.reportFileSeq}; currentFileSeq=${freshness.currentFileSeq}` : ""}), skipping fixes`,
 				);
-			} else {
-				const fixStart = Date.now();
-				const fixSummary = await applyConservativeActionableWarningFixes({
+			} else if (eligibleReport.summary.autoFixEligible > 0) {
+				// #684: same "genuine work about to happen" gate as
+				// publishFormatStart — only fires when the report is fresh AND
+				// has at least one autofix-eligible warning, right before
+				// applyConservativeActionableWarningFixes actually starts.
+				publishAutofixStart({
 					cwd: ctxCwd ?? runtime.projectRoot,
-					report: actionReport.data,
+					paths: eligibleReport.files
+						.filter((file) =>
+							file.warnings.some(
+								(warning) =>
+									!warning.suppressed &&
+									warning.actions.some((action) => action.autoFixEligible),
+							),
+						)
+						.map((file) => file.filePath),
+					eligibleCount: eligibleReport.summary.autoFixEligible,
 					dbg,
 				});
-				for (const changedFile of fixSummary.changedFiles) {
-					if (!nodeFs.existsSync(changedFile)) continue;
-					recordProjectChange({
-						runtime,
-						cwd: ctxCwd ?? runtime.projectRoot,
-						filePath: changedFile,
-						source: "autofix",
-						dbg,
-					});
-					if (!getFlag("no-read-guard"))
-						runtime.readGuard.recordWritten(changedFile);
-					try {
-						const content = nodeFs.readFileSync(changedFile, "utf-8");
-						cacheManager.addModifiedRange(
-							changedFile,
-							{ start: 1, end: content.split("\n").length },
-							/^import\s/m.test(content),
-							ctxCwd ?? runtime.projectRoot,
-						);
-					} catch (err) {
-						dbg(
-							`agent_end actionable warning changed-file tracking failed for ${changedFile}: ${err}`,
-						);
-					}
-				}
+				const fixStart = Date.now();
+				const fixCwd = ctxCwd ?? runtime.projectRoot;
+				const mutationContext: LspMutationContext = {
+					cwd: fixCwd,
+					correlationId: newLspMutationCorrelationId(),
+					tool: "lsp-quickfix",
+					source: "autofix",
+					runtime,
+					cacheManager,
+					readGuard: getFlag("no-read-guard") ? undefined : runtime.readGuard,
+					recordAutofix: getFlag("lens-turn-summary")
+						? (filePath) => runtime.turnSummary.recordAutofix(filePath, { tool: "lsp-quickfix" })
+						: undefined,
+					dbg,
+				};
+				const fixSummary = await applyConservativeActionableWarningFixes({
+					cwd: fixCwd,
+					report: eligibleReport,
+					maxFixes: getGlobalActionableWarningMaxFixes(),
+					dbg,
+					mutationContext,
+				});
 				if (fixSummary.changedFiles.length > 0) {
 					publishFilesTouched({
 						reason: "autofix",
@@ -317,13 +690,6 @@ export async function handleAgentEnd({
 							kind: "autofix" as const,
 						})),
 					});
-					if (getFlag("lens-turn-summary")) {
-						for (const changedFile of fixSummary.changedFiles) {
-							runtime.turnSummary.recordAutofix(changedFile, {
-								tool: "lsp-quickfix",
-							});
-						}
-					}
 				}
 				logLatency({
 					type: "phase",
@@ -344,10 +710,25 @@ export async function handleAgentEnd({
 						"info",
 					);
 				}
+			} else {
+				dbg("agent_end actionable_warnings_autofix: fresh report, 0 autofix-eligible warnings, skipping")
 			}
 		}
 	}
 
+	logLatency({
+		type: "phase",
+		toolName: "agent_end",
+		filePath: ctxCwd ?? runtime.projectRoot,
+		phase: "agent_end_deferred_mutation_drain",
+		durationMs: Date.now() - startedAt,
+		metadata: {
+			autofixRecords: autofixRecords.length,
+			formatRecords: formatRecords.length,
+			coalescedPaths: records.length,
+			requeuedKinds: [...requeuedKinds].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
+		},
+	});
 	logLatency({
 		type: "tool_result",
 		toolName: "agent_end",
@@ -356,6 +737,19 @@ export async function handleAgentEnd({
 		result: "deferred_format_complete",
 		metadata: {
 			queued: summary.queued,
+			formatted: summary.formatted,
+			changed: summary.changed.length,
+			failed: summary.failed.length,
+			skipped: summary.skipped.length,
+		},
+	});
+	logLatency({
+		type: "phase",
+		toolName: "agent_end",
+		filePath: ctxCwd ?? runtime.projectRoot,
+		phase: "agent_end_deferred_format_done",
+		durationMs: Date.now() - startedAt,
+		metadata: {
 			formatted: summary.formatted,
 			changed: summary.changed.length,
 			failed: summary.failed.length,

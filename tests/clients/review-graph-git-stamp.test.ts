@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { gunzipSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FactStore } from "../../clients/dispatch/fact-store.js";
 import { getProjectDataDir } from "../../clients/file-utils.js";
@@ -17,6 +18,7 @@ import {
 	resolveGitIdentity,
 } from "../../clients/review-graph/git-identity.js";
 import * as latencyLogger from "../../clients/latency-logger.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 // Mock out the expensive file system scanning — we only care about persist/
 // stamp behaviour, not real symbol extraction.
@@ -72,7 +74,7 @@ beforeEach(() => {
 
 afterEach(() => {
 	for (const dir of dirs.splice(0)) {
-		fs.rmSync(dir, { recursive: true, force: true });
+		removeTempDirSync(dir);
 	}
 	if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 	else process.env.PILENS_DATA_DIR = previousDataDir;
@@ -93,9 +95,9 @@ describe("review-graph snapshot git stamp (#300)", () => {
 		const identity = resolveGitIdentity(cwd);
 		expect(identity?.headCommit).toBe("a".repeat(40));
 
-		const cachePath = path.join(getProjectDataDir(cwd), "cache", "review-graph.json");
+		const cachePath = path.join(getProjectDataDir(cwd), "cache", "review-graph.json.gz");
 		await waitForFile(cachePath);
-		const raw = JSON.parse(fs.readFileSync(cachePath, "utf-8"));
+		const raw = JSON.parse(gunzipSync(fs.readFileSync(cachePath)).toString("utf-8"));
 		expect(raw.gitStamp).toBeDefined();
 		expect(raw.gitStamp.headCommit).toBe("a".repeat(40));
 		expect(raw.gitStamp.worktreeRoot).toBe(identity?.worktreeRoot);
@@ -104,7 +106,7 @@ describe("review-graph snapshot git stamp (#300)", () => {
 		// "cached" for an unchanged empty file set), not dropped.
 		clearReviewGraphWorkspaceCache();
 		await buildOrUpdateGraph(cwd, [], facts);
-		const raw2 = JSON.parse(fs.readFileSync(cachePath, "utf-8"));
+		const raw2 = JSON.parse(gunzipSync(fs.readFileSync(cachePath)).toString("utf-8"));
 		expect(raw2.gitStamp.headCommit).toBe("a".repeat(40));
 	});
 
@@ -118,9 +120,9 @@ describe("review-graph snapshot git stamp (#300)", () => {
 		await buildOrUpdateGraph(cwd, [], facts);
 		flushReviewGraphPersistsForTests();
 
-		const cachePath = path.join(getProjectDataDir(cwd), "cache", "review-graph.json");
+		const cachePath = path.join(getProjectDataDir(cwd), "cache", "review-graph.json.gz");
 		await waitForFile(cachePath);
-		const before = JSON.parse(fs.readFileSync(cachePath, "utf-8"));
+		const before = JSON.parse(gunzipSync(fs.readFileSync(cachePath)).toString("utf-8"));
 		expect(before.gitStamp.headCommit).toBe("a".repeat(40));
 
 		// Simulate `git worktree remove` + `add` at the SAME path for a different
@@ -146,7 +148,7 @@ describe("review-graph snapshot git stamp (#300)", () => {
 		await buildOrUpdateGraph(cwd, [], facts);
 		flushReviewGraphPersistsForTests();
 		await waitForFile(
-			path.join(getProjectDataDir(cwd), "cache", "review-graph.json"),
+			path.join(getProjectDataDir(cwd), "cache", "review-graph.json.gz"),
 		);
 
 		// Same HEAD → the stamp verifies and the cold read loads from disk.
@@ -166,7 +168,7 @@ describe("review-graph snapshot git stamp (#300)", () => {
 		await buildOrUpdateGraph(cwd, [a], facts);
 		flushReviewGraphPersistsForTests();
 		await waitForFile(
-			path.join(getProjectDataDir(cwd), "cache", "review-graph.json"),
+			path.join(getProjectDataDir(cwd), "cache", "review-graph.json.gz"),
 		);
 
 		// HEAD moves (a plain `git commit`) but no file content changes. The
@@ -191,7 +193,7 @@ describe("review-graph snapshot git stamp (#300)", () => {
 		const cachePath = path.join(
 			getProjectDataDir(cwd),
 			"cache",
-			"review-graph.json",
+			"review-graph.json.gz",
 		);
 		// The write is tmp+rename, so existence implies complete content — the
 		// pre-fix direct fs.writeFile could be observed created-but-partial by a
@@ -199,7 +201,9 @@ describe("review-graph snapshot git stamp (#300)", () => {
 		// 'full'" failure: tier-2 load read truncated JSON and fell open to a
 		// full rebuild).
 		await waitForFile(cachePath);
-		expect(() => JSON.parse(fs.readFileSync(cachePath, "utf-8"))).not.toThrow();
+		expect(() =>
+			JSON.parse(gunzipSync(fs.readFileSync(cachePath)).toString("utf-8")),
+		).not.toThrow();
 		const residue = fs
 			.readdirSync(path.dirname(cachePath))
 			.filter((name) => name.includes(".tmp-"));
@@ -215,9 +219,9 @@ describe("review-graph snapshot git stamp (#300)", () => {
 		await expect(buildOrUpdateGraph(cwd, [], facts)).resolves.toBeDefined();
 		flushReviewGraphPersistsForTests();
 
-		const cachePath = path.join(getProjectDataDir(cwd), "cache", "review-graph.json");
+		const cachePath = path.join(getProjectDataDir(cwd), "cache", "review-graph.json.gz");
 		await waitForFile(cachePath);
-		const raw = JSON.parse(fs.readFileSync(cachePath, "utf-8"));
+		const raw = JSON.parse(gunzipSync(fs.readFileSync(cachePath)).toString("utf-8"));
 		expect(raw.gitStamp).toBeUndefined();
 
 		clearReviewGraphWorkspaceCache();

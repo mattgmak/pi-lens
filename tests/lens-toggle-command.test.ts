@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import piLens from "../index.js";
 import { createPiMock, makeCtx, type PiMock } from "./support/pi-mock.js";
+import { removeTempDirSync } from "./clients/test-utils.js";
 
 // Template for #171: a command test driven entirely through the shared
 // createPiMock() harness — no bespoke ExtensionAPI mock. Run the real entry,
@@ -23,7 +24,7 @@ afterEach(() => {
 	if (previousConfigPath === undefined) delete process.env.PI_LENS_CONFIG_PATH;
 	else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
 	for (const dir of tmpDirs.splice(0)) {
-		fs.rmSync(dir, { recursive: true, force: true });
+		removeTempDirSync(dir);
 	}
 });
 

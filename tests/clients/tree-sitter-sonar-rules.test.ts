@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { TreeSitterClient } from "../../clients/tree-sitter-client.js";
+import { getSharedTreeSitterClient } from "../../clients/tree-sitter-shared.js";
 import { TreeSitterQueryLoader } from "../../clients/tree-sitter-query-loader.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
@@ -27,7 +27,7 @@ afterAll(() => {
 
 describe("no-equality-in-for-condition (S888)", () => {
 	it("flags == in a for-loop termination condition", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("no-equality-in-for-condition");
 		const filePath = writeTempFile("for (let i = 0; i == n; i += 2) {}\n");
 		const matches = await client.runQueryOnFile(query, filePath, "typescript");
@@ -35,7 +35,7 @@ describe("no-equality-in-for-condition (S888)", () => {
 	});
 
 	it("flags != in a for-loop termination condition", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("no-equality-in-for-condition");
 		const filePath = writeTempFile("for (let i = 0; i != n; i++) {}\n");
 		const matches = await client.runQueryOnFile(query, filePath, "typescript");
@@ -43,7 +43,7 @@ describe("no-equality-in-for-condition (S888)", () => {
 	});
 
 	it("does not flag relational operators", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("no-equality-in-for-condition");
 		const filePath = writeTempFile("for (let i = 0; i < n; i++) {}\n");
 		const matches = await client.runQueryOnFile(query, filePath, "typescript");
@@ -51,7 +51,7 @@ describe("no-equality-in-for-condition (S888)", () => {
 	});
 
 	it("does not flag strict equality (===/!==) which is a different operator", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("no-equality-in-for-condition");
 		const filePath = writeTempFile("for (let i = 0; i !== n; i++) {}\n");
 		const matches = await client.runQueryOnFile(query, filePath, "typescript");
@@ -59,7 +59,7 @@ describe("no-equality-in-for-condition (S888)", () => {
 	});
 
 	it("does not flag == used in the loop body, only the condition", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("no-equality-in-for-condition");
 		const filePath = writeTempFile(
 			"for (let i = 0; i < n; i++) { if (a == b) {} }\n",
@@ -71,7 +71,7 @@ describe("no-equality-in-for-condition (S888)", () => {
 
 describe("no-jump-in-finally (S1143)", () => {
 	it("flags a return statement in a finally block", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("no-jump-in-finally");
 		const filePath = writeTempFile(
 			"function f() { try { return 1; } finally { return 2; } }\n",
@@ -81,7 +81,7 @@ describe("no-jump-in-finally (S1143)", () => {
 	});
 
 	it("flags a throw statement in a finally block", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("no-jump-in-finally");
 		const filePath = writeTempFile("try { work(); } finally { throw e; }\n");
 		const matches = await client.runQueryOnFile(query, filePath, "typescript");
@@ -89,7 +89,7 @@ describe("no-jump-in-finally (S1143)", () => {
 	});
 
 	it("does not flag a finally block with no control-flow jump", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("no-jump-in-finally");
 		const filePath = writeTempFile("try { work(); } finally { cleanup(); }\n");
 		const matches = await client.runQueryOnFile(query, filePath, "typescript");
@@ -97,7 +97,7 @@ describe("no-jump-in-finally (S1143)", () => {
 	});
 
 	it("does not flag a return inside a nested function in finally", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("no-jump-in-finally");
 		const filePath = writeTempFile(
 			"try { work(); } finally { arr.forEach((x) => { return x; }); }\n",

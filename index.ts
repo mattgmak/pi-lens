@@ -1,8 +1,32 @@
+import "./clients/console-guard-install.js";
+import {
+	closeModuleLoadConsoleWindow,
+	installConsoleGuard,
+	logExtension,
+	runInConsoleCaptureWindow,
+	withConsoleCaptureWindows,
+} from "./clients/extension-log.js";
+import { wireUserNotifier } from "./clients/user-notify.js";
+import {
+	getDegradationSummary,
+	recordDegradation,
+} from "./clients/degradation-ledger.js";
+import {
+	adoptProjectTrustFromPorts,
+	assertInstallAllowed,
+	readProjectTrustFromContext,
+} from "./clients/project-trust.js";
+import {
+	type ExtensionRunMode,
+	modeSuppressionNote,
+	readExtensionMode,
+	suppressesUserNotify,
+	supportsTuiWidget,
+} from "./clients/extension-mode.js";
 import * as nodeFs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { isToolCallEventType } from "./clients/tool-event.js";
+import { createDefaultHostPorts, type HostPorts } from "./clients/host-ports.js";
 import { AstGrepClient } from "./clients/ast-grep-client.js";
 import { loadBootstrapClients } from "./clients/bootstrap.js";
 import { CacheManager } from "./clients/cache-manager.js";
@@ -14,10 +38,16 @@ import {
 	getSessionLanguages,
 	importWidgetState,
 	type PersistedWidgetState,
+	reconcileCascadeNeighborLspErrors,
 	renderWidget,
+	scheduleStaleReconcile,
 	setRenderCallback,
 } from "./clients/widget-state.js";
 import { selectLspStatus } from "./clients/lsp-status.js";
+import type { PersistedReadGuardState } from "./clients/read-guard.js";
+import { registerReadBridge } from "./clients/read-bridge.js";
+import { isExternalOrVendorFile } from "./clients/path-utils.js";
+import { isPathIgnoredByProject } from "./clients/file-utils.js";
 import {
 	dropStaleFiles,
 	loadSessionState,
@@ -25,35 +55,26 @@ import {
 	sessionStartMode,
 } from "./clients/session-state-store.js";
 import { getDiagnosticTracker } from "./clients/diagnostic-tracker.js";
-import {
-	getCascadeSessionStats,
-	getDispatchSlopScoreLine,
-	getLatencyReports,
-	resetDispatchBaselines,
-} from "./clients/dispatch/integration.js";
-import {
-	extractReadPathsFromCommand,
-	extractWrittenPathsFromCommand,
-} from "./clients/bash-file-access.js";
-import { detectFileKind } from "./clients/file-kinds.js";
-import { isPathIgnoredByProject } from "./clients/file-utils.js";
+import { warmDispatchIntegration, loadDispatchIntegration } from "./clients/dispatch/lazy.js";
 import {
 	getFormatService,
 	resetFormatService,
 } from "./clients/format-service.js";
-import {
-	evaluateGitGuard,
-	isGitCommitOrPushAttempt,
-} from "./clients/git-guard.js";
 import { getAllToolStatuses } from "./clients/installer/index.js";
-import { LANGUAGE_POLICY } from "./clients/language-policy.js";
 import {
 	loadPiLensGlobalConfig,
 	resolvePiLensFlag,
+	resolvePiLensFlagWithSource,
 } from "./clients/lens-config.js";
-import { initLensEvents } from "./clients/lens-events.js";
-import { wireBusEmitter } from "./clients/bus-publish.js";
-import { wireDiagnosticsBusEmitter } from "./clients/diagnostics-publish.js";
+import { LENS_FLAGS } from "./clients/lens-flag-registry.js";
+import { wrapToolsForCompactLine } from "./clients/tool-render.js";
+import { loadPiLensProjectConfig } from "./clients/project-lens-config.js";
+import { initLensEventsGetter } from "./clients/lens-events.js";
+import { wireBusEmitterGetter } from "./clients/bus-publish.js";
+import { wireDiagnosticsBusEmitterGetter } from "./clients/diagnostics-publish.js";
+import { wireDispositionBusEmitterGetter } from "./clients/disposition-publish.js";
+import { wireFormatEventsBusEmitterGetter } from "./clients/format-events-publish.js";
+import { emitBusEventRollupAtSessionEnd } from "./clients/bus-events-logger.js";
 import {
 	consumeAgentNudge,
 	recordCrossProcessTouches,
@@ -64,34 +85,38 @@ import {
 	readCrossProcessTouchesForTurnStart,
 } from "./clients/recent-touches.js";
 import { registerCascadeTierReconcileTask } from "./clients/lsp/cascade-tier.js";
+import { buildResolvedFoundCascadeRun } from "./clients/cascade-format.js";
 import { initLSPConfig } from "./clients/lsp/config.js";
 import { getLSPService, resetLSPService } from "./clients/lsp/index.js";
-import { sweepOrphans, sweepUntrackedOrphans } from "./clients/instance-reaper.js";
+import { warmLspService } from "./clients/lsp-lazy.js";
+import {
+	sweepOrphans,
+	sweepUntrackedOrphans,
+} from "./clients/instance-reaper.js";
 import {
 	deregisterInstance,
+	readInstanceRegistry,
 	registerInstance,
 } from "./clients/instance-registry.js";
+import { logVanishedInstances } from "./clients/vanished-instance-marker.js";
+import {
+	buildMemorySample,
+	formatMemoryHealthLine,
+	shouldEmitMemorySample,
+} from "./clients/memory-sampler.js";
+import { dumpActiveHandles } from "./clients/debug-handles.js";
+import {
+	isDebugHeapEnabled,
+	writeHeapSnapshotNow,
+} from "./clients/debug-heap.js";
+import {
+	checkSmellsAndNoteOnce,
+	countRecentSmells,
+	formatSmellsHealthLine,
+	shouldCheckSmellsThisTurn,
+} from "./clients/smells-rollup.js";
+import { configureWarmAttach } from "./clients/warm-attach.js";
 import { checkCrossProcessLspBudget } from "./clients/lsp-budget.js";
-import {
-	EXPANSION_BUDGET_MS,
-	EXPANSION_LIMIT_LINES,
-	tryExpandRead,
-} from "./clients/read-expansion.js";
-import { logReadGuardEvent } from "./clients/read-guard-logger.js";
-import {
-	countFileLines,
-	getTouchedLinesForGuard,
-	relocateEditRange,
-	tryCorrectIndentationMismatch,
-	tryCorrectIndentationMismatchFromContent,
-} from "./clients/read-guard-tool-lines.js";
-import {
-	computeTrailingWhitespaceOldTextPatch,
-	findUniqueMatchLineRange,
-} from "./clients/oldtext-autopatch.js";
-import { applyPartiallyApplicableEdits } from "./clients/partial-edit-apply.js";
-import { normalizeForGuardMatch } from "./clients/host-edit-normalize.js";
-import { retargetReplacementIndentation } from "./clients/indent-retarget.js";
 import { handleAgentEnd } from "./clients/runtime-agent-end.js";
 import {
 	consumeSessionStartGuidance,
@@ -100,7 +125,9 @@ import {
 } from "./clients/runtime-context.js";
 import { RuntimeCoordinator } from "./clients/runtime-coordinator.js";
 import { handleSessionStart } from "./clients/runtime-session.js";
+import { handleToolCall } from "./clients/runtime-tool-call.js";
 import {
+	classifyCurrentSessionEmission,
 	decideSessionStart,
 	decrementSecondarySessionCount,
 	noteSessionShutdown,
@@ -116,9 +143,7 @@ import {
 	registerQuietWindowTask,
 	runQuietWindow,
 } from "./clients/quiet-window.js";
-import { isExternalOrVendorFile } from "./clients/path-utils.js";
 import { setAmbientAbortSignal } from "./clients/safe-spawn.js";
-import { TreeSitterClient } from "./clients/tree-sitter-client.js";
 import { initI18n, t } from "./i18n.js";
 import { createAstGrepDumpTool } from "./tools/ast-dump.js";
 import {
@@ -126,6 +151,7 @@ import {
 	type ActivatableToolInfo,
 } from "./tools/activate-tools.js";
 import { createLensDiagnosticsTool } from "./tools/lens-diagnostics.js";
+import { createLensDiagnosticMarkTool } from "./tools/lens-diagnostic-mark.js";
 import { createAstGrepReplaceTool } from "./tools/ast-grep-replace.js";
 import { createAstGrepSearchTool } from "./tools/ast-grep-search.js";
 import { createAstGrepOutlineTool } from "./tools/ast-grep-outline.js";
@@ -136,10 +162,25 @@ import {
 	createReadEnclosingTool,
 	createReadSymbolTool,
 } from "./tools/module-report.js";
+import { createProjectReportTool } from "./tools/project-report.js";
 import { createSymbolSearchTool } from "./tools/symbol-search.js";
-import { logLatency } from "./clients/latency-logger.js";
+import { getLastLoggedPhase, logLatency } from "./clients/latency-logger.js";
 import {
+	isFreshSessionStart,
+	planToolSet,
+	recordToolSetMutation,
+	supportsDeferredTools,
+} from "./clients/tool-set-policy.js";
+import {
+	clearCachePrefixSession,
+	logCacheUsage,
+	observeCacheContext,
+	observeCachePrefix,
+} from "./clients/cache-observability.js";
+import {
+	getPiLensEvalMs,
 	markPiLensLoaded,
+	PI_LENS_HOST_BOOT_MS,
 	PI_LENS_LOADED_FROM,
 } from "./clients/startup-timing.js";
 import { toRunnerDisplayPath } from "./clients/dispatch/runner-context.js";
@@ -150,35 +191,187 @@ import {
 import { renderTurnSummaryMessage } from "./clients/turn-summary-render.js";
 import {
 	getEventLoopStats,
+	resetEventLoopMonitor,
 	shouldLogWorstBlock,
 	startEventLoopMonitor,
 } from "./clients/event-loop-monitor.js";
+import { logSessionStart } from "./clients/sessionstart-logger.js";
+import { logConcurrentSessionBind } from "./clients/session-start-observability.js";
+import { warmFormatters } from "./clients/formatters-lazy.js";
+
+type DispatchIntegration = Awaited<ReturnType<typeof loadDispatchIntegration>>;
+let loadedDispatchIntegration: DispatchIntegration | undefined;
+
+function warmDispatchAtSessionStart(): void {
+	void warmDispatchIntegration().then((integration) => {
+		loadedDispatchIntegration = integration;
+	}).catch((err) => {
+		logExtension({ subsystem: "dispatch", level: "warn", message: `dispatch warm failed: ${err}` });
+	});
+}
+
+function resetDispatchBaselines(cwd?: string): void {
+	void loadDispatchIntegration().then(({ resetDispatchBaselines }) => {
+		resetDispatchBaselines(cwd);
+	});
+}
 
 // First executable statement: every import above has been evaluated, so the
 // full load/transpile cost has been paid. Capture it now.
 const PI_LENS_LOAD_MS = markPiLensLoaded();
+const PI_LENS_EVAL_MS = getPiLensEvalMs() ?? 0;
 // Start the event-loop occupancy monitor as early as possible so startup
 // blocks are captured. Native histogram — no per-event overhead. (#192)
 startEventLoopMonitor();
 // Worst event-loop block already persisted to latency.log (so we only log a
-// *new* worst freeze per turn, not the same growing max). (#192)
+// *new* worst freeze per turn, not the same growing max). (#192) A suspected
+// system stall (sleep/paging) never advances this high-water, so a machine
+// freeze can't permanently suppress logging of later genuine blocks. (#1122)
 let lastLoggedLoopWorstMs = 0;
+// Worst *genuine* (non-stall) block this session, for the health readout — the
+// per-turn histogram window (#1122) is reset each turn, so the session-scoped
+// worst is tracked here instead of read from the live histogram.
+let sessionWorstRealBlockMs = 0;
+// How many turns logged a suspected system stall (sleep/paging) this session —
+// surfaced in /lens-health so a machine freeze reads as environment, not a
+// pi-lens block (#1122).
+let sessionSuspectedStalls = 0;
 
-const DEBUG_LOG_DIR = path.join(os.homedir(), ".pi-lens");
-const DEBUG_LOG = path.join(DEBUG_LOG_DIR, "sessionstart.log");
 function dbg(msg: string) {
-	// Skip file logging during tests to isolate test output from production logs
-	if (process.env.PI_LENS_TEST_MODE === "1" || process.env.VITEST) {
+	logSessionStart(msg);
+}
+
+/**
+ * The most recent event ctx, kept ONLY so `clients/user-notify.ts` can resolve
+ * a live `ctx.ui.notify` at delivery time (#1333). Never dereferenced eagerly
+ * and never captured by a long-lived closure — a session replacement swaps the
+ * ctx, and `notifyUserDegradation` swallows the stale-ctx throw.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: heterogeneous pi event ctx shapes
+let latestEventCtx: any;
+
+/** Refresh the notify target from whichever event ctx just arrived. */
+// biome-ignore lint/suspicious/noExplicitAny: heterogeneous pi event ctx shapes
+function rememberEventCtx(ctx: any): void {
+	if (ctx) latestEventCtx = ctx;
+}
+
+/**
+ * Mode-aware `ctx.ui.notify` (#1334 S2). Every user-facing notify in this file
+ * goes through here so terminal ownership is derived from the HOST's
+ * `ctx.mode`, not from pi-lens guessing. In "print"/"json" the message is
+ * logged instead of rendered — those modes are one-shot pipelines whose stdout
+ * belongs to the run's actual output, not to extension chatter. "tui", "rpc"
+ * and an older host with no `mode` field all notify exactly as before.
+ */
+function notifyUi(
+	// biome-ignore lint/suspicious/noExplicitAny: heterogeneous pi event ctx shapes
+	ctx: any,
+	message: string,
+	level: "info" | "warning" | "error" = "info",
+): void {
+	const mode = readExtensionMode(ctx);
+	if (suppressesUserNotify(mode)) {
+		recordDegradation({
+			kind: "mode-suppression",
+			subject: "ctx.ui.notify",
+			reason: modeSuppressionNote(mode),
+		});
+		dbg(`notify ${modeSuppressionNote(mode)}: ${message.split("\n")[0]}`);
 		return;
 	}
-	const line = `[${new Date().toISOString()}] ${msg}\n`;
+	ctx?.ui?.notify?.(message, level);
+}
+
+/**
+ * Best-effort read of the STABLE pi session id off an event ctx
+ * (`ctx.sessionManager.getSessionId()`), the same accessor #473's
+ * session_start handling and #791's deferred-format ownership tagging both
+ * rely on. Never throws — returns `undefined` on any unexpected ctx shape
+ * or accessor error (older host, inconclusive probe, etc).
+ */
+function getStableSessionId(ctx: unknown): string | undefined {
 	try {
-		nodeFs.mkdirSync(DEBUG_LOG_DIR, { recursive: true });
-		nodeFs.appendFileSync(DEBUG_LOG, line);
-	} catch (e) {
-		// Pipeline error logged
-		console.error("[pi-lens-debug] write failed:", e);
+		return (
+			ctx as
+				| { sessionManager?: { getSessionId?: () => string } }
+				| null
+				| undefined
+		)?.sessionManager?.getSessionId?.();
+	} catch {
+		return undefined;
 	}
+}
+
+export interface CreateHostPortsOptions {
+	getContext: () => unknown;
+	getProjectRoot?: () => string | undefined;
+	getRenderInvalidator?: () => (() => void) | undefined;
+}
+
+/** Assemble pi's live ExtensionAPI/context projections behind HostPorts. */
+export function createHostPorts(
+	pi: ExtensionAPI,
+	options: CreateHostPortsOptions,
+): HostPorts {
+	const context = () => options.getContext() as any;
+	const currentMode = () => readExtensionMode(context());
+	const emit = (channel: string, payload: unknown): void => {
+		const bus = pi.events;
+		bus?.emit?.call(bus, channel, payload);
+	};
+	const activeTools = pi as unknown as {
+		getActiveTools?: () => string[];
+		setActiveTools?: (names: string[]) => void;
+	};
+	return createDefaultHostPorts({
+		notify: {
+			user(message, level) {
+				const mode = currentMode();
+				if (mode === "print" || mode === "json") {
+					// #1366: suppressed notices are still LEDGERED so headless
+					// operators can see them in pilens_health.
+					recordDegradation({
+						kind: "mode-suppression",
+						subject: "user degradation notice",
+						reason: modeSuppressionNote(mode),
+					});
+					return;
+				}
+				context()?.ui?.notify?.(message, level ?? "warning");
+			},
+		},
+		trust: { isProjectTrusted: () => readProjectTrustFromContext(context()) },
+		mode: {
+			current: currentMode,
+			supportsTuiWidget: () => supportsTuiWidget(currentMode()),
+			suppressesUserNotify: () => suppressesUserNotify(currentMode()),
+		},
+		log: {
+			extension: logExtension,
+			debug: (message, metadata) =>
+				logExtension({ subsystem: "host", level: "debug", message, metadata }),
+			// DECLARATION-ONLY in S2 (#1367 review): no production code consumes
+			// ports.log.sink yet -- the 13 subsystem loggers still own their
+			// NDJSON files directly. Migrating them onto this port (routing to
+			// their per-subsystem files, NOT extension.log) is S4 scope; this
+			// placeholder exists so the interface is complete for contract tests.
+			sink: (subsystem) => (entry) =>
+				logExtension({ subsystem, level: "debug", message: "host sink entry", metadata: { entry } }),
+		},
+		emit: { bus: emit },
+		status: { set: (name, value) => context()?.ui?.setStatus?.(name, value) },
+		spawn: { abortSignal: () => context()?.signal, isAllowed: assertInstallAllowed },
+		render: { invalidate: () => options.getRenderInvalidator?.()?.() },
+		session: { id: () => getStableSessionId(context()) },
+		workspace: { cwd: () => context()?.cwd, projectRoot: () => options.getProjectRoot?.() },
+		flags: { get: (name) => pi.getFlag(name) },
+		tools: {
+			has: async (name) => typeof (pi as unknown as { getTool?: (tool: string) => unknown }).getTool?.(name) !== "undefined",
+			getActive: () => activeTools.getActiveTools?.() ?? [],
+			setActive: (names) => activeTools.setActiveTools?.(names),
+		},
+	});
 }
 
 // Log how long pi took to load pi-lens — the jiti transpile of every module is
@@ -194,10 +387,41 @@ logLatency({
 	durationMs: PI_LENS_LOAD_MS,
 	metadata: { loadedFrom: PI_LENS_LOADED_FROM },
 });
+logLatency({
+	type: "phase",
+	filePath: "<pi-lens>",
+	phase: "host_boot",
+	durationMs: PI_LENS_HOST_BOOT_MS,
+	metadata: { loadedFrom: PI_LENS_LOADED_FROM },
+});
+logLatency({
+	type: "phase",
+	filePath: "<pi-lens>",
+	phase: "extension_eval",
+	durationMs: PI_LENS_EVAL_MS,
+	metadata: { loadedFrom: PI_LENS_LOADED_FROM },
+});
 
 // No-op log function (verbose console logging was removed with lens-verbose flag)
 function log(_msg: string) {
 	// Previously tied to --lens-verbose flag, now disabled
+}
+
+/**
+ * The pi SDK invalidates a captured `pi`/command ctx after a session
+ * replacement or reload (ctx.newSession/fork/switchSession/reload); every later
+ * `pi.*` call then throws with this signature (installed SDK:
+ * core/extensions/loader.js `assertActive`). We match by message — not `===` a
+ * captured instance — so a fire-and-forget task that races a session swap can
+ * recognise the benign stale-ctx throw and degrade to a no-op. Substring-matched
+ * on the stable "stale after session replacement or reload" phrase so it
+ * survives incidental wording changes around it.
+ */
+function isStaleExtensionCtxError(err: unknown): boolean {
+	return (
+		err instanceof Error &&
+		err.message.includes("stale after session replacement or reload")
+	);
 }
 
 // --- State ---
@@ -209,6 +433,8 @@ const runtime = new RuntimeCoordinator();
 // ONCE (flag below, same pattern as registerCascadeTierReconcileTask) and
 // have it read the CURRENT activation's pi/flag closures through this
 // holder, refreshed on every activation — never a stale captured `pi`.
+let _readBridgeRegistered = false;
+let _readBridgeGetFlag: ((name: string) => boolean | string | undefined) | undefined;
 let _turnSummaryEmitRegistered = false;
 let _turnSummaryEmitCtx:
 	| {
@@ -218,26 +444,18 @@ let _turnSummaryEmitCtx:
 	  }
 	| undefined;
 const _lspConfigInitializedCwds = new Set<string>();
-const _readExpansionClient = new TreeSitterClient();
-const LSP_TOOLCALL_NAV_TOUCH_BUDGET_MS = Math.max(
-	0,
-	Number.parseInt(
-		process.env.PI_LENS_TOOLCALL_NAV_TOUCH_MS ??
-			process.env.PI_LENS_LSP_NAV_CLIENT_WAIT_MS ??
-			"1500",
-		10,
-	) || 1500,
-);
-const LSP_TOOLCALL_TOUCH_BUDGET_MS = Math.max(
-	0,
-	Number.parseInt(process.env.PI_LENS_TOOLCALL_TOUCH_MS ?? "750", 10) || 750,
-);
+const LSP_CONFIG_CWD_CAP = 128;
 
 async function ensureLSPConfigInitialized(cwd: string): Promise<void> {
 	const normalizedCwd = path.resolve(cwd);
 	if (_lspConfigInitializedCwds.has(normalizedCwd)) return;
 	await initLSPConfig(normalizedCwd);
 	_lspConfigInitializedCwds.add(normalizedCwd);
+	while (_lspConfigInitializedCwds.size > LSP_CONFIG_CWD_CAP) {
+		const oldest = _lspConfigInitializedCwds.values().next().value;
+		if (oldest === undefined) break;
+		_lspConfigInitializedCwds.delete(oldest);
+	}
 }
 
 function updateRuntimeIdentityFromEvent(event: unknown): void {
@@ -263,165 +481,6 @@ function normalizeCommandArgs(args: unknown): string[] {
 		return args.trim().split(/\s+/).filter(Boolean);
 	}
 	return [];
-}
-
-function getToolCallRawFilePath(
-	toolName: string,
-	event: { input?: unknown },
-): string | undefined {
-	const inputObj = (event.input ?? {}) as Record<string, unknown>;
-
-	if (
-		isToolCallEventType("write", event as any) ||
-		isToolCallEventType("edit", event as any)
-	) {
-		const filePath = (event.input as { path?: unknown }).path;
-		return typeof filePath === "string" ? filePath : undefined;
-	}
-
-	if (toolName === "read") {
-		if (typeof inputObj.path === "string") return inputObj.path;
-		if (typeof inputObj.filePath === "string") return inputObj.filePath;
-		return undefined;
-	}
-
-	if (toolName === "lsp_navigation") {
-		return typeof inputObj.filePath === "string"
-			? inputObj.filePath
-			: undefined;
-	}
-
-	return undefined;
-}
-
-function resolveToolCallFilePath(
-	rawFilePath: string | undefined,
-	cwd: string | undefined,
-	projectRoot: string,
-): string | undefined {
-	if (!rawFilePath) return undefined;
-	if (path.isAbsolute(rawFilePath)) return rawFilePath;
-	return path.resolve(cwd ?? projectRoot, rawFilePath);
-}
-
-type ReadToolInput = {
-	path?: string;
-	filePath?: string;
-	offset?: number;
-	limit?: number;
-};
-
-function getReadToolInput(
-	toolName: string,
-	input: unknown,
-): ReadToolInput | undefined {
-	if (toolName !== "read") return undefined;
-	return input as ReadToolInput;
-}
-
-function getEffectiveReadLimit(
-	filePath: string | undefined,
-	readInput: ReadToolInput | undefined,
-): number | undefined {
-	if (!filePath || !readInput) return undefined;
-	const requestedOffset = readInput.offset ?? 1;
-	const requestedLimit = readInput.limit;
-	return (
-		requestedLimit ??
-		Math.max(1, countFileLines(filePath) - requestedOffset + 1)
-	);
-}
-
-function isLspCapableFile(filePath: string): boolean {
-	const kind = detectFileKind(filePath);
-	if (!kind) return false;
-	return LANGUAGE_POLICY[kind]?.lspCapable !== false;
-}
-
-function shouldSkipLspAutoTouch(
-	filePath: string,
-	projectRoot: string,
-): boolean {
-	const normalized = path.resolve(filePath).replace(/\\/g, "/").toLowerCase();
-	const base = path.basename(filePath).toLowerCase();
-
-	if (normalized.includes("/.pi-lens/")) return true;
-	if (normalized.includes("/.harness/")) return true;
-	if (isExternalOrVendorFile(filePath, projectRoot)) return true;
-	if (
-		base === "stdout.jsonl" ||
-		base === "stderr.txt" ||
-		base === "prompt.txt"
-	) {
-		return true;
-	}
-	if (base === "case.json" && normalized.includes("/cases/")) {
-		return true;
-	}
-	return false;
-}
-
-// Kept in lockstep with the gate's normalizeContent + oldtext-autopatch's
-// normalizeOldTextForMatch: the host edit tool's full fuzzy-match space, so the
-// autopatch passes count/locate oldText exactly where the host applies it (#257).
-function normalizeOldTextForMatch(text: string): string {
-	return normalizeForGuardMatch(text);
-}
-
-function countTextOccurrences(haystack: string, needle: string): number {
-	if (!needle) return 0;
-	let count = 0;
-	let pos = 0;
-	while (pos < haystack.length) {
-		const idx = haystack.indexOf(needle, pos);
-		if (idx === -1) break;
-		count += 1;
-		pos = idx + needle.length;
-	}
-	return count;
-}
-
-function countOldTextMatches(
-	filePath: string,
-	oldText: string,
-	cachedNormalizedContent?: string,
-): number {
-	try {
-		const content =
-			cachedNormalizedContent ??
-			normalizeOldTextForMatch(nodeFs.readFileSync(filePath, "utf-8"));
-		return countTextOccurrences(content, normalizeOldTextForMatch(oldText));
-	} catch {
-		return 0;
-	}
-}
-
-function isIndentationOnlyChange(before: string, after: string): boolean {
-	const beforeLines = before.replace(/\r\n/g, "\n").split("\n");
-	const afterLines = after.replace(/\r\n/g, "\n").split("\n");
-	if (beforeLines.length !== afterLines.length) return false;
-	// Strip both leading and trailing whitespace: consistent with
-	// findIndentationInsensitiveCandidate which matches via .trimEnd(), so a
-	// candidate that differs only in trailing whitespace is still indentation-only.
-	return beforeLines.every(
-		(line, index) => line.trim() === afterLines[index].trim(),
-	);
-}
-
-function getNewContentFromToolCall(event: unknown): string | undefined {
-	if (isToolCallEventType("write", event as any)) {
-		return ((event as { input?: unknown }).input as { content?: string })
-			.content;
-	}
-	if (isToolCallEventType("edit", event as any)) {
-		const edits = (
-			(event as { input?: unknown }).input as {
-				edits?: Array<{ newText?: string }>;
-			}
-		).edits;
-		return edits?.map((edit) => edit.newText ?? "").join("\n");
-	}
-	return undefined;
 }
 
 function cleanStaleTsBuildInfo(cwd: string): string[] {
@@ -457,13 +516,85 @@ function cleanStaleTsBuildInfo(cwd: string): string[] {
 
 // --- Extension ---
 
-export default function (pi: ExtensionAPI) {
+/**
+ * The extension activation. Always reached through the default export below,
+ * which runs it inside a console capture window (#1434).
+ */
+function activateExtension(hostPi: ExtensionAPI) {
+	// #1434: every pi-lens entry point registered through this API runs inside a
+	// capture window, so a dependency writing to console during our work reaches
+	// the log instead of pi's frame. Host-initiated output stays on the real
+	// console, because it runs outside every window.
+	const pi = withConsoleCaptureWindows(hostPi);
+	// Event contexts belong to the activation that owns this factory closure.
+	// The process-global latest ctx remains only a boot-window fallback.
+	// biome-ignore lint/suspicious/noExplicitAny: heterogeneous pi event ctx shapes
+	let ownEventCtx: any;
+	// biome-ignore lint/suspicious/noExplicitAny: heterogeneous pi event ctx shapes
+	const rememberOwnEventCtx = (ctx: any): void => {
+		if (!ctx) return;
+		ownEventCtx = ctx;
+		rememberEventCtx(ctx);
+	};
+	let renderInvalidator: (() => void) | undefined;
+	const hostPorts = createHostPorts(pi, {
+		getContext: () => latestEventCtx,
+		getProjectRoot: () => runtime.projectRoot,
+		getRenderInvalidator: () => renderInvalidator,
+	});
+	// #1333 — defense in depth, the pi-side mirror of `mcp/server.ts`'s
+	// `console.log = console.error` guard. pi owns the terminal (raw mode +
+	// cursor-addressed diff repaints), so a raw byte from ANY transitively
+	// loaded module desyncs its screen model. pi-lens's own sites are migrated
+	// to real ndjson sinks; this net catches everything else. The REAL install
+	// happens at import time via `clients/console-guard-install.js` (index.ts's
+	// first import) so module-init writes are covered too; this call is an
+	// idempotent re-install for tests that invoke the factory directly. No-op
+	// under test mode and under `PI_LENS_CONSOLE_GUARD=0`.
+	installConsoleGuard();
 	initI18n(pi);
-	initLensEvents(pi);
-	wireBusEmitter(pi.events?.emit?.bind(pi.events));
-	wireDiagnosticsBusEmitter(pi.events?.emit?.bind(pi.events));
+	// #1333 HUMAN channel: user-facing degradations found deep in clients/
+	// (invalid config, offline grammar fetch, WASM abort) reach the user
+	// through the host's own render path. Per the #338/#798 detached-callback
+	// rule the notifier is resolved from the LATEST event ctx at delivery time,
+	// never captured once — a session replacement invalidates the old ctx.ui.
+	// #1334 S2: the ports notifier owns mode suppression + live-ctx resolution
+	// (per-call, never captured -- the #338/#798 detached-callback rule).
+	const refreshCtxDerivedPlumbing = (): void => {
+		// These targets are module singletons, while hostPorts is scoped to this
+		// extension activation. A sibling activation can overwrite them and then
+		// become stale; every session_start must reclaim them before #473 can
+		// return early for a concurrent in-process subagent. (#1383)
+		wireUserNotifier(hostPorts);
+		const getLiveEmit = () => ({
+			emit: hostPorts.emit.bus,
+			// H2 (#1415 review): NOT `?? latestEventCtx`. The global belongs to
+			// whichever activation last received an event — a SIBLING activation
+			// after a replacement, with no relation to this closure's `pi.events`.
+			// Falling back to it pairs a live emitter with a foreign ctx, which
+			// the stale-session probe cannot catch (it looks live) and silently
+			// drops every publish until this activation's own first handler
+			// fires. An unset `ownEventCtx` (this activation's own boot window)
+			// must probe undefined -> "ready" -> delivery attempted, exactly like
+			// today, not borrow a sibling's ctx.
+			ctx: ownEventCtx,
+		});
+		initLensEventsGetter(getLiveEmit);
+		wireBusEmitterGetter(getLiveEmit);
+		wireDiagnosticsBusEmitterGetter(getLiveEmit);
+		wireDispositionBusEmitterGetter(getLiveEmit);
+		wireFormatEventsBusEmitterGetter(getLiveEmit);
+		setRenderCallback(() => hostPorts.render.invalidate());
+	};
+	refreshCtxDerivedPlumbing();
 	// #485: read-only bus subscriber — never publishes, so the #482 loop guard
 	// (ingest -> write -> publish) has no write side to trip here.
+	// #1434 residual risk, accepted not fixed: `pi.events` is the raw host bus,
+	// not `pi` itself, so `withConsoleCaptureWindows` does not wrap its
+	// `subscribe`. A future subscriber body that logs would bypass the capture
+	// window. Subscribers registered on this bus are subscribe-only today
+	// (never publish), so nothing currently exercises that gap — revisit if
+	// `pi.events` grows a subscriber that does real work inside its callback.
 	wireAgentNudgeSubscriber({
 		events: pi.events,
 		getReadGuard: () => runtime.readGuard,
@@ -546,113 +677,89 @@ export default function (pi: ExtensionAPI) {
 
 	// --- Flags ---
 
-	pi.registerFlag("no-lens", {
-		description:
-			"Start pi-lens disabled for this session. Re-enable with /lens-toggle.",
-		type: "boolean",
-		default: false,
-	});
-
-	pi.registerFlag("no-lsp", {
-		description:
-			"Disable unified LSP diagnostics and use language-specific fallbacks (for example pyright)",
-		type: "boolean",
-		default: false,
-	});
-
-	pi.registerFlag("no-autoformat", {
-		description:
-			"Disable automatic formatting entirely (deferred format runs at agent_end by default)",
-		type: "boolean",
-		default: false,
-	});
-
-	pi.registerFlag("immediate-format", {
-		description:
-			"Run automatic formatting immediately after each write/edit instead of deferring to agent_end",
-		type: "boolean",
-		default: false,
-	});
-
-	pi.registerFlag("no-autofix", {
-		description: "Disable auto-fixing of lint issues (Biome, Ruff, ESLint)",
-		type: "boolean",
-		default: false,
-	});
-
-	pi.registerFlag("no-tests", {
-		description: "Disable test runner on write",
-		type: "boolean",
-		default: false,
-	});
-
-	pi.registerFlag("no-delta", {
-		description: "Disable delta mode (show all diagnostics, not just new ones)",
-		type: "boolean",
-		default: false,
-	});
-
-	pi.registerFlag("lens-guard", {
-		description:
-			"Experimental: block git commit/push when unresolved pi-lens blockers exist",
-		type: "boolean",
-		default: false,
-	});
-
-	pi.registerFlag("no-opengrep", {
-		description:
-			"Disable the Opengrep security scanner (a default-on auxiliary LSP; auto-installs, uses repo rules if present else the login-free 'auto' ruleset)",
-		type: "boolean",
-		default: false,
-	});
-
-	pi.registerFlag("no-read-guard", {
-		description: "Disable read-before-edit behavior monitor",
-		type: "boolean",
-		default: false,
-	});
-
-	pi.registerFlag("no-lens-context", {
-		description:
-			"Disable automatic context injection (session-start guidance, turn-end & test findings) while keeping tools, LSP, read-guard, and formatting active. Toggle with /lens-context-toggle. Also via contextInjection.enabled=false in config or PI_LENS_NO_CONTEXT_INJECTION=1.",
-		type: "boolean",
-		default: false,
-	});
-
-	pi.registerFlag("lens-turn-summary", {
-		description:
-			"Opt-in: persist a per-turn transcript entry summarizing diagnostics found, autofixes applied, and autoformats applied this turn (#484). Collapsed one-line, expandable in place. Default off. Also via turnSummary.enabled=true in ~/.pi-lens/config.json.",
-		type: "boolean",
-		default: false,
-	});
+	// #166: registration is driven by clients/lens-flag-registry.ts, the same
+	// declarative array that drives config parsing and precedence resolution, so
+	// a flag cannot exist on the CLI without a config key (or vice versa).
+	for (const spec of LENS_FLAGS) {
+		pi.registerFlag(spec.name, {
+			description: spec.description,
+			type: "boolean",
+			default: spec.default,
+		});
+	}
 
 	const globalConfig = loadPiLensGlobalConfig();
-	const globalConfigOnlyFlags = new Set([
-		"lens-actionable-warnings",
-		"lens-actionable-warning-actions",
-		"lens-actionable-warning-autofix",
-		"lens-actionable-warning-all",
-	]);
-	function getLensFlag(name: string): boolean | string | undefined {
-		const cliValue = globalConfigOnlyFlags.has(name)
-			? undefined
-			: pi.getFlag(name);
-		return resolvePiLensFlag(name, cliValue, globalConfig);
+	function getLensFlag(
+		name: string,
+		editedFilePath?: string,
+	): boolean | string | undefined {
+		const projectConfig = loadPiLensProjectConfig(runtime.projectRoot);
+		return resolvePiLensFlag(
+			name,
+			pi.getFlag(name),
+			globalConfig,
+			projectConfig,
+			editedFilePath,
+			runtime.projectRoot,
+		);
+	}
+
+	// #792: sibling of getLensFlag reporting WHICH config tier decided the
+	// value, so mutation-skip dbg lines can name it (e.g. "source=project")
+	// instead of a bare boolean. Threaded to pipeline/agent_end via the
+	// optional `getFlagSource` field — zero effect on getLensFlag itself.
+	function getLensFlagSource(
+		name: string,
+		editedFilePath?: string,
+	): ReturnType<typeof resolvePiLensFlagWithSource>["source"] {
+		const projectConfig = loadPiLensProjectConfig(runtime.projectRoot);
+		return resolvePiLensFlagWithSource(
+			name,
+			pi.getFlag(name),
+			globalConfig,
+			projectConfig,
+			editedFilePath,
+			runtime.projectRoot,
+		).source;
 	}
 
 	let lensEnabled = !getLensFlag("no-lens");
+
+	// Read-bridge: refresh the flag getter on every factory activation so the
+	// live getLensFlag closure is always used (same pattern as _turnSummaryEmitCtx).
+	// Register the singleton once — subsequent activations only refresh the getter.
+	_readBridgeGetFlag = getLensFlag;
+	if (!_readBridgeRegistered) {
+		_readBridgeRegistered = true;
+		registerReadBridge({
+			getReadGuard: () => runtime.readGuard,
+			getTurnIndex: () => runtime.turnIndex,
+			peekWriteIndex: () => runtime.peekWriteIndex(),
+			isRecordable(filePath: string): boolean {
+				if (_readBridgeGetFlag?.("no-read-guard")) return false;
+				if (isPathIgnoredByProject(filePath, runtime.projectRoot, false)) return false;
+				if (isExternalOrVendorFile(filePath, runtime.projectRoot)) return false;
+				return true;
+			},
+		});
+	}
 	// Automatic context injection (the `context` hook). Independent of lensEnabled
 	// so tools/LSP/read-guard/formatting keep running when it is off. Precedence:
-	// env override → CLI flag → global config (resolved inside getLensFlag).
-	let contextInjectionEnabled =
-		process.env.PI_LENS_NO_CONTEXT_INJECTION !== "1" &&
-		!getLensFlag("no-lens-context");
+	// env override → CLI flag → global config, all resolved inside getLensFlag
+	// from the registry's PI_LENS_NO_CONTEXT_INJECTION env binding (#166).
+	let contextInjectionEnabled = !getLensFlag("no-lens-context");
 	let lensWidgetVisible = globalConfig?.widget?.visible !== false;
+	let mountedLensWidgetUi: LensWidgetUi | undefined;
+	let widgetMountFailureLogged = false;
 	// #190 Phase 2: snapshot of the source session's diagnostics, captured at
 	// `session_before_fork` and adopted by the forked session at the subsequent
 	// `session_start` (reason="fork"). In-memory hand-off (same process) — avoids
 	// deriving the source id from a file path (the id lives in the file header).
 	let pendingForkSnapshot: PersistedWidgetState | undefined;
+	// #1041: the source session's read-guard read-set, stashed at
+	// `session_before_fork` alongside the widget snapshot so a forked session
+	// adopts its parent's read history (same in-memory hand-off pattern).
+	let pendingForkReadGuard: PersistedReadGuardState | undefined;
 	type LensWidgetTui = { requestRender: () => void };
 	type LensWidgetTheme = { fg: (color: string, s: string) => string };
 	type LensWidgetComponent = {
@@ -670,28 +777,66 @@ export default function (pi: ExtensionAPI) {
 		options?: { placement: "belowEditor" },
 	) => void;
 
-	function mountLensWidget(ui: LensWidgetUi | undefined): boolean {
-		if (typeof ui?.setWidget !== "function") return false;
+	/**
+	 * #1334 S2: the widget is a terminal-only custom component. The host's own
+	 * types say so — *"Use `"tui"` to guard terminal-only UI such as custom
+	 * components"* — so mounting is gated on the mode pi reports, not attempted
+	 * blindly. `rpc` is excluded despite `hasUI: true`: dialogs travel over the
+	 * protocol there, a belowEditor component does not. An older host with no
+	 * `mode` field reads "unknown" and mounts exactly as before.
+	 */
+	function mountLensWidget(
+		ui: LensWidgetUi | undefined,
+		mode: ExtensionRunMode,
+	): boolean {
+		if (!supportsTuiWidget(mode)) {
+			dbg(`widget mount ${modeSuppressionNote(mode)}`);
+			return false;
+		}
+		if (typeof ui?.setWidget !== "function") {
+			if (!widgetMountFailureLogged) {
+				widgetMountFailureLogged = true;
+				logExtension({
+					subsystem: "widget",
+					level: "debug",
+					message: "widget mount unavailable: host ui.setWidget is missing",
+				});
+			}
+			return false;
+		}
 		const setWidget = ui.setWidget as LensWidgetSetWidget;
 		setWidget(
 			"pi-lens",
 			(tui: LensWidgetTui, theme: LensWidgetTheme) => {
-				setRenderCallback(() => tui.requestRender());
+				renderInvalidator = () => tui.requestRender();
+				setRenderCallback(() => {
+					scheduleStaleReconcile();
+					hostPorts.render.invalidate();
+				});
 				return {
-					render: (width: number) => renderWidget(width, theme),
-					invalidate: () => setRenderCallback(() => {}),
+					render: (width: number) => {
+						scheduleStaleReconcile();
+						return renderWidget(width, theme);
+					},
+					invalidate: () => {
+						renderInvalidator = undefined;
+						setRenderCallback(() => {});
+					},
 				};
 			},
 			{ placement: "belowEditor" },
 		);
+		mountedLensWidgetUi = ui;
 		return true;
 	}
 
 	function unmountLensWidget(ui: LensWidgetUi | undefined): boolean {
+		renderInvalidator = undefined;
 		setRenderCallback(() => {});
 		if (typeof ui?.setWidget !== "function") return false;
 		const setWidget = ui.setWidget as LensWidgetSetWidget;
 		setWidget("pi-lens", undefined);
+		mountedLensWidgetUi = undefined;
 		return true;
 	}
 
@@ -699,9 +844,15 @@ export default function (pi: ExtensionAPI) {
 	// hosts without registerMessageRenderer simply never get a renderer
 	// registered (the raw `content` fallback text still shows since sendMessage
 	// itself is guarded the same way at the emit site below).
-	if (typeof (pi as { registerMessageRenderer?: unknown }).registerMessageRenderer === "function") {
+	if (
+		typeof (pi as { registerMessageRenderer?: unknown })
+			.registerMessageRenderer === "function"
+	) {
 		try {
-			pi.registerMessageRenderer(TURN_SUMMARY_CUSTOM_TYPE, renderTurnSummaryMessage);
+			pi.registerMessageRenderer(
+				TURN_SUMMARY_CUSTOM_TYPE,
+				renderTurnSummaryMessage,
+			);
 		} catch (registerRendererErr) {
 			dbg(`turn-summary renderer registration failed: ${registerRendererErr}`);
 		}
@@ -714,7 +865,8 @@ export default function (pi: ExtensionAPI) {
 			"Toggle pi-lens on/off for the current session. Usage: /lens-toggle",
 		handler: async (_args, ctx) => {
 			lensEnabled = !lensEnabled;
-			ctx.ui.notify(
+			notifyUi(
+				ctx,
 				lensEnabled
 					? "pi-lens enabled for this session."
 					: "pi-lens disabled for this session. Run /lens-toggle again to resume.",
@@ -728,7 +880,8 @@ export default function (pi: ExtensionAPI) {
 			"Toggle automatic context injection on/off for the current session (tools/LSP/read-guard/formatting stay active). Usage: /lens-context-toggle",
 		handler: async (_args, ctx) => {
 			contextInjectionEnabled = !contextInjectionEnabled;
-			ctx.ui.notify(
+			notifyUi(
+				ctx,
 				contextInjectionEnabled
 					? "pi-lens context injection enabled — findings will be added to the next turn."
 					: "pi-lens context injection disabled — findings are still cached (lens_diagnostics, /lens-health) but not added to model context.",
@@ -742,11 +895,24 @@ export default function (pi: ExtensionAPI) {
 			"Show or hide the pi-lens diagnostics widget below the editor. Usage: /lens-widget-toggle",
 		handler: async (_args, ctx) => {
 			const nextVisible = !lensWidgetVisible;
+			const mode = readExtensionMode(ctx);
+			// #1334 S2: distinguish "this pi is too old" from "this run mode has
+			// no terminal to draw into" — the old single message blamed the pi
+			// version for what is really a mode constraint.
+			if (nextVisible && !supportsTuiWidget(mode)) {
+				notifyUi(
+					ctx,
+					`pi-lens widget needs an interactive TUI — unavailable in "${mode}" mode.`,
+					"warning",
+				);
+				return;
+			}
 			const changed = nextVisible
-				? mountLensWidget(ctx.ui)
+				? mountLensWidget(ctx.ui, mode)
 				: unmountLensWidget(ctx.ui);
 			if (!changed) {
-				ctx.ui.notify(
+				notifyUi(
+					ctx,
 					"pi-lens widget is not supported by this pi version.",
 					"warning",
 				);
@@ -754,7 +920,8 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			lensWidgetVisible = nextVisible;
-			ctx.ui.notify(
+			notifyUi(
+				ctx,
 				lensWidgetVisible
 					? "pi-lens widget shown. Run /lens-widget-toggle to hide it."
 					: "pi-lens widget hidden. Run /lens-widget-toggle to show it.",
@@ -797,7 +964,54 @@ export default function (pi: ExtensionAPI) {
 				summary,
 			];
 
-			ctx.ui.notify(lines.join("\n"), "info");
+			notifyUi(ctx, lines.join("\n"), "info");
+		},
+	});
+
+	pi.registerCommand("lens-map", {
+		description:
+			"Render the review graph as a self-contained interactive HTML project map (pan/zoom/hover/click) and write it to disk. Usage: /lens-map",
+		handler: async (_args, ctx) => {
+			const cwd = ctx.cwd ?? process.cwd();
+			try {
+				const { generateLensMap } = await import("./clients/lens-map.js");
+				const result = await generateLensMap(cwd);
+				// testFileCount is normally 0 (the review graph excludes tests by
+				// role since #260) — only mention it when the map-level guard
+				// actually dropped something.
+				const testNote =
+					result.testFileCount > 0
+						? `, ${result.testFileCount} test files excluded`
+						: "";
+				// Compiled twins (X.js merged into X.ts) only occur in
+				// compile-in-place projects — mention only when something merged.
+				const twinNote =
+					result.compiledTwinCount > 0
+						? `, ${result.compiledTwinCount} compiled twins merged`
+						: "";
+				// Untracked-gitignored files dropped from the map (0 outside a
+				// git repo, where the filter degrades to a no-op).
+				const ignoredNote =
+					result.ignoredFileCount > 0
+						? `, ${result.ignoredFileCount} gitignored files excluded`
+						: "";
+				const lines = [
+					`🗺️ Project map written to ${result.filePath}`,
+					`${result.fileCount} files, ${result.edgeCount} edges, ${result.externalCount} external deps excluded${testNote}${twinNote}${ignoredNote}.`,
+				];
+				if (result.truncated) {
+					lines.push(
+						"Graph exceeded the map's node cap — showing the highest-degree files only (see the in-page note).",
+					);
+				}
+				notifyUi(ctx, lines.join("\n"), "info");
+			} catch (err) {
+				notifyUi(
+					ctx,
+					`Failed to generate the project map: ${err instanceof Error ? err.message : String(err)}`,
+					"error",
+				);
+			}
 		},
 	});
 
@@ -813,7 +1027,10 @@ export default function (pi: ExtensionAPI) {
 				0,
 			);
 
-			const reports = getLatencyReports();
+			const dispatchIntegration =
+				loadedDispatchIntegration ?? (await loadDispatchIntegration());
+			loadedDispatchIntegration = dispatchIntegration;
+			const reports = dispatchIntegration.getLatencyReports();
 			const last = reports.length > 0 ? reports[reports.length - 1] : undefined;
 			const diagStats = getDiagnosticTracker().getStats();
 			const slowRunners = last
@@ -846,7 +1063,7 @@ export default function (pi: ExtensionAPI) {
 					count: crashEntries.length,
 				}),
 			];
-			const slopScoreLine = getDispatchSlopScoreLine();
+			const slopScoreLine = dispatchIntegration.getDispatchSlopScoreLine();
 
 			if (crashEntries.length > 0) {
 				lines.push("", t("lens.health.topCrashFiles", "Top crash files:"));
@@ -892,18 +1109,64 @@ export default function (pi: ExtensionAPI) {
 			);
 
 			// Event-loop occupancy — the dimension our duration logs were blind to
-			// (#192). `maxMs` ≈ the worst synchronous block (TUI stall) this session.
+			// (#192). The histogram window is now per-turn (#1122), so the session
+			// worst genuine (non-stall) block is tracked separately; p99/mean here
+			// reflect the current turn window.
 			const elStats = getEventLoopStats();
 			if (elStats) {
 				lines.push(
 					"",
-					`Event loop (session): worst block ${elStats.maxMs}ms · p99 ${elStats.p99Ms}ms · mean ${elStats.meanMs}ms`,
+					`Event loop: worst genuine block ${sessionWorstRealBlockMs}ms (session) · p99 ${elStats.p99Ms}ms · mean ${elStats.meanMs}ms (turn)`,
 				);
-				if (elStats.maxMs > 100) {
+				if (sessionWorstRealBlockMs > 100) {
 					lines.push(
 						"  ⚠ a >100ms synchronous block can stutter the TUI — check latency.log (#192)",
 					);
 				}
+				if (sessionSuspectedStalls > 0) {
+					lines.push(
+						`  ${sessionSuspectedStalls} suspected system stall(s) (sleep/paging) this session — excluded from the block figure above (#1122)`,
+					);
+				}
+			}
+
+			// Memory attribution (#1123 item 2) — reuses the same O(1) accessors the
+			// periodic latency.log `memory_sample` uses; see clients/memory-sampler.ts.
+			try {
+				lines.push(
+					"",
+					formatMemoryHealthLine(buildMemorySample(runtime.wordIndex)),
+				);
+			} catch {
+				// best-effort — a health-line render must never break /lens-health
+			}
+
+			// On-demand heap snapshot (#1126) — the retainer-attribution half of the
+			// memory line above: it says how many bytes are resident by subsystem,
+			// this captures WHICH objects retain them. Gated behind PI_LENS_DEBUG_HEAP
+			// (zero cost + no file when unset) and only ever triggered from this
+			// operator-invoked diagnostics command — never a hot path or timer, so the
+			// synchronous multi-second snapshot pause is opt-in and explicit. See
+			// clients/debug-heap.ts.
+			if (isDebugHeapEnabled()) {
+				try {
+					const snap = writeHeapSnapshotNow("lens_health");
+					if (snap) {
+						lines.push(
+							`Heap snapshot written: ${snap.path} (RSS ${Math.round(snap.rssBytes / (1024 * 1024))}MB, ${snap.durationMs}ms) — open in Chrome DevTools › Memory`,
+						);
+					}
+				} catch {
+					// best-effort — a snapshot write must never break /lens-health
+				}
+			}
+
+			// Smells self-surfacing (#1123 item 3) — same bounded tail-scan the
+			// session_start line and turn_end note use; see clients/smells-rollup.ts.
+			try {
+				lines.push(formatSmellsHealthLine(countRecentSmells()));
+			} catch {
+				// best-effort — a health-line render must never break /lens-health
 			}
 
 			if (diagStats.repeatOffenders.length > 0) {
@@ -943,7 +1206,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// Cascade summary
-			const cascadeStats = getCascadeSessionStats();
+			const cascadeStats = dispatchIntegration.getCascadeSessionStats();
 			if (cascadeStats.runs > 0) {
 				lines.push(
 					"",
@@ -961,7 +1224,36 @@ export default function (pi: ExtensionAPI) {
 				lines.push("", slopScoreLine);
 			}
 
-			ctx.ui.notify(lines.join("\n"), "info");
+			notifyUi(ctx, lines.join("\n"), "info");
+		},
+	});
+
+	pi.registerCommand("lens-perf", {
+		description:
+			"Show the slowest latency-log phases by p50 and p99 for the current process session and machine-wide active log window. Usage: /lens-perf",
+		handler: async (_args, ctx) => {
+			try {
+				const { collectLatencyPerformance, renderLatencyPerformanceReport } =
+					await import("./clients/performance-report.js");
+				const report = await collectLatencyPerformance({
+					sessionStartedAt: runtime.sessionStartedAt,
+				});
+				const degradations = getDegradationSummary();
+				const degradationText = degradations.length
+					? `\n\nDegradations:\n${degradations.map((group) => `  ${group.kind}: ${group.count} (${group.latestReasons.at(-1)?.subject}: ${group.latestReasons.at(-1)?.reason})`).join("\n")}`
+					: "";
+				notifyUi(
+					ctx,
+					`${renderLatencyPerformanceReport(report)}${degradationText}`,
+					"info",
+				);
+			} catch (err) {
+				notifyUi(
+					ctx,
+					`Failed to read performance telemetry: ${err instanceof Error ? err.message : String(err)}`,
+					"error",
+				);
+			}
 		},
 	});
 
@@ -1060,7 +1352,7 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
-			ctx.ui.notify(lines.join("\n"), "info");
+			notifyUi(ctx, lines.join("\n"), "info");
 		},
 	});
 
@@ -1070,7 +1362,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const [rawTarget] = normalizeCommandArgs(args);
 			if (!rawTarget) {
-				ctx.ui.notify("Usage: /lens-allow-edit <path>", "warning");
+				notifyUi(ctx, "Usage: /lens-allow-edit <path>", "warning");
 				return;
 			}
 
@@ -1078,7 +1370,8 @@ export default function (pi: ExtensionAPI) {
 				? rawTarget
 				: path.resolve(ctx.cwd ?? runtime.projectRoot, rawTarget);
 			runtime.readGuard.addExemption(targetPath);
-			ctx.ui.notify(
+			notifyUi(
+				ctx,
 				`Read guard override armed for next edit: ${targetPath}`,
 				"info",
 			);
@@ -1106,6 +1399,8 @@ export default function (pi: ExtensionAPI) {
 			// a scan-originated write can't clobber a concurrent newer per-edit
 			// write (or vice versa).
 			() => runtime.nextWriteIndex(),
+			captureLspStatusRepaint,
+			() => runtime,
 		),
 		createLspDiagnosticsTool(
 			// #571: same reconciliation wiring as lens_diagnostics mode=full, for
@@ -1113,6 +1408,7 @@ export default function (pi: ExtensionAPI) {
 			() => runtime.nextWriteIndex(),
 		),
 		createSymbolSearchTool(() => runtime.projectRoot),
+		createProjectReportTool(() => runtime.projectRoot),
 		createModuleReportTool(() => runtime.projectRoot),
 		createReadSymbolTool(
 			() => runtime.projectRoot,
@@ -1138,7 +1434,7 @@ export default function (pi: ExtensionAPI) {
 		),
 	];
 
-	// Situational tools (5): registered but, on hosts that support pi's dynamic
+	// Situational tools (6): registered but, on hosts that support pi's dynamic
 	// tooling (`pi.getActiveTools`/`pi.setActiveTools`), left inactive at load —
 	// deactivated in the block below right after registration. The model
 	// activates the ones it needs via `pi_lens_activate_tools`. On hosts without
@@ -1149,7 +1445,16 @@ export default function (pi: ExtensionAPI) {
 		createAstGrepReplaceTool(astGrepClient),
 		createAstGrepOutlineTool(astGrepClient),
 		createAstGrepDumpTool(astGrepClient),
-		createLspNavigationTool((name) => getLensFlag(name)),
+		createLspNavigationTool((name, cwd) => getLensFlag(name, cwd), {
+			runtime,
+			cacheManager,
+			readGuard: runtime.readGuard,
+			dbg,
+		}),
+		createLensDiagnosticMarkTool(() => runtime.projectRoot, () => ({
+			model: runtime.telemetryModelId,
+			provider: runtime.telemetryProviderId,
+		})),
 	];
 	const LAZY_TOOL_CATALOG: ActivatableToolInfo[] = [
 		{
@@ -1159,7 +1464,8 @@ export default function (pi: ExtensionAPI) {
 		},
 		{
 			name: "ast_grep_replace",
-			summary: "AST-aware structural code rewrite/refactor (ast-grep patterns).",
+			summary:
+				"AST-aware structural code rewrite/refactor (ast-grep patterns).",
 		},
 		{
 			name: "ast_grep_outline",
@@ -1176,16 +1482,58 @@ export default function (pi: ExtensionAPI) {
 			summary:
 				"IDE-style LSP navigation: definition, references, implementation, rename, call hierarchy.",
 		},
+		{
+			name: "lens_diagnostic_mark",
+			summary:
+				"Record a disposition for a diagnostic: false-positive / suppress (inline ignore comment) / defer (this session) / flagged (to fix).",
+		},
 	];
+	// #1453: the lazy tools the model activated in THIS logical conversation.
+	// Extension closure state outlives a session rebuild (the runner keeps the
+	// activated extension; it does not re-run this factory), which is exactly
+	// what lets a fork/reload/resume restore the parent's tool posture. Reset
+	// on startup/new, carried across fork/reload/resume — see the session_start
+	// handler below.
+	const rememberedLazyTools = new Set<string>();
 	const activateToolsTool = createActivateToolsTool(
 		pi as unknown as {
 			getActiveTools?: () => string[];
 			setActiveTools?: (names: string[]) => void;
 		},
 		LAZY_TOOL_CATALOG,
+		{
+			onActivated: (names) => {
+				for (const name of names) rememberedLazyTools.add(name);
+			},
+			deferredToolSupport: (ctx) => {
+				try {
+					return supportsDeferredTools(
+						(ctx as { model?: Parameters<typeof supportsDeferredTools>[0] })?.model,
+					);
+				} catch {
+					return false;
+				}
+			},
+			onMutation: recordToolSetMutation,
+		},
 	);
 
-	for (const tool of [...alwaysActiveTools, activateToolsTool, ...lazyTools]) {
+	// #1327: opt-in compact one-line tool rendering. Read once at load (like
+	// the other session-scoped flags above) rather than per-render, so the
+	// flag-off path registers the ORIGINAL tool definitions untouched —
+	// byte-identical to pre-#1327 behavior (no renderCall/renderResult added
+	// or altered). Only tools that already define `renderResult` (every
+	// substantive pi-lens tool — see tools/render-compact.ts) are wrapped;
+	// the rest pass through wrapToolsForCompactLine unchanged.
+	const compactToolLineEnabled = getLensFlag("lens-compact-tool-line") === true;
+	const toolsToRegister = [
+		...alwaysActiveTools,
+		activateToolsTool,
+		...lazyTools,
+	];
+	for (const tool of compactToolLineEnabled
+		? wrapToolsForCompactLine(toolsToRegister as any)
+		: toolsToRegister) {
 		try {
 			pi.registerTool(tool as any);
 		} catch {
@@ -1193,7 +1541,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	// Dynamic tooling (#pi 0.80.x+): deactivate the 5 situational tools so they
+	// Dynamic tooling (#pi 0.80.x+): deactivate the 6 situational tools so they
 	// start inactive and the model must call `pi_lens_activate_tools` to bring
 	// them in (next-turn visibility, per the docs' loader pattern). This used
 	// to run synchronously right here, immediately after registration — but
@@ -1231,49 +1579,41 @@ export default function (pi: ExtensionAPI) {
 	// --- Events ---
 
 	pi.on("session_start", async (event, ctx) => {
+		warmDispatchAtSessionStart();
+		void warmLspService().catch((err) =>
+			logExtension({ subsystem: "lsp", level: "warn", message: `LSP warm failed: ${err}` }),
+		);
+		void warmFormatters().catch((err) =>
+			logExtension({ subsystem: "format", level: "warn", message: `formatter warm failed: ${err}` }),
+		);
+		rememberOwnEventCtx(ctx);
+		refreshCtxDerivedPlumbing();
+		const sessionStartFiredAt = Date.now();
 		try {
 			dbg("session_start fired");
+			const sessionReason = (event as { reason?: string }).reason;
 
-			// Dynamic tooling (#pi 0.80.x+): deactivate the 5 situational tools
-			// (LAZY_TOOL_CATALOG) now that the extension has actually finished
-			// loading — session_start is the correct lifecycle point for this
-			// call (#643; see the comment left at the old call site above, right
-			// after tool registration, for why it can never succeed there).
-			// Feature-detected the same way as elsewhere in this handler:
-			// `pi.getActiveTools`/`setActiveTools` aren't guaranteed present on
-			// every host the broad `@earendil-works/pi-coding-agent` peer
-			// dependency allows, so probe with typeof rather than assuming the
-			// pinned devDependency version's API exists at runtime. session_start
-			// fires multiple times per process (fork/reload/new/resume, see the
-			// reasonLabel handling below); re-running this every time is fine —
-			// `setActiveTools` just replaces the current active set, it isn't
-			// additive or stateful across calls.
-			try {
-				const piWithActiveTools = pi as unknown as {
-					getActiveTools?: () => string[];
-					setActiveTools?: (names: string[]) => void;
-				};
-				if (
-					typeof piWithActiveTools.getActiveTools === "function" &&
-					typeof piWithActiveTools.setActiveTools === "function"
-				) {
-					const lazyNames = new Set(LAZY_TOOL_CATALOG.map((t) => t.name));
-					const active = piWithActiveTools.getActiveTools();
-					const initiallyActive = active.filter(
-						(name) => !lazyNames.has(name),
-					);
-					piWithActiveTools.setActiveTools(initiallyActive);
-				}
-			} catch (deactivateErr) {
+			// #1334 S5: adopt the HOST's project-trust decision before anything
+			// below can auto-install a tool or spawn an LSP server. pi-lens is a
+			// CONSUMER of trust (`ctx.isProjectTrusted()`), never a handler of the
+			// `project_trust` event — answering that question on the user's behalf
+			// is the host's/user's job. Re-read here and on every turn_start because
+			// fork/reload/resume can change cwd and trust can change mid-session.
+			// Feature-detected:
+			// a host without the accessor yields "unknown" and nothing is gated.
+			const trustState = adoptProjectTrustFromPorts(hostPorts);
+			if (trustState !== "unknown") {
+				dbg(`session_start: project trust = ${trustState}`);
+			}
+			if (trustState === "untrusted") {
 				dbg(
-					`dynamic tool deactivation failed (older pi host lacking getActiveTools/setActiveTools, or a genuine host error): ${deactivateErr}`,
+					"session_start: untrusted project — tool auto-install and LSP spawns are disabled for this session",
 				);
 			}
 
 			// #190: pi's session lifecycle. `reason` distinguishes new/resume/fork/
 			// reload/startup; the STABLE session id comes from the session manager
 			// (the event carries none), and is what lets a resumed session rehydrate.
-			const sessionReason = (event as { reason?: string }).reason;
 			const stableSessionId = (() => {
 				try {
 					return (
@@ -1296,18 +1636,83 @@ export default function (pi: ExtensionAPI) {
 				dbg(
 					`session_start: concurrent secondary detected (count=${sessionStartDecision.secondaryCount}) — skipping handleSessionStart`,
 				);
-				logLatency({
-					type: "phase",
-					filePath: "<pi-lens>",
-					phase: "concurrent_session_bind",
-					durationMs: 0,
-					metadata: {
-						secondaryCount: sessionStartDecision.secondaryCount,
-						sessionReason,
-						sameCwd: (ctx as { cwd?: string })?.cwd === process.cwd(),
-					},
+				logConcurrentSessionBind({
+					secondaryCount: sessionStartDecision.secondaryCount,
+					sessionReason,
+					sameCwd: (ctx as { cwd?: string })?.cwd === process.cwd(),
 				});
 				return;
+			}
+
+			// Dynamic tooling (#pi 0.80.x+): put the active tool set back to the
+			// posture this logical conversation had — the always-active baseline
+			// plus exactly the lazy tools (LAZY_TOOL_CATALOG) the model activated
+			// via pi_lens_activate_tools. session_start is the correct lifecycle
+			// point for this call (#643; see the comment left at the old call site
+			// above, right after tool registration, for why it can never succeed
+			// there).
+			//
+			// #1453: this RESTORES, it does not merely shrink. Every session_start
+			// reason arrives with all registered pi-lens tools active, because the
+			// host builds a fresh AgentSession with `includeAllExtensionTools: true`
+			// on fork/reload/resume just as it does on startup, and never persists
+			// an active-tool set per session. Skipping the call on those reasons
+			// would therefore leave every lazy tool active forever AND change the
+			// advertised tool list relative to the parent's cached prompt prefix.
+			// Rebuilding the same set instead keeps the prefix identical and
+			// genuinely preserves the model's activations, because pi-lens's own
+			// closure state (`rememberedLazyTools`) survives the rebuild.
+			//
+			// Deliberately BELOW the #473 concurrent-secondary guard: the active
+			// tool set is shared runtime state (one loader per process), so a
+			// secondary's session_start must never rewrite the still-live
+			// primary's set — last writer would win.
+			//
+			// Feature-detected the same way as elsewhere in this handler:
+			// `pi.getActiveTools`/`setActiveTools` aren't guaranteed present on
+			// every host the broad `@earendil-works/pi-coding-agent` peer
+			// dependency allows, so probe with typeof rather than assuming the
+			// pinned devDependency version's API exists at runtime. Under
+			// `--no-lazy-tools` nothing is touched at all: all-active IS the
+			// requested posture.
+			try {
+				const piWithActiveTools = pi as unknown as {
+					getActiveTools?: () => string[];
+					setActiveTools?: (names: string[]) => void;
+				};
+				if (
+					getLensFlag("no-lazy-tools") !== true &&
+					typeof piWithActiveTools.getActiveTools === "function" &&
+					typeof piWithActiveTools.setActiveTools === "function"
+				) {
+					// A fresh conversation starts with no activation memory; a
+					// rebuild inherits the parent's.
+					if (isFreshSessionStart(sessionReason)) rememberedLazyTools.clear();
+					const lazyNames = new Set(LAZY_TOOL_CATALOG.map((t) => t.name));
+					const plan = planToolSet(
+						piWithActiveTools.getActiveTools(),
+						lazyNames,
+						rememberedLazyTools,
+					);
+					if (plan.changed) {
+						piWithActiveTools.setActiveTools(plan.desired);
+						recordToolSetMutation({
+							addedCount: plan.addedCount,
+							removedCount: plan.removedCount,
+							reason: isFreshSessionStart(sessionReason)
+								? "fresh_session_lazy_deactivation"
+								: "session_rebuild_restore",
+							deferralApplies: supportsDeferredTools(
+								(ctx as { model?: Parameters<typeof supportsDeferredTools>[0] })
+									?.model,
+							),
+						});
+					}
+				}
+			} catch (toolSetErr) {
+				dbg(
+					`dynamic tool set restore failed (older pi host lacking getActiveTools/setActiveTools, or a genuine host error): ${toolSetErr}`,
+				);
 			}
 
 			// #449 slice 1 / #472: register this process in the cross-process
@@ -1317,10 +1722,25 @@ export default function (pi: ExtensionAPI) {
 			// up to maxConcurrent redundant sweeps). Neither call is awaited —
 			// registry I/O and the reaper must never delay session start; both are
 			// internally best-effort (never throw).
+			await configureWarmAttach(ctx.cwd ?? process.cwd());
 			void registerInstance(ctx.cwd ?? process.cwd()).catch(() => {
 				// best-effort observability — never fail session_start over this
 			});
-			void sweepOrphans();
+			// #1123 item 2: log a sessionstart.log marker for any registry entry
+			// whose owning pid is confirmed dead — this instance vanished without
+			// reaching deregisterInstance()'s clean-shutdown removal. MUST read the
+			// registry and log BEFORE sweepOrphans (below) prunes exactly these same
+			// dead-pid entries out from under it, or the vanished set would already
+			// be empty by the time this runs — hence the explicit read here rather
+			// than letting sweepOrphans's own internal read race it.
+			void readInstanceRegistry()
+				.then((registry) => logVanishedInstances(registry))
+				.catch(() => {
+					// best-effort observability — never fail session_start over this
+				})
+				.finally(() => {
+					void sweepOrphans();
+				});
 			// #658: registry-INDEPENDENT backstop sweep, running alongside the
 			// registry-driven one above. `sweepOrphans` can only ever see pids
 			// still listed in some instance's `lspChildren[]`; once that trace is
@@ -1373,6 +1793,7 @@ export default function (pi: ExtensionAPI) {
 				dbg(`lsp config init failed: ${cfgErr}`);
 			}
 
+			const bootstrapClientsStartedAt = Date.now();
 			const {
 				metricsClient,
 				todoScanner,
@@ -1390,10 +1811,17 @@ export default function (pi: ExtensionAPI) {
 				rustClient,
 				deadCodeClients,
 			} = await loadBootstrapClients();
+			const bootstrapClientsDurationMs = Date.now() - bootstrapClientsStartedAt;
+			const handlerEnteredAt = Date.now();
 			await handleSessionStart({
 				ctxCwd: ctx.cwd,
+				sessionStartFiredAt,
+				sessionReason,
+				handlerEnteredAt,
+				bootstrapClientsStartedAt,
+				bootstrapClientsDurationMs,
 				getFlag: (name: string) => getLensFlag(name),
-				notify: (msg, level) => ctx.ui.notify(msg, level),
+				notify: (msg, level) => notifyUi(ctx, msg, level),
 				dbg,
 				log,
 				runtime,
@@ -1447,25 +1875,39 @@ export default function (pi: ExtensionAPI) {
 				importWidgetState(pendingForkSnapshot);
 				const forkedFileCount = pendingForkSnapshot.files.length;
 				pendingForkSnapshot = undefined;
+				// #1041: adopt the source session's read history (staleness-reconciled
+				// against current disk) so the fork isn't zero-read-blocked on files
+				// the parent already read.
+				let forkReadImport: { imported: number; dropped: number } | undefined;
+				if (pendingForkReadGuard) {
+					forkReadImport = runtime.readGuard.importState(pendingForkReadGuard);
+					pendingForkReadGuard = undefined;
+				}
 				if (stableSessionId) {
 					void saveSessionState(
 						ctx.cwd ?? process.cwd(),
 						stableSessionId,
 						exportWidgetState(),
+						runtime.readGuard.exportState(),
 					);
 				}
 				dbg(
-					`session_start: fork — branched ${forkedFileCount} file(s) from source`,
+					`session_start: fork — branched ${forkedFileCount} file(s) from source` +
+						(forkReadImport
+							? `, read-guard +${forkReadImport.imported} (dropped ${forkReadImport.dropped})`
+							: ""),
 				);
 			} else if (startMode === "keep") {
 				dbg("session_start: reload — keeping widget state");
 			} else if (startMode === "clean") {
 				pendingForkSnapshot = undefined;
+				pendingForkReadGuard = undefined;
 				clearWidgetState();
 				dbg("session_start: new — clean widget");
 			} else {
 				// maybe-rehydrate: covers resume AND startup (e.g. `pi --session <id>`)
 				pendingForkSnapshot = undefined;
+				pendingForkReadGuard = undefined;
 				clearWidgetState();
 				if (stableSessionId) {
 					const persisted = await loadSessionState(
@@ -1481,9 +1923,20 @@ export default function (pi: ExtensionAPI) {
 						);
 						const dropped = persisted.widget.files.length - fresh.files.length;
 						importWidgetState(fresh);
+						// #1041: rehydrate the read-before-edit guard's read-set on the
+						// SAME path so the first post-resume edit of a previously-read
+						// file isn't falsely zero-read-blocked. importState reconciles
+						// each read against current disk (drops changed/missing files),
+						// so a resume never masks a real staleness.
+						const readImport = runtime.readGuard.importState(
+							persisted.readGuard,
+						);
 						dbg(
 							`session_start: ${reasonLabel} ${stableSessionId} — rehydrated ${fresh.files.length} file(s)` +
-								(dropped > 0 ? `, dropped ${dropped} stale` : ""),
+								(dropped > 0 ? `, dropped ${dropped} stale` : "") +
+								(readImport.imported > 0 || readImport.dropped > 0
+									? `; read-guard +${readImport.imported} read(s) (dropped ${readImport.dropped} stale)`
+									: ""),
 						);
 					} else {
 						dbg(
@@ -1496,7 +1949,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (lensWidgetVisible) {
-				mountLensWidget(ctx.ui);
+				mountLensWidget(ctx.ui, readExtensionMode(ctx));
 			}
 		} catch (sessionErr) {
 			dbg(`session_start crashed: ${sessionErr}`);
@@ -1511,8 +1964,12 @@ export default function (pi: ExtensionAPI) {
 	(pi as any).on("session_before_fork", () => {
 		try {
 			pendingForkSnapshot = exportWidgetState();
+			// #1041: the source guard is still live here (reset happens in the
+			// fork's own session_start, which fires later), so this captures the
+			// parent's read-set for the fork to adopt.
+			pendingForkReadGuard = runtime.readGuard.exportState();
 			dbg(
-				`session_before_fork: stashed ${pendingForkSnapshot.files.length} file(s) for the fork`,
+				`session_before_fork: stashed ${pendingForkSnapshot.files.length} file(s) + ${pendingForkReadGuard.reads.length} read-guard file(s) for the fork`,
 			);
 		} catch (forkErr) {
 			dbg(`session_before_fork crashed: ${forkErr}`);
@@ -1520,805 +1977,24 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
-		const toolName = (event as { toolName?: string }).toolName ?? "";
-		if (!lensEnabled) return;
-		if (
-			getLensFlag("lens-guard") &&
-			isGitCommitOrPushAttempt(toolName, event.input)
-		) {
-			const guard = evaluateGitGuard(
-				runtime,
-				cacheManager,
-				ctx.cwd ?? runtime.projectRoot,
-			);
-			if (guard.block) {
-				return {
-					block: true,
-					reason: guard.reason,
-				};
-			}
-		}
-
-		const rawFilePath = getToolCallRawFilePath(toolName, event);
-		const filePath = resolveToolCallFilePath(
-			rawFilePath,
-			ctx.cwd,
-			runtime.projectRoot,
-		);
-
-		if (!getLensFlag("no-lsp")) {
-			try {
-				const configCwd = filePath
-					? path.dirname(filePath)
-					: (ctx.cwd ?? runtime.projectRoot ?? process.cwd());
-				await ensureLSPConfigInitialized(configCwd);
-			} catch (cfgErr) {
-				dbg(`lsp config init failed during tool_call: ${cfgErr}`);
-			}
-		}
-
-		if (!filePath) return;
-
-		dbg(
-			`tool_call fired for: ${filePath} (exists: ${nodeFs.existsSync(filePath)})`,
-		);
-		if (!nodeFs.existsSync(filePath)) return;
-		if (isPathIgnoredByProject(filePath, runtime.projectRoot, false)) {
-			dbg(`tool_call: skipping gitignored file ${filePath}`);
-			return;
-		}
-
-		const isExternalOrVendor = isExternalOrVendorFile(
-			filePath,
-			runtime.projectRoot,
-		);
-
-		const lspCapableFile = isLspCapableFile(filePath);
-		const lspAutoTouchSkipped = shouldSkipLspAutoTouch(
-			filePath,
-			runtime.projectRoot,
-		);
-		const lspAutoTouchEligible = lspCapableFile && !lspAutoTouchSkipped;
-		const shouldWarmReadLsp =
-			toolName === "read" &&
-			lspAutoTouchEligible &&
-			runtime.shouldWarmLspOnRead(filePath);
-		const shouldAutoTouch =
-			(toolName === "write" ||
-				toolName === "edit" ||
-				toolName === "lsp_navigation" ||
-				shouldWarmReadLsp) &&
-			!getLensFlag("no-lsp") &&
-			lspAutoTouchEligible;
-		if (!lspCapableFile && !getLensFlag("no-lsp")) {
-			dbg(
-				`lsp auto-touch skipped: ${path.basename(filePath)} (file kind not LSP-capable)`,
-			);
-		} else if (lspAutoTouchSkipped && !getLensFlag("no-lsp")) {
-			dbg(
-				`lsp auto-touch skipped: ${path.basename(filePath)} (internal/support artifact)`,
-			);
-		}
-		if (toolName === "read" && !getLensFlag("no-lsp") && !shouldWarmReadLsp) {
-			const readSkipReason = !lspAutoTouchEligible
-				? "file not eligible for LSP warm"
-				: "already warming or warmed recently";
-			dbg(
-				`lsp read warm skipped: ${path.basename(filePath)} (${readSkipReason})`,
-			);
-		}
-		if (shouldAutoTouch) {
-			try {
-				const fileContent = nodeFs.readFileSync(filePath, "utf-8");
-				const maxClientWaitMs =
-					toolName === "lsp_navigation"
-						? LSP_TOOLCALL_NAV_TOUCH_BUDGET_MS
-						: LSP_TOOLCALL_TOUCH_BUDGET_MS;
-				if (toolName === "read") {
-					runtime.markLspReadWarmStarted(filePath);
-					dbg(`lsp read warm started: ${path.basename(filePath)}`);
-				}
-				void getLSPService()
-					.touchFile(filePath, fileContent, {
-						diagnostics: "none",
-						source: `tool_call:${toolName}`,
-						clientScope: "primary",
-						maxClientWaitMs,
-					})
-					.then((result) => {
-						if (toolName === "read") {
-							if (result === undefined) {
-								runtime.clearLspReadWarmState(filePath);
-								dbg(
-									`lsp read warm unavailable: ${path.basename(filePath)} (no LSP client ready)`,
-								);
-							} else {
-								runtime.markLspReadWarmCompleted(filePath);
-								dbg(`lsp read warm completed: ${path.basename(filePath)}`);
-							}
-						}
-						if (ctx.ui) {
-							ctx.ui && updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
-						}
-					})
-					.catch((err) => {
-						if (toolName === "read") {
-							runtime.clearLspReadWarmState(filePath);
-						}
-						dbg(`lsp auto-touch failed for ${filePath}: ${err}`);
-					});
-			} catch {
-				if (toolName === "read") {
-					runtime.clearLspReadWarmState(filePath);
-				}
-				// Best effort only; never block tool calls.
-			}
-		}
-
-		const readInput = getReadToolInput(toolName, event.input);
-		const requestedReadOffset = readInput?.offset ?? 1;
-		const requestedReadLimit = readInput?.limit;
-		let effectiveReadOffset = requestedReadOffset;
-		let effectiveReadLimit = getEffectiveReadLimit(filePath, readInput);
-
-		// --- Opportunistic read expansion via tree-sitter ---
-		// For partial reads (small limit, not from line 1), find the enclosing
-		// symbol and expand the read range to cover it. This gives the read guard
-		// accurate symbol-level coverage without requiring an LSP server.
-		let expandedByLsp = false;
-		let enclosingSymbol:
-			| {
-					name: string;
-					kind: string;
-					startLine: number;
-					endLine: number;
-			  }
-			| undefined;
-
-		if (
-			toolName === "read" &&
-			!getLensFlag("no-lsp") &&
-			!isExternalOrVendor &&
-			filePath &&
-			readInput &&
-			requestedReadLimit != null &&
-			requestedReadLimit <= EXPANSION_LIMIT_LINES
-		) {
-			const totalLines =
-				effectiveReadLimit != null && requestedReadLimit == null
-					? effectiveReadLimit
-					: countFileLines(filePath);
-			try {
-				const expansion = await tryExpandRead(
-					filePath,
-					requestedReadOffset,
-					requestedReadLimit,
-					totalLines,
-					_readExpansionClient,
-				);
-				if (expansion) {
-					readInput.offset = expansion.newOffset;
-					readInput.limit = expansion.newLimit;
-					effectiveReadOffset = expansion.newOffset;
-					effectiveReadLimit = expansion.newLimit;
-					expandedByLsp = true;
-					enclosingSymbol = expansion.enclosingSymbol;
-					logReadGuardEvent({
-						event: "ts_range_expanded",
-						sessionId: runtime.telemetrySessionId,
-						filePath,
-						requestedOffset: requestedReadOffset,
-						requestedLimit: requestedReadLimit,
-						effectiveOffset: expansion.newOffset,
-						effectiveLimit: expansion.newLimit,
-						symbol: expansion.enclosingSymbol.name,
-						symbolKind: expansion.enclosingSymbol.kind,
-						symbolStartLine: expansion.enclosingSymbol.startLine,
-						symbolEndLine: expansion.enclosingSymbol.endLine,
-						metadata: {
-							durationMs: expansion.durationMs,
-							budgetMs: EXPANSION_BUDGET_MS,
-						},
-					});
-					const symbolPath = [
-						...(expansion.ancestry ?? []).map((a) => a.name),
-						expansion.enclosingSymbol.name,
-					].join(" → ");
-					dbg(
-						`ts expanded read: ${path.basename(filePath)} ` +
-							`lines ${requestedReadOffset}–${requestedReadOffset + requestedReadLimit - 1} ` +
-							`→ ${symbolPath} ` +
-							`(${expansion.newOffset}–${expansion.newOffset + expansion.newLimit - 1})`,
-					);
-				}
-			} catch {
-				// Best-effort only.
-			}
-		}
-
-		// --- Read-Before-Edit Guard: record reads ---
-		if (toolName === "read" && filePath && !isExternalOrVendor) {
-			const totalLines = countFileLines(filePath);
-			const deliveredLimit = effectiveReadLimit ?? 1;
-			logReadGuardEvent({
-				event: "read_pattern",
-				sessionId: runtime.telemetrySessionId,
-				filePath,
-				requestedOffset: requestedReadOffset,
-				requestedLimit: requestedReadLimit ?? deliveredLimit,
-				effectiveOffset: effectiveReadOffset,
-				effectiveLimit: deliveredLimit,
-				metadata: {
-					totalLines,
-					isPartial:
-						requestedReadLimit != null && requestedReadLimit < totalLines,
-					fileKind: detectFileKind(filePath) ?? "unknown",
-					fractionRead:
-						totalLines > 0
-							? Math.round((deliveredLimit / totalLines) * 100) / 100
-							: 1,
-					expandedByTs: expandedByLsp,
-				},
-			});
-			runtime.readGuard.recordRead({
-				filePath,
-				requestedOffset: requestedReadOffset,
-				requestedLimit: requestedReadLimit ?? deliveredLimit,
-				effectiveOffset: effectiveReadOffset,
-				effectiveLimit: deliveredLimit,
-				expandedByLsp,
-				enclosingSymbol,
-				turnIndex: runtime.turnIndex,
-				writeIndex: runtime.peekWriteIndex(),
-				timestamp: Date.now(),
-			});
-		}
-
-		// --- Read-Before-Edit Guard: register file access done via `bash` ---
-		// Mirrors how the Read/Write tools are tracked. Only the bash tool —
-		// grep/find tools (and their patterns) are not contiguous file access.
-		//   reads  (cat/head/tail/sed -n) → recordRead with the exact range shown
-		//   writes (>, >>, tee, sed -i, cp/mv dest, touch) → noteCreatedFile, so the
-		//          agent "owns" the file (recordWritten fires at tool_result), same
-		//          as the Write tool.
-		if (toolName === "bash" && !getLensFlag("no-read-guard")) {
-			const cmd = (event.input as Record<string, unknown>)?.command;
-			if (typeof cmd === "string" && cmd) {
-				const effectiveCwd = ctx.cwd ?? runtime.projectRoot ?? process.cwd();
-				const inScope = (fp: string) =>
-					!isPathIgnoredByProject(fp, runtime.projectRoot, false) &&
-					!isExternalOrVendorFile(fp, runtime.projectRoot);
-
-				for (const span of extractReadPathsFromCommand(cmd, effectiveCwd)) {
-					if (!inScope(span.filePath)) continue;
-					runtime.readGuard.recordRead({
-						filePath: span.filePath,
-						requestedOffset: span.offset,
-						requestedLimit: span.limit,
-						effectiveOffset: span.offset,
-						effectiveLimit: span.limit,
-						expandedByLsp: false,
-						turnIndex: runtime.turnIndex,
-						writeIndex: runtime.peekWriteIndex(),
-						timestamp: Date.now(),
-					});
-				}
-
-				for (const wp of extractWrittenPathsFromCommand(cmd, effectiveCwd)) {
-					if (!inScope(wp)) continue;
-					runtime.readGuard.noteCreatedFile(
-						wp,
-						runtime.turnIndex,
-						runtime.peekWriteIndex(),
-					);
-				}
-			}
-		}
-
-		const { complexityClient } = await loadBootstrapClients();
-		// Record complexity baseline for historical tracking (booboo/tdi).
-		// Not shown inline - just captured for delta analysis.
-		if (
-			!isExternalOrVendor &&
-			complexityClient.isSupportedFile(filePath) &&
-			!runtime.complexityBaselines.has(filePath)
-		) {
-			const baseline = await complexityClient.analyzeFile(filePath);
-			if (baseline) {
-				runtime.complexityBaselines.set(filePath, baseline);
-				const { captureSnapshot } = await import(
-					"./clients/metrics-history.js"
-				);
-				captureSnapshot(filePath, {
-					maintainabilityIndex: baseline.maintainabilityIndex,
-					cognitiveComplexity: baseline.cognitiveComplexity,
-					maxNestingDepth: baseline.maxNestingDepth,
-					linesOfCode: baseline.linesOfCode,
-					maxCyclomatic: baseline.maxCyclomaticComplexity,
-					entropy: baseline.codeEntropy,
-				});
-			}
-		}
-
-		// --- Read-Before-Edit Guard: check edits ---
-		// write = full replacement; no prior read needed (you're starting fresh).
-		// edit = partial modification; guard enforced to prevent blind overwrites.
-		const isEditOnly = isToolCallEventType("edit", event);
-		const isWriteOrEdit = isToolCallEventType("write", event) || isEditOnly;
-
-		// Track any Write so recordWritten can inject a synthetic read afterward.
-		// The agent authored the content (new or overwritten), so it trivially "knows" the file.
-		if (
-			!isEditOnly &&
-			isWriteOrEdit &&
-			filePath &&
-			!getLensFlag("no-read-guard")
-		) {
-			runtime.readGuard.noteCreatedFile(
-				filePath,
-				runtime.turnIndex,
-				runtime.peekWriteIndex(),
-			);
-		}
-
-		// --- Indentation mismatch correction ---
-		// Some models output spaces in oldText when the file uses tabs (or vice versa).
-		// Detect this before the read guard runs so a recoverable mismatch does not
-		// degrade into a no-line-info allow path.
-		if (isEditOnly && filePath) {
-			const editInput = (event as { input?: unknown }).input as {
-				oldText?: string;
-				newText?: string;
-				edits?: Array<{ oldText?: string; newText?: string }>;
-			};
-			type EditIndentTarget = {
-				label: string;
-				value: string;
-				newText: string | undefined;
-				apply: (corrected: string) => void;
-				applyNewText: (corrected: string) => void;
-			};
-			const oldTexts: EditIndentTarget[] = editInput.oldText
-				? [
-						{
-							label: "oldText",
-							value: editInput.oldText,
-							newText: editInput.newText,
-							apply: (corrected: string) => {
-								editInput.oldText = corrected;
-							},
-							applyNewText: (corrected: string) => {
-								editInput.newText = corrected;
-							},
-						},
-					]
-				: (editInput.edits ?? [])
-						.map((e, i) =>
-							e.oldText
-								? {
-										label: `edits[${i}].oldText`,
-										value: e.oldText,
-										newText: e.newText,
-										apply: (corrected: string) => {
-											e.oldText = corrected;
-										},
-										applyNewText: (corrected: string) => {
-											e.newText = corrected;
-										},
-									}
-								: null,
-						)
-						.filter((entry): entry is EditIndentTarget => entry !== null);
-			// Read the file once; derive the two normalized forms needed by
-			// tryCorrectIndentationMismatchFromContent (CRLF->LF only) and
-			// countOldTextMatches / the autopatch bridge (host fuzzy-match space).
-			let crlfContent: string | undefined;
-			let matchNormalizedContent: string | undefined;
-			try {
-				const raw = nodeFs.readFileSync(filePath, "utf-8");
-				crlfContent = raw.replace(/\r\n/g, "\n");
-				matchNormalizedContent = normalizeOldTextForMatch(raw);
-			} catch {
-				// File unreadable — corrections will be skipped gracefully below.
-			}
-
-			// --- Pass 0: escaped control-char correction ---
-			// Models may write literal \n or \t in oldText (JSON interprets them as actual
-			// newline/tab) when the file has the two-character escape sequences (e.g. inside
-			// a regex or string literal). Safety gates: original must not match at all;
-			// escaped version must match exactly once.
-			if (matchNormalizedContent !== undefined) {
-				for (const entry of oldTexts) {
-					const v = entry.value;
-					if (!v.includes("\t") && !v.includes("\n")) continue;
-					if (countOldTextMatches(filePath, v, matchNormalizedContent) !== 0)
-						continue;
-					const escaped = v.replace(/\t/g, "\\t").replace(/\n/g, "\\n");
-					if (escaped === v) continue;
-					if (
-						countOldTextMatches(filePath, escaped, matchNormalizedContent) !== 1
-					)
-						continue;
-					entry.apply(escaped);
-					entry.value = escaped;
-					logReadGuardEvent({
-						event: "oldtext_escape_autopatched",
-						sessionId: runtime.telemetrySessionId,
-						filePath,
-						metadata: { tool: "edit", label: entry.label },
-					});
-				}
-			}
-
-			// --- Pass 1: trailing whitespace correction ---
-			// Editors strip trailing whitespace on save; the model may copy content
-			// that had it. Safety gates: the original raw oldText must not already
-			// match, and the stripped raw candidate must match exactly once. When
-			// trailing empty lines are stripped from oldText, strip the equivalent
-			// suffix from newText so the replacement span is not accidentally widened.
-			if (crlfContent !== undefined) {
-				for (const entry of oldTexts) {
-					const patch = computeTrailingWhitespaceOldTextPatch({
-						oldText: entry.value,
-						newText: entry.newText,
-						fileContent: crlfContent,
-					});
-					if (!patch) continue;
-					entry.apply(patch.oldText);
-					entry.value = patch.oldText;
-					const newTextPatched =
-						patch.newText !== undefined && patch.newText !== entry.newText;
-					if (newTextPatched) {
-						entry.applyNewText(patch.newText!);
-						entry.newText = patch.newText;
-					}
-					logReadGuardEvent({
-						event: "oldtext_trailing_ws_autopatched",
-						sessionId: runtime.telemetrySessionId,
-						filePath,
-						metadata: {
-							tool: "edit",
-							label: entry.label,
-							removedLineTrailingWhitespace:
-								patch.removedLineTrailingWhitespace,
-							removedTrailingEmptyLineCount:
-								patch.removedTrailingEmptyLineCount,
-							newTextTrailingEmptyLinesPatched: newTextPatched,
-						},
-					});
-					// Bridge: same rationale as the indent autopatch — the
-					// trailing-ws patcher only applies when the stripped oldText
-					// matches exactly once against the file, so the agent's text
-					// reflects real content at the matched span. Register a
-					// synthetic read covering it so the read-guard downstream
-					// doesn't fire a zero_read block after the verification.
-					if (matchNormalizedContent !== undefined && runtime.readGuard) {
-						const range = findUniqueMatchLineRange(
-							matchNormalizedContent,
-							patch.oldText,
-						);
-						if (range) {
-							runtime.readGuard.recordRead({
-								filePath,
-								requestedOffset: range.startLine,
-								requestedLimit: range.endLine - range.startLine + 1,
-								effectiveOffset: range.startLine,
-								effectiveLimit: range.endLine - range.startLine + 1,
-								expandedByLsp: false,
-								turnIndex: runtime.turnIndex,
-								writeIndex: 0,
-								timestamp: Date.now(),
-							});
-						}
-					}
-				}
-			}
-
-			const correctedOldTexts = oldTexts
-				.map(({ label, value, newText, apply, applyNewText }) => {
-					const corrected =
-						crlfContent !== undefined
-							? tryCorrectIndentationMismatchFromContent(value, crlfContent)
-							: tryCorrectIndentationMismatch(value, filePath);
-					return corrected === undefined
-						? undefined
-						: {
-								label,
-								value,
-								newText,
-								corrected,
-								apply,
-								applyNewText,
-								currentMatchCount: countOldTextMatches(
-									filePath,
-									value,
-									matchNormalizedContent,
-								),
-								correctedMatchCount: countOldTextMatches(
-									filePath,
-									corrected,
-									matchNormalizedContent,
-								),
-								indentationOnly: isIndentationOnlyChange(value, corrected),
-							};
-				})
-				.filter(
-					(
-						entry,
-					): entry is EditIndentTarget & {
-						corrected: string;
-						currentMatchCount: number;
-						correctedMatchCount: number;
-						indentationOnly: boolean;
-					} => entry !== undefined,
-				);
-			// Apply safe corrections individually — each edit stands alone.
-			// Unsafe corrections (non-indentation-only or ambiguous) fall through
-			// to resolveOldTextEdits, which handles them per-edit with proper
-			// oldtext_duplicate / oldtext_not_found reporting and partial apply.
-			for (const entry of correctedOldTexts) {
-				if (
-					entry.indentationOnly &&
-					entry.currentMatchCount === 0 &&
-					entry.correctedMatchCount === 1
-				) {
-					entry.apply(entry.corrected);
-					const correctedNewText = entry.newText
-						? retargetReplacementIndentation(
-								entry.newText,
-								entry.value,
-								entry.corrected,
-							)
-						: undefined;
-					if (correctedNewText !== undefined) {
-						entry.applyNewText(correctedNewText);
-					}
-					logReadGuardEvent({
-						event: "oldtext_indent_autopatched",
-						sessionId: runtime.telemetrySessionId,
-						filePath,
-						metadata: {
-							tool: "edit",
-							label: entry.label,
-							correctedMatchCount: entry.correctedMatchCount,
-							newTextIndentationPatched: correctedNewText !== undefined,
-						},
-					});
-					// Bridge: a unique-match autopatch proves the agent's oldText
-					// reflects real content at this span. Register a synthetic read
-					// for the matched range so a zero_read block downstream isn't
-					// thrown after the autopatch already verified the content.
-					if (matchNormalizedContent !== undefined && runtime.readGuard) {
-						const range = findUniqueMatchLineRange(
-							matchNormalizedContent,
-							entry.corrected,
-						);
-						if (range) {
-							runtime.readGuard.recordRead({
-								filePath,
-								requestedOffset: range.startLine,
-								requestedLimit: range.endLine - range.startLine + 1,
-								effectiveOffset: range.startLine,
-								effectiveLimit: range.endLine - range.startLine + 1,
-								expandedByLsp: false,
-								turnIndex: runtime.turnIndex,
-								writeIndex: 0,
-								timestamp: Date.now(),
-							});
-						}
-					}
-				}
-			}
-		}
-		if (isEditOnly && filePath && !getLensFlag("no-read-guard")) {
-			const readGuard = runtime.readGuard;
-			const isExistingFile =
-				typeof readGuard?.isNewFile !== "function" ||
-				!readGuard.isNewFile(filePath);
-			if (readGuard && isExistingFile && !isExternalOrVendor) {
-				const {
-					touchedLines,
-					editRanges,
-					preflightError,
-					partiallyApplicable,
-					contentMatchValidated,
-				} = getTouchedLinesForGuard(
-					event,
-					filePath,
-					runtime.telemetrySessionId,
-				);
-				if (preflightError) {
-					if (partiallyApplicable && partiallyApplicable.length > 0) {
-						try {
-							const partial = await applyPartiallyApplicableEdits({
-								filePath,
-								edits: partiallyApplicable,
-								afterWrite: async () => {
-									const {
-										biomeClient,
-										ruffClient,
-										metricsClient,
-										agentBehaviorClient,
-									} = await loadBootstrapClients();
-									const result = await handleToolResult({
-										event: {
-											toolName: "write",
-											input: { path: filePath },
-											details: { piLensPartialApply: true },
-											content: [],
-											provider: (event as { provider?: string }).provider,
-											model: (event as { model?: string }).model,
-											sessionId: (event as { sessionId?: string }).sessionId,
-											session: (event as { session?: { id?: string } }).session,
-										},
-										getFlag: (name: string) => getLensFlag(name),
-										dbg,
-										runtime,
-										cacheManager,
-										biomeClient,
-										ruffClient,
-										metricsClient,
-										resetLSPService,
-										readGuard: runtime.readGuard,
-										agentBehaviorRecord: (toolName, analyzedPath) =>
-											agentBehaviorClient.recordToolCall(
-												toolName,
-												analyzedPath,
-											),
-										formatBehaviorWarnings: (warnings) =>
-											agentBehaviorClient.formatWarnings(warnings as any),
-									});
-									return result?.content
-										?.map((item) => item.text)
-										.filter((text): text is string => !!text)
-										.join("\n\n");
-								},
-							});
-							if (partial.appliedCount > 0) {
-								logReadGuardEvent({
-									event: "edit_partial_apply",
-									sessionId: runtime.telemetrySessionId,
-									filePath,
-									metadata: {
-										appliedCount: partial.appliedCount,
-										appliedIndices: partial.appliedIndices,
-										routedThroughPostEditPipeline: true,
-									},
-								});
-								let reason = preflightError.replace(
-									"🔄 RETRYABLE — Edit target not found",
-									`⚠️ PARTIAL APPLY — ${partial.appliedCount} edit${partial.appliedCount !== 1 ? "s" : ""} applied (${partial.appliedIndices})`,
-								);
-								if (partial.postEditOutput) {
-									reason += `\n\nPost-apply analysis:\n${partial.postEditOutput}`;
-								}
-								return { block: true, reason };
-							}
-						} catch {
-							// fall through to full block
-						}
-					}
-					return { block: true, reason: preflightError };
-				}
-				logReadGuardEvent({
-					event: "edit_check_started",
-					sessionId: runtime.telemetrySessionId,
-					filePath,
-					metadata: {
-						tool: isToolCallEventType("write", event) ? "write" : "edit",
-						touchedLines: touchedLines ?? null,
-						isExistingFile,
-					},
-				});
-				const verdict =
-					typeof readGuard.checkEdit === "function"
-						? readGuard.checkEdit(filePath, touchedLines, editRanges, {
-								skipSnapshotCheck: !!contentMatchValidated,
-								oldTextResolved: !!contentMatchValidated,
-							})
-						: { action: "allow" as const };
-				// Content-verified range-stale relocation: the lines the agent meant
-				// to edit moved (read-time line hashes uniquely match the new spot),
-				// so re-target the positional edit to where the content now lives
-				// instead of dead-ending. Safe because the hashes prove the new span
-				// IS the intended content — the same guarantee that lets
-				// pi-hashline-readmap auto-apply. Single-range only (set by the guard).
-				if (verdict.relocation) {
-					const relocated = relocateEditRange(
-						(event as { input?: unknown }).input,
-						verdict.relocation.from,
-						verdict.relocation.to,
-					);
-					if (relocated) {
-						const [toStart, toEnd] = verdict.relocation.to;
-						runtime.readGuard?.recordRead({
-							filePath,
-							requestedOffset: toStart,
-							requestedLimit: toEnd - toStart + 1,
-							effectiveOffset: toStart,
-							effectiveLimit: toEnd - toStart + 1,
-							expandedByLsp: false,
-							turnIndex: runtime.turnIndex,
-							writeIndex: 0,
-							timestamp: Date.now(),
-						});
-						logReadGuardEvent({
-							event: "edit_range_relocated",
-							sessionId: runtime.telemetrySessionId,
-							filePath,
-							metadata: {
-								tool: "edit",
-								from: verdict.relocation.from,
-								to: verdict.relocation.to,
-							},
-						});
-						// Relocation applied — let the re-targeted edit proceed.
-					} else if (verdict.action === "block") {
-						return { block: true, reason: verdict.reason };
-					}
-				} else if (verdict.action === "block") {
-					return {
-						block: true,
-						reason: verdict.reason,
-					};
-				}
-			}
-		}
-
-		// --- Pre-write duplicate detection ---
-		// Check if new content redefines functions that already exist elsewhere.
-		// Uses cachedExports (populated at session_start via ast-grep scan).
-		if (isWriteOrEdit && runtime.cachedExports.size > 0) {
-			const newContent = getNewContentFromToolCall(event);
-			if (newContent) {
-				const dupeWarnings: string[] = [];
-				const exportRe =
-					/export\s+(?:async\s+)?(?:function|class|const|let|type|interface)\s+(\w+)/g;
-				// Read current on-disk content once so we can check whether the file
-				// being written already owns a given export (e.g. it IS the source and
-				// another file merely re-exports from it). cachedExports only tracks one
-				// file per name — whichever was scanned first — so a re-exporter can
-				// win the slot and incorrectly shadow the original definition.
-				let currentFileExports: Set<string> | undefined;
-				if (filePath && nodeFs.existsSync(filePath)) {
-					try {
-						const currentContent = nodeFs.readFileSync(filePath, "utf-8");
-						currentFileExports = new Set<string>();
-						for (const m of currentContent.matchAll(exportRe)) {
-							currentFileExports.add(m[1]);
-						}
-					} catch {
-						// non-fatal — fall back to no current-export knowledge
-					}
-				}
-				for (const match of newContent.matchAll(exportRe)) {
-					const name = match[1];
-					const existingFile = runtime.cachedExports.get(name);
-					if (
-						existingFile &&
-						path.resolve(existingFile) !== path.resolve(filePath) &&
-						!currentFileExports?.has(name)
-					) {
-						dupeWarnings.push(
-							`\`${name}\` already exists in ${path.relative(runtime.projectRoot, existingFile)}`,
-						);
-					}
-				}
-				if (dupeWarnings.length > 0) {
-					return {
-						block: true,
-						reason:
-							"🔴 STOP - Redefining existing export(s). Import instead:\n" +
-							dupeWarnings.map((w) => "  • " + w).join("\n"),
-					};
-				}
-			}
-		}
+		return handleToolCall({
+			event: event as unknown as Parameters<typeof handleToolCall>[0]["event"],
+			ctx: ctx as unknown as Parameters<typeof handleToolCall>[0]["ctx"],
+			lensEnabled,
+			getFlag: (name: string) => getLensFlag(name),
+			dbg,
+			runtime,
+			cacheManager,
+			ensureLSPConfigInitialized,
+			updateLspStatus,
+			resetLSPService,
+		});
 	});
 
 	// Real-time feedback on file writes/edits
 	// biome-ignore lint/suspicious/noExplicitAny: pi.on overload mismatch for tool_result event type
 	(pi as any).on("tool_result", async (event: any, ctx: any) => {
+		rememberOwnEventCtx(ctx);
 		if (!lensEnabled) return;
 		updateRuntimeIdentityFromEvent(event);
 		// Publish this turn's abort signal so the dispatch's linter/type-check
@@ -2346,7 +2022,10 @@ export default function (pi: ExtensionAPI) {
 				await loadBootstrapClients();
 			return await handleToolResult({
 				event: event as any,
-				getFlag: (name: string) => getLensFlag(name),
+				getFlag: (name: string, filePath?: string) =>
+					getLensFlag(name, filePath),
+				getFlagSource: (name: string, filePath?: string) =>
+					getLensFlagSource(name, filePath),
 				dbg,
 				runtime,
 				cacheManager,
@@ -2359,6 +2038,11 @@ export default function (pi: ExtensionAPI) {
 					agentBehaviorClient.recordToolCall(toolName, filePath),
 				formatBehaviorWarnings: (warnings) =>
 					agentBehaviorClient.formatWarnings(warnings as any),
+				// #791: tags any deferred-format record queued from this tool_result
+				// with the STABLE session id of the ctx that produced it, so a
+				// later agent_end can tell its own queued work apart from a
+				// concurrent in-process secondary session's.
+				sessionId: getStableSessionId(ctx),
 			});
 		} finally {
 			setAmbientAbortSignal(undefined);
@@ -2368,6 +2052,17 @@ export default function (pi: ExtensionAPI) {
 	// --- Turn end: batch jscpd/madge on collected files, then clear state ---
 	// Clear cascade snapshot at start of each new turn so stale data never leaks
 	pi.on("turn_start", (_event: any, ctx) => {
+		rememberOwnEventCtx(ctx);
+		// Trust can change without a new session. Re-adopt before this turn can
+		// reach any install-capable or LSP-spawn path.
+		adoptProjectTrustFromPorts(hostPorts);
+		if (
+			lensWidgetVisible &&
+			ctx?.ui &&
+			(mountedLensWidgetUi === undefined || mountedLensWidgetUi !== ctx.ui)
+		) {
+			mountLensWidget(ctx.ui, readExtensionMode(ctx));
+		}
 		runtime.beginTurn();
 		clearLastAnalyzedStateCache();
 
@@ -2414,19 +2109,50 @@ export default function (pi: ExtensionAPI) {
 		// Esc/abort during the deferred format + flush kills in-flight children.
 		setAmbientAbortSignal((ctx as { signal?: AbortSignal })?.signal);
 		try {
+			const currentSessionId = getStableSessionId(ctx);
+			// #791 defense-in-depth: mirrors how session_start already skips
+			// handleSessionStart for a concurrent in-process secondary
+			// (subagent) — if THIS agent_end firing is positively identified as
+			// belonging to a live sibling secondary session rather than the
+			// registered primary, skip the deferred-format flush entirely
+			// rather than relying only on the per-record ownership filter
+			// inside handleAgentEnd. Fail-safe: any inconclusive signal
+			// classifies "primary" and runs as before.
+			const emission = classifyCurrentSessionEmission(ctx, currentSessionId);
+			if (emission === "concurrent-secondary") {
+				dbg(
+					`agent_end: concurrent secondary session detected — skipping deferred-format flush (sessionId=${currentSessionId})`,
+				);
+				logLatency({
+					type: "phase",
+					filePath: ctx.cwd ?? "<pi-lens>",
+					phase: "agent_end_concurrent_secondary_skip",
+					durationMs: 0,
+					metadata: { sessionId: currentSessionId },
+				});
+				return;
+			}
 			// Ensure any pipeline still queued in the debounce window finishes
 			// before agent_end runs — otherwise project change-log entries and
 			// modified ranges this turn produced may not be reflected yet.
 			await flushDebouncedToolResults();
 			await handleAgentEnd({
 				ctxCwd: ctx.cwd,
-				getFlag: (name: string) => getLensFlag(name),
-				notify: (msg, level) => ctx.ui.notify(msg, level),
+				getFlag: (name: string, filePath?: string) =>
+					getLensFlag(name, filePath),
+				getFlagSource: (name: string, filePath?: string) =>
+					getLensFlagSource(name, filePath),
+				notify: (msg, level) => notifyUi(ctx, msg, level),
 				dbg,
 				runtime,
 				cacheManager,
 				getFormatService: () =>
 					getFormatService(runtime.telemetrySessionId, true),
+				getAutofixClients: async () => {
+					const { biomeClient, ruffClient } = await loadBootstrapClients();
+					return { biomeClient, ruffClient };
+				},
+				currentSessionId,
 			});
 			ctx.ui && updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
 		} catch (agentEndErr) {
@@ -2445,17 +2171,87 @@ export default function (pi: ExtensionAPI) {
 		try {
 			const repaintLspStatus = captureLspStatusRepaint(ctx);
 			// Persist a new worst event-loop block to latency.log, attributed to
-			// this turn, so freezes are queryable across sessions (#192).
-			const loopMaxMs = getEventLoopStats()?.maxMs ?? 0;
+			// this turn, so freezes are queryable across sessions (#192). The
+			// window is per-turn (#1122): the probe cannot itself see machine
+			// sleep or commit-charge paging, both of which freeze the process and
+			// masquerade as huge synchronous blocks, so we tag samples the turn's
+			// CPU budget can't account for as `suspectSystemStall` and keep them
+			// out of the genuine-block high-waters. `lastPhase` is cheap block
+			// attribution (#1123 item 1) — the last phase that ran before the
+			// block was detected.
+			const elStats = getEventLoopStats();
+			const loopMaxMs = elStats?.maxMs ?? 0;
+			const suspectSystemStall = elStats?.suspectSystemStall ?? false;
 			if (shouldLogWorstBlock(loopMaxMs, lastLoggedLoopWorstMs)) {
+				const lastPhase = getLastLoggedPhase();
 				logLatency({
 					type: "phase",
 					filePath: "<pi-lens>",
 					phase: "loop_block",
 					durationMs: Math.round(loopMaxMs),
-					metadata: { worstSoFar: true, turnIndex: runtime.turnIndex },
+					metadata: {
+						worstSoFar: true,
+						turnIndex: runtime.turnIndex,
+						suspectSystemStall,
+						windowCpuMs: elStats?.windowCpuMs,
+						windowWallMs: elStats?.windowWallMs,
+						lastPhase: lastPhase?.phase,
+						lastPhaseAt: lastPhase?.ts,
+					},
 				});
-				lastLoggedLoopWorstMs = loopMaxMs;
+				// A system stall must not raise the "new worst genuine block"
+				// bar, or it would silence every real block that follows it.
+				if (suspectSystemStall) {
+					sessionSuspectedStalls += 1;
+				} else {
+					lastLoggedLoopWorstMs = loopMaxMs;
+					sessionWorstRealBlockMs = Math.max(
+						sessionWorstRealBlockMs,
+						loopMaxMs,
+					);
+				}
+			}
+			// Start a fresh per-turn occupancy window so the next turn's worst
+			// block is attributable to that turn and its CPU budget is measured
+			// over the same span (#1122).
+			resetEventLoopMonitor();
+
+			// #1123 item 2: periodic memory-attribution sample, every
+			// MEMORY_SAMPLE_TURN_INTERVAL turns — cheap (O(1)/O(bounded-cache-size)
+			// reads only, see clients/memory-sampler.ts) so no extra throttling is
+			// needed beyond the turn cadence itself.
+			if (shouldEmitMemorySample(runtime.turnIndex)) {
+				try {
+					const sample = buildMemorySample(runtime.wordIndex);
+					logLatency({
+						type: "phase",
+						filePath: "<pi-lens>",
+						phase: "memory_sample",
+						durationMs: 0,
+						metadata: { turnIndex: runtime.turnIndex, ...sample },
+					});
+				} catch {
+					// best-effort observability — never fail turn_end over this
+				}
+			}
+
+			// #1123 item 3: bounded smells re-check, same cadence style as the memory
+			// sample above — at most once per SMELLS_TURN_CHECK_INTERVAL turns, and
+			// each smell notifies at most once per session (checkSmellsAndNoteOnce's
+			// gate). See clients/smells-rollup.ts for the tail-scan cost bound.
+			if (shouldCheckSmellsThisTurn(runtime.turnIndex)) {
+				try {
+					// S3c (#1432 review): use the in-process session start instead of
+					// letting countRecentSmells() fall back to its 24h rolling
+					// window — turn_end already knows exactly when this session
+					// began, so admitted rows are scoped to it, not to a day-wide
+					// guess that could straddle multiple sessions.
+					for (const note of checkSmellsAndNoteOnce(countRecentSmells(undefined, runtime.sessionStartedAt))) {
+						notifyUi(ctx, note, "warning");
+					}
+				} catch {
+					// best-effort observability — never fail turn_end over this
+				}
 			}
 
 			// Drain any tool_result still in the debounce window so turn_end
@@ -2483,7 +2279,7 @@ export default function (pi: ExtensionAPI) {
 				// must not touch ctx.ui after session replacement/reload (#338).
 				resetLSPService: () => {
 					try {
-						resetLSPService();
+						resetLSPService({ reason: "idle" });
 					} finally {
 						repaintLspStatus?.();
 					}
@@ -2501,6 +2297,9 @@ export default function (pi: ExtensionAPI) {
 					ctx.cwd ?? process.cwd(),
 					runtime.telemetrySessionId,
 					exportWidgetState(),
+					// #1041: persist the read-guard read-set on the same snapshot so a
+					// later resume can rehydrate it (reconciled against disk on load).
+					runtime.readGuard.exportState(),
 				);
 			}
 
@@ -2539,7 +2338,35 @@ export default function (pi: ExtensionAPI) {
 	registerBuiltinQuietWindowTasks(() => runtime);
 	// #458: reconcile any cascade-lane Tier-3 touches that skipped their
 	// in-lane wait (clients/lsp/cascade-tier.ts) in the same quiet window.
-	registerCascadeTierReconcileTask(() => getLSPService());
+	// #1023: re-inject a cold-snapshot neighbor whose error resolved after the
+	// turn ended through the SAME turn-end cascade seam (append a CascadeRun the
+	// next turn_end merges), reusing the existing neighbor→turn-end formatting —
+	// previously this outcome was logs-only, a silent under-report (#533).
+	registerCascadeTierReconcileTask(() => getLSPService(), {
+		onResolvedFound: ({ filePath, diagnostics }) => {
+			const run = buildResolvedFoundCascadeRun(runtime.projectRoot, {
+				filePath,
+				diagnostics,
+			});
+			// #1443: the appended run outlives this turn's consumption —
+			// `beginTurn` carries it into the next turn_end exactly once instead
+			// of wiping it (which used to dead-end this whole delivery path).
+			if (run) runtime.appendCascadeRun(run);
+		},
+		// #1444 (issue impact #2): the mirror case — the neighbour published
+		// CLEAN after the skipped in-lane wait. The in-lane path reconciles that
+		// into the footer (`reconcileCascadeNeighborLspErrors`, the #1093 seam);
+		// the skipped path never could, so a fixed neighbour kept showing its old
+		// errors. Errors-only MERGE, so a live warning/biome finding survives; no
+		// write token exists at quiet-window time (the run is idle, nothing is
+		// racing this write), and `publishedAt` stamps the real observation time.
+		// Scope caveat: the touch was `clientScope: "primary"`, so this clears the
+		// LSP-error entries of a multi-primary-server file on one server's clean —
+		// the same errors-only tradeoff the in-lane reconcile documents.
+		onResolvedClean: ({ filePath, publishedAt }) => {
+			reconcileCascadeNeighborLspErrors(filePath, [], undefined, publishedAt);
+		},
+	});
 	// #484: emit the opt-in run summary entry HERE, not at turn_end. The SDK's
 	// sendCustomMessage STEERS the live model conversation when the session
 	// isStreaming, and turn_end can fire mid-stream; at agent_settled the
@@ -2568,7 +2395,31 @@ export default function (pi: ExtensionAPI) {
 		registerQuietWindowTask("turn_summary_emit", () => {
 			const emitCtx = _turnSummaryEmitCtx;
 			if (!emitCtx || !emitCtx.isLensEnabled()) return;
-			if (!emitCtx.getLensFlag("lens-turn-summary")) return;
+			// The captured `pi` can go STALE between the activation that set this
+			// holder and this fire-and-forget quiet-window run: an interim
+			// newSession/fork/switchSession/reload invalidates the runtime, after
+			// which any `pi.*` call — the getFlag below (reached first), or the
+			// sendMessage later — throws the SDK's stale-ctx guard. That is benign
+			// here: the session this run's summary belonged to is gone, so there is
+			// nothing to emit into. Treat it as a no-op, NOT a task failure — this
+			// exact throw at the flag read (outside the sendMessage try/catch)
+			// spammed the live-dogfood sessionstart.log 55× as `quiet_window:
+			// task "turn_summary_emit" failed` — the single most frequent error in
+			// that log. A non-stale error still propagates to the scheduler so it
+			// is recorded (ok:false) + logged with its stack.
+			let turnSummaryEnabled: boolean | string | undefined;
+			try {
+				turnSummaryEnabled = emitCtx.getLensFlag("lens-turn-summary");
+			} catch (err) {
+				if (isStaleExtensionCtxError(err)) {
+					dbg(
+						"turn_summary_emit: skipped — captured pi ctx is stale (session replaced/reloaded before the quiet window ran)",
+					);
+					return;
+				}
+				throw err;
+			}
+			if (!turnSummaryEnabled) return;
 			if (runtime.turnSummary.isEmpty()) return;
 			const summaryStart = Date.now();
 			const cwd = runtime.projectRoot || process.cwd();
@@ -2588,6 +2439,12 @@ export default function (pi: ExtensionAPI) {
 						details,
 					});
 				} catch (sendErr) {
+					if (isStaleExtensionCtxError(sendErr)) {
+						dbg(
+							"turn_summary_emit: skipped emit — pi ctx went stale (session replaced/reloaded)",
+						);
+						return;
+					}
 					dbg(`turn-summary sendMessage failed: ${sendErr}`);
 				}
 			} else {
@@ -2611,16 +2468,24 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 	try {
-		(pi as any).on("agent_settled", (_event: unknown, ctx: { cwd?: string }) => {
-			if (!lensEnabled) return;
-			void runQuietWindow({
-				runtime,
-				dbg,
-				cwd: ctx?.cwd,
-			}).catch((err) => {
-				dbg(`quiet_window crashed: ${err}`);
-			});
-		});
+		(pi as any).on(
+			"agent_settled",
+			(_event: unknown, ctx: { cwd?: string }) => {
+				if (!lensEnabled) return;
+				void runQuietWindow({
+					runtime,
+					dbg,
+					cwd: ctx?.cwd,
+				}).catch((err) => {
+					dbg(`quiet_window crashed: ${err}`);
+				});
+				// #1123 item 4: dump active handles AFTER the quiet-window work is
+				// scheduled — the #1097-class leak (a stray ref'd timer surviving
+				// past settle) is only visible once whatever settle itself queued is
+				// already in flight. No-op unless PI_LENS_DEBUG_HANDLES=1.
+				dumpActiveHandles("agent_settled");
+			},
+		);
 	} catch (registerErr) {
 		dbg(`agent_settled registration failed (older pi host?): ${registerErr}`);
 	}
@@ -2648,9 +2513,17 @@ export default function (pi: ExtensionAPI) {
 		const shutdownClassification = noteSessionShutdown(ctx, stableSessionId);
 		if (shutdownClassification === "secondary") {
 			decrementSecondarySessionCount();
-			dbg("session_shutdown: concurrent secondary — skipping shared-infra teardown");
+			dbg(
+				"session_shutdown: concurrent secondary — skipping shared-infra teardown",
+			);
 			return;
 		}
+
+		// #1018: drop this (primary) session's prefix baseline now it has ended,
+		// so its entry is reclaimed promptly instead of lingering until the LRU
+		// evicts it. Respects the #473 guard above (a concurrent-secondary
+		// shutdown returned already, so its entry is left for the LRU backstop).
+		clearCachePrefixSession(stableSessionId);
 
 		cancelLSPIdleReset();
 		// #449 slice 1: SYNC-only deregistration (no child spawns — see the
@@ -2664,15 +2537,87 @@ export default function (pi: ExtensionAPI) {
 		// children when a parent dies) — they rely on stdin EOF, LSP
 		// `initialize.processId` self-watchdog compliance, and the #449/#472
 		// cross-process instance registry's orphan reaper as the backstop (#472).
-		resetLSPService({ fast: true, processExiting: true });
+		resetLSPService({
+			fast: true,
+			processExiting: true,
+			reason: "session_shutdown",
+		});
+		// S2d (gap 5, #1432 review): one session_end_bus_rollup row per event
+		// name with any activity this session — same primary-only placement as
+		// the shared-infra teardown above (a concurrent secondary already
+		// returned before reaching here), since the rollup counters are
+		// process-wide module state a live secondary would still need.
+		emitBusEventRollupAtSessionEnd(runtime.projectRoot);
+		// #1123 item 4: dump active handles AFTER teardown — whatever is still
+		// alive at this point is exactly what would keep a --print/--no-session
+		// process from exiting (the #1097 lesson: what survives IS the leak).
+		// No-op unless PI_LENS_DEBUG_HANDLES=1.
+		dumpActiveHandles("session_shutdown");
 	});
+
+	// --- Prompt-cache response-side usage observability (#1018) ---
+	// On each assistant message_end, append ONE `cache_usage` latency record with
+	// the provider-reported token/cost breakdown. `message_end` is a newer host
+	// event; register defensively (clients/agent-nudge.ts pattern) — guard `pi.on`,
+	// wrap in try/catch, and never throw out of the handler — so an older pi host
+	// that never fires it simply produces no records rather than crashing wireup.
+	try {
+		// biome-ignore lint/suspicious/noExplicitAny: message_end overload absent on older host types
+		(pi as any).on?.("message_end", (event: unknown, ctx: unknown) => {
+			if (!lensEnabled) return;
+			try {
+				const sessionId = getStableSessionId(ctx);
+				logCacheUsage((event as { message?: unknown })?.message, dbg, {
+					sessionId,
+					sessionRole: classifyCurrentSessionEmission(ctx, sessionId),
+					turnIndex: runtime.turnIndex,
+				});
+			} catch (err) {
+				dbg(`message_end handler error: ${err}`);
+			}
+		});
+	} catch (err) {
+		dbg(`message_end subscribe failed (older pi host?): ${err}`);
+	}
 
 	// --- Inject turn-end findings into next agent turn ---
 	// jscpd, madge, and turn-end delta results are cached at turn_end and consumed here
 	// via the context event, which fires before each provider request.
-	// Important: keep the user's prompt as the trailing message. Some provider bridges
-	// treat the final message as the active user action, so pi-lens context must be
-	// prepended instead of appended.
+	// Placement (#1016): splice the ephemeral pi-lens findings in IMMEDIATELY BEFORE
+	// the final message rather than prepending at index 0. Prepending flipped
+	// messages[0] every turn, which invalidated the entire prompt-cache prefix on
+	// EVERY prefix-caching provider (Anthropic, Bedrock, AND OpenAI — all key the
+	// cache on the exact token prefix). Inserting before the last message keeps
+	// messages[0] (the real first user turn) byte-stable so the prior conversation
+	// stays cached, AND keeps the real user prompt as the trailing message —
+	// preserving the trailing-`user` cache breakpoint and the historical fe0ed5da
+	// guarantee that input is never empty (existingMessages are always preserved,
+	// never dropped).
+	//
+	// The `context` event fires before EVERY provider/LLM call, not just at turn
+	// boundaries (clients/agent-nudge.ts), so mid-agentic-loop the trailing message
+	// is often a `tool_result` — which MUST stay immediately adjacent to the
+	// assistant message carrying its matching `tool_use`/`tool_calls`, across all of
+	// Anthropic, Bedrock, and OpenAI (a 400 otherwise). The trailing-role guard
+	// (isPlainUserPrompt) therefore only splices before the last message when it is a
+	// plain user prompt; otherwise it APPENDS after the whole transcript, which both
+	// preserves that adjacency and is still fully cache-friendly (the entire prior
+	// transcript stays an untouched prefix).
+	const isPlainUserPrompt = (msg: {
+		role: string;
+		content: unknown;
+	}): boolean => {
+		if (msg.role !== "user") return false;
+		// String content is a plain prompt; only an array of content blocks can
+		// carry a tool_result, which must not be preceded by an injected message.
+		if (!Array.isArray(msg.content)) return true;
+		return !msg.content.some(
+			(block) =>
+				typeof block === "object" &&
+				block !== null &&
+				(block as { type?: unknown }).type === "tool_result",
+		);
+	};
 	// biome-ignore lint/suspicious/noExplicitAny: pi.on("context") overload has TS resolution bug
 	(pi as any).on(
 		"context",
@@ -2680,31 +2625,147 @@ export default function (pi: ExtensionAPI) {
 			event: { messages?: Array<{ role: string; content: unknown }> } | unknown,
 			ctx: { cwd?: string },
 		) => {
-			if (!lensEnabled || !contextInjectionEnabled) return;
+			// #1018: context telemetry deliberately runs even when the lens or its
+			// injection toggle is off, so an A/B run has a no-injection observation.
+			const existingMessages =
+				(event as { messages?: Array<{ role: string; content: unknown }> })
+					?.messages ?? [];
+			const prefixSessionId = getStableSessionId(ctx);
+			const sessionRole = classifyCurrentSessionEmission(ctx, prefixSessionId);
+			const prefixObservation = observeCachePrefix(
+				existingMessages,
+				runtime.turnIndex,
+				prefixSessionId,
+				sessionRole,
+				dbg,
+			);
+			const effectiveInjectionEnabled = lensEnabled && contextInjectionEnabled;
+			let telemetryLogged = false;
+			const logContextObservation = (
+				resultMessages: Array<{ role: string; content: unknown }>,
+				placement: "prepend" | "insert-before-final" | "append" | "none",
+				injectionSources: Array<
+					"session-guidance" | "turn-findings" | "test-findings" | "agent-nudge"
+				>,
+				injectedMessages: Array<{ role: string; content: unknown }>,
+			) => {
+				if (telemetryLogged) return;
+				telemetryLogged = true;
+				observeCacheContext({
+					existingMessages,
+					resultMessages,
+					sessionId: prefixSessionId,
+					sessionRole,
+					turnIndex: runtime.turnIndex,
+					injectionEnabled: effectiveInjectionEnabled,
+					injectionSources,
+					injectedMessages,
+					placement,
+					prefixObservation,
+					dbg,
+				});
+			};
 			try {
 				const cwd = ctx.cwd ?? process.cwd();
-				const turnEndFindings = consumeTurnEndFindings(cacheManager, cwd);
+
+				if (!effectiveInjectionEnabled) {
+					logContextObservation(existingMessages, "none", [], []);
+					return;
+				}
+
+				const turnEndFindings = consumeTurnEndFindings(cacheManager, cwd, runtime);
 				const sessionGuidance = consumeSessionStartGuidance(cacheManager, cwd);
-				const testFindings = consumeTestFindings(cacheManager, cwd);
+				const testFindings = consumeTestFindings(cacheManager, cwd, runtime);
 				const agentNudge = consumeAgentNudge(dbg);
-				const injectedMessages = [
-					...(sessionGuidance?.messages ?? []),
-					...(turnEndFindings?.messages ?? []),
-					...(testFindings?.messages ?? []),
-					...(agentNudge?.messages ?? []),
+				const sourceMessages = [
+					{
+						source: "session-guidance" as const,
+						messages: sessionGuidance?.messages ?? [],
+					},
+					{
+						source: "turn-findings" as const,
+						messages: turnEndFindings?.messages ?? [],
+					},
+					{
+						source: "test-findings" as const,
+						messages: testFindings?.messages ?? [],
+					},
+					{
+						source: "agent-nudge" as const,
+						messages: agentNudge?.messages ?? [],
+					},
+				].filter((source) => source.messages.length > 0);
+				const injectedMessages = sourceMessages.flatMap(
+					(source) => source.messages,
+				);
+				const injectionSources = sourceMessages.map((source) => source.source);
+				if (injectedMessages.length === 0) {
+					logContextObservation(existingMessages, "none", [], []);
+					return;
+				}
+
+				// Empty transcript (no turns yet): fall back to prepend semantics —
+				// there is no trailing user message to sit before, and we must never
+				// emit empty input (fe0ed5da: OpenAI Responses fails on empty input).
+				if (existingMessages.length === 0) {
+					const resultMessages = [...injectedMessages];
+					logContextObservation(
+						resultMessages,
+						"prepend",
+						injectionSources,
+						injectedMessages,
+					);
+					return { messages: resultMessages };
+				}
+
+				const lastMessage = existingMessages[existingMessages.length - 1];
+
+				// Mid-loop the tail can be a tool_result (or assistant/tool) message;
+				// inserting before it would break tool_use↔tool_result adjacency. Only
+				// splice before the last message when it is a plain user prompt.
+				if (!isPlainUserPrompt(lastMessage)) {
+					// Append after the whole transcript — pure append preserves the
+					// adjacency AND leaves the entire prior transcript as an untouched
+					// cache prefix.
+					const resultMessages = [...existingMessages, ...injectedMessages];
+					logContextObservation(
+						resultMessages,
+						"append",
+						injectionSources,
+						injectedMessages,
+					);
+					return { messages: resultMessages };
+				}
+
+				// Insert the injected block just before the final message so
+				// messages[0] stays stable and the real user prompt stays trailing.
+				const resultMessages = [
+					...existingMessages.slice(0, -1),
+					...injectedMessages,
+					lastMessage,
 				];
-				if (injectedMessages.length === 0) return;
-
-				const existingMessages =
-					(event as { messages?: Array<{ role: string; content: unknown }> })
-						?.messages ?? [];
-
-				return {
-					messages: [...injectedMessages, ...existingMessages],
-				};
+				logContextObservation(
+					resultMessages,
+					"insert-before-final",
+					injectionSources,
+					injectedMessages,
+				);
+				return { messages: resultMessages };
 			} catch (err) {
+				if (!telemetryLogged)
+					logContextObservation(existingMessages, "none", [], []);
 				dbg(`context event error: ${err}`);
 			}
 		},
 	);
 }
+
+export default function (pi: ExtensionAPI) {
+	return runInConsoleCaptureWindow(() => activateExtension(pi));
+}
+
+// #1434: the import graph has finished evaluating, so the module window closes
+// here. Everything after this point is host-owned execution, until one of
+// pi-lens's own entry points opens its own window. This must stay the last
+// statement in index.ts.
+closeModuleLoadConsoleWindow();

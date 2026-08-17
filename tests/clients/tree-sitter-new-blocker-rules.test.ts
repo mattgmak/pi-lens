@@ -2,8 +2,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { TreeSitterClient } from "../../clients/tree-sitter-client.js";
+import { getSharedTreeSitterClient } from "../../clients/tree-sitter-shared.js";
 import { TreeSitterQueryLoader } from "../../clients/tree-sitter-query-loader.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 const tmpDirs: string[] = [];
 
@@ -27,13 +28,13 @@ async function getQuery(id: string) {
 
 afterAll(() => {
 	for (const dir of tmpDirs) {
-		fs.rmSync(dir, { recursive: true, force: true });
+		removeTempDirSync(dir);
 	}
 });
 
 describe("S1219 — switch non-case labels (TS)", () => {
 	it("matches non-case label inside switch", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("switch-non-case-labels-ts");
 		const filePath = writeTempFile(
 			"ts",
@@ -52,7 +53,7 @@ describe("S1219 — switch non-case labels (TS)", () => {
 	});
 
 	it("does not match normal switch", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("switch-non-case-labels-ts");
 		const filePath = writeTempFile(
 			"ts",
@@ -73,7 +74,7 @@ describe("S1219 — switch non-case labels (TS)", () => {
 
 describe("S2970 — incomplete assertion (TS)", () => {
 	it("matches bare expect() in test block", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("ts-incomplete-assertion");
 		const filePath = writeTempFile(
 			"ts",
@@ -87,7 +88,7 @@ describe("S2970 — incomplete assertion (TS)", () => {
 	});
 
 	it("matches uncalled matcher in test block", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("ts-incomplete-assertion");
 		const filePath = writeTempFile(
 			"ts",
@@ -101,7 +102,7 @@ describe("S2970 — incomplete assertion (TS)", () => {
 	});
 
 	it("matches uncalled matcher with not modifier", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("ts-incomplete-assertion");
 		const filePath = writeTempFile(
 			"ts",
@@ -115,7 +116,7 @@ describe("S2970 — incomplete assertion (TS)", () => {
 	});
 
 	it("does not match complete assertion", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("ts-incomplete-assertion");
 		const filePath = writeTempFile(
 			"ts",
@@ -129,7 +130,7 @@ describe("S2970 — incomplete assertion (TS)", () => {
 	});
 
 	it("does not match complete assertion with not modifier", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("ts-incomplete-assertion");
 		const filePath = writeTempFile(
 			"ts",
@@ -143,7 +144,7 @@ describe("S2970 — incomplete assertion (TS)", () => {
 	});
 
 	it("does not match when expect is assigned (not a statement)", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("ts-incomplete-assertion");
 		const filePath = writeTempFile(
 			"ts",
@@ -157,7 +158,7 @@ describe("S2970 — incomplete assertion (TS)", () => {
 	});
 
 	it("does not flag Chai property assertions", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("ts-incomplete-assertion");
 		const filePath = writeTempFile(
 			"ts",

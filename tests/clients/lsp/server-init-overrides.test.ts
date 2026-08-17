@@ -10,6 +10,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { removeTempDirSync } from "../test-utils.js";
 
 process.env.PI_LENS_TEST_MODE = "1";
 
@@ -31,7 +32,7 @@ function tmpDir(): string {
 
 afterEach(() => {
 	for (const dir of dirs.splice(0)) {
-		fs.rmSync(dir, { recursive: true, force: true });
+		removeTempDirSync(dir);
 	}
 	vi.resetModules();
 });

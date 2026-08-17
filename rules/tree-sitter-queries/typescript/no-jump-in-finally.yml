@@ -4,6 +4,7 @@ id: no-jump-in-finally
 name: Control-flow jump in finally block
 severity: warning
 category: bug
+defect_class: silent-error
 inline_tier: warning
 language: typescript
 

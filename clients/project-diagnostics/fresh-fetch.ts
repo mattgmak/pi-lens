@@ -1,19 +1,22 @@
 /**
- * Fresh-fetch counterpart to `extractCachedProjectDiagnostics` (./extractors.ts)
- * for `lens_diagnostics mode=full` (#585).
+ * THE heavyweight-analyzer reader for `lens_diagnostics mode=full` (#585).
  *
- * `extractCachedProjectDiagnostics` is deliberately cache-only — see its own
- * header comment — because historically mode=full had no safe way to trigger
- * a scan itself: relaunching knip/jscpd/gitleaks/govulncheck/trivy/dead-code
- * concurrently with the session_start background pass over the SAME project
- * root could double-spawn a CPU-bound analyzer (the exact TUI-freeze/zombie-
- * process pathology `KnipClient.inFlight`'s docstring describes).
+ * It superseded a cache-ONLY reader (`extractCachedProjectDiagnostics`, since
+ * removed from ./extractors.ts as a #585-class dead parallel path — see that
+ * file's header). That reader was deliberately cache-only because historically
+ * mode=full had no safe way to trigger a scan itself: relaunching knip/jscpd/
+ * gitleaks/govulncheck/opengrep/trivy/dead-code concurrently with the
+ * session_start background pass over the SAME project root could double-spawn a
+ * CPU-bound analyzer (the exact TUI-freeze/zombie-process pathology
+ * `KnipClient.inFlight`'s docstring describes).
  *
  * That pathology is now closed for every one of these analyzers:
  * `KnipClient`, `JscpdClient`, and the `DeadCodeClient`s each carry their own
  * `inFlight` de-dupe map, and `GitleaksClient`/`GovulncheckClient`/
- * `TrivyClient` share `SecurityScanClient.dedupeScan` (landed in #313, well
- * before this issue — verified before writing this module). So mode=full can
+ * `TrivyClient`/`OpengrepClient` share `SecurityScanClient.dedupeScan` (landed
+ * in #313, well before this issue — verified before writing this module). So
+ * a mode=full opengrep run that races the session_start whole-tree scan of the
+ * same root JOINS it rather than spawning a second (heavy) scan. So mode=full can
  * now safely trigger — or, via the de-dupe guard, *join* — a fresh run of
  * each analyzer instead of settling for a session_start-only snapshot that
  * can be hours stale in a long session.
@@ -64,14 +67,27 @@
  * "ran clean") and `abortedIds` (so a caller can render a more honest reason
  * than "not applicable").
  *
- * Refs: #585, #313 (the SecurityScanClient de-dupe prerequisite)
+ * One analyzer does NOT follow the trigger-or-join shape above: `test-runner`
+ * (#1004). Its "scan" is the per-edit turn_end test fire (`runtime-turn.ts`),
+ * which only ever runs the targeted/cascade-aware test files touched by a
+ * turn's edits — there is no whole-project run to trigger here, and forcing
+ * one on every mode=full call would be exactly the double-spawn-a-heavy-
+ * analyzer cost the de-dupe guards above exist to avoid. Its task is a plain
+ * cache-read of the `"test-runner-findings"` key turn_end already wrote,
+ * mirroring the pre-#585 `extractCachedProjectDiagnostics` registry's
+ * "test-runner" row (cache-only, never triggers a run) rather than the
+ * fresh-run pattern every other task here uses — see that task's own comment.
+ *
+ * Refs: #585, #313 (the SecurityScanClient de-dupe prerequisite), #1004
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { BootstrapClients } from "../bootstrap.js";
 import type { CacheManager } from "../cache-manager.js";
+import type { RuntimeCoordinator } from "../runtime-coordinator.js";
 import { getKnipIgnorePatterns } from "../file-utils.js";
+import { isAtOrAboveHomeDir } from "../path-utils.js";
 import { GitleaksClient } from "../gitleaks-client.js";
 import { GovulncheckClient } from "../govulncheck-client.js";
 import { TrivyClient } from "../trivy-client.js";
@@ -81,8 +97,12 @@ import { govulncheckResultToProjectDiagnostics } from "./runner-adapters/govulnc
 import { jscpdResultToProjectDiagnostics } from "./runner-adapters/jscpd.js";
 import { knipIssuesToProjectDiagnostics } from "./runner-adapters/knip.js";
 import { circularDepsToProjectDiagnostics } from "./runner-adapters/madge.js";
+import { opengrepResultToProjectDiagnostics } from "./runner-adapters/opengrep.js";
+import type { TestRunnerFindingsCache } from "./runner-adapters/runner-findings.js";
+import { testRunnerFindingsToProjectDiagnostics } from "./runner-adapters/runner-findings.js";
 import { trivyResultToProjectDiagnostics } from "./runner-adapters/trivy.js";
 import type { ProjectDiagnostic } from "./types.js";
+import type { FailedProjectAnalyzer } from "./extractors.js";
 
 export interface FreshProjectDiagnosticsResult {
 	diagnostics: ProjectDiagnostic[];
@@ -91,6 +111,8 @@ export interface FreshProjectDiagnosticsResult {
 	/** Extractor ids skipped this run (not applicable / tool unavailable, OR
 	 *  aborted before settling — see `abortedIds`). */
 	cold: string[];
+	/** Analyzers that ran but explicitly reported failure. */
+	failed: FailedProjectAnalyzer[];
 	/** Wall-clock ms spent per extractor id that actually ran (join time
 	 *  included when this call joined an already-in-flight scan). */
 	timings: Record<string, number>;
@@ -101,19 +123,31 @@ export interface FreshProjectDiagnosticsResult {
 	 *  subset of `cold` — kept separate so a caller can render a distinct
 	 *  "stopped mid-scan" reason instead of "not applicable to this project". */
 	abortedIds?: string[];
+	/** True when the fetch refused to run because `cwd` resolved at or above
+	 *  the home directory (#747) — every analyzer is listed in `cold`, and
+	 *  nothing was spawned. Kept separate from the per-analyzer skip reasons so
+	 *  a caller can render "unsafe root" instead of "not applicable". */
+	unsafeRoot?: boolean;
 }
 
-/** Registry order mirrors `extractors.ts`'s `EXTRACTORS` ids — kept in sync by
- *  hand since this module intentionally doesn't share that table (additive,
- *  not a registry restructure — see the module header). */
-const ANALYZER_IDS = [
+/** The heavyweight analyzers surfaced in `lens_diagnostics mode=full` — this is
+ *  now the single source of truth for that list (#585 removed the parallel
+ *  cache-only `EXTRACTORS` registry that used to shadow it). `warmTriggerFor`
+ *  (extractors.ts) is keyed by these same ids for the "cold" honesty note.
+ *  Exported so `tests/clients/project-diagnostics/analyzer-coverage.test.ts`
+ *  (#1004's guardrail) can assert every session-start/turn-end analyzer cache
+ *  writer id is a member — the exact #585-class check that would have caught
+ *  opengrep's (and then test-runner's, #1004) omission before it shipped. */
+export const ANALYZER_IDS = [
 	"knip",
 	"jscpd",
 	"madge",
 	"gitleaks",
 	"govulncheck",
+	"opengrep",
 	"trivy",
 	"dead-code",
+	"test-runner",
 ] as const;
 
 function pushUnique(list: string[], id: string): void {
@@ -123,8 +157,7 @@ function pushUnique(list: string[], id: string): void {
 /**
  * Trigger (or join, via each client's in-flight de-dupe guard) a fresh run of
  * every heavyweight project analyzer and adapt the results to
- * `ProjectDiagnostic[]`, mirroring `extractCachedProjectDiagnostics`'s return
- * shape. Runs all analyzers in parallel — total wall time is bounded by the
+ * `ProjectDiagnostic[]`. Runs all analyzers in parallel — total wall time is bounded by the
  * single slowest one (trivy's own timeout ceiling) rather than their sum.
  *
  * `signal`, when provided and it fires before every analyzer has settled,
@@ -137,11 +170,32 @@ export async function fetchFreshProjectDiagnostics(
 	cwd: string,
 	clients: BootstrapClients,
 	signal?: AbortSignal,
+	options: { homeDir?: string; runtime?: RuntimeCoordinator } = {},
 ): Promise<FreshProjectDiagnosticsResult> {
 	const analysisRoot = path.resolve(cwd);
+	// #747: refuse to spawn any heavyweight analyzer when the analysis root is
+	// at — or above — the home directory (the #250/#253 escape class). Every
+	// analyzer here treats `analysisRoot` as a whole tree to walk; from $HOME
+	// that means scanning every unrelated repo under it (observed: a jscpd run
+	// from a WSL home reached 44 GB RSS and OOM-killed the whole instance).
+	// Same ceiling as startup-scan.ts / runtime-session.ts's resolveSnapshotRoot
+	// / review-graph's buildOrUpdateGraph; like the latter, there is no safe
+	// substitute root to fall back to — the caller's `paths` scope only filters
+	// REPORTED results, it never narrows what these analyzers walk.
+	if (isAtOrAboveHomeDir(analysisRoot, options.homeDir)) {
+		return {
+			diagnostics: [],
+			runners: [],
+			cold: [...ANALYZER_IDS],
+			failed: [],
+			timings: {},
+			unsafeRoot: true,
+		};
+	}
 	const diagnostics: ProjectDiagnostic[] = [];
 	const runners: string[] = [];
 	const cold: string[] = [];
+	const failed: FailedProjectAnalyzer[] = [];
 	const timings: Record<string, number> = {};
 	const settledIds = new Set<string>();
 
@@ -151,6 +205,19 @@ export async function fetchFreshProjectDiagnostics(
 			diagnostics.push(...adapted);
 			pushUnique(runners, id);
 		}
+	}
+
+	function recordFailed(
+		id: string,
+		result: { summary?: string } | object,
+	): void {
+		failed.push({
+			id,
+			summary:
+				"summary" in result && typeof result.summary === "string"
+					? result.summary
+					: "analyzer reported an unsuccessful run",
+		});
 	}
 
 	function task(id: string, run: () => Promise<void>): Promise<void> {
@@ -166,6 +233,10 @@ export async function fetchFreshProjectDiagnostics(
 				analysisRoot,
 				getKnipIgnorePatterns(),
 			);
+			if (!result.success) {
+				recordFailed("knip", result);
+				return;
+			}
 			cacheManager.writeCache("knip", result, analysisRoot, {
 				scanDurationMs: Date.now() - startMs,
 			});
@@ -194,6 +265,10 @@ export async function fetchFreshProjectDiagnostics(
 				undefined,
 				isTsProject,
 			);
+			if (!result.success) {
+				recordFailed("jscpd", result);
+				return;
+			}
 			cacheManager.writeCache(scannerKey, result, analysisRoot, {
 				scanDurationMs: Date.now() - startMs,
 			});
@@ -244,6 +319,10 @@ export async function fetchFreshProjectDiagnostics(
 			const result = await clients.gitleaksClient.scan(analysisRoot, {
 				requireSignal: false,
 			});
+			if (!result.success) {
+				recordFailed("gitleaks", result);
+				return;
+			}
 			cacheManager.writeCache("gitleaks", result, analysisRoot, {
 				scanDurationMs: Date.now() - startMs,
 			});
@@ -266,12 +345,51 @@ export async function fetchFreshProjectDiagnostics(
 			}
 			const startMs = Date.now();
 			const result = await clients.govulncheckClient.analyze(analysisRoot);
+			if (!result.success) {
+				recordFailed("govulncheck", result);
+				return;
+			}
 			cacheManager.writeCache("govulncheck", result, analysisRoot, {
 				scanDurationMs: Date.now() - startMs,
 			});
 			record(
 				"govulncheck",
 				govulncheckResultToProjectDiagnostics(analysisRoot, result),
+				Date.now() - startMs,
+			);
+		}),
+
+		// opengrep — full-workspace semgrep-grade security/quality findings via a
+		// single project-wide CLI scan (#584). Structurally always-on: mirrors
+		// session_start (`runtime-session.ts`) and the LSP auxiliary's own
+		// enablement (`OpengrepClient.resolveConfig` only picks WHICH rules run,
+		// never whether opengrep runs at all), so unlike gitleaks/govulncheck/trivy
+		// it carries NO static project-type gate — only an availability probe.
+		// Re-entrancy-safe like the other SecurityScanClient-family analyzers:
+		// `OpengrepClient.scan` routes through `SecurityScanClient.dedupeScan`, so a
+		// call here that races the session_start whole-tree scan of the same root
+		// JOINS the in-flight run instead of paying a second heavy scan (#883 single
+		// source of truth — the exact wiring gitleaks/trivy use above). #585: this
+		// was the one extractor registered in `extractors.ts` but MISSING here, so
+		// opengrep scanned+cached yet nothing production read it back into
+		// `lens_diagnostics mode=full` — the honesty gap (#533) this task closes.
+		task("opengrep", async () => {
+			if (!(await clients.opengrepClient.ensureAvailable())) {
+				cold.push("opengrep");
+				return;
+			}
+			const startMs = Date.now();
+			const result = await clients.opengrepClient.scan(analysisRoot);
+			if (!result.success) {
+				recordFailed("opengrep", result);
+				return;
+			}
+			cacheManager.writeCache("opengrep", result, analysisRoot, {
+				scanDurationMs: Date.now() - startMs,
+			});
+			record(
+				"opengrep",
+				opengrepResultToProjectDiagnostics(analysisRoot, result),
 				Date.now() - startMs,
 			);
 		}),
@@ -288,6 +406,10 @@ export async function fetchFreshProjectDiagnostics(
 			}
 			const startMs = Date.now();
 			const result = await clients.trivyClient.scan(analysisRoot);
+			if (!result.success) {
+				recordFailed("trivy", result);
+				return;
+			}
 			cacheManager.writeCache("trivy", result, analysisRoot, {
 				scanDurationMs: Date.now() - startMs,
 			});
@@ -314,6 +436,10 @@ export async function fetchFreshProjectDiagnostics(
 					const cacheKey = `dead-code-${client.id}`;
 					const startMs = Date.now();
 					const result = await client.analyze(analysisRoot);
+					if (!result.success) {
+						recordFailed("dead-code", result);
+						return;
+					}
 					cacheManager.writeCache(cacheKey, result, analysisRoot, {
 						scanDurationMs: Date.now() - startMs,
 					});
@@ -323,6 +449,50 @@ export async function fetchFreshProjectDiagnostics(
 						Date.now() - startMs,
 					);
 				}),
+			);
+		}),
+
+		// test-runner — CACHE-READ only, unlike every task above (#1004). Its
+		// session cadence doesn't fit the "trigger-or-join a fresh run" shape the
+		// rest of this module uses: the actual scan is the per-edit turn_end fire
+		// in `runtime-turn.ts`, which only ever runs the (targeted, cascade-aware)
+		// test files touched by THIS turn's edits — there is no "whole project"
+		// test run to (re-)trigger here, and unconditionally spawning a full suite
+		// on every mode=full call would be the exact "heavy re-run on every call"
+		// cost this module's other tasks avoid via de-dupe/gating. So this task
+		// instead peeks at the `"test-runner-findings"` cache turn_end already
+		// wrote — the same cache key, the same adapter
+		// (`testRunnerFindingsToProjectDiagnostics`), and the same cache-only
+		// contract the pre-#585 `extractCachedProjectDiagnostics` registry's
+		// "test-runner" row used (see extractors.ts's removal note) — before #585
+		// dropped that reader without replacing this one row's semantics here.
+		// Deliberately never calls `writeCache`: there is nothing fresher to write
+		// back, only what turn_end already produced.
+		//
+		// No double-count / honesty gap (#533): `consumeTestFindings`
+		// (`runtime-context.ts`) reads-and-clears this SAME cache key once, to
+		// inject a one-shot "fix before continuing" message into the NEXT turn.
+		// This task only ever reads (never clears) it, so it can't race that
+		// consumption into re-delivering a message twice — at most it surfaces
+		// the same underlying failures a second time, through a different
+		// surface (the mode=full project snapshot) that was previously silently
+		// empty for this analyzer. If `consumeTestFindings` already cleared the
+		// cache before this runs, this task correctly sees nothing and reports
+		// `cold` rather than inventing stale data.
+		task("test-runner", async () => {
+			const startMs = Date.now();
+			const cached = cacheManager.readCache<TestRunnerFindingsCache>(
+				"test-runner-findings",
+				analysisRoot,
+			);
+			if (!cached?.data) {
+				cold.push("test-runner");
+				return;
+			}
+			record(
+				"test-runner",
+				testRunnerFindingsToProjectDiagnostics(cached.data, analysisRoot, options.runtime),
+				Date.now() - startMs,
 			);
 		}),
 	];
@@ -352,8 +522,16 @@ export async function fetchFreshProjectDiagnostics(
 	if (outcome === "aborted") {
 		const abortedIds = ANALYZER_IDS.filter((id) => !settledIds.has(id));
 		for (const id of abortedIds) pushUnique(cold, id);
-		return { diagnostics, runners, cold, timings, aborted: true, abortedIds };
+		return {
+			diagnostics,
+			runners,
+			cold,
+			failed,
+			timings,
+			aborted: true,
+			abortedIds,
+		};
 	}
 
-	return { diagnostics, runners, cold, timings };
+	return { diagnostics, runners, cold, failed, timings };
 }

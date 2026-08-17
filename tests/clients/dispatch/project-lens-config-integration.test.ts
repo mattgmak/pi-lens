@@ -16,6 +16,7 @@ import {
 import type { DispatchContext } from "../../../clients/dispatch/types.js";
 import type { FileKind } from "../../../clients/file-kinds.js";
 import type { FunctionSummary } from "../../../clients/dispatch/facts/function-facts.js";
+import { removeTempDirSync } from "../test-utils.js";
 
 function makeCtx(
 	filePath: string,
@@ -83,7 +84,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-	fs.rmSync(tmpDir, { recursive: true, force: true });
+	removeTempDirSync(tmpDir);
 	resetHighComplexityThresholds();
 	resetHighFanOutThreshold();
 	resetProjectLensConfigCache();
@@ -239,7 +240,7 @@ describe("applyProjectLensConfig", () => {
 			const ctx = makeCtx(filePath, facts, otherConfig);
 			expect(highFanOutRule.evaluate(ctx, facts)).toHaveLength(0);
 		} finally {
-			fs.rmSync(otherDir, { recursive: true, force: true });
+			removeTempDirSync(otherDir);
 		}
 	});
 

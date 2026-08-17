@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { generateSourceTree, measureMaxSyncBlockMs } from "./perf-harness.js";
+import { removeTempDirSync } from "../clients/test-utils.js";
 
 describe("measureMaxSyncBlockMs", () => {
 	it("reports a large block for a fully non-yielding (synchronous) burst", async () => {
@@ -37,7 +38,7 @@ describe("generateSourceTree", () => {
 		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-perf-harness-"));
 	});
 	afterEach(() => {
-		fs.rmSync(tmp, { recursive: true, force: true });
+		removeTempDirSync(tmp);
 	});
 
 	it("creates approximately the requested number of source files + ignored noise", () => {

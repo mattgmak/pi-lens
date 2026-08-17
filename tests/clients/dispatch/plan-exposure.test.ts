@@ -76,7 +76,14 @@ describe("dispatch plan exposure", () => {
 		const sqlIds = flattenRunnerIds(TOOL_PLANS.sql);
 
 		expect(yamlIds).toContain("yamllint");
+		expect(yamlIds).toContain("helm-lint");
 		expect(sqlIds).toContain("sqlfluff");
+	});
+
+	it("routes tpl helpers through the explicit Helm template plan", () => {
+		expect(flattenRunnerIds(TOOL_PLANS["helm-template"])).toEqual([
+			"helm-lint",
+		]);
 	});
 
 	it("routes html/docker/powershell/php/prisma through aligned primary plans", () => {

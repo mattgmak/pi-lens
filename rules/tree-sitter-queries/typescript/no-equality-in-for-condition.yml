@@ -4,6 +4,7 @@ id: no-equality-in-for-condition
 name: Loose equality in for-loop condition
 severity: warning
 category: bug
+defect_class: correctness
 inline_tier: warning
 language: typescript
 

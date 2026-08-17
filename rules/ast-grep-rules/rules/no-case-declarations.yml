@@ -1,6 +1,8 @@
 id: no-case-declarations
 language: TypeScript
-message: "Unexpected lexical declaration in case block — wrap in braces to restrict scope"
+message: >-
+  Unexpected lexical declaration in case block — wrap in braces to restrict
+  scope
 severity: error
 note: |
   Variables declared with let/const in a case clause are accessible to the
@@ -17,5 +19,4 @@ rule:
     - not:
         inside:
           kind: statement_block
-          inside:
-            kind: switch_case
+          stopBy: end

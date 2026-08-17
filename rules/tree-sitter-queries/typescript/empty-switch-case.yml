@@ -8,11 +8,14 @@ defect_class: correctness
 inline_tier: blocking
 language: typescript
 
-message: "Switch case should not be empty"
+message: "Switch case is empty and shares no body with a following label"
 
 description: |
-  Empty switch cases are confusing and likely indicate incomplete
-  code. Add handling or remove the case.
+  A case with no body and no following label handles nothing — likely
+  incomplete code. Add handling or remove the case.
+
+  Grouped labels are not flagged: in `case 1: case 2: doWork();` the first
+  label deliberately shares the second's body.
 
   ✅ FIX: Add case body or remove
 
@@ -27,11 +30,10 @@ description: |
 query: |
   (switch_statement
     body: (switch_body
-      (switch_case
-        consequence: (statement_block) @BLOCK)))
+      (switch_case) @CASE))
 
 metavars:
-  - BLOCK
+  - CASE
 
 post_filter: is_empty_block
 
@@ -42,13 +44,15 @@ tags:
 
 examples:
   bad: |
-    case 1:  // BAD - empty
-    case 2:
+    case 1:
         doWork();
+        break;
+    case 2:  // BAD - empty, nothing follows it
 
   good: |
     case 1:
-        handleOne();  // GOOD
+    case 2:      // GOOD - grouped labels share the body below
+        doWork();
         break;
 
 has_fix: false

@@ -92,6 +92,12 @@ describe("LSP primary reachability", () => {
 		expect(defaultPrimary(".psd1")).toBe("powershell");
 	});
 
+	it("routes Fish and both CMake filename forms to their primary servers (#892, #893)", () => {
+		expect(defaultPrimary(".fish")).toBe("fish");
+		expect(defaultPrimary(".cmake")).toBe("cmake");
+		expect(defaultPrimary("CMakeLists.txt")).toBe("cmake");
+	});
+
 	it("each declared alternate is wired behind its default and is the next pick when predecessors drop out", () => {
 		for (const { id, defaultId, ext } of ALTERNATES) {
 			const chain = primaryCandidates(ext).map((s) => s.id);

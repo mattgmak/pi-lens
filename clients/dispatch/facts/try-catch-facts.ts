@@ -2,6 +2,7 @@ import type { FactProvider } from "../fact-provider-types.js";
 import {
 	extractFactsFromTree,
 	firstChildOfType,
+	type TsNode,
 	walk,
 } from "./tree-sitter-facts.js";
 
@@ -21,6 +22,16 @@ export interface TryCatchSummary {
 	catchReturnsStructuredError: boolean;
 	/** Catch body is a documented intentional local fallback (has explaining comment) */
 	isDocumentedLocalFallback: boolean;
+	/**
+	 * Catch body mutates state (an assignment to an existing binding, e.g.
+	 * `tokenExpiresAt = Date.now() + FALLBACK_TTL`) as its fallback, rather
+	 * than rethrowing/logging/returning. This is a THIRD legitimate way a
+	 * catch clause can address "the exception is handled" — recognized
+	 * separately from `hasRethrow`/`hasLogging`/an explicit `return` because
+	 * none of those match a catch whose whole job is to fall back to a
+	 * degraded-but-working state via assignment (#969).
+	 */
+	catchHasFallbackAssignment: boolean;
 	/** Try body only reads/resolves local values — no async IO or side effects */
 	tryResolvesLocalValues: boolean;
 	/** Pattern: try { existsSync / statSync / readFileSync } catch { return default } */
@@ -30,6 +41,16 @@ export interface TryCatchSummary {
 }
 
 // --- Helpers ---
+
+/** Does `node`'s subtree contain an `assignment_expression` (`x = ...`, `x += ...`, …)? */
+function hasAssignmentExpression(node: TsNode | undefined): boolean {
+	if (!node) return false;
+	let found = false;
+	walk(node, (n) => {
+		if (n.type === "assignment_expression") found = true;
+	});
+	return found;
+}
 
 function isOnlyWhitespaceOrComments(text: string): boolean {
 	let stripped = text.replace(/\/\*[\s\S]*?\*\//g, "");
@@ -131,6 +152,7 @@ export const tryCatchFactProvider: FactProvider = {
 						STRUCTURED_ERROR_PATTERN.test(bodyText);
 					const isDocumentedLocalFallback =
 						EXPLAINING_COMMENT_PATTERN.test(bodyText);
+					const catchHasFallbackAssignment = hasAssignmentExpression(catchBody);
 
 					const catchLogsOnly =
 						hasLogging &&
@@ -159,6 +181,7 @@ export const tryCatchFactProvider: FactProvider = {
 						catchReturnsDefault,
 						catchReturnsStructuredError,
 						isDocumentedLocalFallback,
+						catchHasFallbackAssignment,
 						tryResolvesLocalValues,
 						isFilesystemExistenceProbe,
 						boundaryCategory,

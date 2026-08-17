@@ -1,18 +1,23 @@
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
+import { getMaxLogSizeMB } from "./log-cleanup.js";
 
 const LATENCY_LOG_DIR = getGlobalPiLensDir();
 const LATENCY_LOG_FILE = path.join(LATENCY_LOG_DIR, "latency.log");
 
-const writer = createNdjsonLogger({ filePath: LATENCY_LOG_FILE });
+const writer = createNdjsonLogger({
+	filePath: LATENCY_LOG_FILE,
+	maxBytes: getMaxLogSizeMB() * 1024 * 1024,
+});
 
 export interface LatencyEntry {
 	type: "runner" | "tool_result" | "phase";
 	/** ISO timestamp when this entry was written (= finish time for runners) */
 	ts?: string;
+	/** Process that wrote the entry; used to isolate current-session telemetry. */
+	pid?: number;
 	/** ISO timestamp when the runner/phase started — diff with ts = durationMs */
 	startedAt?: string;
 	toolName?: string;
@@ -37,11 +42,85 @@ export interface LatencyEntry {
 	metadata?: Record<string, unknown>;
 }
 
+/**
+ * Most recent non-`loop_block` phase seen by `logLatency`, for cheap block
+ * attribution (#1122 / #1123 item 1): the event-loop-block probe fires at
+ * turn_end and cannot see *what* stalled the loop, so it stamps the last phase
+ * that ran as a starting point for root-causing a genuine block. Tracked before
+ * the test-mode guard so it is deterministic and unit-testable.
+ */
+let lastPhase: { phase: string; ts: string } | undefined;
+
+/**
+ * Phases excluded from `lastPhase` attribution alongside `loop_block`.
+ * #1412 L3: `lsp_typescript_project_identity` is the classic-TS first-open
+ * project-identity probe (tsserver-sync.ts) — a detached, best-effort
+ * telemetry sample fired on every first didOpen, not genuine work. Letting it
+ * win `lastPhase` would overwrite the real stall attribution for a
+ * loop_block that happens to land right after a first open.
+ * #1432 review: `advisory_provenance_decision`,
+ * `authoritative_content_attachment_decision`, and
+ * `agent_end_deferred_mutation_drain` are the same shape — zero-duration
+ * decision telemetry, not genuine work — so they get the same exclusion.
+ * `agent_end_deferred_mutation_requeue` (S2d gap 4's per-requeue record) and
+ * `session_end_bus_rollup` (S2d gap 5's session-end rollup) are new
+ * zero-duration siblings of the same shape, added alongside them.
+ *
+ * `lsp_aux_wait_outcome` (#1458) is DIFFERENT from every entry above: its
+ * `durationMs` is a REAL bounded wait (the post-primary auxiliary grace, up
+ * to a few seconds), not zero-duration decision telemetry. It is still
+ * excluded because it is a WAIT-OUTCOME RECORD written after the aux wait
+ * already completed, not the stall itself — that wait ran inside the
+ * `lsp_touch_file`/diagnostics phase surrounding it, so letting this summary
+ * row win `lastPhase` would misattribute a `loop_block` to the record instead
+ * of to whatever phase is actually stalled when the block fires.
+ * #1453: `tool_set_mutation` records an active-tool-set rewrite (zero-duration
+ * bookkeeping, and it fires during session_start where a real stall must stay
+ * attributed to the work around it), so it is excluded for the same reason.
+ * #1467: `availability_decision` records a tool-probe verdict. Its `durationMs`
+ * is the child's own probe time (often zero for a fast path or a cached
+ * decision) and the record is bookkeeping ABOUT a probe, not host work — a
+ * loop_block landing next to one must stay attributed to whatever really
+ * stalled the loop, which is frequently the very thing that expired the probe.
+ *
+ * #1461 slice 1: `finding_dead_path_drop` is the same shape — the record a
+ * delivery seam writes when it drops findings whose cited path no longer
+ * exists.
+ */
+const LAST_PHASE_EXCLUDED = new Set([
+	"loop_block",
+	"lsp_typescript_project_identity",
+	"advisory_provenance_decision",
+	"authoritative_content_attachment_decision",
+	"agent_end_deferred_mutation_drain",
+	"agent_end_deferred_mutation_requeue",
+	"session_end_bus_rollup",
+	"lsp_aux_wait_outcome",
+	"tool_set_mutation",
+	"availability_decision",
+	"finding_dead_path_drop",
+]);
+
+/**
+ * The last non-`loop_block` phase logged, or undefined if none yet. Carries its
+ * own `ts` so a consumer can gauge staleness: it is intentionally NOT cleared at
+ * turn/window boundaries, so on a turn that logged no phase of its own it may
+ * point at a prior turn's phase — compare `ts` against the block time before
+ * trusting it as the cause (it is a breadcrumb, not proof).
+ */
+export function getLastLoggedPhase(): { phase: string; ts: string } | undefined {
+	return lastPhase;
+}
+
 export function logLatency(entry: LatencyEntry): void {
+	const ts = new Date().toISOString();
+	if (entry.type === "phase" && entry.phase && !LAST_PHASE_EXCLUDED.has(entry.phase)) {
+		lastPhase = { phase: entry.phase, ts };
+	}
 	if (isTestMode()) {
 		return;
 	}
-	writer.log({ ts: new Date().toISOString(), ...entry });
+	writer.log({ ...entry, ts, pid: process.pid });
 }
 
 export function getLatencyLogPath(): string {
@@ -51,19 +130,6 @@ export function getLatencyLogPath(): string {
 /** Resolve once all enqueued latency writes are on disk (tests/shutdown). */
 export function flushLatencyLog(): Promise<void> {
 	return writer.flush();
-}
-
-export function readLatencyLog(limit = 100): LatencyEntry[] {
-	try {
-		const content = fs.readFileSync(LATENCY_LOG_FILE, "utf-8");
-		const lines = content.trim().split(/\r?\n/).filter(Boolean);
-		return lines
-			.slice(-limit)
-			.map((line) => JSON.parse(line))
-			.reverse();
-	} catch {
-		return [];
-	}
 }
 
 export function clearLatencyLog(): void {

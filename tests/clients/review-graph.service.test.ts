@@ -1,9 +1,12 @@
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FactStore } from "../../clients/dispatch/fact-store.js";
 import { getProjectDataDir } from "../../clients/file-utils.js";
+import { _resetUntrackedIgnoredCacheForTests } from "../../clients/git-tracked-ignore.js";
+import { logLatency } from "../../clients/latency-logger.js";
 import { normalizeMapKey } from "../../clients/path-utils.js";
 import {
 	buildOrUpdateGraph,
@@ -15,10 +18,20 @@ import {
 	clearReviewGraphWorkspaceCache,
 	flushReviewGraphPersistsForTests,
 	getCachedReviewGraph,
+	getGraphSourceFiles,
 	getLastGraphBuildInfo,
+	_setReviewGraphEntryCounterForTests,
 	isReviewGraphMigrationNeeded,
+	REVIEW_GRAPH_VERSION,
 } from "../../clients/review-graph/builder.js";
+import { clearModuleGraphCache } from "../../clients/review-graph/workspace-modules.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
+
+vi.mock("../../clients/latency-logger.js", async (importOriginal) => {
+	const actual =
+		await importOriginal<typeof import("../../clients/latency-logger.js")>();
+	return { ...actual, logLatency: vi.fn() };
+});
 
 describe("review graph service", () => {
 	it("builds a TS graph and surfaces importers/callers without duplicate edges", async () => {
@@ -74,6 +87,56 @@ describe("review graph service", () => {
 		}
 	});
 
+	it("extracts production call edges for every JavaScript-family extension", async () => {
+		const env = setupTestEnvironment("pi-lens-review-graph-javascript-");
+		try {
+			const calleePath = createTempFile(
+				env.tmpDir,
+				"src/callee.js",
+				"export function helper() { return 1; }\n",
+			);
+			const callers = [
+				["caller.js", "callerJs"],
+				["caller.jsx", "callerJsx"],
+				["caller.mjs", "callerMjs"],
+				["caller.cjs", "callerCjs"],
+			] as const;
+			const callerPaths = callers.map(([file, name]) =>
+				createTempFile(
+					env.tmpDir,
+					`src/${file}`,
+					`import { helper } from "./callee.js";\nexport function ${name}() { return helper(); }\n`,
+				),
+			);
+
+			const graph = await buildOrUpdateGraph(env.tmpDir, [], new FactStore());
+			const helperNode = [...graph.nodes.values()].find(
+				(node) => node.symbolName === "helper" && node.filePath === normalizeMapKey(calleePath),
+			);
+			expect(helperNode).toBeDefined();
+			for (const [index, [, name]] of callers.entries()) {
+				const callerPath = normalizeMapKey(callerPaths[index]);
+				const callerNode = [...graph.nodes.values()].find(
+					(node) => node.symbolName === name && node.filePath === callerPath,
+				);
+				expect(callerNode, `${name} was not extracted`).toBeDefined();
+				expect(
+					graph.edges.some(
+						(edge) =>
+							edge.kind === "calls" &&
+							edge.from === callerNode?.id &&
+							edge.to === helperNode?.id,
+					),
+				).toBe(true);
+				const fileNode = graph.nodes.get(`file:${callerPath}`);
+				expect(fileNode?.metadata?.extractionCoverage).toMatchObject({ calls: "complete" });
+			}
+		} finally {
+			clearReviewGraphWorkspaceCache();
+			env.cleanup();
+		}
+	});
+
 	it("excludes test files from the graph (#260)", async () => {
 		const env = setupTestEnvironment("pi-lens-review-graph-notests-");
 		try {
@@ -94,9 +157,7 @@ describe("review graph service", () => {
 			// The *.test.ts file is not graph-relevant: no node, no edges.
 			expect(graph.fileNodes.has(normalizeMapKey(testPath))).toBe(false);
 			expect(
-				graph.edges.some(
-					(e) => e.from === `file:${normalizeMapKey(testPath)}`,
-				),
+				graph.edges.some((e) => e.from === `file:${normalizeMapKey(testPath)}`),
 			).toBe(false);
 
 			// Incremental guard: passing the test file as a changed file must not
@@ -108,6 +169,26 @@ describe("review graph service", () => {
 			);
 			expect(g2.fileNodes.has(normalizeMapKey(testPath))).toBe(false);
 		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("getGraphSourceFiles matches the graph's canonical file set", async () => {
+		const env = setupTestEnvironment("pi-lens-review-graph-source-set-");
+		const previousMaxBytes = process.env.PI_LENS_REVIEW_GRAPH_MAX_FILE_BYTES;
+		try {
+			const sourcePath = createTempFile(env.tmpDir, "src/source.ts", "x");
+			const testPath = createTempFile(env.tmpDir, "src/source.test.ts", "x");
+			const oversizedPath = createTempFile(env.tmpDir, "src/oversized.ts", "this file is deliberately oversized\n");
+			process.env.PI_LENS_REVIEW_GRAPH_MAX_FILE_BYTES = "2";
+
+			const result = await getGraphSourceFiles(env.tmpDir);
+			expect(result.files).toContain(normalizeMapKey(sourcePath));
+			expect(result.files).not.toContain(normalizeMapKey(testPath));
+			expect(result.files).not.toContain(normalizeMapKey(oversizedPath));
+		} finally {
+			if (previousMaxBytes === undefined) delete process.env.PI_LENS_REVIEW_GRAPH_MAX_FILE_BYTES;
+			else process.env.PI_LENS_REVIEW_GRAPH_MAX_FILE_BYTES = previousMaxBytes;
 			env.cleanup();
 		}
 	});
@@ -188,6 +269,11 @@ describe("review graph service", () => {
 		// like the v2→v3 (#260) bump was, not partially reused.
 		const env = setupTestEnvironment("pi-lens-review-graph-v3-migrate-");
 		try {
+			// Deliberately pinned to "v3", below REVIEW_GRAPH_VERSION, to exercise
+			// the legacy-migration rejection path itself (the #1082/#1106
+			// vacuous-fixture class: a future bump to "v3" would silently
+			// un-exercise this).
+			expect(REVIEW_GRAPH_VERSION).not.toBe("v3");
 			const cacheDir = path.join(getProjectDataDir(env.tmpDir), "cache");
 			fs.mkdirSync(cacheDir, { recursive: true });
 			fs.writeFileSync(
@@ -222,7 +308,7 @@ describe("review graph service", () => {
 			);
 			expect(getCachedReviewGraph(env.tmpDir)).toBeUndefined();
 
-			// A real build produces a fresh v4 graph with the new ID shape, not the
+			// A real build produces a fresh v8 graph with the new ID shape, not the
 			// old one, and is no longer flagged as needing migration.
 			createTempFile(
 				env.tmpDir,
@@ -230,11 +316,73 @@ describe("review graph service", () => {
 				"export function alpha() {\n  return 1;\n}\n",
 			);
 			const graph = await buildOrUpdateGraph(env.tmpDir, [], new FactStore());
-			expect(graph.version).toBe("v4");
+			expect(graph.version).toBe(REVIEW_GRAPH_VERSION);
 			const alphaId = [...graph.nodes.keys()].find((id) =>
 				id.includes(":alpha:"),
 			);
 			expect(alphaId).toBeDefined();
+			flushReviewGraphPersistsForTests();
+			for (let i = 0; i < 20 && isReviewGraphMigrationNeeded(env.tmpDir); i++) {
+				await new Promise((r) => setTimeout(r, 25));
+			}
+			expect(isReviewGraphMigrationNeeded(env.tmpDir)).toBe(false);
+		} finally {
+			clearReviewGraphWorkspaceCache();
+			env.cleanup();
+		}
+	});
+
+	it("refs #694: a v4 snapshot (pre-twin-preference, compiled-artifact edges) is detected as stale and safely rebuilt", async () => {
+		// #694's v5 bump: import resolution now prefers a .ts/.tsx source twin
+		// over a compiled .js sibling, and node creation is gated against
+		// untracked-AND-ignored files. A real v4 snapshot from a compile-in-place
+		// project has edges materialized on the compiled artifact node
+		// throughout — merging that with newly-built v5 edges would leave the
+		// graph in mixed, partially-corrected state, so it must be rejected
+		// exactly like the earlier version bumps.
+		const env = setupTestEnvironment("pi-lens-review-graph-v4-migrate-");
+		try {
+			// Deliberately pinned to "v4", below REVIEW_GRAPH_VERSION, to exercise
+			// the legacy-migration rejection path itself (the #1082/#1106
+			// vacuous-fixture class: a future bump to "v4" would silently
+			// un-exercise this).
+			expect(REVIEW_GRAPH_VERSION).not.toBe("v4");
+			const cacheDir = path.join(getProjectDataDir(env.tmpDir), "cache");
+			fs.mkdirSync(cacheDir, { recursive: true });
+			fs.writeFileSync(
+				path.join(cacheDir, "review-graph.json"),
+				JSON.stringify({
+					version: "v4",
+					builtAt: "x",
+					signature: "s",
+					nodes: [
+						[
+							"file:src/types.js",
+							{
+								id: "file:src/types.js",
+								kind: "file",
+								language: "jsts",
+								filePath: "src/types.js",
+							},
+						],
+					],
+					edges: [],
+				}),
+			);
+			expect(isReviewGraphMigrationNeeded(env.tmpDir)).toBe(true);
+
+			const { getCachedReviewGraph } = await import(
+				"../../clients/review-graph/builder.js"
+			);
+			expect(getCachedReviewGraph(env.tmpDir)).toBeUndefined();
+
+			createTempFile(
+				env.tmpDir,
+				"src/types.ts",
+				"export interface Foo {\n  a: number;\n}\n",
+			);
+			const graph = await buildOrUpdateGraph(env.tmpDir, [], new FactStore());
+			expect(graph.version).toBe(REVIEW_GRAPH_VERSION);
 			flushReviewGraphPersistsForTests();
 			for (let i = 0; i < 20 && isReviewGraphMigrationNeeded(env.tmpDir); i++) {
 				await new Promise((r) => setTimeout(r, 25));
@@ -283,11 +431,7 @@ describe("review graph service", () => {
 			);
 
 			const facts = new FactStore();
-			const graph = await buildOrUpdateGraph(
-				env.tmpDir,
-				[aPath],
-				facts,
-			);
+			const graph = await buildOrUpdateGraph(env.tmpDir, [aPath], facts);
 
 			const helperCallEdge = graph.edges.find(
 				(e) =>
@@ -420,16 +564,18 @@ describe("review graph service", () => {
 			);
 
 			const facts = new FactStore();
-			await buildOrUpdateGraph(env.tmpDir, [aPath], facts);
+			const initialGraph = await buildOrUpdateGraph(env.tmpDir, [aPath], facts);
 			clearGraphCache();
 			createTempFile(
 				env.tmpDir,
 				"src/a.ts",
 				"export function alpha() { return 222; }\n",
 			);
+			await new Promise((resolve) => setTimeout(resolve, 5));
 
 			const graph = await buildOrUpdateGraph(env.tmpDir, [aPath], facts);
 			expect(getLastGraphBuildInfo()).toMatchObject({ mode: "incremental" });
+			expect(graph.builtAt).not.toBe(initialGraph.builtAt);
 			const impact = computeImpactCascade(graph, aPath);
 			expect(impact.directImporters).toContain(normalizeMapKey(bPath));
 			expect(impact.directCallers).toContain(normalizeMapKey(bPath));
@@ -472,6 +618,152 @@ describe("review graph service", () => {
 			expect(
 				graph.changedSymbolsByFile.get(normalizeMapKey(changedPath)),
 			).toEqual(["changed"]);
+		} finally {
+			if (previous === undefined)
+				delete process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES;
+			else process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES = previous;
+			env.cleanup();
+		}
+	});
+
+	it("logs a review_graph_size_skip latency phase on truncation (#775 R3: no silent caps)", async () => {
+		const env = setupTestEnvironment("pi-lens-review-graph-cap-log-");
+		const previous = process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES;
+		process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES = "2";
+		(logLatency as ReturnType<typeof vi.fn>).mockClear();
+		try {
+			const changedPath = createTempFile(
+				env.tmpDir,
+				"src/changed.ts",
+				"export function changed() { return 1; }\n",
+			);
+			for (let i = 0; i < 3; i += 1) {
+				createTempFile(
+					env.tmpDir,
+					`src/extra-${i}.ts`,
+					`export function extra${i}() { return ${i}; }\n`,
+				);
+			}
+
+			const facts = new FactStore();
+			await buildOrUpdateGraph(env.tmpDir, [changedPath], facts);
+
+			const calls = (logLatency as ReturnType<typeof vi.fn>).mock.calls;
+			const skipCall = calls.find(
+				(args) => args[0]?.phase === "review_graph_size_skip",
+			);
+			expect(skipCall).toBeDefined();
+			expect(skipCall?.[0]).toMatchObject({
+				type: "phase",
+				phase: "review_graph_size_skip",
+				metadata: expect.objectContaining({
+					maxFileCount: 2,
+				}),
+			});
+			expect(skipCall?.[0]?.metadata?.sourceFileCount).toBeGreaterThan(2);
+			expect(skipCall?.[0]?.metadata?.sourceFileCountLabel).toBe(
+				"more than 2 files",
+			);
+		} finally {
+			if (previous === undefined)
+				delete process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES;
+			else process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES = previous;
+			env.cleanup();
+		}
+	});
+
+	it("stops the size-gate walk at cap+1 visited entries", async () => {
+		const env = setupTestEnvironment("pi-lens-review-graph-cap-bound-");
+		const previous = process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES;
+		process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES = "3";
+		let visited = 0;
+		_setReviewGraphEntryCounterForTests(() => {
+			visited += 1;
+		});
+		try {
+			for (let i = 0; i < 12; i += 1) {
+				createTempFile(
+					env.tmpDir,
+					`source-${i}.ts`,
+					`export const source${i} = ${i};\n`,
+				);
+			}
+			await buildOrUpdateGraph(env.tmpDir, [], new FactStore());
+			expect(getLastGraphBuildInfo()).toMatchObject({
+				mode: "skipped",
+				skipReason: "too_many_files",
+				maxFileCount: 3,
+			});
+			expect(visited).toBeLessThanOrEqual(4);
+		} finally {
+			_setReviewGraphEntryCounterForTests();
+			if (previous === undefined)
+				delete process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES;
+			else process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES = previous;
+			env.cleanup();
+		}
+	});
+
+	it("keeps the complete under-cap walk and does not report a near miss", async () => {
+		const env = setupTestEnvironment("pi-lens-review-graph-cap-under-");
+		const previous = process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES;
+		process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES = "3";
+		let visited = 0;
+		_setReviewGraphEntryCounterForTests(() => {
+			visited += 1;
+		});
+		(logLatency as ReturnType<typeof vi.fn>).mockClear();
+		try {
+			for (let i = 0; i < 2; i += 1) {
+				createTempFile(
+					env.tmpDir,
+					`source-${i}.ts`,
+					`export const source${i} = ${i};\n`,
+				);
+			}
+			const graph = await buildOrUpdateGraph(env.tmpDir, [], new FactStore());
+			expect(getLastGraphBuildInfo()?.skipReason).not.toBe("too_many_files");
+			expect(graph.fileNodes.size).toBe(2);
+			expect(visited).toBe(2);
+			expect(
+				(logLatency as ReturnType<typeof vi.fn>).mock.calls.some(
+					(args) => args[0]?.phase === "review_graph_size_near_miss",
+				),
+			).toBe(false);
+		} finally {
+			_setReviewGraphEntryCounterForTests();
+			if (previous === undefined)
+				delete process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES;
+			else process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES = previous;
+			env.cleanup();
+		}
+	});
+
+	it("logs a distinct near-miss event within 5% of the cap", async () => {
+		const env = setupTestEnvironment("pi-lens-review-graph-near-miss-");
+		const previous = process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES;
+		process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES = "20";
+		(logLatency as ReturnType<typeof vi.fn>).mockClear();
+		try {
+			for (let i = 0; i < 21; i += 1) {
+				createTempFile(
+					env.tmpDir,
+					`source-${i}.ts`,
+					`export const source${i} = ${i};\n`,
+				);
+			}
+			await buildOrUpdateGraph(env.tmpDir, [], new FactStore());
+			const nearMissCall = (logLatency as ReturnType<typeof vi.fn>).mock.calls.find(
+				(args) => args[0]?.phase === "review_graph_size_near_miss",
+			);
+			expect(nearMissCall?.[0]).toMatchObject({
+				phase: "review_graph_size_near_miss",
+				metadata: expect.objectContaining({
+					maxFileCount: 20,
+					sourceFileCount: 21,
+					sourceFileCountLabel: "more than 20 files",
+				}),
+			});
 		} finally {
 			if (previous === undefined)
 				delete process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES;
@@ -630,6 +922,227 @@ describe("review graph service", () => {
 			// who-imports-this works at file granularity through the resolved edge.
 			const impact = computeImpactCascade(graph, bPath);
 			expect(impact.directImporters).toContain(normalizeMapKey(aPath));
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+describe("review graph: ignore-gated node creation (#694)", () => {
+	function initGitRepo(cwd: string): void {
+		execFileSync("git", ["init", "-q"], { cwd });
+		execFileSync("git", ["config", "user.email", "test@example.com"], { cwd });
+		execFileSync("git", ["config", "user.name", "Test"], { cwd });
+	}
+
+	beforeEach(() => {
+		_resetUntrackedIgnoredCacheForTests();
+	});
+	afterEach(() => {
+		_resetUntrackedIgnoredCacheForTests();
+	});
+
+	it("never materializes an untracked-AND-gitignored import target as a file node, but keeps a tracked one matching the same pattern", async () => {
+		const env = setupTestEnvironment("pi-lens-review-graph-ignore-gate-");
+		try {
+			initGitRepo(env.tmpDir);
+			// vendor.js is committed BEFORE the `*.js` ignore pattern exists — the
+			// real-world shape of "vendored source that predates/survives a later
+			// broad ignore rule." Git's own semantic: once tracked, a file is never
+			// "ignored" even when a later pattern matches it.
+			const vendorPath = createTempFile(
+				env.tmpDir,
+				"src/vendor.js",
+				"exports.vendor = 1;\n",
+			);
+			execFileSync("git", ["add", "src/vendor.js"], { cwd: env.tmpDir });
+			execFileSync("git", ["commit", "-q", "-m", "vendor"], {
+				cwd: env.tmpDir,
+			});
+
+			// Broad `*.js` pattern (mirrors pi-lens's own root .gitignore) — matches
+			// BOTH gen.js (untracked build artifact, no .ts twin) and vendor.js.
+			createTempFile(env.tmpDir, ".gitignore", "*.js\n");
+			const genPath = createTempFile(
+				env.tmpDir,
+				"src/gen.js",
+				"exports.gen = 1;\n",
+			);
+			const aPath = createTempFile(
+				env.tmpDir,
+				"src/a.ts",
+				"import './gen.js';\nimport './vendor.js';\n",
+			);
+			// Commit .gitignore and a.ts — deliberately NOT gen.js, so it stays
+			// untracked (and therefore actually ignored by git).
+			execFileSync("git", ["add", ".gitignore", "src/a.ts"], {
+				cwd: env.tmpDir,
+			});
+			execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: env.tmpDir });
+
+			const facts = new FactStore();
+			const graph = await buildOrUpdateGraph(env.tmpDir, [aPath], facts);
+
+			const genId = `file:${normalizeMapKey(genPath)}`;
+			const vendorId = `file:${normalizeMapKey(vendorPath)}`;
+			expect(graph.nodes.has(genId)).toBe(false);
+			expect(graph.nodes.has(vendorId)).toBe(true);
+
+			const aId = `file:${normalizeMapKey(aPath)}`;
+			expect(
+				graph.edges.some(
+					(e) => e.from === aId && e.to === vendorId && e.kind === "imports",
+				),
+			).toBe(true);
+			// The filtered-out ignored target must not leave a dangling edge either.
+			expect(graph.edges.some((e) => e.to === genId)).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("degrades to unfiltered (no git binary reachable in the repo) without throwing", async () => {
+		// Not a git repo at all: collectUntrackedIgnoredIds' spawn fails/returns
+		// non-zero, so the caller must skip the filter entirely rather than
+		// guessing via a matcher that can't see tracked status.
+		const env = setupTestEnvironment("pi-lens-review-graph-ignore-gate-nogit-");
+		try {
+			createTempFile(env.tmpDir, ".gitignore", "*.js\n");
+			const genPath = createTempFile(
+				env.tmpDir,
+				"src/gen.js",
+				"exports.gen = 1;\n",
+			);
+			const aPath = createTempFile(
+				env.tmpDir,
+				"src/a.ts",
+				"import './gen.js';\n",
+			);
+			const facts = new FactStore();
+			const graph = await buildOrUpdateGraph(env.tmpDir, [aPath], facts);
+			// No git identity available ⇒ filter skipped ⇒ the import target is
+			// still admitted (status quo, not a regression from this change).
+			const genId = `file:${normalizeMapKey(genPath)}`;
+			expect(graph.nodes.has(genId)).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+describe("review graph - workspace-package bare specifiers (#775)", () => {
+	afterEach(() => {
+		clearReviewGraphWorkspaceCache();
+		clearModuleGraphCache();
+	});
+
+	it("resolves a bare specifier pointing at a sibling workspace package to a file-level import edge", async () => {
+		const env = setupTestEnvironment("pi-lens-review-graph-workspace-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"package.json",
+				JSON.stringify({ name: "root", workspaces: ["packages/*"] }),
+			);
+			createTempFile(
+				env.tmpDir,
+				"packages/b/package.json",
+				JSON.stringify({ name: "@scope/b", main: "src/index.ts" }),
+			);
+			const bEntry = createTempFile(
+				env.tmpDir,
+				"packages/b/src/index.ts",
+				"export const b = 1;\n",
+			);
+			const aPath = createTempFile(
+				env.tmpDir,
+				"packages/a/src/index.ts",
+				"import { b } from '@scope/b';\nexport function useB() { return b; }\n",
+			);
+
+			clearModuleGraphCache();
+			const graph = await buildOrUpdateGraph(env.tmpDir, [], new FactStore());
+			const aId = `file:${normalizeMapKey(aPath)}`;
+			const bId = `file:${normalizeMapKey(bEntry)}`;
+			expect(graph.nodes.has(bId)).toBe(true);
+			expect(
+				graph.edges.some(
+					(e) => e.from === aId && e.to === bId && e.kind === "imports",
+				),
+			).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("resolves a workspace-package subpath import to a file within the package", async () => {
+		const env = setupTestEnvironment("pi-lens-review-graph-workspace-subpath-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"package.json",
+				JSON.stringify({ name: "root", workspaces: ["packages/*"] }),
+			);
+			createTempFile(
+				env.tmpDir,
+				"packages/b/package.json",
+				JSON.stringify({ name: "@scope/b" }),
+			);
+			const bUtil = createTempFile(
+				env.tmpDir,
+				"packages/b/src/utils.ts",
+				"export const util = 1;\n",
+			);
+			const aPath = createTempFile(
+				env.tmpDir,
+				"packages/a/src/index.ts",
+				"import { util } from '@scope/b/src/utils';\n",
+			);
+
+			clearModuleGraphCache();
+			const graph = await buildOrUpdateGraph(env.tmpDir, [], new FactStore());
+			const aId = `file:${normalizeMapKey(aPath)}`;
+			const bId = `file:${normalizeMapKey(bUtil)}`;
+			expect(
+				graph.edges.some(
+					(e) => e.from === aId && e.to === bId && e.kind === "imports",
+				),
+			).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("a non-workspace bare specifier stays an external node, not a fabricated file edge", async () => {
+		const env = setupTestEnvironment(
+			"pi-lens-review-graph-workspace-external-",
+		);
+		try {
+			createTempFile(
+				env.tmpDir,
+				"package.json",
+				JSON.stringify({ name: "root", workspaces: ["packages/*"] }),
+			);
+			createTempFile(
+				env.tmpDir,
+				"packages/b/package.json",
+				JSON.stringify({ name: "@scope/b" }),
+			);
+			const aPath = createTempFile(
+				env.tmpDir,
+				"packages/a/src/index.ts",
+				"import React from 'react';\n",
+			);
+
+			clearModuleGraphCache();
+			const graph = await buildOrUpdateGraph(env.tmpDir, [], new FactStore());
+			const aId = `file:${normalizeMapKey(aPath)}`;
+			expect(
+				graph.edges.some(
+					(e) =>
+						e.from === aId && e.kind === "imports" && e.to === "external:react",
+				),
+			).toBe(true);
 		} finally {
 			env.cleanup();
 		}

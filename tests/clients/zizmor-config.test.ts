@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { removeTempDirSync } from "./test-utils.js";
 
 // Controllable mock for the `gh auth token` derivation.
 const safeSpawnAsync = vi.fn();
@@ -56,7 +57,7 @@ describe("findLocalZizmorConfig (#272)", () => {
 		root = fs.mkdtempSync(path.join(os.tmpdir(), "zizmor-cfg-"));
 	});
 	afterEach(() => {
-		fs.rmSync(root, { recursive: true, force: true });
+		removeTempDirSync(root);
 	});
 
 	it("finds a root-level zizmor.yml", () => {

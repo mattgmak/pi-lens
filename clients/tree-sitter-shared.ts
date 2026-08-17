@@ -4,25 +4,38 @@
  * web-tree-sitter's WASM runtime is module-level — one per process. TRANSFER_BUFFER
  * and _ts_init are global, so every subsystem MUST share a single TreeSitterClient:
  * separate clients race on init and corrupt the shared WASM heap. This module is
- * that single seam — the dispatch tree-sitter runner, project scanner, module-report,
- * review-graph, and fact providers all obtain their client here, so a file parsed by
- * one is served from the shared tree cache for the others (one parse per write).
+ * that single seam — read expansion, the dispatch tree-sitter runner, project scanner,
+ * module-report, review-graph, and fact providers all obtain their client here, so a
+ * file parsed by one is reused by the others while its content version remains resident.
  *
  * Once the WASM runtime aborts (Emscripten abort()), the heap is corrupted with no
  * in-process recovery. markTreeSitterWasmAborted() poisons the singleton so EVERY
  * consumer skips further tree-sitter work (previously only the runner tracked this,
  * while the other subsystems kept calling the dead runtime).
  */
+import { notifyUserDegradation } from "./user-notify.js";
 import * as path from "node:path";
-import { TreeSitterClient } from "./tree-sitter-client.js";
+import {
+	type ParsedTreeOutcome,
+	TreeSitterClient,
+} from "./tree-sitter-client.js";
+import { logTreeSitter } from "./tree-sitter-logger.js";
 
 let _shared: TreeSitterClient | null = null;
 let _wasmAborted = false;
+let _wasmAbortedAt: string | undefined;
+
+export interface TreeSitterRuntimeStatus {
+	available: boolean;
+	wasmAborted: boolean;
+	recovery: "restart_required" | "not_required";
+	abortedAt?: string;
+}
 
 /** The process-wide TreeSitterClient, or null once the WASM runtime has aborted. */
 export function getSharedTreeSitterClient(): TreeSitterClient | null {
 	if (_wasmAborted) return null;
-	_shared ??= new TreeSitterClient();
+	_shared ??= new TreeSitterClient(false, markTreeSitterWasmAborted);
 	return _shared;
 }
 
@@ -30,26 +43,61 @@ export function isTreeSitterWasmAborted(): boolean {
 	return _wasmAborted;
 }
 
+/** Machine-readable process-wide runtime health for status/reporting surfaces. */
+export function getTreeSitterRuntimeStatus(): TreeSitterRuntimeStatus {
+	return {
+		available: !_wasmAborted,
+		wasmAborted: _wasmAborted,
+		recovery: _wasmAborted ? "restart_required" : "not_required",
+		...(_wasmAbortedAt ? { abortedAt: _wasmAbortedAt } : {}),
+	};
+}
+
 /**
  * Poison the singleton after an unrecoverable Emscripten abort() — the module-level
  * WASM heap is corrupted, so no client can be used again this process.
  */
 export function markTreeSitterWasmAborted(): void {
+	if (_wasmAborted) return;
 	_wasmAborted = true;
+	_wasmAbortedAt = new Date().toISOString();
 	_shared = null;
+	// HUMAN-audience: structural analysis is dead for the rest of the process
+	// and only a restart recovers it. Reaches the user through the HOST's
+	// render path (#1333); the machine-readable record is the logTreeSitter
+	// `runtime_abort` entry below.
+	notifyUserDegradation(
+		"pi-lens: tree-sitter WASM runtime aborted; structural analysis is disabled " +
+			"for this process. Restart the pi-lens extension/MCP server to recover.",
+		"error",
+	);
+	logTreeSitter({
+		phase: "runtime_abort",
+		filePath: process.cwd(),
+		status: "degraded",
+		reason: "wasm_aborted_restart_required",
+		metadata: { abortedAt: _wasmAbortedAt },
+	});
 }
 
 /** Test-only: reset the singleton + abort flag. */
 export function _resetSharedTreeSitterClientForTests(): void {
 	_shared = null;
 	_wasmAborted = false;
+	_wasmAbortedAt = undefined;
 }
 
-// Grammar selection by extension. `.tsx` → the tsx grammar (parses JSX); `.jsx` →
-// the javascript grammar. NOTE: the project scanner keeps its OWN ext→lang map
-// because its query lookup is keyed by language id (it maps `.tsx`→typescript to
-// reuse typescript queries) — do not fold that one in without re-keying its queries.
-const EXT_TO_LANG: Record<string, string> = {
+// Grammar selection by extension — the single ext→grammar-id authority. `.tsx` →
+// the tsx grammar (parses JSX); `.jsx` → the javascript grammar. The project
+// scanner (project-diagnostics/scanner.ts) DERIVES its map from this one and
+// module-report (module-report.ts `tsLangForFile`, #887) resolves its
+// extension-split kinds (jsts/cxx) through `resolveTreeSitterLanguage` below,
+// so neither can drift: post-#877 both key `.tsx`→tsx (the old note here said the
+// scanner mapped `.tsx`→typescript to reuse typescript queries — that stopped
+// being true when #877 moved typescript-rule inheritance into
+// `queriesForLanguage`). The scanner layers only java/kotlin on top, whose
+// grammars + rule dirs exist but are not wired into a per-edit runner `appliesTo`.
+export const EXT_TO_LANG: Record<string, string> = {
 	".ts": "typescript",
 	".mts": "typescript",
 	".cts": "typescript",
@@ -87,7 +135,9 @@ const EXT_TO_LANG: Record<string, string> = {
 };
 
 /** Resolve a tree-sitter grammar/language id from a file path's extension. */
-export function resolveTreeSitterLanguage(filePath: string): string | undefined {
+export function resolveTreeSitterLanguage(
+	filePath: string,
+): string | undefined {
 	return EXT_TO_LANG[path.extname(filePath).toLowerCase()];
 }
 
@@ -97,27 +147,28 @@ export function resolveTreeSitterLanguage(filePath: string): string | undefined 
 // biome-ignore lint/suspicious/noExplicitAny: web-tree-sitter node (see tree-sitter-client.ts)
 export type TsNode = any;
 
-/**
- * Parse `content` for `filePath` via the shared client and return the root node,
- * or null when the grammar is unavailable / parse fails / wasm aborted. init()
- * lazily loads the grammar (memoized) and must run before parseFile.
- */
-export async function parseTreeSitterRoot(
+export async function withTreeSitterRoot<T>(
 	filePath: string,
 	content: string,
-): Promise<TsNode | null> {
+	consume: (root: TsNode) => T,
+): Promise<ParsedTreeOutcome<T>> {
 	const languageId = resolveTreeSitterLanguage(filePath);
 	const client = getSharedTreeSitterClient();
-	if (!languageId || !client || !(await client.init())) return null;
-	const tree = await client.parseFile(filePath, languageId, content);
-	return tree ? tree.rootNode : null;
+	if (!languageId || !client || !(await client.init()))
+		return { parsed: false };
+	return client.withParsedTree(filePath, languageId, content, (tree) =>
+		consume(tree.rootNode as TsNode),
+	);
 }
 
 export function childrenOfType(node: TsNode, type: string): TsNode[] {
 	return (node.children ?? []).filter((c: TsNode) => c && c.type === type);
 }
 
-export function firstChildOfType(node: TsNode, type: string): TsNode | undefined {
+export function firstChildOfType(
+	node: TsNode,
+	type: string,
+): TsNode | undefined {
 	return (node.children ?? []).find((c: TsNode) => c && c.type === type);
 }
 

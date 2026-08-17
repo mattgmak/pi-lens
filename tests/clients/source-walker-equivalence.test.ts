@@ -37,6 +37,7 @@ import {
 	countSourceFilesWithinLimit,
 	countSourceFilesWithinLimitAsync,
 } from "../../clients/startup-scan.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 let tmpDir: string;
 
@@ -45,8 +46,7 @@ let tmpDir: string;
  * every point of known caller divergence:
  *
  *  - `a.ts`, `b.py`        — plain source, kept by every walker.
- *  - `c.vue`                — only in source-filter's extension set.
- *  - `d.java`                — only in warmup's extension set.
+ *  - `c.vue`, `d.java`      — supported-kind sources kept by both walkers.
  *  - `vendor/e.ts`          — excluded by `.gitignore` for every walker.
  *  - `node_modules/f.ts`    — excluded by the shared default exclude list for every walker.
  *  - `generated/g.ts`      — a `GENERATED_DIR_NAMES` directory. Only
@@ -104,16 +104,15 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-	fs.rmSync(tmpDir, { recursive: true, force: true });
+	removeTempDirSync(tmpDir);
 	_resetGeneratedArtifactCaches();
 });
 
 describe("collectSourceFiles / collectSourceFilesAsync — preserved semantics", () => {
 	// Build-artifact shadowing + generated-dir skip + generated-header content
-	// sniffing are all still applied. .java and warmup-only extensions are
-	// still excluded (default extension set is ALL_SCANNABLE_EXTENSIONS, which
-	// has no .java).
-	const expected = ["a.ts", "b.py", "c.vue", "shadow.ts"];
+	// sniffing are all still applied. The default extension set now derives every
+	// supported kind, so Java is kept alongside the previously-scanned files.
+	const expected = ["a.ts", "b.py", "c.vue", "d.java", "shadow.ts"];
 
 	it("sync collector keeps exactly the expected set", () => {
 		const files = collectSourceFiles(tmpDir);
@@ -128,12 +127,13 @@ describe("collectSourceFiles / collectSourceFilesAsync — preserved semantics",
 
 describe("collectSourceFilesForWarmup — preserved semantics", () => {
 	// No build-artifact shadowing, no generated-content sniffing, and
-	// `generated/` is walked into (unlike source-filter). .java is in the
-	// warmup extension set; .vue is not.
+	// `generated/` is walked into (unlike source-filter). Its extension set now
+	// derives every supported kind, including both Java and Vue.
 	const expected = [
 		"a.ts",
 		"b.py",
 		"banner.js",
+		"c.vue",
 		"d.java",
 		"generated/g.ts",
 		"shadow.js",

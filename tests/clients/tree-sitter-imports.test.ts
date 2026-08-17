@@ -18,7 +18,8 @@ import {
 	grammarBlockReason,
 	LANGUAGE_TO_GRAMMAR,
 } from "../../clients/grammar-source.js";
-import { TreeSitterClient } from "../../clients/tree-sitter-client.js";
+import { getSharedTreeSitterClient } from "../../clients/tree-sitter-shared.js";
+import type { TreeSitterClient } from "../../clients/tree-sitter-client.js";
 import { TreeSitterSymbolExtractor } from "../../clients/tree-sitter-symbol-extractor.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
@@ -120,7 +121,7 @@ const CASES: Record<string, ImportCase> = {
 
 let client: TreeSitterClient;
 beforeAll(async () => {
-	client = new TreeSitterClient();
+	client = getSharedTreeSitterClient()!;
 	await client.init();
 });
 

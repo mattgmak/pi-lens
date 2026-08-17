@@ -2,8 +2,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { TreeSitterClient } from "../../clients/tree-sitter-client.js";
+import { getSharedTreeSitterClient } from "../../clients/tree-sitter-shared.js";
 import { TreeSitterQueryLoader } from "../../clients/tree-sitter-query-loader.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 const tmpDirs: string[] = [];
 
@@ -27,13 +28,13 @@ async function getQuery(id: string) {
 
 afterAll(() => {
 	for (const dir of tmpDirs) {
-		fs.rmSync(dir, { recursive: true, force: true });
+		removeTempDirSync(dir);
 	}
 });
 
 describe("tree-sitter concurrency rules", () => {
 	it("matches detached async call in TypeScript", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("ts-detached-async-call");
 		const filePath = writeTempFile(
 			"ts",
@@ -44,7 +45,7 @@ describe("tree-sitter concurrency rules", () => {
 	});
 
 	it("matches threaded global state write in Python", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("python-thread-global-write");
 		const filePath = writeTempFile(
 			"py",

@@ -11,6 +11,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { removeTempDirSync } from "./test-utils.js";
 
 let dir: string;
 
@@ -25,7 +26,8 @@ describe("instance-registry", () => {
 	});
 
 	afterEach(() => {
-		fs.rmSync(dir, { recursive: true, force: true });
+		vi.unstubAllEnvs();
+		removeTempDirSync(dir);
 	});
 
 	function registryFilePath(): string {
@@ -42,6 +44,86 @@ describe("instance-registry", () => {
 		expect(parsed.instances[0].pid).toBe(process.pid);
 		expect(parsed.instances[0].projectRoot).toContain("some/project");
 		expect(parsed.instances[0].lspChildren).toEqual([]);
+	});
+
+	it("persists subagent identity when registering a subagent session", async () => {
+		vi.stubEnv("PI_SUBAGENT_CHILD", "1");
+		vi.stubEnv("PI_SUBAGENT_CHILD_AGENT", "reviewer");
+		vi.stubEnv("PI_SUBAGENT_PARENT_PID", "12345");
+		vi.stubEnv("PI_SUBAGENT_RUN_ID", "run-822");
+		const { registerInstance } = await import("../../clients/instance-registry.js");
+
+		await registerInstance("/some/project");
+
+		const parsed = JSON.parse(fs.readFileSync(registryFilePath(), "utf-8"));
+		expect(parsed.instances[0].subagent).toEqual({
+			marker: "pi-subagents",
+			agentType: "reviewer",
+			parentPid: 12345,
+			runId: "run-822",
+		});
+	});
+
+	it("omits the subagent field entirely for a primary session", async () => {
+		vi.stubEnv("PI_SUBAGENT_CHILD", "");
+		vi.stubEnv("PI_SUBAGENT_CHILD_AGENT", "");
+		vi.stubEnv("PI_SUBAGENT_PARENT_PID", "");
+		vi.stubEnv("PI_SUBAGENT_RUN_ID", "");
+		const { registerInstance } = await import("../../clients/instance-registry.js");
+
+		await registerInstance("/some/project");
+
+		const parsed = JSON.parse(fs.readFileSync(registryFilePath(), "utf-8"));
+		expect(parsed.instances[0]).not.toHaveProperty("subagent");
+	});
+
+	it("round-trips mixed old and new registry entries through read, register, and reap", async () => {
+		const now = new Date().toISOString();
+		const oldPid = process.pid + 100_001;
+		const newPid = process.pid + 100_002;
+		const oldEntry = {
+			pid: oldPid,
+			startedAt: now,
+			projectRoot: "/old",
+			lspChildren: [],
+			lspChildCount: 0,
+			rssBytes: 1,
+			heartbeatAt: now,
+		};
+		const newEntry = {
+			...oldEntry,
+			pid: newPid,
+			projectRoot: "/new",
+			subagent: {
+				marker: "avtc-pi-subagent",
+				agentType: "reviewer",
+				parentPid: 12345,
+			},
+		};
+		fs.writeFileSync(
+			registryFilePath(),
+			JSON.stringify({ instances: [oldEntry, newEntry] }),
+			"utf-8",
+		);
+		const { readInstanceRegistry, registerInstance } = await import(
+			"../../clients/instance-registry.js"
+		);
+		const { decideOrphanReaping } = await import(
+			"../../clients/instance-reaper.js"
+		);
+
+		const before = await readInstanceRegistry();
+		expect(before).toHaveLength(2);
+		expect(() => decideOrphanReaping(before, () => true)).not.toThrow();
+		await expect(registerInstance("/current")).resolves.not.toThrow();
+
+		const after = await readInstanceRegistry();
+		expect(after).toHaveLength(3);
+		expect(after.find((entry) => entry.pid === oldEntry.pid)?.subagent).toBeUndefined();
+		expect(after.find((entry) => entry.pid === newEntry.pid)?.subagent).toEqual(
+			newEntry.subagent,
+		);
+		expect(() => decideOrphanReaping(after, () => true)).not.toThrow();
 	});
 
 	it("registerInstance overwrites (not duplicates) this pid's prior entry", async () => {
@@ -328,6 +410,118 @@ describe("instance-registry", () => {
 			expect(footprint.totalLspChildCount).toBe(1);
 			expect(footprint.totalCpuPercent).toBe(12);
 			expect(footprint.totalRssBytes).toBeGreaterThan(999); // host rss + 999
+		});
+
+		// --- #735: dead-pid registry entries must not report as live instances ---
+
+		it("computeResourceFootprint drops instances whose pid is confirmed dead when isPidAlive is supplied", async () => {
+			const { computeResourceFootprint } = await import(
+				"../../clients/instance-registry.js"
+			);
+			const deadPid = process.pid + 100_003;
+			const registry = [
+				{
+					pid: 1,
+					startedAt: "t",
+					projectRoot: "/alive",
+					rssBytes: 100,
+					cpuPercent: 5,
+					heartbeatAt: "t",
+					lspChildCount: 0,
+					lspChildren: [],
+				},
+				{
+					pid: deadPid, // classified by the injected predicate below
+					startedAt: "t",
+					projectRoot: "/dead",
+					rssBytes: 233 * 1024 * 1024,
+					cpuPercent: 12,
+					heartbeatAt: "t",
+					lspChildCount: 0,
+					lspChildren: [],
+				},
+			];
+			const isPidAlive = (pid: number) => pid !== deadPid;
+
+			const footprint = computeResourceFootprint(registry, isPidAlive);
+
+			expect(footprint.instanceCount).toBe(1);
+			expect(footprint.perInstance.map((i) => i.pid)).toEqual([1]);
+			expect(footprint.totalRssBytes).toBe(100);
+			expect(footprint.totalCpuPercent).toBe(5);
+		});
+
+		it("computeResourceFootprint applies no filtering when isPidAlive is omitted (pure default, unchanged pre-#735 behavior)", async () => {
+			const { computeResourceFootprint } = await import(
+				"../../clients/instance-registry.js"
+			);
+			const registry = [
+				{
+					pid: 99999,
+					startedAt: "t",
+					projectRoot: "/whatever",
+					rssBytes: 50,
+					cpuPercent: 1,
+					heartbeatAt: "t",
+					lspChildCount: 0,
+					lspChildren: [],
+				},
+			];
+
+			const footprint = computeResourceFootprint(registry);
+
+			expect(footprint.instanceCount).toBe(1);
+			expect(footprint.totalRssBytes).toBe(50);
+		});
+
+		it("getResourceFootprint excludes a dead-pid instance and opportunistically prunes it from the registry file", async () => {
+			const { registerInstance, recordLspChild, getResourceFootprint, readInstanceRegistry } =
+				await import("../../clients/instance-registry.js");
+			const deadPid = process.pid + 100_000;
+			await registerInstance("/proj");
+			await recordLspChild({ pid: 7002, serverId: "typescript", command: "tsserver" });
+
+			// Simulate a second, hard-killed instance's stale registry entry by
+			// writing directly to the registry file (bypassing registerInstance,
+			// which always stamps the CURRENT process's own live pid).
+			const raw = JSON.parse(fs.readFileSync(registryFilePath(), "utf-8"));
+			raw.instances.push({
+				pid: deadPid, // classified by the injected predicate below
+				startedAt: "t",
+				projectRoot: "/dead-project",
+				rssBytes: 233 * 1024 * 1024,
+				cpuPercent: 9,
+				heartbeatAt: new Date().toISOString(),
+				lspChildCount: 0,
+				lspChildren: [],
+			});
+			fs.writeFileSync(registryFilePath(), JSON.stringify(raw), "utf-8");
+
+			const isPidAlive = (pid: number) => pid !== deadPid;
+			const footprint = await getResourceFootprint(isPidAlive);
+
+			expect(footprint.instanceCount).toBe(1);
+			expect(footprint.perInstance.map((i) => i.pid)).not.toContain(deadPid);
+
+			// Prune is fire-and-forget — wait a tick for the background write.
+			await new Promise((r) => setTimeout(r, 20));
+			const remaining = await readInstanceRegistry();
+			expect(remaining.map((i) => i.pid)).not.toContain(deadPid);
+			expect(remaining).toHaveLength(1);
+		});
+
+		it("getResourceFootprint leaves the registry untouched when every pid is alive", async () => {
+			const { registerInstance, getResourceFootprint, readInstanceRegistry } = await import(
+				"../../clients/instance-registry.js"
+			);
+			await registerInstance("/proj");
+
+			const footprint = await getResourceFootprint(() => true);
+			expect(footprint.instanceCount).toBe(1);
+
+			await new Promise((r) => setTimeout(r, 20));
+			const remaining = await readInstanceRegistry();
+			expect(remaining).toHaveLength(1);
 		});
 	});
 

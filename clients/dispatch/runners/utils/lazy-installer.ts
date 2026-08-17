@@ -1,4 +1,5 @@
 import { safeSpawnAsync } from "../../../safe-spawn.js";
+import { assertInstallAllowed } from "../../../project-trust.js";
 
 type LazyTool = "golangci-lint" | "rubocop" | "rust-clippy";
 
@@ -14,6 +15,7 @@ function key(cwd: string, tool: LazyTool): string {
  * Installs are attempted once per cwd+tool per session to avoid repeated churn.
  */
 export async function tryLazyInstall(tool: LazyTool, cwd: string): Promise<boolean> {
+	if (!assertInstallAllowed(`runner lazy install: ${tool}`)) return false;
 	const k = key(cwd, tool);
 	if (attempted.has(k)) return false;
 	attempted.add(k);

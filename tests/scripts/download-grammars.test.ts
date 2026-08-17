@@ -24,6 +24,7 @@ import {
 	loadManifest,
 	sidecarPathFor,
 } from "../../scripts/download-grammars.js";
+import { removeTempDirSync } from "../clients/test-utils.js";
 
 const SCRIPT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -36,7 +37,7 @@ const dirs: string[] = [];
 
 afterEach(() => {
 	for (const dir of dirs.splice(0)) {
-		fs.rmSync(dir, { recursive: true, force: true });
+		removeTempDirSync(dir);
 	}
 });
 

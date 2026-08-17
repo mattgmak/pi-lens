@@ -112,6 +112,7 @@ describe("getSubagentIdentity", () => {
 			runId: "run-123",
 			agentName: "code-reviewer",
 			marker: undefined,
+			parentPid: undefined,
 		});
 	});
 
@@ -121,6 +122,7 @@ describe("getSubagentIdentity", () => {
 			runId: "run-456",
 			agentName: undefined,
 			marker: undefined,
+			parentPid: undefined,
 		});
 	});
 
@@ -130,6 +132,7 @@ describe("getSubagentIdentity", () => {
 			runId: undefined,
 			agentName: "explore",
 			marker: undefined,
+			parentPid: undefined,
 		});
 	});
 
@@ -147,6 +150,7 @@ describe("getSubagentIdentity", () => {
 			runId: undefined,
 			agentName: "code-reviewer",
 			marker: "pi-subagents",
+			parentPid: undefined,
 		});
 	});
 
@@ -158,6 +162,7 @@ describe("getSubagentIdentity", () => {
 			runId: undefined,
 			agentName: "reviewer-1",
 			marker: "avtc-pi-subagent",
+			parentPid: 12345,
 		});
 	});
 });

@@ -23,6 +23,10 @@ import { FactStore } from "../../clients/dispatch/fact-store.js";
  * in a sane default for every field the runners under test actually read
  * (`kind: "jsts"`, `fileRole: "source"`, `autofix: false`, `deltaMode: true`,
  * a fresh `FactStore`, `hasTool` resolving `true`, and a no-op `log`).
+ *
+ * Overrides REPLACE the default, never merge with it — overriding `facts`
+ * shared across several `addFile` calls is the one stale-content path, since
+ * `file.content` facts beat disk reads in both runners.
  */
 export type RunnerCtxOverrides = Partial<DispatchContext>;
 

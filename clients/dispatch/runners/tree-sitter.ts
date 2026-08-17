@@ -5,11 +5,10 @@
  * for fast AST-based pattern matching.
  */
 
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { RuleCache } from "../../cache/rule-cache.js";
+import { minimatch } from "../../deps/minimatch.js";
 import { isTestFile } from "../../file-utils.js";
-import { resolvePackagePath } from "../../package-root.js";
 import {
 	buildOrUpdateGraph,
 	computeImpactCascade,
@@ -25,7 +24,10 @@ import {
 import { logTreeSitter } from "../../tree-sitter-logger.js";
 import {
 	isDisabledQueryFilePath,
+	queriesForLanguage,
 	queryLoader,
+	ruleFilesForLanguage,
+	ruleSourceLanguages,
 	type TreeSitterQuery,
 } from "../../tree-sitter-query-loader.js";
 import { classifyDefect } from "../diagnostic-taxonomy.js";
@@ -51,7 +53,7 @@ function runBlastRadiusInBackground(
 	void (async () => {
 		try {
 			const graph = await buildOrUpdateGraph(cwd, [filePath], facts);
-			const impact = computeImpactCascade(graph, filePath);
+			const impact = computeImpactCascade(graph, filePath, cwd);
 			logTreeSitter({
 				phase: "blast_radius",
 				filePath,
@@ -266,6 +268,7 @@ async function extractEntitySnapshot(
 	client: TreeSitterClient,
 	filePath: string,
 	languageId: string,
+	contentOverride?: string,
 ): Promise<Map<string, string>> {
 	const defs = ENTITY_QUERIES[languageId] ?? [];
 	const snapshot = new Map<string, string>();
@@ -287,6 +290,10 @@ async function extractEntitySnapshot(
 			filePath,
 			languageId,
 			{ maxResults: 200 },
+			// Parse the same buffer content the diagnostics phase used (#885).
+			// Without this, unsaved buffers snapshot stale disk content and
+			// thrash the parse-cache entry the rule walk just populated.
+			contentOverride,
 		);
 
 		for (const match of matches) {
@@ -349,6 +356,28 @@ function getTotalLinesChanged(
 /** Threshold: skip entity extraction for changes under 5 lines */
 const ENTITY_EXTRACTION_LINE_THRESHOLD = 5;
 
+/**
+ * `filePath` relative to `root`, forward-slashed, for matching a rule's
+ * `ignore_paths` globs. Falls back to the absolute (slash-normalized) path
+ * when `filePath` isn't under `root` (e.g. an out-of-tree temp file), so a
+ * glob like `scripts/**` simply never matches rather than throwing.
+ */
+function relativeForIgnoreGlob(filePath: string, root: string): string {
+	const rel = path.relative(root, filePath);
+	const normalized = (rel.startsWith("..") ? filePath : rel).split(path.sep).join("/");
+	return normalized;
+}
+
+function matchesIgnorePaths(
+	filePath: string,
+	root: string,
+	patterns: string[] | undefined,
+): boolean {
+	if (!patterns || patterns.length === 0) return false;
+	const rel = relativeForIgnoreGlob(filePath, root);
+	return patterns.some((pattern) => minimatch(rel, pattern, { dot: true }));
+}
+
 const treeSitterRunner: RunnerDefinition = {
 	id: "tree-sitter",
 	appliesTo: ["jsts", "python", "go", "rust", "ruby", "cxx", "csharp", "php", "css"],
@@ -399,29 +428,11 @@ const treeSitterRunner: RunnerDefinition = {
 		let languageQueries: TreeSitterQuery[] = [];
 		const cache = new RuleCache(languageId, ctx.cwd);
 
-		// Get all rule files for this language — project-local AND pi-lens built-ins.
-		// Both sets must be in the hash so the cache is invalidated when either changes.
-		const rulesDir = path.join(
-			ctx.cwd,
-			"rules",
-			"tree-sitter-queries",
-			languageId,
-		);
-		const builtinRulesDir = resolvePackagePath(
-			import.meta.url,
-			"rules",
-			"tree-sitter-queries",
-			languageId,
-		);
-		const ruleFileSet = new Set<string>();
-		for (const dir of [rulesDir, builtinRulesDir]) {
-			if (fs.existsSync(dir)) {
-				for (const f of fs.readdirSync(dir)) {
-					if (f.endsWith(".yml")) ruleFileSet.add(path.join(dir, f));
-				}
-			}
-		}
-		const ruleFiles = [...ruleFileSet];
+		// Fingerprint EVERY rule file the effective rule set for this language is
+		// built from — project-local AND bundled built-ins, across all rule-source
+		// languages (tsx also runs the typescript rules; #878). The loader owns
+		// that composition so this can't drift from `queriesForLanguage`.
+		const ruleFiles = ruleFilesForLanguage(languageId, ctx.cwd);
 
 		// Try cache
 		const cached = cache.get(ruleFiles);
@@ -440,15 +451,24 @@ const treeSitterRunner: RunnerDefinition = {
 				)
 				.filter((q) => !isDisabledQueryFilePath(q.filePath));
 		} else {
-			// Load from disk
-			await queryLoader.loadQueries(ctx.cwd);
+			// A miss means the rule-file fingerprint moved (or no cache yet), so the
+			// loader's in-memory memo may hold the PRE-edit rules — without `force`
+			// it would hand those back and cache.set below would persist stale rules
+			// under the fresh fingerprint, poisoning every future process (#878).
+			await queryLoader.loadQueries(ctx.cwd, { force: true });
 
-			languageQueries = queryLoader.getQueriesForLanguage(languageId);
-			if (languageId === "javascript") {
-				// JavaScript files also match TypeScript rules (shared grammar)
-				const tsQueries = queryLoader.getQueriesForLanguage("typescript");
-				languageQueries = [...languageQueries, ...tsQueries];
-			}
+			// The effective rule set is composed by the loader (tsx also runs the
+			// typescript rules; javascript deliberately does not — see
+			// ruleSourceLanguages in tree-sitter-query-loader.ts).
+			languageQueries = queriesForLanguage(
+				new Map(
+					ruleSourceLanguages(languageId).map((lang) => [
+						lang,
+						queryLoader.getQueriesForLanguage(lang),
+					]),
+				),
+				languageId,
+			);
 
 			// Save to cache
 			cache.set(
@@ -465,7 +485,10 @@ const treeSitterRunner: RunnerDefinition = {
 					post_filter_params: q.post_filter_params,
 					defect_class: q.defect_class,
 					inline_tier: q.inline_tier,
+					skip_test_files: q.skip_test_files,
+					ignore_paths: q.ignore_paths,
 					has_fix: q.has_fix,
+					fix_action: q.fix_action,
 					filePath: q.filePath,
 				})),
 			);
@@ -492,11 +515,20 @@ const treeSitterRunner: RunnerDefinition = {
 		// python-assert-production — `assert` is the idiomatic test assertion) opt
 		// out via `skip_test_files` while the runner otherwise runs on test files.
 		const fileIsTest = isTestFile(filePath);
+		// Per-rule path carve-out (#965): a rule that's noise on CLI scripts or a
+		// project's own logging sink (e.g. no-console-except-error firing inside
+		// scripts/** or lib/logger.ts) opts out via `ignore_paths`, the same way
+		// `skip_test_files` opts a rule out of test files above.
+		const ignoreRoot = ctx.projectRoot ?? ctx.cwd;
 		const effectiveQueries = (
 			ctx.blockingOnly
 				? languageQueries.filter((q) => q.inline_tier !== "review")
 				: languageQueries
-		).filter((q) => !(fileIsTest && q.skip_test_files));
+		).filter(
+			(q) =>
+				!(fileIsTest && q.skip_test_files) &&
+				!matchesIgnorePaths(filePath, ignoreRoot, q.ignore_paths),
+		);
 
 		logTreeSitter({
 			phase: "queries_loaded",
@@ -517,136 +549,135 @@ const treeSitterRunner: RunnerDefinition = {
 				? contentFromFacts
 				: undefined;
 
-		// Run queries in parallel with concurrency limit for optimal performance
-		const CONCURRENCY_LIMIT = 6;
-		const queryResults: Diagnostic[][] = [];
-
-		for (let i = 0; i < effectiveQueries.length; i += CONCURRENCY_LIMIT) {
-			// Yield the event loop between batches so already-resolved promises from
-			// other parallel groups (LSP, eslint skip, etc.) can drain. Each wasm query
-			// batch is synchronous CPU work that would otherwise pin the event loop for
-			// the full runner duration, making other runners' latency measurements wrong.
-			if (i > 0) await new Promise<void>((r) => setImmediate(r));
-			const batch = effectiveQueries.slice(i, i + CONCURRENCY_LIMIT);
-			const batchResults = await Promise.all(
-				batch.map(async (query) => {
-					const queryDiagnostics: Diagnostic[] = [];
-					try {
-						const matches = await client.runQueryOnFile(
-							query,
-							filePath,
-							languageId,
-							{ maxResults: 10 },
-							contentOverride,
-						);
-
-						for (const match of matches) {
-							// Get line/column from match (already 0-indexed from tree-sitter)
-							const line = match.line;
-							const column = match.column;
-
-							// Modified-ranges gate only applies to blocking-tier diagnostics.
-							// Warning-tier diagnostics always flow through for logging.
-							const isSeverityBlocking =
-								query.severity === "error" ||
-								query.inline_tier === "blocking" ||
-								SILENT_ERROR_QUERY_IDS.has(query.id);
-							if (
-								ctx.blockingOnly &&
-								isSeverityBlocking &&
-								!isLineInModifiedRanges(line + 1, ctx.modifiedRanges)
-							) {
-								continue;
-							}
-
-							// Map severity to semantic
-							const semantic =
-								query.severity === "error"
-									? "blocking"
-									: query.severity === "warning"
-										? "warning"
-										: "none";
-							const defectClass =
-								(query.defect_class as any) ??
-								classifyDefect(query.id, "tree-sitter", query.message);
-							const suggestion =
-								query.has_fix && query.fix_action
-									? `${query.fix_action} this statement`
-									: semantic === "blocking"
-										? defaultFixSuggestion(defectClass, query.id)
-										: undefined;
-
-							const hasSuggestedFix = !!query.has_fix;
-							queryDiagnostics.push({
-								id: `tree-sitter:${query.id}:${line}`,
-								message: query.message.replace(
-									/\{\{(\w+)\}\}/g,
-									(_, name) => match.captures[name]?.trim() ?? `{{${name}}}`,
-								),
-								filePath,
-								line: line + 1, // 1-indexed
-								column: column + 1, // 1-indexed
-								severity: query.severity,
-								semantic,
-								tool: "tree-sitter",
-								rule: query.id,
-								defectClass,
-								// Surface fix intent to agent — tree-sitter never auto-applies;
-								// linters (biome/ruff/eslint) own the autofix phase.
-								fixable: hasSuggestedFix,
-								autoFixAvailable: false,
-								fixKind: hasSuggestedFix ? "suggestion" : undefined,
-								fixSuggestion: suggestion,
-								matchedText: match.matchedText || undefined,
-								astNodeType: match.nodeType || undefined,
-							});
-						}
-					} catch (err) {
-						// pi-lens-ignore: missing-error-propagation — per-query resilience loop, intentional
-						const msg = err instanceof Error ? err.message : String(err);
-						// Emscripten abort() corrupts the entire module-level wasm heap.
-						// Poison the singleton so no further queries attempt to use the dead runtime.
-						if (msg.includes("Aborted") || msg.includes("abort()")) {
-							markTreeSitterWasmAborted();
-							logTreeSitter({
-								phase: "query_error",
-								filePath,
-								languageId,
-								queryId: query.id,
-								error: "wasm_aborted_fatal",
-							});
-						} else {
-							console.error(`[tree-sitter] Query ${query.id} failed:`, err);
-							logTreeSitter({
-								phase: "query_error",
-								filePath,
-								languageId,
-								queryId: query.id,
-								error: msg,
-							});
-						}
-					}
-					return queryDiagnostics;
-				}),
+		// ONE tree walk for the whole effective rule set, not one per rule (#888).
+		// The per-rule loop re-walked the tree ~30-40 times per edit; the work is
+		// synchronous WASM, so the concurrency-limit batching only chunked CPU work
+		// without parallelizing anything. runQueriesOnFile concatenates the patterns
+		// in rule order and maps each match back to its owning rule, so the per-rule
+		// maxResults(10) cap, metavars, predicates and post-filters still apply and
+		// results stay grouped in rule order. The post-match gating below (modified
+		// ranges, severity mapping) is unchanged.
+		const diagnostics: Diagnostic[] = [];
+		try {
+			const found = await client.runQueriesOnFile(
+				effectiveQueries,
+				filePath,
+				languageId,
+				{ maxResults: 10 },
+				contentOverride,
 			);
-			queryResults.push(...batchResults);
+
+			for (const { queryDef: query, match } of found) {
+				// match.line/column are already 1-indexed — the client emits
+				// startPosition.row + 1 (tree-sitter-client searchFileWithQuery).
+				const { line, column } = match;
+
+				// Modified-ranges gate only applies to blocking-tier diagnostics.
+				// Warning-tier diagnostics always flow through for logging.
+				const isSeverityBlocking =
+					query.severity === "error" ||
+					query.inline_tier === "blocking" ||
+					SILENT_ERROR_QUERY_IDS.has(query.id);
+				if (
+					ctx.blockingOnly &&
+					isSeverityBlocking &&
+					!isLineInModifiedRanges(line, ctx.modifiedRanges)
+				) {
+					continue;
+				}
+
+				// Map severity to semantic
+				const semantic =
+					query.severity === "error"
+						? "blocking"
+						: query.severity === "warning"
+							? "warning"
+							: "none";
+				const defectClass =
+					(query.defect_class as any) ??
+					classifyDefect(query.id, "tree-sitter", query.message);
+				const suggestion =
+					query.has_fix && query.fix_action
+						? `${query.fix_action} this statement`
+						: semantic === "blocking"
+							? defaultFixSuggestion(defectClass, query.id)
+							: undefined;
+
+				const hasSuggestedFix = !!query.has_fix;
+				diagnostics.push({
+					id: `tree-sitter:${query.id}:${line}`,
+					message: query.message.replace(
+						/\{\{(\w+)\}\}/g,
+						(_, name) => match.captures[name]?.trim() ?? `{{${name}}}`,
+					),
+					filePath,
+					line,
+					column,
+					severity: query.severity,
+					semantic,
+					tool: "tree-sitter",
+					rule: query.id,
+					defectClass,
+					// Surface fix intent to agent — tree-sitter never auto-applies;
+					// linters (biome/ruff/eslint) own the autofix phase.
+					fixable: hasSuggestedFix,
+					autoFixAvailable: false,
+					fixKind: hasSuggestedFix ? "suggestion" : undefined,
+					fixSuggestion: suggestion,
+					matchedText: match.matchedText || undefined,
+					astNodeType: match.nodeType || undefined,
+				});
+			}
+		} catch (err) {
+			// pi-lens-ignore: missing-error-propagation — per-dispatch resilience, intentional
+			const msg = err instanceof Error ? err.message : String(err);
+			// Emscripten abort() corrupts the entire module-level wasm heap.
+			// Poison the singleton so no further queries attempt to use the dead runtime.
+			if (msg.includes("Aborted") || msg.includes("abort()")) {
+				markTreeSitterWasmAborted();
+				logTreeSitter({
+					phase: "query_error",
+					filePath,
+					languageId,
+					error: "wasm_aborted_fatal",
+					metadata: { queryIds: effectiveQueries.map((q) => q.id) },
+				});
+			} else {
+				// #1333: the logTreeSitter call below already carries this failure to
+				// tree-sitter.log — the console.error was a duplicate RAW write into
+				// pi's frame, not a second destination. Sink kept, write dropped.
+				logTreeSitter({
+					phase: "query_error",
+					filePath,
+					languageId,
+					error: msg,
+					metadata: { queryIds: effectiveQueries.map((q) => q.id) },
+				});
+			}
 		}
 
-		// Flatten all query results into final diagnostics array
-		const diagnostics: Diagnostic[] = queryResults.flat();
-
-		// Skip expensive entity extraction for trivial changes (< 5 lines)
-		// This avoids ~500-800ms overhead for small edits like single-line fixes
+		// Skip expensive entity extraction for trivial changes (< 5 lines).
+		// Before #885 this threshold only guarded the zero-diagnostics early
+		// return below; a second extractEntitySnapshot block ran UNCONDITIONALLY
+		// after it, so small edits (skipEntityExtraction=true) still paid the
+		// ~500-800ms snapshot cost on every dispatch. One guarded block now
+		// serves both paths.
+		// Absent/empty modifiedRanges means "whole file" (full-file dispatches,
+		// fresh writes — see isLineInModifiedRanges above), never "trivial edit":
+		// entity extraction must run in that case.
 		const totalLinesChanged = getTotalLinesChanged(ctx.modifiedRanges);
 		const skipEntityExtraction =
+			ctx.modifiedRanges != null &&
+			ctx.modifiedRanges.length > 0 &&
 			totalLinesChanged < ENTITY_EXTRACTION_LINE_THRESHOLD;
 
-		if (diagnostics.length === 0 && !skipEntityExtraction) {
+		if (!skipEntityExtraction) {
 			try {
 				const snapshot = await extractEntitySnapshot(
 					client,
 					filePath,
 					languageId,
+					contentOverride,
 				);
 				const diff = recordEntitySnapshotDiff(ctx.facts, filePath, snapshot);
 				const changedEntityKeys = [
@@ -689,7 +720,9 @@ const treeSitterRunner: RunnerDefinition = {
 			} catch {
 				/* entity snapshot / blast-radius enrichment is best-effort */
 			}
+		}
 
+		if (diagnostics.length === 0) {
 			logTreeSitter({
 				phase: "runner_complete",
 				filePath,
@@ -708,48 +741,6 @@ const treeSitterRunner: RunnerDefinition = {
 		const blockingCount = diagnostics.filter(
 			(d) => d.semantic === "blocking",
 		).length;
-		try {
-			const snapshot = await extractEntitySnapshot(
-				client,
-				filePath,
-				languageId,
-			);
-			const diff = recordEntitySnapshotDiff(ctx.facts, filePath, snapshot);
-			const changedEntityKeys = [
-				...diff.added,
-				...diff.modified,
-				...diff.removed,
-			];
-
-			if (changedEntityKeys.length > 0) {
-				logTreeSitter({
-					phase: "entity_diff",
-					filePath,
-					languageId,
-					metadata: {
-						added: diff.added,
-						modified: diff.modified,
-						removed: diff.removed,
-						totalChanged: changedEntityKeys.length,
-					},
-				});
-
-				const lastBlast = blastCooldownByFile.get(filePath) ?? 0;
-				if (Date.now() - lastBlast < BLAST_COOLDOWN_MS) {
-					logTreeSitter({
-						phase: "blast_radius",
-						filePath,
-						languageId,
-						metadata: { skipped: "cooldown", cooldownMs: BLAST_COOLDOWN_MS },
-					});
-				} else {
-					blastCooldownByFile.set(filePath, Date.now());
-					runBlastRadiusInBackground(ctx.cwd, filePath, languageId, ctx.facts);
-				}
-			}
-		} catch {
-			// best-effort experimental telemetry only
-		}
 
 		logTreeSitter({
 			phase: "runner_complete",

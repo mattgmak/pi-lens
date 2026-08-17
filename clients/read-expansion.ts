@@ -310,31 +310,40 @@ export async function tryExpandRead(
 			0,
 			EXPANSION_BUDGET_MS - (Date.now() - startedAt),
 		);
-		const tree = await withBudget(
-			tsClient.parseFile(filePath, languageId, content),
-			remaining,
-		);
-		if (!tree) return undefined;
-
 		// tree-sitter rows are 0-indexed; offsets are 1-indexed
 		const requestedStartRow = requestedOffset - 1;
 		const requestedEndRow = Math.min(
 			totalLines - 1,
 			requestedOffset + requestedLimit - 2,
 		);
-		// biome-ignore lint/suspicious/noExplicitAny: tree-sitter root node
-		const enclosing = findEnclosingNodeForRange(
-			tree.rootNode as any,
-			requestedStartRow,
-			requestedEndRow,
-			enclosingTypes,
+		// Resolve the enclosing node INSIDE the cache-safe callback: a tree handed
+		// back across an await can be retired by another consumer's eviction (#417).
+		const parsed = await withBudget(
+			tsClient.withParsedTree(filePath, languageId, content, (tree) => {
+				// biome-ignore lint/suspicious/noExplicitAny: tree-sitter root node
+				const node = findEnclosingNodeForRange(
+					tree.rootNode as any,
+					requestedStartRow,
+					requestedEndRow,
+					enclosingTypes,
+				);
+				if (!node) return undefined;
+				return {
+					name: getSymbolName(node),
+					kind: node.type as string,
+					startRow: node.startPosition.row,
+					// biome-ignore lint/suspicious/noExplicitAny: endPosition not in local interface
+					endRow: (node as any).endPosition?.row ?? node.startPosition.row,
+					ancestry: buildAncestryChain(node, enclosingTypes),
+				};
+			}),
+			remaining,
 		);
+		const enclosing = parsed?.parsed ? parsed.value : undefined;
 		if (!enclosing) return undefined;
 
-		const symbolStart: number = enclosing.startPosition.row + 1;
-		// biome-ignore lint/suspicious/noExplicitAny: endPosition not in local interface
-		const symbolEnd: number =
-			((enclosing as any).endPosition?.row ?? enclosing.startPosition.row) + 1;
+		const symbolStart: number = enclosing.startRow + 1;
+		const symbolEnd: number = enclosing.endRow + 1;
 		const requestedStartLine = requestedOffset;
 		const requestedEndLine = requestedEndRow + 1;
 		const expandedStart = Math.min(requestedStartLine, symbolStart);
@@ -344,17 +353,17 @@ export async function tryExpandRead(
 		if (expandedSize > EXPANDED_SIZE_CAP_LINES) return undefined;
 		if (expandedSize <= requestedLimit) return undefined;
 
-		const ancestry = buildAncestryChain(enclosing, enclosingTypes);
 		return {
 			newOffset: expandedStart,
 			newLimit: expandedSize,
 			enclosingSymbol: {
-				name: getSymbolName(enclosing),
-				kind: enclosing.type as string,
+				name: enclosing.name,
+				kind: enclosing.kind,
 				startLine: symbolStart,
 				endLine: symbolEnd,
 			},
-			ancestry: ancestry.length > 0 ? ancestry : undefined,
+			ancestry:
+				enclosing.ancestry.length > 0 ? enclosing.ancestry : undefined,
 			durationMs: Date.now() - startedAt,
 		};
 	} catch {

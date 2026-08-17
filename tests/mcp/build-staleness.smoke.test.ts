@@ -35,7 +35,13 @@ describe("warm build-staleness guard (real spawn)", { retry: 2 }, () => {
 		stampFile = path.join(stampDir, "entry-stamp.txt");
 		writeFileSync(stampFile, "initial\n");
 		harness = new McpHarness({
-			env: { PI_LENS_MCP_STALENESS_STAT_PATH: stampFile },
+			env: {
+				PI_LENS_MCP_STALENESS_STAT_PATH: stampFile,
+				// Disables the gate's re-stat throttle so the mtime bump below is
+				// visible on the very next call, instead of this test having to
+				// sleep out a full checkIntervalMs (default 1000ms).
+				PI_LENS_MCP_STALENESS_INTERVAL_MS: "0",
+			},
 		});
 	});
 
@@ -58,13 +64,14 @@ describe("warm build-staleness guard (real spawn)", { retry: 2 }, () => {
 
 	it("force-routes pilens_analyze to fresh once the stamp file's mtime advances", async () => {
 		// Simulate a rebuild landing while this server keeps running: bump the
-		// isolated stamp file's mtime forward. The gate re-stats at most once per
-		// second, so push it comfortably past both that throttle and filesystem
-		// mtime-resolution granularity (some Windows filesystems only resolve to
-		// ~2s).
+		// isolated stamp file's mtime forward. The harness disables the gate's
+		// re-stat throttle above, so a short settle is enough to clear the wire
+		// round-trip — comfortably past filesystem mtime-resolution granularity
+		// too (some Windows filesystems only resolve to ~2s), since the mtime is
+		// pushed 5 minutes forward.
 		const future = new Date(Date.now() + 5 * 60_000);
 		utimesSync(stampFile, future, future);
-		await new Promise((resolve) => setTimeout(resolve, 1200));
+		await new Promise((resolve) => setTimeout(resolve, 50));
 
 		const target = path.join(repoRoot, "clients", "mcp", "host-shim.ts");
 		const res = await harness.request(2, "tools/call", {

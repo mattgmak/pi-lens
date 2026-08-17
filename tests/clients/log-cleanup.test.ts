@@ -27,6 +27,7 @@ import {
 	rotateLogIfNeeded,
 } from "../../clients/log-cleanup.js";
 import { createNdjsonLogger } from "../../clients/ndjson-logger.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -36,7 +37,7 @@ beforeEach(() => {
 	dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-logclean-"));
 });
 afterEach(() => {
-	fs.rmSync(dir, { recursive: true, force: true });
+	removeTempDirSync(dir);
 });
 
 function write(name: string, ageDays = 0): string {
@@ -127,6 +128,13 @@ describe("getManagedLogFiles — auto-derivation", () => {
 		expect(getManagedLogFiles(dir)).toContain("new-subsystem.log");
 	});
 
+	it("matches registered paths when the directory uses Windows separators", () => {
+		createNdjsonLogger({ filePath: path.join(dir, "separator-safe.log") });
+		const slashVariant = dir.replace(/\\/g, "/");
+
+		expect(getManagedLogFiles(slashVariant)).toContain("separator-safe.log");
+	});
+
 	it("does not register a lazy (function) filePath — those are logs/*.jsonl territory", () => {
 		createNdjsonLogger({ filePath: () => path.join(dir, "dated.jsonl") });
 
@@ -139,7 +147,7 @@ describe("getManagedLogFiles — auto-derivation", () => {
 			createNdjsonLogger({ filePath: path.join(otherDir, "elsewhere.log") });
 			expect(getManagedLogFiles(dir)).not.toContain("elsewhere.log");
 		} finally {
-			fs.rmSync(otherDir, { recursive: true, force: true });
+			removeTempDirSync(otherDir);
 		}
 	});
 
@@ -158,10 +166,6 @@ describe("getManagedLogFiles — auto-derivation", () => {
 		const managed = getManagedLogFiles(dir);
 		expect(managed).not.toContain("latency.2026-04-20T12-44-37-686Z.log");
 		expect(managed).not.toContain("cascade.log.2026-03-01");
-	});
-
-	it("always includes the sessionstart.log straggler (not on createNdjsonLogger)", () => {
-		expect(getManagedLogFiles(dir)).toContain("sessionstart.log");
 	});
 
 	it("includes bus-events.log once its logger is constructed — the #551 gap this PR closes", () => {

@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { BoundedLruCache } from "../../bounded-cache.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { findCompiledClassesDir } from "../../tool-policy.js";
 import { PRIORITY } from "../priorities.js";
@@ -31,7 +32,7 @@ interface SpotbugsCacheEntry {
 	signature: string;
 	diagnostics: Diagnostic[];
 }
-const scanCache = new Map<string, SpotbugsCacheEntry>();
+const scanCache = new BoundedLruCache<string, SpotbugsCacheEntry>(32);
 
 /** Reset the SpotBugs scan cache (tests). */
 export function _resetSpotbugsCacheForTests(): void {

@@ -11,6 +11,7 @@ import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getProjectDataDir } from "./file-utils.js";
+import { writeFileAtomic } from "./atomic-write.js";
 
 // --- Types ---
 
@@ -119,7 +120,7 @@ export function saveHistory(history: MetricsHistory): void {
 
 	history.capturedAt = new Date().toISOString();
 	const historyPath = path.join(historyDir, "metrics-history.json");
-	fs.writeFileSync(historyPath, JSON.stringify(history, null, 2));
+	writeFileAtomic(historyPath, JSON.stringify(history, null, 2));
 }
 
 // In-memory cache to avoid loading/saving on every capture

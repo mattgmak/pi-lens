@@ -20,9 +20,9 @@
  * the primary language server per file. Auxiliaries are cross-cutting
  * scanners layered on top of (not required for) core diagnostics, so this is
  * the cheapest, highest-signal thing to shed under machine-wide pressure.
- * The issue's OTHER suggested mechanism — shortening this session's own
- * idle-reaper timeout — is a documented follow-up, not implemented here (see
- * the module docstring's "Not implemented" note below).
+ * The cached decision also shortens this session's idle reset and lets
+ * pull-capable servers skip their push fallback. All three degrade mechanisms
+ * read the same session-boundary snapshot; pressure never changes mid-touch.
  *
  * Ceiling default (`DEFAULT_LSP_BUDGET_CEILING = 16`): a rough RAM-budget
  * back-of-envelope, not a measured figure (#620's CPU/RSS sampling had not
@@ -48,11 +48,12 @@ import {
 	isInstanceRegistryEnabled,
 	readInstanceRegistry,
 } from "./instance-registry.js";
-import { realIsPidAlive } from "./instance-reaper.js";
+import { realIsPidAlive, STALE_HEARTBEAT_MS } from "./instance-reaper.js";
 import { logLatency } from "./latency-logger.js";
 
 /** See the module docstring for the derivation. */
 export const DEFAULT_LSP_BUDGET_CEILING = 16;
+export const DEFAULT_LSP_BUDGET_IDLE_TIMEOUT_MS = 60_000;
 
 /** `PI_LENS_CROSS_PROCESS_BUDGET=0` disables the budget check entirely —
  *  lazy env read (house style), never memoized so tests can flip it mid-run. */
@@ -69,6 +70,19 @@ export function getLspBudgetCeiling(): number {
 	return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_LSP_BUDGET_CEILING;
 }
 
+/** Optional aggregate host + LSP-child RSS ceiling. Undefined means disabled. */
+export function getLspBudgetRssCeilingBytes(): number | undefined {
+	const raw = Number(process.env.PI_LENS_LSP_BUDGET_RSS_MB);
+	return Number.isFinite(raw) && raw > 0 ? raw * 1024 * 1024 : undefined;
+}
+
+export function getLspBudgetIdleTimeoutMs(): number {
+	const raw = Number(process.env.PI_LENS_LSP_BUDGET_IDLE_TIMEOUT_MS);
+	return Number.isFinite(raw) && raw > 0
+		? raw
+		: DEFAULT_LSP_BUDGET_IDLE_TIMEOUT_MS;
+}
+
 export interface LspBudgetDecision {
 	/** Sum of `lspChildren.length` across every registry entry whose owning
 	 *  pid is currently alive. Entries whose parent pid is dead are excluded —
@@ -76,6 +90,9 @@ export interface LspBudgetDecision {
 	 *  not counted as "live" load here. */
 	totalLiveLspServers: number;
 	ceiling: number;
+	totalRssBytes?: number;
+	rssCeilingBytes?: number;
+	rssPressure: boolean;
 	overBudget: boolean;
 	/** The one degrade mechanism this prototype implements: skip auxiliary
 	 *  LSP servers for the current session. Equal to `overBudget` today —
@@ -83,6 +100,8 @@ export interface LspBudgetDecision {
 	 *  independently-triggered mechanism (e.g. shorter idle-reaper timeout)
 	 *  without every caller needing to re-derive it from `overBudget`. */
 	degradeAuxiliary: boolean;
+	shortenIdleTimeout: boolean;
+	preferPullOnly: boolean;
 }
 
 /**
@@ -101,18 +120,53 @@ export function decideLspBudget(
 	registry: readonly InstanceEntry[],
 	isPidAlive: (pid: number) => boolean,
 	ceiling: number,
+	rssCeilingBytes?: number,
+	now = Date.now(),
 ): LspBudgetDecision {
-	const totalLiveLspServers = registry.reduce(
-		(sum, instance) =>
-			isPidAlive(instance.pid) ? sum + instance.lspChildren.length : sum,
+	const liveInstances = registry.filter((instance) => isPidAlive(instance.pid));
+	const totalLiveLspServers = liveInstances.reduce(
+		(sum, instance) => sum + instance.lspChildren.length,
 		0,
 	);
-	const overBudget = totalLiveLspServers >= ceiling;
+	const hasCompleteFreshSamples =
+		rssCeilingBytes !== undefined &&
+		liveInstances.length > 0 &&
+		liveInstances.every((instance) => {
+			const heartbeatMs = Date.parse(instance.heartbeatAt);
+			return (
+				Number.isFinite(heartbeatMs) &&
+				now - heartbeatMs <= STALE_HEARTBEAT_MS &&
+				Number.isFinite(instance.rssBytes) &&
+				instance.lspChildren.every((child) => Number.isFinite(child.rssBytes))
+			);
+		});
+	const totalRssBytes = hasCompleteFreshSamples
+		? liveInstances.reduce(
+				(sum, instance) =>
+					sum +
+					instance.rssBytes +
+					instance.lspChildren.reduce(
+						(childSum, child) => childSum + (child.rssBytes ?? 0),
+						0,
+					),
+				0,
+			)
+		: undefined;
+	const rssPressure =
+		totalRssBytes !== undefined &&
+		rssCeilingBytes !== undefined &&
+		totalRssBytes >= rssCeilingBytes;
+	const overBudget = totalLiveLspServers >= ceiling || rssPressure;
 	return {
 		totalLiveLspServers,
 		ceiling,
+		totalRssBytes,
+		rssCeilingBytes,
+		rssPressure,
 		overBudget,
 		degradeAuxiliary: overBudget,
+		shortenIdleTimeout: overBudget,
+		preferPullOnly: overBudget,
 	};
 }
 
@@ -135,6 +189,14 @@ export function shouldDegradeAuxiliaryLsp(): boolean {
 	return cachedDecision?.degradeAuxiliary ?? false;
 }
 
+export function shouldShortenLspIdleTimeout(): boolean {
+	return cachedDecision?.shortenIdleTimeout ?? false;
+}
+
+export function shouldPreferPullOnlyDiagnostics(): boolean {
+	return cachedDecision?.preferPullOnly ?? false;
+}
+
 /** Test-only: reset the module-scope cache between tests. */
 export function _resetLspBudgetDecisionForTests(): void {
 	cachedDecision = undefined;
@@ -148,20 +210,24 @@ export function _resetLspBudgetDecisionForTests(): void {
  * default, matching every other best-effort registry consumer in this
  * codebase (registerInstance/sweepOrphans).
  *
- * Not implemented in this prototype (documented follow-up, see the issue):
- * shortening THIS session's own idle-reaper timeout when over budget. Skip-
- * auxiliary was chosen as the single mechanism for the first slice because
- * it's a pure spawn-time decision (no interaction with already-warm clients),
- * whereas an idle-timeout change would need to reach into already-configured
- * per-server wait/reap state.
  */
-export async function checkCrossProcessLspBudget(): Promise<void> {
+export async function checkCrossProcessLspBudget(
+	testOverrides: {
+		registry?: readonly InstanceEntry[];
+		isPidAlive?: (pid: number) => boolean;
+	} = {},
+): Promise<void> {
 	if (!isCrossProcessBudgetEnabled() || !isInstanceRegistryEnabled()) return;
 	try {
-		const registry = await readInstanceRegistry();
+		const registry = testOverrides.registry ?? (await readInstanceRegistry());
 		if (registry.length === 0) return; // nothing to be over budget against
 		const ceiling = getLspBudgetCeiling();
-		const decision = decideLspBudget(registry, realIsPidAlive, ceiling);
+		const decision = decideLspBudget(
+			registry,
+			testOverrides.isPidAlive ?? realIsPidAlive,
+			ceiling,
+			getLspBudgetRssCeilingBytes(),
+		);
 		cachedDecision = decision;
 		if (decision.overBudget) {
 			logLatency({
@@ -172,6 +238,9 @@ export async function checkCrossProcessLspBudget(): Promise<void> {
 				metadata: {
 					totalLiveLspServers: decision.totalLiveLspServers,
 					ceiling: decision.ceiling,
+					totalRssBytes: decision.totalRssBytes,
+					rssCeilingBytes: decision.rssCeilingBytes,
+					rssPressure: decision.rssPressure,
 					instanceCount: registry.length,
 				},
 			});

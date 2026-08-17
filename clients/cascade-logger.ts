@@ -2,11 +2,15 @@ import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
+import { getMaxLogSizeMB } from "./log-cleanup.js";
 
 const CASCADE_LOG_DIR = getGlobalPiLensDir();
 const CASCADE_LOG_FILE = path.join(CASCADE_LOG_DIR, "cascade.log");
 
-const writer = createNdjsonLogger({ filePath: CASCADE_LOG_FILE });
+const writer = createNdjsonLogger({
+	filePath: CASCADE_LOG_FILE,
+	maxBytes: getMaxLogSizeMB() * 1024 * 1024,
+});
 
 export interface CascadeLogEntry {
 	ts?: string;
@@ -20,8 +24,12 @@ export interface CascadeLogEntry {
 		| "neighbor_fallback" // neighbor fell back to getAllDiagnostics (error or degraded)
 		| "cascade_result" // final per-file cascade result
 		| "cascade_turn_end" // merged result emitted at turn_end
+		| "cascade_indeterminate" // #1023: impact could not be computed — honest advisory surfaced
 		| "cascade_tier3_skip" // #458: in-lane wait skipped for a tier-3 neighbor touch
-		| "cascade_tier3_reconcile"; // #458: quiet-window reconcile of outstanding tier-3 touches
+		| "cascade_tier3_reconcile" // #458: quiet-window reconcile of outstanding tier-3 touches
+		| "cascade_carry_over_drop" // #1443: late/carried run dropped — superseded by a later write, or the one-turn carry bound lapsed
+		| "cascade_injected" // #1446 item 1: what cascade text actually reached blockerParts this turn
+		| "cascade_test_targets"; // #1446 item 2: which tests were suggested for cascade neighbors, including the zero-suggestion case
 	filePath: string;
 	neighborFile?: string;
 	reason?: string;

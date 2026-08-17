@@ -16,19 +16,12 @@ description: |
   ✅ FIX: use SecureRandom.hex/base64/uuid.
 
 query: |
-  [
-    (call
-      method: (identifier) @FN
-      arguments: (argument_list) @ARGS)
-    (call_expression
-      receiver: (constant) @MOD
-      method: (identifier) @FN
-      arguments: (argument_list) @ARGS)
-  ]
-  (#match? @FN "^(rand|srand)$")
+  (call
+    method: (identifier) @FN
+    (#match? @FN "^(rand|srand)$")
+    arguments: (argument_list) @ARGS)
 
 metavars:
-  - MOD
   - FN
   - ARGS
 

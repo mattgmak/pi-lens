@@ -8,19 +8,26 @@
  * Docs: https://github.com/kucherenko/jscpd
  */
 
+import { createSubsystemLogger } from "./extension-log.js";
 import * as fs from "node:fs";
 import { mkdtempSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
 	getExcludedDirGlobs,
-	getGlobalPiLensDir,
 	getProjectIgnoreGlobs,
 	getProjectIgnoreMatcher,
-	isExcludedDirName,
 } from "./file-utils.js";
 import { findNodeToolBinary } from "./package-manager.js";
+import { isAtOrAboveHomeDir, isFullyQualified } from "./path-utils.js";
+import { getJscpdMaxEntriesDerived } from "./project-scale.js";
+import {
+	createAvailabilityChecker,
+	findManagedNodeToolBinary,
+	resolveAvailableOrInstall,
+} from "./dispatch/runners/utils/runner-helpers.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
+import { shouldRecurseIntoDir, walkTreeStackSync } from "./source-walker.js";
 
 // --- Types ---
 
@@ -51,16 +58,28 @@ const EMPTY_RESULT: JscpdResult = {
 
 const SCAN_TIMEOUT_MS = 30_000;
 
+const jscpdAvailability = createAvailabilityChecker("jscpd", "", ["--version"], {
+	probeTimeout: 1500,
+	// One definition of the managed-shim fast path, shared with knip (#1476).
+	fastPath: () => findManagedNodeToolBinary("jscpd"),
+});
+
 // --- Client ---
 
 export class JscpdClient {
-	private available: boolean | null = null;
-	private ensureInFlight: Promise<boolean> | null = null;
+	// Absolute path of a MANAGED jscpd (the global ~/.pi-lens tools shim
+	// discovered by the availability fast path, or the ensureTool install
+	// result), else null. Nullable on purpose: a bare-name sentinel can't
+	// distinguish "resolved" from "on PATH" — ensureTool may legitimately
+	// return a bare command for an already-spawnable tool (#1289 review).
+	// Project-local binaries are NOT stored; each scan resolves those against
+	// its own cwd via findNodeToolBinary.
+	private jscpdManagedPath: string | null = null;
 	private inFlight = new Map<string, Promise<JscpdResult>>();
 	private log: (msg: string) => void;
 
 	constructor(verbose = false) {
-		this.log = verbose ? (msg) => console.error(`[jscpd] ${msg}`) : () => {};
+		this.log = verbose ? createSubsystemLogger("jscpd") : () => {};
 	}
 
 	/**
@@ -77,125 +96,91 @@ export class JscpdClient {
 	 * them.
 	 */
 	private hasSourceFilesRecursive(rootDir: string): boolean {
-		const stack = [rootDir];
 		const ignoreMatcher = getProjectIgnoreMatcher(rootDir);
-		let visited = 0;
-		const MAX_ENTRIES = 6000;
+		const state = { visited: 0 };
+		// #776: derived from the `maxProjectFiles` scale knob (project-scale.ts),
+		// reproducing this same 6,000 default at the default base.
+		const MAX_ENTRIES = getJscpdMaxEntriesDerived(rootDir);
 
-		while (stack.length > 0 && visited < MAX_ENTRIES) {
-			const dir = stack.pop();
-			if (!dir) continue;
-
-			let entries: fs.Dirent[];
-			try {
-				entries = fs.readdirSync(dir, { withFileTypes: true });
-			} catch {
-				continue;
-			}
-
-			for (const entry of entries) {
-				visited += 1;
-				if (entry.isSymbolicLink()) continue;
+		// #761: the traversal loop, readdir-safety, and directory-recursion
+		// decision are the shared `walkTreeStackSync` engine; this client keeps
+		// its own per-entry policy (skip ALL symlinks — files too — before the
+		// dir/file branch, its own multi-language source regex, and a
+		// per-directory entry budget via `shouldStop`, matching the pre-#761
+		// `while (stack.length > 0 && visited < MAX_ENTRIES)` condition: the
+		// current directory's entry loop always finishes, but no further
+		// directory is popped once the budget is spent).
+		return walkTreeStackSync(
+			rootDir,
+			(entry, fullPath) => {
+				state.visited += 1;
+				if (entry.isSymbolicLink()) return "skip";
 				if (entry.isDirectory()) {
-					const fullPath = path.join(dir, entry.name);
-					if (isExcludedDirName(entry.name)) continue;
-					if (ignoreMatcher.isIgnored(fullPath, true)) continue;
-					stack.push(fullPath);
-					continue;
+					return shouldRecurseIntoDir(entry, fullPath, {
+						ignoreMatcher,
+						followSymlinks: true,
+					})
+						? "recurse"
+						: "skip";
 				}
-				if (!entry.isFile()) continue;
-				if (ignoreMatcher.isIgnored(path.join(dir, entry.name), false))
-					continue;
+				if (!entry.isFile()) return "skip";
+				if (ignoreMatcher.isIgnored(fullPath, false)) return "skip";
 				if (
 					/\.(ts|tsx|js|jsx|mjs|cjs|py|pyi|java|go|rs|rb|php|swift|kt|kts|dart|lua|scala|c|h|cpp|cc|cxx|hpp|hxx|cs|m|mm)$/.test(
 						entry.name,
 					)
 				) {
-					if (entry.name.endsWith(".d.ts")) continue;
-					return true;
+					if (entry.name.endsWith(".d.ts")) return "skip";
+					return "stop";
 				}
-			}
-		}
-
-		return false;
+				return "skip";
+			},
+			{ shouldStop: () => state.visited >= MAX_ENTRIES },
+		);
 	}
 
 	/**
 	 * Check if jscpd is available, auto-install if not
 	 */
 	async ensureAvailable(): Promise<boolean> {
-		// Fast path: already checked
-		if (this.available !== null) return this.available;
-
-		// Deduplicate concurrent calls
-		if (this.ensureInFlight) return this.ensureInFlight;
-
-		this.ensureInFlight = this.doEnsureAvailable();
-		try {
-			return await this.ensureInFlight;
-		} finally {
-			this.ensureInFlight = null;
-		}
-	}
-
-	private async doEnsureAvailable(): Promise<boolean> {
-		// Fast path: check local install before any spawn
-		const isWin = process.platform === "win32";
-		const localBase = path.join(
-			getGlobalPiLensDir(),
-			"tools",
-			"node_modules",
-			".bin",
+		const resolved = await resolveAvailableOrInstall(
+			jscpdAvailability,
 			"jscpd",
+			process.cwd(),
 		);
-		const localCandidates = isWin
-			? [`${localBase}.cmd`, `${localBase}.exe`, localBase]
-			: [localBase];
-		for (const candidate of localCandidates) {
-			try {
-				if (fs.existsSync(candidate)) {
-					this.available = true;
-					return true;
-				}
-			} catch {
-				// continue
-			}
-		}
-
-		// Check if available in PATH (short timeout — if not instantly available, it's not in PATH)
-		const result = await safeSpawnAsync("jscpd", ["--version"], {
-			timeout: 1500,
-		});
-		this.available = !result.error && result.status === 0;
-		if (this.available) {
-			return true;
-		}
-
-		// Auto-install via pi-lens installer
-		const { ensureTool } = await import("./installer/index.js");
-		const installedPath = await ensureTool("jscpd");
-
-		if (installedPath) {
-			this.available = true;
-			return true;
-		}
-
-		this.available = false;
-		return false;
+		if (!resolved) return false;
+		if (isFullyQualified(resolved)) this.jscpdManagedPath = resolved;
+		return true;
 	}
 
 	/**
 	 * Scan a directory for duplicate code blocks.
 	 * Uses a temp output dir to capture JSON report.
 	 * @param isTsProject - If true, excludes .js files (they're compiled artifacts in TS projects)
+	 *
+	 * Root contract (#747/#250): unlike `KnipClient`/`DeadCodeClient`, this
+	 * client does NOT resolve a project root via `findNearestMarkerRoot`, so it
+	 * has historically relied on every caller to guard the scan root itself. The
+	 * `isAtOrAboveHomeDir` refusal below is belt-and-braces internal protection
+	 * so a FUTURE caller that forgets that contract can't spawn a whole-$HOME
+	 * jscpd walk (the observed OOM: a jscpd run from a WSL home reached 44 GB
+	 * RSS). `options.homeDir` overrides `os.homedir()` for tests.
 	 */
 	async scan(
 		cwd: string,
 		minLines = 5,
 		minTokens = 50,
 		isTsProject = false,
+		options: { homeDir?: string } = {},
 	): Promise<JscpdResult> {
 		const targetDir = path.resolve(cwd);
+
+		// #747/#250: never walk from a cwd at/above $HOME — from there jscpd's
+		// tokenizer would run across every unrelated repo under home.
+		if (isAtOrAboveHomeDir(targetDir, options.homeDir)) {
+			this.log(`Refusing scan of unsafe root at/above home: ${targetDir}`);
+			return { ...EMPTY_RESULT };
+		}
 
 		// Return early for non-existent or empty directories before probing/installing.
 		if (!fs.existsSync(targetDir)) {
@@ -263,7 +248,9 @@ export class JscpdClient {
 			const bin = await findNodeToolBinary("jscpd", cwd);
 			const { cmd, prefix } = bin
 				? { cmd: bin, prefix: [] as string[] }
-				: { cmd: "npx", prefix: ["jscpd"] };
+				: this.jscpdManagedPath
+					? { cmd: this.jscpdManagedPath, prefix: [] as string[] }
+					: { cmd: "npx", prefix: ["jscpd"] };
 			const result = await safeSpawnAsync(
 				cmd,
 				[

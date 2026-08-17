@@ -14,6 +14,7 @@
 
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
+import type { PiLensFlagSource } from "./lens-config.js";
 import { findNearestContaining } from "./path-utils.js";
 import {
 	recordFromDispatchDiagnostic,
@@ -27,10 +28,7 @@ import type { BiomeClient } from "./biome-client.js";
 import { recordDiagnostics } from "./widget-state.js";
 import { getDiagnosticLogger } from "./diagnostic-logger.js";
 import { getDiagnosticTracker } from "./diagnostic-tracker.js";
-import {
-	computeCascadeForFile,
-	dispatchLintWithResult,
-} from "./dispatch/integration.js";
+import { loadDispatchIntegration } from "./dispatch/lazy.js";
 import { toRunnerDisplayPath } from "./dispatch/runner-context.js";
 import {
 	createAvailabilityChecker,
@@ -56,14 +54,16 @@ import {
 	wasPreviouslyReportedDirty,
 	type PilensDiagnosticEntry,
 } from "./diagnostics-publish.js";
-import { getLSPService } from "./lsp/index.js";
+import { loadLspService } from "./lsp-lazy.js";
 import type { MetricsClient } from "./metrics-client.js";
 import { clearGraphCache } from "./review-graph/builder.js";
+import { BoundedLruCache } from "./bounded-cache.js";
 import type { RuffClient } from "./ruff-client.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
 import type { WordIndex } from "./word-index.js";
 import { getAmbientAbortSignal, safeSpawnAsync } from "./safe-spawn.js";
 import { combineAbortSignals } from "./deadline-utils.js";
+import { recordDegradationOnce } from "./degradation-ledger.js";
 import {
 	getAutofixPolicyForFile,
 	getPreferredAutofixTools,
@@ -73,11 +73,14 @@ import {
 	hasEslintConfig,
 	hasGolangciConfig,
 	hasKtfmtConfig,
+	hasKtlintConfig,
 	hasOxlintConfig,
 	hasRubocopConfig,
 	hasSqlfluffConfig,
 	hasStylelintConfig,
+	markdownlintConfigArgs,
 } from "./tool-policy.js";
+import type { PathSetLike } from "./runtime-coordinator.js";
 
 const LSP_MAX_FILE_BYTES = RUNTIME_CONFIG.pipeline.lspMaxFileBytes;
 const LSP_MAX_FILE_LINES = RUNTIME_CONFIG.pipeline.lspMaxFileLines;
@@ -121,7 +124,10 @@ async function snapshotDirInto(
 ): Promise<void> {
 	let entries: nodeFs.Dirent[];
 	try {
-		entries = nodeFs.readdirSync(dir, { withFileTypes: true });
+		// Async (#1137): a synchronous per-directory read blocks the loop for the
+		// whole stall on a slow cloud-backed (OneDrive) directory; fs.promises
+		// keeps this tool_result-path walk off the event loop.
+		entries = await nodeFs.promises.readdir(dir, { withFileTypes: true });
 	} catch {
 		return;
 	}
@@ -139,7 +145,7 @@ async function snapshotDirInto(
 		if (!entry.isFile()) continue;
 		if (ignoreMatcher.isIgnored(fullPath, false)) continue;
 		try {
-			const stat = nodeFs.statSync(fullPath);
+			const stat = await nodeFs.promises.stat(fullPath);
 			snapshot.set(path.resolve(fullPath), {
 				mtimeMs: stat.mtimeMs,
 				size: stat.size,
@@ -160,6 +166,10 @@ export async function snapshotProjectFiles(root: string): Promise<FileSnapshot> 
 	const snapshot: FileSnapshot = new Map();
 	const projectRoot = path.resolve(root);
 	const ignoreMatcher = getProjectIgnoreMatcher(projectRoot);
+	// #703: prime the tracked-files set once before the walk so a tracked file
+	// matching a `.gitignore`/global pattern still shows up in the autofix
+	// snapshot. Fail-open on no-git/spawn failure.
+	await ignoreMatcher.ensureTrackedIndex();
 	const stack = [projectRoot];
 	const counter = { n: 0 };
 	while (stack.length > 0 && snapshot.size < AUTOFIX_CHANGED_FILE_SCAN_LIMIT) {
@@ -216,17 +226,33 @@ function exceedsLspSyncLimits(
 
 export interface PipelineContext {
 	filePath: string;
+	/** Language/tool root used for runner execution and config resolution. */
 	cwd: string;
+	/** Authoritative workspace root used for project-wide policy and state. */
+	projectRoot?: string;
 	toolName: string;
+	/** Receipt-time decision; never infer this after debounce coalescing. */
+	autofixMode?: "immediate" | "deferred";
 	modifiedRanges?: { start: number; end: number }[];
 	telemetry?: {
 		model: string;
 		sessionId: string;
 		turnIndex: number;
 		writeIndex: number;
+		/** Raw model id / provider, separate from the combined `model` display
+		 * string above — worklog attribution (#1448) wants the two apart. */
+		modelId?: string;
+		provider?: string;
 	};
 	/** pi.getFlag accessor */
-	getFlag: (name: string) => boolean | string | undefined;
+	getFlag: (name: string, filePath?: string) => boolean | string | undefined;
+	/**
+	 * Optional: resolve which config tier (cli/project/global/default) decided
+	 * a mutation flag's value, for provenance in dbg/skip logs (#792). Absent
+	 * ⇒ logs omit the `source=` suffix (existing tests that don't wire this
+	 * through keep passing unchanged).
+	 */
+	getFlagSource?: (name: string, filePath?: string) => PiLensFlagSource;
 	/** Debug logger */
 	dbg: (msg: string) => void;
 	/**
@@ -258,7 +284,7 @@ export interface PipelineDeps {
 	ruffClient: RuffClient;
 	metricsClient: MetricsClient;
 	getFormatService: () => FormatService;
-	fixedThisTurn: Set<string>;
+	fixedThisTurn: PathSetLike;
 }
 
 export interface PipelineResult {
@@ -298,6 +324,8 @@ export interface PipelineResult {
 	fixedCount?: number;
 	/** `tool:count` labels for autofix tools that ran this run. */
 	autofixTools?: string[];
+	/** Authoritative bytes after an immediate mutation of the target file. */
+	postMutation?: { filePath: string; content: string; source: "autofix" };
 }
 
 // --- Phase timing helpers ---
@@ -344,10 +372,7 @@ export {
 	hasStylelintConfig,
 };
 
-const _eslintCache = new Map<
-	string,
-	{ available: boolean; bin: string | null }
->();
+const _eslintCache = new BoundedLruCache<string, { available: boolean; bin: string | null }>(32);
 
 /**
  * Run eslint --fix on a file. Runs a single spawn and diffs the file before/after,
@@ -360,7 +385,9 @@ const _eslintCache = new Map<
 async function tryEslintFix(filePath: string, cwd: string): Promise<number> {
 	const userHasConfig = hasEslintConfig(cwd);
 	if (!userHasConfig) return 0;
-	const cacheKey = path.resolve(cwd);
+	// PATH is part of command resolution; include it so an install or PATH
+	// refresh cannot leave a negative eslint result live for the session.
+	const cacheKey = `${path.resolve(cwd)}|${process.env.PATH ?? ""}`;
 	let cached = _eslintCache.get(cacheKey);
 	if (!cached) {
 		const candidate = resolveToolCommand(cwd, "eslint") ?? "eslint";
@@ -497,8 +524,18 @@ async function tryDetektFix(filePath: string, cwd: string): Promise<number> {
 async function tryMarkdownlintFix(filePath: string, cwd: string): Promise<number> {
 	const cmd = await resolveToolCommandWithInstallFallback(cwd, "markdownlint");
 	if (!cmd) return 0;
+	// Shared config-args seam (#1247): the lint runner consumes the same
+	// builder, so the bare --fix here can never fall back to markdownlint's
+	// default all-rules-on config again (the whole-file CHANGELOG/AGENTS
+	// reformat + `#946` → `# 946` corruption).
 	// markdownlint-cli2 --fix exits non-zero when unfixable violations remain.
-	return detectFileChangedAfterCommand(filePath, cmd, ["--fix", filePath], cwd, [1]);
+	return detectFileChangedAfterCommand(
+		filePath,
+		cmd,
+		[...markdownlintConfigArgs(cwd), "--fix", filePath],
+		cwd,
+		[1],
+	);
 }
 
 async function tryOxlintFix(filePath: string, cwd: string): Promise<number> {
@@ -553,6 +590,7 @@ export async function runAutofix(
 	getFlag: PipelineContext["getFlag"],
 	dbg: PipelineContext["dbg"],
 	deps: Pick<PipelineDeps, "biomeClient" | "ruffClient" | "fixedThisTurn">,
+	getFlagSource?: PipelineContext["getFlagSource"],
 ): Promise<{
 	fixedCount: number;
 	autofixTools: string[];
@@ -562,7 +600,7 @@ export async function runAutofix(
 	skipReason?: string;
 }> {
 	const { biomeClient, ruffClient, fixedThisTurn } = deps;
-	const noAutofix = getFlag("no-autofix");
+	const noAutofix = getFlag("no-autofix", filePath);
 	let fixedCount = 0;
 	const autofixTools: string[] = [];
 	const attemptedTools: string[] = [];
@@ -583,7 +621,10 @@ export async function runAutofix(
 	}
 
 	if (noAutofix) {
-		dbg(`autofix: skipped for ${filePath} (--no-autofix)`);
+		const source = getFlagSource?.("no-autofix", filePath);
+		dbg(
+			`autofix: skipped for ${filePath} (--no-autofix${source ? `, source=${source}` : ""})`,
+		);
 		return {
 			fixedCount,
 			autofixTools,
@@ -603,6 +644,7 @@ export async function runAutofix(
 		hasGolangciConfig: hasGolangciConfig(cwd),
 		hasDetektConfig: hasDetektConfig(cwd),
 		hasKtfmtConfig: hasKtfmtConfig(cwd),
+		hasKtlintConfig: hasKtlintConfig(cwd),
 		hasOxlintConfig: hasOxlintConfig(cwd),
 	};
 	const autofixPolicy = getAutofixPolicyForFile(filePath, autofixContext);
@@ -649,7 +691,7 @@ export async function runAutofix(
 				dbg(`autofix: ruff unavailable for ${filePath}`);
 				continue;
 			}
-			const result = await ruffClient.fixFileAsync(filePath);
+			const result = await ruffClient.fixFileAsync(filePath, cwd);
 			if (result.success && result.fixed > 0) {
 				fixedCount += result.fixed;
 				autofixTools.push(`ruff:${result.fixed}`);
@@ -669,7 +711,7 @@ export async function runAutofix(
 				dbg(`autofix: biome unavailable or unsupported for ${filePath}`);
 				continue;
 			}
-			const result = await biomeClient.fixFileAsync(filePath);
+			const result = await biomeClient.fixFileAsync(filePath, cwd);
 			if (result.success && result.fixed > 0) {
 				fixedCount += result.fixed;
 				autofixTools.push(`biome:${result.fixed}`);
@@ -842,7 +884,6 @@ export async function runAutofix(
 				dbg(`autofix: oxlint --fix fixed ${filePath}`);
 				needsContentRefresh = true;
 			}
-			continue;
 		}
 	}
 
@@ -876,7 +917,7 @@ export async function resyncLspFile(
 	if (limitCheck.tooLarge) return;
 
 	try {
-		const lspService = getLSPService();
+		const lspService = (await loadLspService()).getLSPService();
 		if (lspService.supportsLSP(filePath)) {
 			// Push the final post-format/post-fix content through touchFile (not the
 			// bare openFile) so it registers in the touch-debounce map via
@@ -955,7 +996,11 @@ function toPilensDiagnosticEntry(d: Diagnostic): PilensDiagnosticEntry {
 	return entry;
 }
 
-type DispatchResult = Awaited<ReturnType<typeof dispatchLintWithResult>>;
+	type DispatchResult = Awaited<
+		ReturnType<
+			(typeof import("./dispatch/integration.js"))["dispatchLintWithResult"]
+		>
+	>;
 function buildAllClearOutput(
 	_dispatchResult: DispatchResult,
 	elapsed: number,
@@ -1008,6 +1053,13 @@ export async function runFormatPhase(
 		}
 		if (!result.allSucceeded) {
 			const failures = result.formatters.filter((f) => !f.success);
+			for (const failure of failures) {
+				recordDegradationOnce({
+					kind: "formatter-failure",
+					subject: `${failure.name}:${path.basename(filePath)}`,
+					reason: failure.error ?? "unknown error",
+				});
+			}
 			formatFailures.push(
 				...failures.map((f) => `${f.name}: ${f.error ?? "unknown error"}`),
 			);
@@ -1020,6 +1072,11 @@ export async function runFormatPhase(
 		}
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
+		recordDegradationOnce({
+			kind: "formatter-failure",
+			subject: `format-service:${path.basename(filePath)}`,
+			reason: message,
+		});
 		formatFailures.push(message);
 		dbg(`autoformat error: ${err}`);
 	}
@@ -1078,7 +1135,7 @@ export async function runPipeline(
 	ctx: PipelineContext,
 	deps: PipelineDeps,
 ): Promise<PipelineResult> {
-	const { filePath, cwd, toolName, getFlag, dbg } = ctx;
+	const { filePath, cwd, toolName, getFlag, getFlagSource, dbg } = ctx;
 	const { getFormatService } = deps;
 
 	const phase = createPhaseTracker(toolName, filePath);
@@ -1102,7 +1159,7 @@ export async function runPipeline(
 	let formattersUsed: string[] = [];
 	let formatFailures: string[] = [];
 	const piChangedFiles = new Set<string>();
-	const autoformatDisabled = !!getFlag("no-autoformat");
+	const autoformatDisabled = !!getFlag("no-autoformat", filePath);
 	const immediateFormat = !!getFlag("immediate-format");
 	const formatDeferred =
 		!autoformatDisabled && !immediateFormat && !!fileContent;
@@ -1129,6 +1186,11 @@ export async function runPipeline(
 		}
 	} else if (formatDeferred) {
 		dbg(`autoformat: deferred until agent_end for ${filePath}`);
+	} else if (autoformatDisabled) {
+		const source = getFlagSource?.("no-autoformat", filePath);
+		dbg(
+			`autoformat: skipped for ${filePath} (--no-autoformat${source ? `, source=${source}` : ""})`,
+		);
 	}
 	phase.end("format", {
 		formattersUsed,
@@ -1138,14 +1200,23 @@ export async function runPipeline(
 
 	// --- 3. Auto-fix ---
 	phase.start("autofix");
-	const {
+	let fixedCount = 0;
+	let autofixTools: string[] = [];
+	let attemptedTools: string[] = [];
+	let autofixChangedFiles: string[] = [];
+	let fixRefresh = false;
+	let autofixSkipReason: string | undefined;
+	if (ctx.autofixMode === "deferred") {
+		autofixSkipReason = "deferred_to_agent_end";
+		dbg(`autofix: deferred until agent_end for ${filePath}`);
+	} else ({
 		fixedCount,
 		autofixTools,
 		attemptedTools,
 		changedFiles: autofixChangedFiles,
 		needsContentRefresh: fixRefresh,
 		skipReason: autofixSkipReason,
-	} = await runAutofix(filePath, cwd, getFlag, dbg, deps);
+	} = await runAutofix(filePath, cwd, getFlag, dbg, deps, getFlagSource));
 	for (const changedFile of autofixChangedFiles) {
 		piChangedFiles.add(path.resolve(changedFile));
 	}
@@ -1200,6 +1271,8 @@ export async function runPipeline(
 	const piApi: PiAgentAPI = {
 		getFlag: getFlag as (flag: string) => boolean | string | undefined,
 	};
+	const { dispatchLintWithResult, computeCascadeForFile } =
+		await loadDispatchIntegration();
 	const dispatchResult = await dispatchLintWithResult(
 		filePath,
 		cwd,
@@ -1210,6 +1283,12 @@ export async function runPipeline(
 			sessionId: ctx.telemetry?.sessionId ?? "unknown",
 			turnIndex: ctx.telemetry?.turnIndex ?? 0,
 			writeIndex: ctx.telemetry?.writeIndex ?? 0,
+		},
+		{
+			projectRoot: ctx.projectRoot,
+			writeIndex: ctx.telemetry?.writeIndex,
+			telemetryModel: ctx.telemetry?.modelId,
+			telemetryProvider: ctx.telemetry?.provider,
 		},
 	);
 	recordDiagnostics(
@@ -1325,7 +1404,14 @@ export async function runPipeline(
 		const fileList = changedList.length
 			? "\nModified files:\n" + topFiles + overflow
 			: "";
-		output += `\n\n⚠️ **File was modified by auto-format/fix. You MUST re-read modified file(s) before making any further edits — the content on disk has changed (whitespace, indentation, quotes, or code). Editing from memory will produce mismatches.**${fileList}`;
+		const targetHasAuthoritativeAttachment =
+			ctx.autofixMode !== "deferred" &&
+			autofixChangedFiles.some(
+				(changedFile) => path.resolve(changedFile) === path.resolve(filePath),
+			);
+		output += targetHasAuthoritativeAttachment
+			? `\n\n⚠️ **The attached full content for ${toRunnerDisplayPath(cwd, filePath)} is authoritative after autofix. You MUST re-read any other modified side-effect files before editing them.**${fileList}`
+			: `\n\n⚠️ **File was modified by auto-format/fix. You MUST re-read modified file(s) before making any further edits — the content on disk has changed (whitespace, indentation, quotes, or code). Editing from memory will produce mismatches.**${fileList}`;
 	}
 	phase.end("dispatch_lint", {
 		hasOutput: !!dispatchResult.output,
@@ -1338,6 +1424,11 @@ export async function runPipeline(
 	// result is never shown inline — settled (bounded) and surfaced at turn_end.
 	// The stored promise must never reject: an unhandled rejection is fatal, so a
 	// failing compute resolves to an "error" skip-run instead.
+	const cascadeOrigin = {
+		turnSeq: ctx.telemetry?.turnIndex,
+		writeSeq: ctx.telemetry?.writeIndex,
+		projectSeq: ctx.seqState?.projectSeq(),
+	};
 	const cascadePromise = getFlag("no-lsp")
 		? undefined
 		: computeCascadeForFile(filePath, cwd, {
@@ -1349,15 +1440,24 @@ export async function runPipeline(
 				fileContent,
 				wordIndex: ctx.wordIndex,
 				onWordIndexUpdated: ctx.onWordIndexUpdated,
-			}).catch(
+			}).then((run) => ({ ...run, origin: cascadeOrigin }))
+			.catch(
 				(err): import("./cascade-types.js").CascadeRun => {
 					dbg(`cascade compute failed for ${filePath}: ${err}`);
 					return {
 						filePath,
+						origin: cascadeOrigin,
 						result: undefined,
 						neighborCount: 0,
 						diagnosticCount: 0,
 						skipReason: "error",
+						// #1023: a thrown compute is ALSO "couldn't compute downstream
+						// impact" — carry an indeterminate marker so turn_end surfaces an
+						// honest advisory instead of the error skip being logs-only.
+						indeterminate: {
+							reason: "error",
+							detail: "cascade computation failed",
+						},
 					};
 				},
 			);
@@ -1407,5 +1507,9 @@ export async function runPipeline(
 		formattersUsed,
 		fixedCount,
 		autofixTools,
+		postMutation:
+			ctx.autofixMode !== "deferred" && autofixChangedFiles.some((f) => path.resolve(f) === path.resolve(filePath)) && fileContent !== undefined
+				? { filePath: path.resolve(filePath), content: fileContent, source: "autofix" }
+				: undefined,
 	};
 }

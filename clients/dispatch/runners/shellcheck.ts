@@ -22,7 +22,6 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { ensureTool } from "../../installer/index.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { PRIORITY } from "../priorities.js";
 import type {
@@ -34,6 +33,7 @@ import type {
 import {
 	createAvailabilityChecker,
 	lspPrimaryCoversFile,
+	resolveAvailableOrInstall,
 } from "./utils/runner-helpers.js";
 
 const shellcheck = createAvailabilityChecker("shellcheck", ".exe");
@@ -160,7 +160,11 @@ const shellcheckRunner: RunnerDefinition = {
 		if (await (shellcheck.isAvailableAsync(cwd))) {
 			cmd = shellcheck.getCommand(cwd);
 		} else {
-			const managed = await ensureTool("shellcheck");
+			const managed = await resolveAvailableOrInstall(
+				shellcheck,
+				"shellcheck",
+				cwd,
+			);
 			if (managed) cmd = managed;
 		}
 		if (!cmd) return { status: "skipped", diagnostics: [], semantic: "none" };

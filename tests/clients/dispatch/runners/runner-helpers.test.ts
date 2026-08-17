@@ -3,18 +3,35 @@ import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	createAvailabilityChecker,
+	getSgCommand,
+	isSgAvailableAsync,
 	lspPrimaryCoversFile,
 	resolveCommandArgsWithInstallFallback,
 	resolveCommandWithInstallFallback,
+	resolveAvailableOrInstall,
 	resolveLocalFirstAsync,
 	resolveNodeToolCommand,
 	resolveToolCommand,
 	resolveToolCommandWithInstallFallback,
+	resetDispatchAvailabilityState,
 	resolveVendorToolCommand,
 } from "../../../../clients/dispatch/runners/utils/runner-helpers.ts";
 import type { DispatchContext } from "../../../../clients/dispatch/types.ts";
 import { findGlobalBinary } from "../../../../clients/package-manager.js";
 import { setupTestEnvironment } from "../../test-utils.js";
+
+const { logSessionStartSpy } = vi.hoisted(() => ({
+	logSessionStartSpy: vi.fn(),
+}));
+
+const missingSpawnFailure = () => ({
+	kind: "tool-not-found" as const,
+	cause: Object.assign(new Error("missing"), { code: "ENOENT" }),
+}) as never;
+
+vi.mock("../../../../clients/sessionstart-logger.js", () => ({
+	logSessionStart: logSessionStartSpy,
+}));
 
 vi.mock("../../../../clients/safe-spawn.js", () => ({
 	safeSpawn: vi.fn(() => ({ stdout: "", stderr: "", status: 1 })),
@@ -23,6 +40,10 @@ vi.mock("../../../../clients/safe-spawn.js", () => ({
 
 vi.mock("../../../../clients/installer/index.js", () => ({
 	ensureTool: vi.fn(async () => null),
+	// Pass the on-disk pre-check so these tests keep exercising the --version
+	// probe path through the mocked safeSpawnAsync.
+	isSpawnableCommand: vi.fn(async () => true),
+	resetPathWalkMemo: vi.fn(),
 }));
 
 vi.mock("../../../../clients/package-manager.js", async (importOriginal) => ({
@@ -41,6 +62,8 @@ describe("runner-helpers availability checker", () => {
 		vi.mocked(installerMod.ensureTool).mockReset();
 		vi.mocked(findGlobalBinary).mockReset();
 		vi.mocked(findGlobalBinary).mockResolvedValue(undefined);
+		logSessionStartSpy.mockReset();
+		resetDispatchAvailabilityState();
 	});
 
 	it("resolves local node_modules/.bin commands before global fallback", () => {
@@ -93,11 +116,8 @@ describe("runner-helpers availability checker", () => {
 	});
 
 	it("resolves installed command after version check fallback", async () => {
-		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
 		const installerMod = await import("../../../../clients/installer/index.js");
-		vi.mocked(safeSpawnMod.safeSpawnAsync)
-			.mockResolvedValueOnce({ stdout: "", stderr: "not found", status: 1 })
-			.mockResolvedValueOnce({ stdout: "1.0.0", stderr: "", status: 0 });
+		vi.mocked(installerMod.isSpawnableCommand).mockResolvedValueOnce(false);
 		vi.mocked(installerMod.ensureTool).mockResolvedValue("stylelint");
 
 		const resolved = await resolveCommandWithInstallFallback(
@@ -153,6 +173,33 @@ describe("runner-helpers availability checker", () => {
 		expect(resolvedByToolId).toBeNull();
 	});
 
+	it("dedupes concurrent missing-tool probe and install transactions", async () => {
+		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
+		const installerMod = await import("../../../../clients/installer/index.js");
+		vi.mocked(safeSpawnMod.safeSpawnAsync).mockResolvedValue({
+			stdout: "",
+			stderr: "not found",
+			status: 1,
+			error: Object.assign(new Error("missing"), { code: "ENOENT" }),
+			failure: "spawn",
+			spawnFailure: missingSpawnFailure(),
+		});
+		vi.mocked(installerMod.ensureTool).mockResolvedValue("ruff");
+		const checker = createAvailabilityChecker("ruff");
+
+		const results = await Promise.all(
+			Array.from({ length: 8 }, () =>
+				resolveAvailableOrInstall(checker, "ruff", process.cwd()),
+			),
+		);
+
+		expect(results).toEqual(Array(8).fill("ruff"));
+		expect(installerMod.ensureTool).toHaveBeenCalledTimes(1);
+		// Mutation verification: removing the shared resolve/install in-flight map
+		// makes this same test observe 8 ensureTool calls; the dedupe extension was
+		// temporarily reverted and the test was rerun before restoring the fix.
+	});
+
 	it("probes with custom versionArgs (e.g. `zig version`, not `--version`)", async () => {
 		// Regression guard for #209: zig rejects `--version` (its version
 		// subcommand is `zig version`), so the default probe made zig-check skip on
@@ -171,6 +218,42 @@ describe("runner-helpers availability checker", () => {
 		expect(probedArgs).toEqual(["version"]);
 	});
 
+	it("does not let an old in-flight probe delete a newer generation", async () => {
+		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
+		let releaseOld!: (value: unknown) => void;
+		let releaseNew!: (value: unknown) => void;
+		const oldProbe = new Promise((resolve) => {
+			releaseOld = resolve;
+		});
+		const newProbe = new Promise((resolve) => {
+			releaseNew = resolve;
+		});
+		vi.mocked(safeSpawnMod.safeSpawnAsync)
+			.mockReturnValueOnce(oldProbe as never)
+			.mockReturnValueOnce(newProbe as never);
+
+		const checker = createAvailabilityChecker("generation-tool");
+		const oldResult = checker.isAvailableAsync(process.cwd());
+		await vi.waitFor(() =>
+			expect(safeSpawnMod.safeSpawnAsync).toHaveBeenCalledTimes(1),
+		);
+
+		resetDispatchAvailabilityState();
+		const newResult = checker.isAvailableAsync(process.cwd());
+		await vi.waitFor(() =>
+			expect(safeSpawnMod.safeSpawnAsync).toHaveBeenCalledTimes(2),
+		);
+		releaseOld({ stdout: "", stderr: "", status: 1 });
+		await oldResult;
+
+		// If the old finally deleted the new entry, this call would start a third
+		// probe instead of sharing the replacement-generation promise.
+		void checker.isAvailableAsync(process.cwd());
+		expect(safeSpawnMod.safeSpawnAsync).toHaveBeenCalledTimes(2);
+		releaseNew({ stdout: "1.0.0", stderr: "", status: 0 });
+		await newResult;
+	});
+
 	it("defaults versionArgs to --version when not overridden", async () => {
 		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
 		let probedArgs: string[] | undefined;
@@ -184,6 +267,126 @@ describe("runner-helpers availability checker", () => {
 		const checker = createAvailabilityChecker("sometool");
 		expect(await checker.isAvailableAsync(process.cwd())).toBe(true);
 		expect(probedArgs).toEqual(["--version"]);
+	});
+
+	it("re-probes a cached positive when its resolved command disappears", async () => {
+		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
+		const installerMod = await import("../../../../clients/installer/index.js");
+		vi.mocked(safeSpawnMod.safeSpawnAsync)
+			.mockResolvedValueOnce({ stdout: "1.0.0", stderr: "", status: 0 })
+			.mockResolvedValueOnce({
+				stdout: "",
+				stderr: "missing",
+				status: null,
+				error: Object.assign(new Error("missing"), { code: "ENOENT" }),
+				failure: "spawn",
+				spawnFailure: missingSpawnFailure(),
+			});
+		vi.mocked(installerMod.isSpawnableCommand).mockResolvedValueOnce(false);
+		// Scoped count: earlier tests in this file legitimately trigger the
+		// session-reset path, which also calls resetPathWalkMemo.
+		vi.mocked(installerMod.resetPathWalkMemo).mockClear();
+		const checker = createAvailabilityChecker("deleted-tool");
+		expect(await checker.isAvailableAsync(process.cwd())).toBe(true);
+		expect(await checker.isAvailableAsync(process.cwd())).toBe(false);
+		expect(safeSpawnMod.safeSpawnAsync).toHaveBeenCalledTimes(2);
+		expect(installerMod.resetPathWalkMemo).toHaveBeenCalledOnce();
+	});
+
+	it("resets the shared ast-grep availability memo at session start", async () => {
+		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
+		const installerMod = await import("../../../../clients/installer/index.js");
+		vi.mocked(safeSpawnMod.safeSpawnAsync).mockResolvedValue({
+			stdout: "",
+			stderr: "missing",
+			status: 1,
+		});
+		expect(await isSgAvailableAsync()).toBe(false);
+		vi.mocked(installerMod.resetPathWalkMemo).mockClear();
+		resetDispatchAvailabilityState();
+		expect(installerMod.resetPathWalkMemo).toHaveBeenCalledOnce();
+		vi.mocked(safeSpawnMod.safeSpawnAsync).mockResolvedValue({
+			stdout: "ast-grep 0.40.0",
+			stderr: "",
+			status: 0,
+		});
+		expect(await isSgAvailableAsync()).toBe(true);
+		expect(getSgCommand().cmd).toContain("ast-grep");
+	});
+
+	it("bounds missing-tool installs to one attempt and records the failure", async () => {
+		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
+		const installerMod = await import("../../../../clients/installer/index.js");
+		vi.mocked(safeSpawnMod.safeSpawnAsync).mockResolvedValue({
+			stdout: "",
+			stderr: "",
+			status: null,
+			error: Object.assign(new Error("spawn missing ENOENT"), { code: "ENOENT" }),
+			failure: "spawn",
+			spawnFailure: missingSpawnFailure(),
+		});
+		vi.mocked(installerMod.ensureTool).mockResolvedValue(undefined);
+
+		const checker = createAvailabilityChecker("missing-tool");
+		for (let attempt = 0; attempt < 4; attempt += 1) {
+			await expect(
+				resolveAvailableOrInstall(checker, "ruff", process.cwd()),
+			).resolves.toBeNull();
+		}
+
+		// The first failed install suppresses same-session re-entry, so the
+		// effective retry cap is one attempt per tool and cwd.
+		expect(installerMod.ensureTool).toHaveBeenCalledTimes(1);
+		expect(logSessionStartSpy).toHaveBeenCalledTimes(1);
+		expect(logSessionStartSpy).toHaveBeenCalledWith(
+			"dispatch availability ruff: install attempt 1 failed; suppressing retries until the next session or a successful install",
+		);
+
+		resetDispatchAvailabilityState();
+		await expect(
+			resolveAvailableOrInstall(checker, "ruff", process.cwd()),
+		).resolves.toBeNull();
+		expect(installerMod.ensureTool).toHaveBeenCalledTimes(2);
+		expect(logSessionStartSpy).toHaveBeenCalledTimes(2);
+		expect(logSessionStartSpy).toHaveBeenLastCalledWith(
+			"dispatch availability ruff: install attempt 1 failed; suppressing retries until the next session or a successful install",
+		);
+	});
+
+	it("allows a later retry after a successful install clears the failure state", async () => {
+		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
+		const installerMod = await import("../../../../clients/installer/index.js");
+		vi.mocked(safeSpawnMod.safeSpawnAsync).mockResolvedValue({
+			stdout: "",
+			stderr: "",
+			status: null,
+			error: Object.assign(new Error("spawn missing ENOENT"), { code: "ENOENT" }),
+			failure: "spawn",
+			spawnFailure: missingSpawnFailure(),
+		});
+		const checker = createAvailabilityChecker("missing-tool-success");
+
+		vi.mocked(installerMod.ensureTool).mockResolvedValueOnce(undefined);
+		await expect(
+			resolveAvailableOrInstall(checker, "ruff", process.cwd()),
+		).resolves.toBeNull();
+
+		// The session reset permits the successful install attempt; the assertion
+		// below verifies that noteInstallSuccess removes the prior tool state.
+		resetDispatchAvailabilityState();
+		vi.mocked(installerMod.ensureTool).mockResolvedValueOnce("/managed/ruff");
+		await expect(
+			resolveAvailableOrInstall(checker, "ruff", process.cwd()),
+		).resolves.toBe("/managed/ruff");
+
+		vi.mocked(installerMod.ensureTool).mockResolvedValueOnce(undefined);
+		await expect(
+			resolveAvailableOrInstall(checker, "ruff", process.cwd()),
+		).resolves.toBeNull();
+		expect(installerMod.ensureTool).toHaveBeenCalledTimes(3);
+		expect(logSessionStartSpy).toHaveBeenLastCalledWith(
+			"dispatch availability ruff: install attempt 1 failed; suppressing retries until the next session or a successful install",
+		);
 	});
 
 	it("lspPrimaryCoversFile: true when the named server is the file's primary (#233)", () => {
@@ -301,15 +504,13 @@ describe("runner-helpers availability checker", () => {
 
 			const checker = createAvailabilityChecker("ruff", ".exe");
 
-			vi.mocked(safeSpawnMod.safeSpawnAsync).mockImplementation(
-				async (cmd) => {
-					const text = String(cmd);
-					if (text.includes(dirB.tmpDir)) {
-						return { stdout: "ruff 1.0.0", stderr: "", status: 0 };
-					}
-					return { stdout: "", stderr: "not found", status: 1 };
-				},
-			);
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockImplementation(async (cmd) => {
+				const text = String(cmd);
+				if (text.includes(dirB.tmpDir)) {
+					return { stdout: "ruff 1.0.0", stderr: "", status: 0 };
+				}
+				return { stdout: "", stderr: "not found", status: 1 };
+			});
 
 			expect(await checker.isAvailableAsync(dirA.tmpDir)).toBe(false);
 			expect(await checker.isAvailableAsync(dirB.tmpDir)).toBe(true);

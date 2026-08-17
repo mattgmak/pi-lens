@@ -11,11 +11,12 @@
  * indicators. These are silent metrics surfaced in the session summary.
  */
 
+import { createSubsystemLogger } from "./extension-log.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
 	firstChildOfType,
-	parseTreeSitterRoot,
+	withTreeSitterRoot,
 	resolveTreeSitterLanguage,
 	type TsNode,
 	walk,
@@ -471,7 +472,7 @@ export class ComplexityClient {
 
 	constructor(verbose = false) {
 		this.log = verbose
-			? (msg: string) => console.error(`[complexity] ${msg}`)
+			? createSubsystemLogger("complexity")
 			: () => {};
 	}
 
@@ -489,19 +490,19 @@ export class ComplexityClient {
 		if (!nodes) return null;
 
 		let content: string;
-		let root: TsNode | null;
 		try {
 			if (!fs.existsSync(absolutePath)) return null;
 			content = fs.readFileSync(absolutePath, "utf-8");
-			root = await parseTreeSitterRoot(absolutePath, content);
 		} catch (err) {
-			this.log(`Read/parse error for ${filePath}: ${(err as Error).message}`);
+			this.log(`Read error for ${filePath}: ${(err as Error).message}`);
 			return null;
 		}
-		if (!root) return null;
 
 		try {
-			return this.computeMetrics(absolutePath, content, root, nodes);
+			const parsed = await withTreeSitterRoot(absolutePath, content, (root) =>
+				this.computeMetrics(absolutePath, content, root, nodes),
+			);
+			return parsed.parsed ? parsed.value : null;
 		} catch (err) {
 			this.log(`Analysis error for ${filePath}: ${(err as Error).message}`);
 			return null;

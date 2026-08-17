@@ -11,16 +11,12 @@
  * - Explicit config wins; otherwise smart defaults apply
  */
 
+import { logExtension } from "./extension-log.js";
 import * as path from "node:path";
 import { recordFormatter } from "./widget-state.js";
 import { FileTime } from "./file-time.js";
-import {
-	clearFormatterRuntimeState,
-	type FormatterInfo,
-	type FormatterResult,
-	formatFile,
-	getFormattersForFile,
-} from "./formatters.js";
+import type { FormatterInfo, FormatterResult } from "./formatters.js";
+import { loadFormatters } from "./formatters-lazy.js";
 
 // --- Configuration ---
 
@@ -81,9 +77,12 @@ export class FormatService {
 
 		// Check if file was modified externally (safety check)
 		if (this.fileTime.hasChanged(absolutePath)) {
-			console.warn(
-				`[format] File ${absolutePath} modified externally, skipping format`,
-			);
+			logExtension({
+				subsystem: "format",
+				level: "warn",
+				message: `File ${absolutePath} modified externally, skipping format`,
+				metadata: { filePath: absolutePath },
+			});
 			return {
 				filePath: absolutePath,
 				formatters: [],
@@ -95,7 +94,7 @@ export class FormatService {
 		// Get formatters for this file
 		const formatters = options.formatters
 			? await this.getFormattersByName(options.formatters)
-			: await getFormattersForFile(absolutePath, cwd);
+			: await (await loadFormatters()).getFormattersForFile(absolutePath, cwd);
 
 		if (formatters.length === 0) {
 			return {
@@ -152,10 +151,16 @@ export class FormatService {
 		const results: FormatterResult[] = [];
 
 		for (const formatter of formatters) {
+			// #1097: keep the timer handle so it can be cleared once the race
+			// settles. An uncleared, REF'D 30s setTimeout that outlives a fast
+			// `formatFile` win would keep a one-shot `pi --print` process alive for
+			// up to 30s after completion (same uncleared-race-timeout class as the
+			// LSP client-wait leak fixed in clients/lsp/index.ts).
+			let formatTimer: ReturnType<typeof setTimeout> | undefined;
 			try {
 				const timeoutMs = 30000;
 				const timeoutPromise = new Promise<FormatterResult>((_, reject) => {
-					setTimeout(
+					formatTimer = setTimeout(
 						() =>
 							reject(
 								new Error(
@@ -167,7 +172,7 @@ export class FormatService {
 				});
 
 				const result = await Promise.race([
-					formatFile(filePath, formatter),
+					loadFormatters().then(({ formatFile }) => formatFile(filePath, formatter)),
 					timeoutPromise,
 				]);
 				results.push(result);
@@ -177,6 +182,8 @@ export class FormatService {
 					changed: false,
 					error: error instanceof Error ? error.message : String(error),
 				});
+			} finally {
+				if (formatTimer) clearTimeout(formatTimer);
 			}
 		}
 
@@ -187,9 +194,7 @@ export class FormatService {
 	 * Get formatters by name (for explicit formatter selection)
 	 */
 	private async getFormattersByName(names: string[]): Promise<FormatterInfo[]> {
-		const { listAllFormatters, ...formatters } = await import(
-			"./formatters.js"
-		);
+		const { listAllFormatters, ...formatters } = await loadFormatters();
 		const allNames = listAllFormatters();
 
 		return names
@@ -232,7 +237,9 @@ export class FormatService {
 	 * Clear detection cache
 	 */
 	clearCache(): void {
-		clearFormatterRuntimeState();
+		void loadFormatters().then(({ clearFormatterRuntimeState }) =>
+			clearFormatterRuntimeState(),
+		);
 	}
 }
 
@@ -259,7 +266,9 @@ export function getFormatService(
 }
 
 export function resetFormatService(): void {
-	clearFormatterRuntimeState();
+	void loadFormatters().then(({ clearFormatterRuntimeState }) =>
+		clearFormatterRuntimeState(),
+	);
 	globalFormatService = null;
 	currentSessionID = null;
 }

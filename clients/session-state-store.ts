@@ -11,16 +11,27 @@
 
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
+import { writeFileAtomicAsync } from "./atomic-write.js";
 import { getProjectDataDir } from "./file-utils.js";
+import { readJsonCacheAsync } from "./json-cache-read.js";
+import type { PersistedReadGuardState } from "./read-guard.js";
 import type { PersistedWidgetState } from "./widget-state.js";
 
-const STATE_VERSION = 1;
+export const STATE_VERSION = 1;
 
 export interface PersistedSessionState {
 	version: number;
 	sessionId: string;
 	savedAt: number;
 	widget: PersistedWidgetState;
+	/**
+	 * Read-before-edit guard read-set (#1041). Optional and additive: sessions
+	 * persisted before this field existed simply omit it, and load cleanly as
+	 * "no prior reads" — so STATE_VERSION is deliberately NOT bumped (a bump
+	 * would reject those older files entirely and lose their widget rehydration
+	 * too). Rehydrated with disk-staleness reconciliation by ReadGuard.importState.
+	 */
+	readGuard?: PersistedReadGuardState;
 }
 
 /**
@@ -67,6 +78,7 @@ export async function saveSessionState(
 	cwd: string,
 	sessionId: string | undefined,
 	widget: PersistedWidgetState,
+	readGuard?: PersistedReadGuardState,
 ): Promise<void> {
 	if (!sessionId || !sessionId.trim()) return;
 	try {
@@ -77,11 +89,17 @@ export async function saveSessionState(
 			sessionId,
 			savedAt: Date.now(),
 			widget,
+			...(readGuard ? { readGuard } : {}),
 		};
 		const file = sessionFilePath(cwd, sessionId);
-		const tmp = `${file}.${process.pid}.tmp`;
-		await fs.writeFile(tmp, JSON.stringify(payload), "utf8");
-		await fs.rename(tmp, file);
+		// bestEffort (default): a failed write/rename just means this snapshot is
+		// lost, matching this store's documented "start clean" fallback — never
+		// throw for the caller. (Tmp naming is now the shared
+		// `${target}.tmp-${pid}-${seq}` shape (unique per call, not just per process,
+		// since #1205) rather than this site's former
+		// `${file}.${pid}.tmp` — no behavioral difference: nothing reads the
+		// intermediate tmp filename.)
+		await writeFileAtomicAsync(file, JSON.stringify(payload));
 	} catch {
 		/* best-effort */
 	}
@@ -126,12 +144,12 @@ export async function loadSessionState(
 	sessionId: string | undefined,
 ): Promise<PersistedSessionState | undefined> {
 	if (!sessionId || !sessionId.trim()) return undefined;
-	try {
-		const raw = await fs.readFile(sessionFilePath(cwd, sessionId), "utf8");
-		const parsed = JSON.parse(raw) as PersistedSessionState;
-		if (parsed?.version !== STATE_VERSION || !parsed.widget) return undefined;
-		return parsed;
-	} catch {
-		return undefined;
-	}
+	return readJsonCacheAsync<PersistedSessionState>(
+		sessionFilePath(cwd, sessionId),
+		(parsed) => {
+			const state = parsed as PersistedSessionState;
+			if (state?.version !== STATE_VERSION || !state.widget) return undefined;
+			return state;
+		},
+	);
 }

@@ -13,7 +13,25 @@ const openFile = vi.fn();
 const touchFile = vi.fn();
 const getDiagnostics = vi.fn();
 const codeAction = vi.fn();
+
+// #1179: `touchFile` now resolves the `{ diags, inconclusive, binding }` wrapper
+// (shape-5 structural fix) — wrap a mocked diagnostics array in the same shape.
+const diagsResult = (
+	diags: unknown[],
+	extra: {
+		inconclusive?: boolean;
+		// #1470: the narrowed confirmation an aux cut off by the grace timer
+		// produces — the touch is NOT inconclusive, but it no longer speaks for
+		// the named servers.
+		confirmation?: "confirmed" | "partial";
+		unconfirmedServerIds?: string[];
+	} = {},
+) => ({ diags, ...extra });
 const readFileContent = vi.fn(() => "const x = 1;\n");
+const warmAttach = vi.hoisted(() => ({
+	diagnostics: vi.fn(),
+	codeActions: vi.fn(),
+}));
 
 vi.mock("../../../../clients/safe-spawn.js", () => ({
 	safeSpawn,
@@ -40,12 +58,21 @@ vi.mock("../../../../clients/dispatch/runners/utils.js", () => ({
 	readFileContent,
 }));
 
-function ctx(filePath: string, cwd: string) {
+vi.mock("../../../../clients/warm-attach.js", () => ({
+	tryWarmAttachedDiagnostics: warmAttach.diagnostics,
+	tryWarmAttachedCodeActions: warmAttach.codeActions,
+}));
+
+function ctx(
+	filePath: string,
+	cwd: string,
+	overrides: { fileRole?: string } = {},
+) {
 	return {
 		filePath,
 		cwd,
 		kind: "jsts",
-		fileRole: "source",
+		fileRole: overrides.fileRole ?? "source",
 		pi: {
 			getFlag: (name: string) => name === "lens-lsp",
 		},
@@ -71,6 +98,9 @@ describe("runner status/semantic edge cases", () => {
 		readFileContent.mockReset();
 		readFileContent.mockReturnValue("const x = 1;\n");
 		supportsLSP.mockReturnValue(true);
+		warmAttach.diagnostics.mockReset();
+		warmAttach.codeActions.mockReset();
+		warmAttach.diagnostics.mockResolvedValue(undefined);
 	});
 
 	it("golangci-lint returns failed/blocking for error diagnostics", async () => {
@@ -211,7 +241,7 @@ describe("runner status/semantic edge cases", () => {
 			fs.writeFileSync(filePath, "const x = 1;\n");
 
 			supportsLSP.mockReturnValue(true);
-			touchFile.mockResolvedValue([]);
+			touchFile.mockResolvedValue(diagsResult([]));
 
 			const result = await runner.run(ctx(filePath, env.tmpDir) as never);
 			expect(result.status).toBe("succeeded");
@@ -272,15 +302,115 @@ describe("runner status/semantic edge cases", () => {
 			fs.writeFileSync(filePath, "const x = 1;\n");
 
 			supportsLSP.mockReturnValue(true);
-			const inconclusiveResult: unknown[] = [];
-			Object.defineProperty(inconclusiveResult, "inconclusive", {
-				value: true,
-			});
-			touchFile.mockResolvedValue(inconclusiveResult);
+			// #1179: empty `.diags` but `inconclusive: true` — an unconfirmed touch
+			// (notify/diagnostics wait lapsed). The flag is now an explicit enumerable
+			// wrapper field, so it survives any copy of `.diags` by construction.
+			touchFile.mockResolvedValue(diagsResult([], { inconclusive: true }));
 
 			const result = await runner.run(ctx(filePath, env.tmpDir) as never);
 			expect(result.status).toBe("skipped");
 			expect(result.diagnostics).toEqual([]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("lsp runner returns skipped for an EMPTY result whose auxiliary was cut off (#1470)", async () => {
+		// The practical shape from #1470: opengrep hangs, our grace timer cuts it
+		// off, the primary answers clean. The touch is deliberately NOT
+		// inconclusive (the primary's answer is real), so the pre-fix runner
+		// reported "succeeded / no-diagnostics" — a clean bill of health on the
+		// security lane for a scan that never ran. `RunnerResult` has no
+		// per-server coverage channel, so "skipped" is the honest verdict for an
+		// EMPTY result and the coverage notice says so.
+		const runner = (await import("../../../../clients/dispatch/runners/lsp.js"))
+			.default;
+		const env = setupTestEnvironment("pi-lens-lsp-cutoff-");
+		try {
+			const filePath = path.join(env.tmpDir, "main.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+
+			supportsLSP.mockReturnValue(true);
+			touchFile.mockResolvedValue(
+				diagsResult([], {
+					confirmation: "partial",
+					unconfirmedServerIds: ["opengrep"],
+				}),
+			);
+
+			const result = await runner.run(ctx(filePath, env.tmpDir) as never);
+			expect(result.status).toBe("skipped");
+			expect(result.diagnostics).toEqual([]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("lsp runner still reports the PRIMARY's findings when only an auxiliary was cut off (#1470)", async () => {
+		// The other half of the narrowing: collapsing a partial touch to
+		// skipped/inconclusive across the board would discard a trustworthy
+		// primary answer. Real findings must still reach the agent.
+		const runner = (await import("../../../../clients/dispatch/runners/lsp.js"))
+			.default;
+		const env = setupTestEnvironment("pi-lens-lsp-cutoff-findings-");
+		try {
+			const filePath = path.join(env.tmpDir, "main.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+
+			supportsLSP.mockReturnValue(true);
+			codeAction.mockResolvedValue([]);
+			touchFile.mockResolvedValue(
+				diagsResult(
+					[
+						{
+							severity: 1,
+							message: "Type error",
+							range: {
+								start: { line: 0, character: 0 },
+								end: { line: 0, character: 5 },
+							},
+						},
+					],
+					{ confirmation: "partial", unconfirmedServerIds: ["opengrep"] },
+				),
+			);
+
+			const result = await runner.run(ctx(filePath, env.tmpDir) as never);
+			expect(result.status).toBe("failed");
+			expect(result.failureKind).toBe("blocking_diagnostics");
+			expect(result.diagnostics[0]?.message).toContain("Type error");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("lsp runner returns skipped for a warm-attached EMPTY result whose auxiliary was cut off (#1470)", async () => {
+		// The same #1470 shape as the incumbent-touch test above, but on the
+		// warm-attach IPC route: `available: true` with an empty diagnostics
+		// array and `unconfirmedServerIds` on the response DTO. The wrapper this
+		// runner builds from a warm-attach answer must carry that field through
+		// to `touchCoverageGap`, not drop it — a hung opengrep must not read as
+		// a clean bill of health here either.
+		const runner = (await import("../../../../clients/dispatch/runners/lsp.js"))
+			.default;
+		const env = setupTestEnvironment("pi-lens-lsp-warm-cutoff-");
+		try {
+			const filePath = path.join(env.tmpDir, "main.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+
+			warmAttach.diagnostics.mockResolvedValue({
+				available: true,
+				response: {
+					diagnostics: [],
+					confirmation: "partial",
+					unconfirmedServerIds: ["opengrep"],
+				},
+			});
+
+			const result = await runner.run(ctx(filePath, env.tmpDir) as never);
+			expect(result.status).toBe("skipped");
+			expect(result.diagnostics).toEqual([]);
+			expect(touchFile).not.toHaveBeenCalled();
 		} finally {
 			env.cleanup();
 		}
@@ -318,7 +448,7 @@ describe("runner status/semantic edge cases", () => {
 
 			hasLSP.mockResolvedValue(true);
 			openFile.mockResolvedValue(undefined);
-			touchFile.mockResolvedValue([
+			touchFile.mockResolvedValue(diagsResult([
 				{
 					severity: 1,
 					message: "Type 'number' is not assignable to type 'string'.",
@@ -328,7 +458,7 @@ describe("runner status/semantic edge cases", () => {
 					},
 					code: "2322",
 				},
-			]);
+			])); 
 			codeAction.mockResolvedValue([
 				{ title: "Change type of 'a' to 'number'", kind: "quickfix" },
 				{ title: "Convert number to string", kind: "quickfix" },
@@ -349,6 +479,155 @@ describe("runner status/semantic edge cases", () => {
 		}
 	});
 
+	it("enriches warm-attached diagnostics with incumbent quickfixes", async () => {
+		const runner = (await import("../../../../clients/dispatch/runners/lsp.js"))
+			.default;
+		const env = setupTestEnvironment("pi-lens-lsp-warm-fix-");
+		try {
+			const filePath = path.join(env.tmpDir, "main.ts");
+			fs.writeFileSync(filePath, "const a: string = 1;\n");
+			warmAttach.diagnostics.mockResolvedValue({
+				available: true,
+				response: {
+					diagnostics: [
+						{
+							severity: 1,
+							message: "Type mismatch",
+							range: {
+								start: { line: 0, character: 6 },
+								end: { line: 0, character: 7 },
+							},
+						},
+					],
+				},
+			});
+			warmAttach.codeActions.mockResolvedValue({
+				available: true,
+				response: {
+					actions: [[{ title: "Change type", kind: "quickfix" }]],
+				},
+			});
+
+			const result = await runner.run(ctx(filePath, env.tmpDir) as never);
+
+			expect(result.diagnostics[0]?.fixSuggestion).toContain("Change type");
+			expect(touchFile).not.toHaveBeenCalled();
+			expect(codeAction).not.toHaveBeenCalled();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("keeps warm diagnostics and does not promote when enrichment fails", async () => {
+		const runner = (await import("../../../../clients/dispatch/runners/lsp.js"))
+			.default;
+		const env = setupTestEnvironment("pi-lens-lsp-warm-fix-fail-");
+		try {
+			const filePath = path.join(env.tmpDir, "main.ts");
+			fs.writeFileSync(filePath, "const a: string = 1;\n");
+			warmAttach.diagnostics.mockResolvedValue({
+				available: true,
+				response: {
+					diagnostics: [
+						{
+							severity: 1,
+							message: "Type mismatch",
+							range: {
+								start: { line: 0, character: 6 },
+								end: { line: 0, character: 7 },
+							},
+						},
+					],
+				},
+			});
+			warmAttach.codeActions.mockResolvedValue({
+				available: false,
+				reason: "timeout",
+			});
+
+			const result = await runner.run(ctx(filePath, env.tmpDir) as never);
+
+			expect(result.diagnostics).toHaveLength(1);
+			expect(result.diagnostics[0]?.fixSuggestion).toBeUndefined();
+			expect(warmAttach.diagnostics).toHaveBeenCalledTimes(1);
+			expect(touchFile).not.toHaveBeenCalled();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("lsp runner drops ast-grep auxiliary findings on test files, but keeps opengrep's (#687)", async () => {
+		const runner = (await import("../../../../clients/dispatch/runners/lsp.js"))
+			.default;
+		const env = setupTestEnvironment("pi-lens-lsp-astgrep-test-skip-");
+		try {
+			const filePath = path.join(env.tmpDir, "main.test.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+
+			supportsLSP.mockReturnValue(true);
+			touchFile.mockResolvedValue(diagsResult([
+				{
+					severity: 2,
+					message: "ast-grep finding",
+					range: {
+						start: { line: 0, character: 0 },
+						end: { line: 0, character: 1 },
+					},
+					code: "no-javascript-url",
+					source: "ast-grep",
+				},
+				{
+					severity: 2,
+					message: "opengrep finding",
+					range: {
+						start: { line: 0, character: 0 },
+						end: { line: 0, character: 1 },
+					},
+					code: "some-rule",
+					source: "Semgrep",
+				},
+			])); 
+
+			const result = await runner.run(
+				ctx(filePath, env.tmpDir, { fileRole: "test" }) as never,
+			);
+			expect(result.diagnostics).toHaveLength(1);
+			expect(result.diagnostics[0]?.tool).toBe("opengrep");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("lsp runner keeps ast-grep auxiliary findings on non-test files", async () => {
+		const runner = (await import("../../../../clients/dispatch/runners/lsp.js"))
+			.default;
+		const env = setupTestEnvironment("pi-lens-lsp-astgrep-source-");
+		try {
+			const filePath = path.join(env.tmpDir, "main.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+
+			supportsLSP.mockReturnValue(true);
+			touchFile.mockResolvedValue(diagsResult([
+				{
+					severity: 2,
+					message: "ast-grep finding",
+					range: {
+						start: { line: 0, character: 0 },
+						end: { line: 0, character: 1 },
+					},
+					code: "no-javascript-url",
+					source: "ast-grep",
+				},
+			])); 
+
+			const result = await runner.run(ctx(filePath, env.tmpDir) as never);
+			expect(result.diagnostics).toHaveLength(1);
+			expect(result.diagnostics[0]?.tool).toBe("ast-grep");
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("lsp runner ignores refactor-only code actions for fix guidance", async () => {
 		const runner = (await import("../../../../clients/dispatch/runners/lsp.js"))
 			.default;
@@ -359,7 +638,7 @@ describe("runner status/semantic edge cases", () => {
 
 			hasLSP.mockResolvedValue(true);
 			openFile.mockResolvedValue(undefined);
-			touchFile.mockResolvedValue([
+			touchFile.mockResolvedValue(diagsResult([
 				{
 					severity: 1,
 					message: "Type 'number' is not assignable to type 'string'.",
@@ -369,7 +648,7 @@ describe("runner status/semantic edge cases", () => {
 					},
 					code: "2322",
 				},
-			]);
+			])); 
 			codeAction.mockResolvedValue([
 				{ title: "Move to a new file", kind: "refactor.move.newFile" },
 			]);
@@ -398,7 +677,7 @@ describe("runner status/semantic edge cases", () => {
 			hasLSP.mockResolvedValue(true);
 			openFile.mockResolvedValue(undefined);
 			touchFile.mockResolvedValue(
-				[0, 1, 2].map((line) => ({
+				diagsResult([0, 1, 2].map((line) => ({
 					severity: 1,
 					message: "Type 'number' is not assignable to type 'string'.",
 					range: {
@@ -407,7 +686,7 @@ describe("runner status/semantic edge cases", () => {
 					},
 					code: "2322",
 				})),
-			);
+			)); 
 			// Assert concurrency by observed overlap (max in-flight lookups), not
 			// wall-clock — elapsed-time bounds flake under parallel vitest load.
 			// Sequential awaits would never have more than 1 lookup in flight.

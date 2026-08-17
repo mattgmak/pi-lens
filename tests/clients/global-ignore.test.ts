@@ -17,6 +17,7 @@ import {
 	loadPiLensGlobalConfig,
 } from "../../clients/lens-config.js";
 import { resetProjectLensConfigCache } from "../../clients/project-lens-config.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 let tmpDir: string;
 let projectRoot: string;
@@ -40,7 +41,7 @@ beforeEach(() => {
 afterEach(() => {
 	if (previousConfigPath === undefined) delete process.env.PI_LENS_CONFIG_PATH;
 	else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
-	fs.rmSync(tmpDir, { recursive: true, force: true });
+	removeTempDirSync(tmpDir);
 	resetProjectLensConfigCache();
 });
 

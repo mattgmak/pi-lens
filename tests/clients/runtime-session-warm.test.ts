@@ -4,7 +4,9 @@
  * lazy translation-unit indexing.
  */
 
+import * as fs from "node:fs";
 import * as os from "node:os";
+import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleSessionStart } from "../../clients/runtime-session.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
@@ -216,6 +218,76 @@ describe("warmFiles session start", () => {
 				clientScope: "primary",
 				diagnostics: "none",
 			});
+		} finally {
+			env.cleanup();
+			restoreStartupMode();
+		}
+	}, 15_000);
+
+	it("ignores json/yaml dominance and warms the dominant CODE kind (#894 review)", async () => {
+		const env = setupTestEnvironment("pi-lens-warm-");
+		const restoreStartupMode = setStartupMode("full");
+
+		// Data files outnumber TypeScript (5 json + 2 yaml vs 2 ts) and
+		// json/yaml have builtin LSP servers — but the dominant-language warm
+		// must still pick tsserver, or the first .ts edit pays the cold-spawn
+		// stall (#203) this warm exists to prevent.
+		createTempFile(env.tmpDir, "package.json", JSON.stringify({ type: "module" }));
+		for (let i = 0; i < 4; i++) {
+			createTempFile(env.tmpDir, `locales/l${i}.json`, `{"n": ${i}}`);
+		}
+		createTempFile(env.tmpDir, "ci/a.yml", "a: 1\n");
+		createTempFile(env.tmpDir, "ci/b.yml", "b: 2\n");
+		createTempFile(env.tmpDir, "src/a.ts", "export const a = 1;");
+		createTempFile(env.tmpDir, "src/b.ts", "export const b = 2;");
+
+		vi.mocked(loadLSPConfig).mockResolvedValue({});
+		vi.mocked(getLSPService).mockReturnValue({
+			touchFile: mockTouchFile,
+			supportsLSP: (f: string) => /\.(ts|json|ya?ml)$/.test(f),
+		} as any);
+
+		try {
+			await handleSessionStart(makeDeps({ ctxCwd: env.tmpDir }));
+
+			await vi.waitFor(() => expect(mockTouchFile).toHaveBeenCalledTimes(1), {
+				timeout: 5000,
+			});
+
+			const [filePath] = mockTouchFile.mock.calls[0] as [string];
+			expect(filePath).toMatch(/\.ts$/);
+		} finally {
+			env.cleanup();
+			restoreStartupMode();
+		}
+	}, 15_000);
+
+	it("falls back to a non-code kind when no code kind is present (#894 review)", async () => {
+		const env = setupTestEnvironment("pi-lens-warm-");
+		const restoreStartupMode = setStartupMode("full");
+
+		// Pure-config repo: the non-code fallback keeps #203's warm-something
+		// behavior instead of skipping warmup entirely. A .git marker makes the
+		// root warm-eligible (canWarmCaches) without adding any code files.
+		fs.mkdirSync(path.join(env.tmpDir, ".git"), { recursive: true });
+		createTempFile(env.tmpDir, "a.yaml", "a: 1\n");
+		createTempFile(env.tmpDir, "b.yaml", "b: 2\n");
+
+		vi.mocked(loadLSPConfig).mockResolvedValue({});
+		vi.mocked(getLSPService).mockReturnValue({
+			touchFile: mockTouchFile,
+			supportsLSP: (f: string) => /\.ya?ml$/.test(f),
+		} as any);
+
+		try {
+			await handleSessionStart(makeDeps({ ctxCwd: env.tmpDir }));
+
+			await vi.waitFor(() => expect(mockTouchFile).toHaveBeenCalledTimes(1), {
+				timeout: 5000,
+			});
+
+			const [filePath] = mockTouchFile.mock.calls[0] as [string];
+			expect(filePath).toMatch(/\.ya?ml$/);
 		} finally {
 			env.cleanup();
 			restoreStartupMode();

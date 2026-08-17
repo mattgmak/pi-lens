@@ -45,14 +45,42 @@ function setStartupMode(mode: "full" | "quick"): () => void {
 async function runSessionStart(
 	mode: "full" | "quick",
 	setup?: (tmpDir: string) => void,
+	overrides: {
+		astGrepEnsure?: () => Promise<boolean>;
+		scanExports?: () => Promise<Map<string, string>>;
+	} = {},
 ) {
 	const env = setupTestEnvironment("pi-lens-runtime-session-");
 	setup?.(env.tmpDir);
+	// #810 root cause: in "full" mode with a package.json present,
+	// scheduleStartupScans (clients/runtime-session.ts) fires "todo" and
+	// "word-index" as fire-and-forget background tasks (setImmediate) that do
+	// REAL, unmocked fs reads against env.tmpDir (collectTodoBaselineItems /
+	// collectWordIndexDocs walk the project for real — unlike knip/jscpd/
+	// ast-grep-exports/etc, which this test stubs out entirely). Earlier
+	// versions of this helper returned as soon as handleSessionStart's own
+	// promise resolved and let the caller's `finally { env.cleanup() }` run
+	// immediately after — but those two tasks were often still mid-read at
+	// that point, so the recursive rm raced an open file handle inside
+	// tmpDir and threw EPERM on Windows (deterministic here, not a load
+	// flake). Track the real in-flight-scan set via
+	// markStartupScanInFlight/clearStartupScanInFlight (the same primitive
+	// production code uses, `clients/runtime-coordinator.ts`) and wait for
+	// "todo"/"word-index" to clear before returning, so cleanup never races
+	// them. call-graph/codebase-model are deliberately excluded — they're
+	// staggered 5+ seconds out by design (see taskDeferMsByName) and would
+	// slow every test down for no correctness benefit; by the time they
+	// fire (in a later test's turn), a stale/missing analysisRoot is a
+	// harmless no-op/caught-error path, not a handle race.
+	const inFlightScans = new Set<string>();
 	const notify = vi.fn();
 	const scanDirectory = vi.fn(() => ({ items: [] }));
 	const scanFile = vi.fn((): unknown[] => []);
 	const ensureTool = vi.fn(async () => null);
-	const astGrepEnsure = vi.fn(async () => false);
+	const astGrepEnsure = vi.fn(overrides.astGrepEnsure ?? (async () => false));
+	const scanExports = vi.fn(
+		overrides.scanExports ?? (async () => new Map<string, string>()),
+	);
 	const biomeEnsure = vi.fn(async () => false);
 	const ruffEnsure = vi.fn(async () => false);
 	const knipEnsure = vi.fn(async () => false);
@@ -78,8 +106,12 @@ async function runSessionStart(
 			runtime: {
 				sessionGeneration: 1,
 				isCurrentSession: () => true,
-				markStartupScanInFlight: () => {},
-				clearStartupScanInFlight: () => {},
+				markStartupScanInFlight: (name: string) => {
+					inFlightScans.add(name);
+				},
+				clearStartupScanInFlight: (name: string) => {
+					inFlightScans.delete(name);
+				},
 				complexityBaselines: new Map(),
 				resetForSession: () => {},
 				projectRoot: "",
@@ -103,7 +135,7 @@ async function runSessionStart(
 			astGrepClient: {
 				isAvailable: () => false,
 				ensureAvailable: astGrepEnsure,
-				scanExports: async () => new Map(),
+				scanExports,
 			},
 			biomeClient: {
 				isAvailable: () => false,
@@ -138,8 +170,25 @@ async function runSessionStart(
 			resetLSPService,
 		} as any);
 
+		// The returned `cleanup` waits for the tmpDir-touching background scans
+		// to settle (see the #810 comment above `inFlightScans`) before deleting
+		// the directory — deliberately NOT awaited here at return time, since
+		// several tests assert on the deferred/not-yet-called state of these
+		// same background tasks immediately after `runSessionStart` resolves.
+		const cleanup = async (): Promise<void> => {
+			await vi.waitFor(
+				() => {
+					if (inFlightScans.has("todo") || inFlightScans.has("word-index")) {
+						throw new Error("background startup scans still touching tmpDir");
+					}
+				},
+				{ timeout: 2000 },
+			);
+			env.cleanup();
+		};
+
 		return {
-			env,
+			env: { ...env, cleanup },
 			notify,
 			scanDirectory,
 			scanFile,
@@ -164,6 +213,30 @@ async function runSessionStart(
 
 afterEach(() => {
 	delete process.env.PI_LENS_STARTUP_MODE;
+});
+
+it("executes the ast-grep export path and reports the returned exports", async () => {
+	const exports = new Map([
+		["readConfig", "src/config.ts"],
+		["writeConfig", "src/config.ts"],
+	]);
+	const scanExports = vi.fn(async () => exports);
+	const { env, astGrepEnsure, dbg } = await runSessionStart(
+		"full",
+		(tmpDir) => createTempFile(tmpDir, "package.json", JSON.stringify({ type: "module" })),
+		{ astGrepEnsure: async () => true, scanExports },
+	);
+	try {
+		await vi.waitFor(() => expect(astGrepEnsure).toHaveBeenCalled());
+		await vi.waitFor(() => expect(scanExports).toHaveBeenCalled());
+		await vi.waitFor(() =>
+			expect(dbg).toHaveBeenCalledWith(
+				expect.stringContaining("exports scan: 2 functions found"),
+			),
+		);
+	} finally {
+		await env.cleanup();
+	}
 });
 
 describe("runtime-session notifications", () => {
@@ -328,9 +401,9 @@ describe("runtime-session notifications", () => {
 			);
 			expect(scanDirectory).not.toHaveBeenCalled();
 			expect(ensureTool).not.toHaveBeenCalled();
-			expect(resetLSPService).toHaveBeenCalledWith({ fast: true });
+			expect(resetLSPService).toHaveBeenCalledWith({ fast: true, reason: "session_start" });
 		} finally {
-			env.cleanup();
+			await env.cleanup();
 		}
 	});
 
@@ -356,7 +429,7 @@ describe("runtime-session notifications", () => {
 			expect(scanDirectory).not.toHaveBeenCalled();
 			expect(ensureTool).not.toHaveBeenCalled();
 		} finally {
-			env.cleanup();
+			await env.cleanup();
 		}
 	});
 
@@ -377,7 +450,7 @@ describe("runtime-session notifications", () => {
 			expect(scanFile).not.toHaveBeenCalled();
 			await vi.waitFor(() => expect(scanFile).toHaveBeenCalled());
 		} finally {
-			env.cleanup();
+			await env.cleanup();
 		}
 	});
 
@@ -414,7 +487,7 @@ describe("runtime-session notifications", () => {
 					),
 				).toBe(true);
 			} finally {
-				env.cleanup();
+				await env.cleanup();
 			}
 		} finally {
 			delete process.env.PI_LENS_FORCE_SLOW_FS;
@@ -470,7 +543,7 @@ describe("runtime-session notifications", () => {
 				).toBe(true);
 				expect(mockTouchFile).not.toHaveBeenCalled();
 			} finally {
-				env.cleanup();
+				await env.cleanup();
 			}
 		} finally {
 			delete process.env.PI_SUBAGENT_CHILD;
@@ -504,12 +577,217 @@ describe("runtime-session notifications", () => {
 					),
 				).toBe(false);
 			} finally {
-				env.cleanup();
+				await env.cleanup();
 			}
 		} finally {
 			delete process.env.PI_SUBAGENT_CHILD;
 			delete process.env.PI_LENS_SUBAGENT_FULL;
 			_resetSubagentModeForTests();
+		}
+	});
+
+	it("startupModeOverride:'full' on first call gets full mode (MCP host path, #546)", async () => {
+		// Simulate the MCP host: first call of the process, no PI_LENS_STARTUP_MODE
+		// set in env, but deps.startupModeOverride = "full". The dbg log line
+		// "startup mode: full" is the cheapest reliable discriminant — it's
+		// emitted synchronously for every startup mode before the quick/full
+		// branch diverges.
+		const env = setupTestEnvironment("pi-lens-mcp-startup-mode-");
+		const globals = globalThis as unknown as {
+			__piLensFirstSessionDone?: boolean;
+			__piLensWarmupScheduled?: boolean;
+		};
+		const prevFirst = globals.__piLensFirstSessionDone;
+		const prevWarmup = globals.__piLensWarmupScheduled;
+		globals.__piLensFirstSessionDone = false;
+		globals.__piLensWarmupScheduled = false;
+		delete process.env.PI_LENS_STARTUP_MODE;
+		const dbg = vi.fn();
+		try {
+			await handleSessionStart({
+				ctxCwd: env.tmpDir,
+				startupModeOverride: "full",
+				getFlag: (name: string) => name === "no-lsp",
+				notify: () => {},
+				dbg,
+				log: () => {},
+				runtime: {
+					sessionGeneration: 1,
+					isCurrentSession: () => true,
+					markStartupScanInFlight: () => {},
+					clearStartupScanInFlight: () => {},
+					complexityBaselines: new Map(),
+					resetForSession: () => {},
+					projectRoot: "",
+					projectRulesScan: { hasCustomRules: false, rules: [] },
+					cachedExports: new Map(),
+					errorDebtBaseline: { testsPassed: true, buildPassed: true },
+				},
+				metricsClient: { reset: () => {} },
+				cacheManager: { writeCache: () => {}, readCache: () => null },
+				todoScanner: { scanDirectory: () => ({ items: [] }), scanFile: () => [] },
+				astGrepClient: { isAvailable: () => false, ensureAvailable: async () => false, scanExports: async () => new Map() },
+				biomeClient: { isAvailable: () => false, ensureAvailable: async () => false },
+				ruffClient: { isAvailable: () => false, ensureAvailable: async () => false },
+				knipClient: { isAvailable: () => false, ensureAvailable: async () => false, analyze: async () => ({ success: true, issues: [], unusedExports: [], unusedFiles: [], unusedDeps: [], unlistedDeps: [], summary: "skipped" }) },
+				jscpdClient: { isAvailable: () => false, ensureAvailable: async () => false },
+				depChecker: { isAvailable: () => false, ensureAvailable: async () => false },
+				testRunnerClient: { detectRunner: () => ({ runner: "vitest", config: null }), runTestFile: () => ({ failed: 1, error: false }) },
+				goClient: { isGoAvailableAsync: async () => false },
+				rustClient: { isAvailableAsync: async () => false },
+				ensureTool: async () => null,
+				cleanStaleTsBuildInfo: () => [],
+				resetDispatchBaselines: () => {},
+				resetLSPService: () => {},
+			} as any);
+			// dbg records the resolved startup mode synchronously
+			expect(
+				dbg.mock.calls.some(([msg]) =>
+					String(msg).includes("startup mode: full"),
+				),
+			).toBe(true);
+			// quick-mode emits a "skipping slow tool probes" dbg line; full does not
+			expect(
+				dbg.mock.calls.some(([msg]) =>
+					String(msg).includes("quick mode active"),
+				),
+			).toBe(false);
+		} finally {
+			globals.__piLensFirstSessionDone = prevFirst;
+			globals.__piLensWarmupScheduled = prevWarmup;
+			env.cleanup();
+		}
+	});
+
+	it("plain/TUI first call (no startupModeOverride) still gets quick mode (#546 non-regression)", async () => {
+		// Ensure the TUI path is unchanged: first call with no override → quick.
+		const env = setupTestEnvironment("pi-lens-tui-startup-mode-");
+		const globals = globalThis as unknown as {
+			__piLensFirstSessionDone?: boolean;
+			__piLensWarmupScheduled?: boolean;
+		};
+		const prevFirst = globals.__piLensFirstSessionDone;
+		const prevWarmup = globals.__piLensWarmupScheduled;
+		globals.__piLensFirstSessionDone = false;
+		globals.__piLensWarmupScheduled = false;
+		delete process.env.PI_LENS_STARTUP_MODE;
+		const dbg = vi.fn();
+		try {
+			await handleSessionStart({
+				ctxCwd: env.tmpDir,
+				// no startupModeOverride → TUI heuristic applies → quick
+				getFlag: (name: string) => name === "no-lsp",
+				notify: () => {},
+				dbg,
+				log: () => {},
+				runtime: {
+					sessionGeneration: 1,
+					isCurrentSession: () => true,
+					markStartupScanInFlight: () => {},
+					clearStartupScanInFlight: () => {},
+					complexityBaselines: new Map(),
+					resetForSession: () => {},
+					projectRoot: "",
+					projectRulesScan: { hasCustomRules: false, rules: [] },
+					cachedExports: new Map(),
+					errorDebtBaseline: { testsPassed: true, buildPassed: true },
+				},
+				metricsClient: { reset: () => {} },
+				cacheManager: { writeCache: () => {}, readCache: () => null },
+				todoScanner: { scanDirectory: () => ({ items: [] }), scanFile: () => [] },
+				astGrepClient: { isAvailable: () => false, ensureAvailable: async () => false, scanExports: async () => new Map() },
+				biomeClient: { isAvailable: () => false, ensureAvailable: async () => false },
+				ruffClient: { isAvailable: () => false, ensureAvailable: async () => false },
+				knipClient: { isAvailable: () => false, ensureAvailable: async () => false, analyze: async () => ({ success: true, issues: [], unusedExports: [], unusedFiles: [], unusedDeps: [], unlistedDeps: [], summary: "skipped" }) },
+				jscpdClient: { isAvailable: () => false, ensureAvailable: async () => false },
+				depChecker: { isAvailable: () => false, ensureAvailable: async () => false },
+				testRunnerClient: { detectRunner: () => ({ runner: "vitest", config: null }), runTestFile: () => ({ failed: 1, error: false }) },
+				goClient: { isGoAvailableAsync: async () => false },
+				rustClient: { isAvailableAsync: async () => false },
+				ensureTool: async () => null,
+				cleanStaleTsBuildInfo: () => [],
+				resetDispatchBaselines: () => {},
+				resetLSPService: () => {},
+			} as any);
+			expect(
+				dbg.mock.calls.some(([msg]) =>
+					String(msg).includes("startup mode: quick"),
+				),
+			).toBe(true);
+			expect(
+				dbg.mock.calls.some(([msg]) =>
+					String(msg).includes("quick mode active"),
+				),
+			).toBe(true);
+		} finally {
+			globals.__piLensFirstSessionDone = prevFirst;
+			globals.__piLensWarmupScheduled = prevWarmup;
+			env.cleanup();
+		}
+	});
+
+	it("explicit PI_LENS_STARTUP_MODE env wins over startupModeOverride (both hosts, #546)", async () => {
+		// Even with startupModeOverride:"full", if PI_LENS_STARTUP_MODE=quick is
+		// set, the env var takes precedence (highest priority rule).
+		const env = setupTestEnvironment("pi-lens-env-override-startup-mode-");
+		const globals = globalThis as unknown as {
+			__piLensFirstSessionDone?: boolean;
+			__piLensWarmupScheduled?: boolean;
+		};
+		const prevFirst = globals.__piLensFirstSessionDone;
+		const prevWarmup = globals.__piLensWarmupScheduled;
+		globals.__piLensFirstSessionDone = false;
+		globals.__piLensWarmupScheduled = false;
+		process.env.PI_LENS_STARTUP_MODE = "quick";
+		const dbg = vi.fn();
+		try {
+			await handleSessionStart({
+				ctxCwd: env.tmpDir,
+				startupModeOverride: "full", // would normally force full for MCP host…
+				getFlag: (name: string) => name === "no-lsp",
+				notify: () => {},
+				dbg,
+				log: () => {},
+				runtime: {
+					sessionGeneration: 1,
+					isCurrentSession: () => true,
+					markStartupScanInFlight: () => {},
+					clearStartupScanInFlight: () => {},
+					complexityBaselines: new Map(),
+					resetForSession: () => {},
+					projectRoot: "",
+					projectRulesScan: { hasCustomRules: false, rules: [] },
+					cachedExports: new Map(),
+					errorDebtBaseline: { testsPassed: true, buildPassed: true },
+				},
+				metricsClient: { reset: () => {} },
+				cacheManager: { writeCache: () => {}, readCache: () => null },
+				todoScanner: { scanDirectory: () => ({ items: [] }), scanFile: () => [] },
+				astGrepClient: { isAvailable: () => false, ensureAvailable: async () => false, scanExports: async () => new Map() },
+				biomeClient: { isAvailable: () => false, ensureAvailable: async () => false },
+				ruffClient: { isAvailable: () => false, ensureAvailable: async () => false },
+				knipClient: { isAvailable: () => false, ensureAvailable: async () => false, analyze: async () => ({ success: true, issues: [], unusedExports: [], unusedFiles: [], unusedDeps: [], unlistedDeps: [], summary: "skipped" }) },
+				jscpdClient: { isAvailable: () => false, ensureAvailable: async () => false },
+				depChecker: { isAvailable: () => false, ensureAvailable: async () => false },
+				testRunnerClient: { detectRunner: () => ({ runner: "vitest", config: null }), runTestFile: () => ({ failed: 1, error: false }) },
+				goClient: { isGoAvailableAsync: async () => false },
+				rustClient: { isAvailableAsync: async () => false },
+				ensureTool: async () => null,
+				cleanStaleTsBuildInfo: () => [],
+				resetDispatchBaselines: () => {},
+				resetLSPService: () => {},
+			} as any);
+			// PI_LENS_STARTUP_MODE=quick wins → resolveStartupMode() returns "quick"
+			// before the heuristic even runs (env var check skips the override branch)
+			expect(
+				dbg.mock.calls.some(([msg]) =>
+					String(msg).includes("startup mode: quick"),
+				),
+			).toBe(true);
+		} finally {
+			globals.__piLensFirstSessionDone = prevFirst;
+			globals.__piLensWarmupScheduled = prevWarmup;
+			env.cleanup();
 		}
 	});
 
@@ -544,7 +822,7 @@ describe("runtime-session notifications", () => {
 			expect(knipAnalyze).toHaveBeenCalledTimes(1);
 			expect(jscpdEnsure).toHaveBeenCalledTimes(1);
 		} finally {
-			env.cleanup();
+			await env.cleanup();
 		}
 	});
 });

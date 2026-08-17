@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { parse, Lang } from "@ast-grep/napi";
-import yaml from "js-yaml";
+import * as yaml from "js-yaml";
 
 // Guards the #239 Phase-2 invariant: EVERY shipped ast-grep rule must be
 // accepted by napi's native engine (root.findAll) — the SAME Rust core the

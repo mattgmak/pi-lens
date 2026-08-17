@@ -47,6 +47,33 @@ function wireParents(n: any): void {
 	}
 }
 
+/**
+ * Stand-in for the shared client. Expansion resolves its enclosing node INSIDE
+ * `withParsedTree`'s callback (#417), so the stub runs `consume` on the mock tree.
+ */
+function stubClient(tree: unknown) {
+	return {
+		init: async () => true,
+		withParsedTree: async (
+			_filePath: string,
+			_languageId: string,
+			_content: string | undefined,
+			consume: (tree: any) => unknown,
+		) => ({ parsed: true as const, value: consume(tree) }),
+	};
+}
+
+function unusedClient(reason: string) {
+	return {
+		init: async () => {
+			throw new Error(reason);
+		},
+		withParsedTree: async () => {
+			throw new Error(reason);
+		},
+	};
+}
+
 describe("EXPANSION_LIMIT_LINES", () => {
 	it("is 100", () => {
 		expect(EXPANSION_LIMIT_LINES).toBe(100);
@@ -65,7 +92,7 @@ describe("EXPANSION_LIMIT_LINES", () => {
 					]),
 				]),
 			};
-			const tsClient = { init: async () => true, parseFile: async () => tree };
+			const tsClient = stubClient(tree);
 			// Request exactly EXPANSION_LIMIT_LINES — should expand
 			const result = await tryExpandRead(filePath, 50, 100, 110, tsClient as any);
 			expect(result).toBeDefined();
@@ -80,7 +107,7 @@ describe("EXPANSION_LIMIT_LINES", () => {
 			const lines = Array.from({ length: 110 }, (_, i) => `line${i + 1}`).join("\n") + "\n";
 			const filePath = path.join(env.tmpDir, "file.ts");
 			fs.writeFileSync(filePath, lines);
-			const tsClient = { init: async () => { throw new Error("should not be called"); }, parseFile: async () => { throw new Error("should not be called"); } };
+			const tsClient = unusedClient("should not be called");
 			const result = await tryExpandRead(filePath, 1, 101, 110, tsClient as any);
 			expect(result).toBeUndefined();
 		} finally {
@@ -102,10 +129,7 @@ describe("tryExpandRead", () => {
 					]),
 				]),
 			};
-			const tsClient = {
-				init: async () => true,
-				parseFile: async () => tree,
-			};
+			const tsClient = stubClient(tree);
 
 			const result = await tryExpandRead(filePath, 3, 1, 6, tsClient as any);
 			expect(result).toMatchObject({
@@ -135,10 +159,7 @@ describe("tryExpandRead", () => {
 					]),
 				]),
 			};
-			const tsClient = {
-				init: async () => true,
-				parseFile: async () => tree,
-			};
+			const tsClient = stubClient(tree);
 
 			const result = await tryExpandRead(filePath, 2, 2, 6, tsClient as any);
 			expect(result).toMatchObject({
@@ -169,7 +190,7 @@ describe("tryExpandRead", () => {
 					]),
 				]),
 			};
-			const tsClient = { init: async () => true, parseFile: async () => tree };
+			const tsClient = stubClient(tree);
 			const result = await tryExpandRead(filePath, 3, 1, 6, tsClient as any);
 			expect(result).toBeDefined();
 			expect(result?.ancestry).toBeUndefined();
@@ -198,7 +219,7 @@ describe("tryExpandRead", () => {
 					]),
 				]),
 			};
-			const tsClient = { init: async () => true, parseFile: async () => tree };
+			const tsClient = stubClient(tree);
 			const result = await tryExpandRead(filePath, 6, 1, 12, tsClient as any);
 			expect(result).toBeDefined();
 			expect(result?.enclosingSymbol.name).toBe("myMethod");
@@ -222,12 +243,7 @@ describe("tryExpandRead", () => {
 				filePath,
 				"# Title\nline2\nline3\n## Section A\nline5\nline6\n## Section B\nline8\n",
 			);
-			const tsClient = {
-				init: async () => true,
-				parseFile: async () => {
-					throw new Error("should not be called for markdown");
-				},
-			};
+			const tsClient = unusedClient("should not be called for markdown");
 
 			// Read inside Section A (line 5), should expand to lines 4-6
 			const result = await tryExpandRead(filePath, 5, 1, 8, tsClient as any);

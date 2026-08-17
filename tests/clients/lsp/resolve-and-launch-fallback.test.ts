@@ -6,14 +6,18 @@ const { launchLSP } = vi.hoisted(() => ({ launchLSP: vi.fn() }));
 const { logLatency } = vi.hoisted(() => ({ logLatency: vi.fn() }));
 vi.mock("../../../clients/lsp/launch.js", () => ({ launchLSP }));
 vi.mock("../../../clients/latency-logger.js", () => ({ logLatency }));
+const { ensureTool } = vi.hoisted(() => ({ ensureTool: vi.fn(async () => null) }));
 vi.mock("../../../clients/installer/index.js", () => ({
-	ensureTool: vi.fn(async () => null),
+	ensureTool,
 	getToolEnvironment: () => ({}),
 }));
 
 import { resolveAndLaunch } from "../../../clients/lsp/server.ts";
+import { SpawnFailureError } from "../../../clients/safe-spawn.js";
 
 const fakeProc = { stdout: {}, stderr: {} } as never;
+const toolNotFound = (message: string) =>
+	Object.assign(new Error(message), { kind: "tool-not-found" as const });
 const failedPhases = () =>
 	logLatency.mock.calls.filter(
 		(c) => c[0]?.phase === "lsp_launch_candidate_failed",
@@ -45,8 +49,8 @@ describe("resolveAndLaunch — fallback failures are deferred", () => {
 
 	it("logs every candidate failure when ALL candidates fail", async () => {
 		launchLSP
-			.mockRejectedValueOnce(new Error("fail a"))
-			.mockRejectedValueOnce(new Error("fail b"));
+			.mockRejectedValueOnce(toolNotFound("fail a"))
+			.mockRejectedValueOnce(toolNotFound("fail b"));
 
 		const result = await resolveAndLaunch(
 			{ candidates: ["a", "b"], args: [], cwd: "/tmp/p" }, // no managedToolId
@@ -55,5 +59,23 @@ describe("resolveAndLaunch — fallback failures are deferred", () => {
 
 		expect(result).toBeUndefined();
 		expect(failedPhases()).toHaveLength(2);
+	});
+
+	it("does not install when a present tool fails because cwd is unresolvable", async () => {
+		const cause = Object.assign(new Error("spawn node ENOENT"), { code: "ENOENT" });
+		launchLSP.mockRejectedValue(
+			new SpawnFailureError("cwd-unresolvable", "working directory missing", cause),
+		);
+
+		await expect(
+			resolveAndLaunch({
+				candidates: [process.execPath],
+				args: ["--version"],
+				cwd: "/definitely/missing/pi-lens-cwd",
+				managedToolId: "typescript-language-server",
+			}, true),
+		).rejects.toMatchObject({ kind: "cwd-unresolvable" });
+
+		expect(ensureTool).not.toHaveBeenCalled();
 	});
 });

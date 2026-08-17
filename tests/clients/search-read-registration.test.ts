@@ -7,6 +7,7 @@ import {
 	registerSearchReads,
 	type SearchReadLocation,
 } from "../../clients/search-read-registration.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 vi.mock("../../clients/read-guard-logger.js", () => ({
 	logReadGuardEvent: vi.fn(),
@@ -39,7 +40,7 @@ beforeEach(() => {
 	tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-srr-"));
 });
 afterEach(() => {
-	fs.rmSync(tmp, { recursive: true, force: true });
+	removeTempDirSync(tmp);
 });
 
 describe("registerSearchReads", () => {

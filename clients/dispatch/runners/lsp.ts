@@ -12,6 +12,8 @@
  * unified runner that delegates to the LSP service.
  */
 
+import { logExtension } from "../../extension-log.js";
+import { touchCoverageGap } from "../../lsp/diagnostic-binding.js";
 import { getLSPService } from "../../lsp/index.js";
 import { RUNTIME_CONFIG } from "../../runtime-config.js";
 import { PRIORITY } from "../priorities.js";
@@ -25,10 +27,17 @@ import type {
 import { convertLspDiagnostics } from "../utils/lsp-diagnostics.js";
 import {
 	enabledAuxiliaryLspServerIds,
-	findAuxiliaryProfileForSource,
-	isAuxiliaryDiagnosticSuppressed,
+	retagAuxiliaryDiagnostics,
 } from "../auxiliary-lsp.js";
 import { readFileContent } from "./utils.js";
+import {
+	tryWarmAttachedCodeActions,
+	tryWarmAttachedDiagnostics,
+} from "../../warm-attach.js";
+import {
+	contentHash,
+	WARM_CODE_ACTION_LOOKUP_LIMIT,
+} from "../../mcp/ipc.js";
 
 const LSP_MAX_FILE_BYTES = RUNTIME_CONFIG.pipeline.lspMaxFileBytes;
 const LSP_MAX_FILE_LINES = RUNTIME_CONFIG.pipeline.lspMaxFileLines;
@@ -40,7 +49,6 @@ const LSP_SPAWN_BUDGET_MS = RUNTIME_CONFIG.pipeline.lspSpawnBudgetMs;
 // after the cap still land in the client's cache and surface on the
 // next edit. Overridable via PI_LENS_LSP_DIAGNOSTICS_MAX_WAIT_MS.
 const LSP_DIAGNOSTICS_WAIT_MS = 2500;
-const MAX_CODE_ACTION_LOOKUPS = 6;
 const MAX_CODE_ACTION_TITLES = 3;
 
 function normalizeActionTitle(title: string): string {
@@ -136,6 +144,12 @@ const lspRunner: RunnerDefinition = {
 		// one spawned server) — an empty `lspDiags` in that case is NOT a
 		// confirmed clean result and must not be reported as one (#570).
 		let diagnosticsInconclusive = false;
+		// #1470: server ids the touch carries no evidence for — an auxiliary whose
+		// push wait our aux grace timer cut off. The touch is NOT inconclusive (the
+		// primary answered, and its findings below are real), so this is tracked
+		// separately: the only claim it invalidates is "0 diagnostics means clean".
+		let unconfirmedServerIds: readonly string[] = [];
+		let usedWarmAttach = false;
 		let failureReason = "";
 		const content = readFileContent(ctx.filePath);
 		if (!content) {
@@ -155,7 +169,32 @@ const lspRunner: RunnerDefinition = {
 			ctx.pi.getFlag(f),
 		);
 		try {
-			const touched = await lspService.touchFile(ctx.filePath, content, {
+			const attached = await tryWarmAttachedDiagnostics(
+				ctx.filePath,
+				content,
+				Math.max(LSP_SPAWN_BUDGET_MS, LSP_DIAGNOSTICS_WAIT_MS),
+			);
+			usedWarmAttach = attached?.available === true;
+			// #1179 (shape-5 structural fix): both branches normalize to the
+			// `touchFile` wrapper shape. The warm-attach IPC branch resolves a plain
+			// diagnostics array — `available` no longer implies a fully confirmed
+			// answer: a `partial` confirmation (an auxiliary cut off by the grace
+			// timer) is served as `available: true` too (the IPC gate at
+			// `clients/mcp/ipc.ts:248` rejects only `inconclusive`). Carry the
+			// incumbent's `unconfirmedServerIds` onto the wrapper so
+			// `touchCoverageGap` below sees it — dropping it here is the same
+			// false-clean defect already fixed at `clients/lsp/index.ts` (the
+			// workspace sweep wrapper) and `tools/lsp-diagnostics.ts` (the tool
+			// consumer); wrap it as `{ diags }`; the incumbent branch already
+			// returns the wrapper.
+			const touched = attached?.available
+				? {
+						diags: attached.response.diagnostics,
+						...(attached.response.unconfirmedServerIds !== undefined && {
+							unconfirmedServerIds: attached.response.unconfirmedServerIds,
+						}),
+					}
+				: await lspService.touchFile(ctx.filePath, content, {
 				diagnostics: "document",
 				collectDiagnostics: true,
 				clientScope: auxiliaryServerIds.length > 0 ? "with-auxiliary" : "primary",
@@ -167,8 +206,9 @@ const lspRunner: RunnerDefinition = {
 			if (touched === undefined) {
 				lspClientReady = false;
 			} else {
-				lspDiags = touched;
+				lspDiags = touched.diags;
 				diagnosticsInconclusive = touched.inconclusive === true;
+				unconfirmedServerIds = touchCoverageGap(touched);
 			}
 		} catch (err) {
 			serverFailed = true;
@@ -179,9 +219,11 @@ const lspRunner: RunnerDefinition = {
 				failureReason.includes("connection") ||
 				failureReason.includes("JSON RPC")
 			) {
-				console.error(
-					`[lsp-runner] LSP server failed for ${diagnosticPath}: ${failureReason}`,
-				);
+				logExtension({
+					subsystem: "lsp-runner",
+					message: `LSP server failed for ${diagnosticPath}: ${failureReason}`,
+					metadata: { filePath: diagnosticPath },
+				});
 			}
 		}
 
@@ -229,6 +271,20 @@ const lspRunner: RunnerDefinition = {
 		}
 
 		if (lspDiags.length === 0) {
+			if (unconfirmedServerIds.length > 0) {
+				// #1470: an auxiliary was cut off by the aux grace timer, so this empty
+				// merged result is missing whatever that scanner would have said — a
+				// hung opengrep must not read as a clean bill of health on the security
+				// lane. `RunnerResult` has no channel for "clean for these servers,
+				// unknown for those", so the only honest verdict this seam can express
+				// for an EMPTY result is "not checked" — which is what "skipped" means
+				// here, and it lets the coverage notice say so once. Nothing is thrown
+				// away: the primary answered with zero findings, so there is nothing to
+				// report; when it DOES have findings the branches below still report
+				// them (see the non-empty path), which is how a trustworthy primary
+				// stays trustworthy under a cut-off auxiliary.
+				return { status: "skipped", diagnostics: [], semantic: "none" };
+			}
 			return {
 				status: "succeeded",
 				diagnostics: [],
@@ -247,10 +303,33 @@ const lspRunner: RunnerDefinition = {
 		const blockingDiagIndexes = validLspDiags
 			.map((d, idx) => ({ d, idx }))
 			.filter(({ d }) => d.severity === 1)
-			.slice(0, MAX_CODE_ACTION_LOOKUPS);
+			.slice(0, WARM_CODE_ACTION_LOOKUP_LIMIT);
 
-		await Promise.all(
-			blockingDiagIndexes.map(async ({ d, idx }) => {
+		if (usedWarmAttach) {
+			// Diagnostics have already succeeded. Code actions are optional
+			// enrichment, so ANY IPC failure degrades to today's skip without
+			// promoting the attached session to a local LSP fleet.
+			const ranges = blockingDiagIndexes.map(({ d }) => ({
+				start: d.range.start,
+				end: d.range.end ?? d.range.start,
+			}));
+			const result = await tryWarmAttachedCodeActions(
+				ctx.filePath,
+				contentHash(content),
+				ranges,
+				LSP_DIAGNOSTICS_WAIT_MS,
+			);
+			if (result?.available) {
+				result.response.actions.forEach((actions, responseIndex) => {
+					const diagnosticIndex = blockingDiagIndexes[responseIndex]?.idx;
+					const suggestion = buildCodeActionSuggestion(actions);
+					if (diagnosticIndex !== undefined && suggestion) {
+						fixSuggestionByIndex.set(diagnosticIndex, suggestion);
+					}
+				});
+			}
+		} else {
+			await Promise.all(blockingDiagIndexes.map(async ({ d, idx }) => {
 				try {
 					const start = d.range.start;
 					const end = d.range.end ?? d.range.start;
@@ -268,8 +347,8 @@ const lspRunner: RunnerDefinition = {
 				} catch {
 					// Best-effort enrichment only; base diagnostics remain authoritative.
 				}
-			}),
-		);
+			}));
+		}
 
 		const diagnostics: Diagnostic[] = convertLspDiagnostics(
 			validLspDiags,
@@ -280,35 +359,15 @@ const lspRunner: RunnerDefinition = {
 		// convertLspDiagnostics maps validLspDiags 1:1, so re-tag any
 		// auxiliary-sourced diagnostics (opengrep emits source "Semgrep", …) with
 		// their tool id + semantic policy — language-server diagnostics keep "lsp".
-		// blockingAllowed is per-workspace (e.g. curated repo rules), computed once.
-		const blockingAllowedByProfile = new Map<unknown, boolean>();
-		// Diagnostics dropped by the tool's NATIVE inline suppression (e.g. opengrep
-		// `# nosemgrep`, #441). Reuses `content` from the sync read above.
-		const suppressedIndices = new Set<number>();
-		for (let i = 0; i < diagnostics.length; i++) {
-			const profile = findAuxiliaryProfileForSource(validLspDiags[i]?.source);
-			if (!profile) continue;
-			if (isAuxiliaryDiagnosticSuppressed(validLspDiags[i], content)) {
-				suppressedIndices.add(i);
-				continue;
-			}
-			let blockingAllowed = blockingAllowedByProfile.get(profile);
-			if (blockingAllowed === undefined) {
-				blockingAllowed = profile.allowBlocking?.(ctx.cwd) ?? false;
-				blockingAllowedByProfile.set(profile, blockingAllowed);
-			}
-			const d = diagnostics[i];
-			d.tool = profile.tool;
-			d.semantic = profile.semantic(validLspDiags[i], { blockingAllowed });
-			if (d.semantic !== "blocking" && d.severity === "error") {
-				d.severity = "warning";
-			}
-			const defectClass = profile.defectClass?.(validLspDiags[i]);
-			if (defectClass) d.defectClass = defectClass;
-		}
-		const keptDiagnostics = suppressedIndices.size
-			? diagnostics.filter((_, i) => !suppressedIndices.has(i))
-			: diagnostics;
+		// #692: shared with the scan/sweep reconcile paths (`retagAuxiliaryDiagnostics`
+		// in `../auxiliary-lsp.js`) so a scan-reconciled aux finding gets identical
+		// tool/semantic/defectClass tagging instead of keeping tool "lsp".
+		const keptDiagnostics = retagAuxiliaryDiagnostics(
+			diagnostics,
+			validLspDiags,
+			content,
+			{ cwd: ctx.cwd, fileRole: ctx.fileRole },
+		);
 
 		const hasErrors = keptDiagnostics.some((d) => d.semantic === "blocking");
 		const resultSemantic = hasErrors

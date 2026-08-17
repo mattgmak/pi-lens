@@ -2,10 +2,10 @@
 # Detects dynamic regex construction that can lead to ReDoS
 id: unsafe-regex
 name: Dynamic Regex Construction
-severity: error
+severity: warning
 category: security
 defect_class: injection
-inline_tier: blocking
+inline_tier: warning
 language: typescript
 
 message: "Dynamic regex from user input — can cause ReDoS (Regular Expression Denial of Service)"
@@ -43,6 +43,8 @@ metavars:
   - CTOR
   - INTERPOLATION
   - PATTERN
+
+post_filter: unsafe_regex_dynamic_identifier
 
 has_fix: false
 

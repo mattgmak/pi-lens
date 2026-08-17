@@ -3,9 +3,20 @@
  * used both for long-lived-process heartbeat sampling (instance-registry
  * host + LSP children) and transient-spawn bracketing (safe-spawn.ts).
  *
- * `pidusage` is mocked throughout so these tests never touch real process
- * tables — mirrors clients/instance-reaper.ts's test style (pure decision
- * logic + injected fakes, no real spawns/kills).
+ * The sampler is platform-split: on Linux/macOS it uses `pidusage` (mocked
+ * here so tests never touch a real process table); on Windows it runs a fully
+ * guarded `Get-CimInstance Win32_Process` query (the `node:child_process`
+ * `spawn` is mocked so tests never spawn a real process, and each test drives
+ * the fake child's stdout / error / exit to exercise a specific path). Both
+ * branches are exercised by forcing `process.platform` per describe block, so
+ * coverage is identical regardless of the host OS this suite runs on.
+ *
+ * The whole point of the Windows path is #533/#620: pidusage's unguarded
+ * internal spawn could throw `spawn UNKNOWN` synchronously in a detached
+ * callback → uncaughtException → the pi host crashes. The regression tests
+ * below simulate that spawn failing every way (sync throw / error event /
+ * non-zero exit) and assert `sampleProcesses` still RESOLVES — a sampling
+ * failure can only ever lose a data point, never crash the caller.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -15,29 +26,85 @@ vi.mock("pidusage", () => ({
 	default: (...args: unknown[]) => pidusageMock(...args),
 }));
 
-// On Windows, startSpawnUsageSampler's poll tick resolves a live descendant
-// tree via a real `powershell.exe`/CIM query (findDescendantPidsWindows) —
-// mock `node:child_process` so these tests never spawn a real process for
-// that lookup; the fake child "closes" immediately with empty output, so the
-// descendant list is just `[]` and the sampler falls back to the bare pid.
+// Controllable fake `spawn`. Each test assigns `fakeSpawn` to shape the child's
+// behavior (emit stdout, emit an "error" event, close with a code, or throw
+// synchronously). Defaults to a child that closes immediately with empty
+// output — the neutral "no data this tick" shape.
+type SpawnFn = (...args: unknown[]) => unknown;
+let fakeSpawn: SpawnFn = () => makeFakeChild({ stdout: "" });
 vi.mock("node:child_process", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:child_process")>();
 	return {
 		...actual,
-		spawn: vi.fn(() => {
-			const child = {
-				stdout: { on: vi.fn() },
-				once: (event: string, cb: (...args: unknown[]) => void) => {
-					if (event === "close") queueMicrotask(() => cb(0));
-				},
-			};
-			return child;
-		}),
+		spawn: (...args: unknown[]) => fakeSpawn(...args),
 	};
 });
 
-const { sampleProcesses, UsageAccumulator, walkDescendantPids, startSpawnUsageSampler } =
-	await import("../../clients/resource-sampler.js");
+const {
+	sampleProcesses,
+	UsageAccumulator,
+	walkDescendantPids,
+	startSpawnUsageSampler,
+	__resetWindowsCpuHistoryForTests,
+} = await import("../../clients/resource-sampler.js");
+
+/**
+ * Build a fake ChildProcess that emits `stdout` (if any) then fires `close`
+ * with `code`, all on the microtask queue so `await`-ing the sampler flushes
+ * them. `emitError: true` fires an "error" event instead of closing normally.
+ */
+interface FakeChild {
+	stdout: {
+		on: (event: string, cb: (chunk: Buffer) => void) => void;
+		unref: ReturnType<typeof vi.fn>;
+	};
+	once: (event: string, cb: (...a: unknown[]) => void) => void;
+	unref: ReturnType<typeof vi.fn>;
+}
+
+function makeFakeChild(opts: {
+	stdout?: string;
+	code?: number;
+	emitError?: boolean;
+}): FakeChild {
+	const handlers = new Map<string, (...a: unknown[]) => void>();
+	const dataCbs: Array<(chunk: Buffer) => void> = [];
+	const child = {
+		stdout: {
+			on: (event: string, cb: (chunk: Buffer) => void) => {
+				if (event === "data") dataCbs.push(cb);
+			},
+			unref: vi.fn(),
+		},
+		once: (event: string, cb: (...a: unknown[]) => void) => {
+			handlers.set(event, cb);
+		},
+		unref: vi.fn(),
+	};
+	queueMicrotask(() => {
+		if (opts.emitError) {
+			handlers.get("error")?.(new Error("spawn failed (async)"));
+			return;
+		}
+		if (opts.stdout) {
+			for (const cb of dataCbs) cb(Buffer.from(opts.stdout));
+		}
+		handlers.get("close")?.(opts.code ?? 0);
+	});
+	return child;
+}
+
+const realPlatform = process.platform;
+function setPlatform(platform: NodeJS.Platform): void {
+	Object.defineProperty(process, "platform", {
+		value: platform,
+		configurable: true,
+	});
+}
+afterEach(() => {
+	setPlatform(realPlatform);
+	fakeSpawn = () => makeFakeChild({ stdout: "" });
+});
 
 describe("UsageAccumulator (pure)", () => {
 	it("returns null when no sample was ever added", () => {
@@ -116,9 +183,10 @@ describe("walkDescendantPids (pure BFS)", () => {
 	});
 });
 
-describe("sampleProcesses", () => {
+describe("sampleProcesses (POSIX / pidusage path)", () => {
 	beforeEach(() => {
 		pidusageMock.mockReset();
+		setPlatform("linux");
 	});
 
 	it("returns an empty map and never calls pidusage for an empty pid list", async () => {
@@ -160,9 +228,160 @@ describe("sampleProcesses", () => {
 	});
 });
 
+describe("sampleProcesses (Windows / guarded CIM path)", () => {
+	beforeEach(() => {
+		pidusageMock.mockReset();
+		__resetWindowsCpuHistoryForTests();
+		setPlatform("win32");
+	});
+
+	it("never calls pidusage on Windows — the whole point of the fix", async () => {
+		fakeSpawn = () =>
+			makeFakeChild({ stdout: "111,1024,0,0\r\n", code: 0 });
+		await sampleProcesses([111]);
+		expect(pidusageMock).not.toHaveBeenCalled();
+	});
+
+	it("parses RSS (WorkingSetSize) from the CIM output; first tick reports cpu 0", async () => {
+		// One line: pid,workingSet,kernel100ns,user100ns
+		fakeSpawn = () =>
+			makeFakeChild({ stdout: "111,4096,0,0\r\n222,8192,0,0\r\n", code: 0 });
+
+		const result = await sampleProcesses([111, 222]);
+		expect(result.get(111)).toEqual({ rssBytes: 4096, cpuPercent: 0 });
+		expect(result.get(222)).toEqual({ rssBytes: 8192, cpuPercent: 0 });
+	});
+
+	it("computes CPU% from the kernel+user delta over elapsed wall time on the second tick", async () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(0);
+			// Tick 1: cumulative CPU time = 0 (kernel=0,user=0). Seeds history.
+			fakeSpawn = () => makeFakeChild({ stdout: "111,4096,0,0\r\n", code: 0 });
+			const first = await sampleProcesses([111]);
+			expect(first.get(111)).toEqual({ rssBytes: 4096, cpuPercent: 0 });
+
+			// 10s of wall time elapses; the process burned 5s of CPU.
+			// UserModeTime is in 100 ns units → 5000 ms = 5000 * 1e4 = 5e7 units.
+			vi.setSystemTime(10_000);
+			fakeSpawn = () =>
+				makeFakeChild({ stdout: "111,4096,0,50000000\r\n", code: 0 });
+			const second = await sampleProcesses([111]);
+			// 5000 ms CPU / 10000 ms wall * 100 = 50%.
+			expect(second.get(111)?.cpuPercent).toBeCloseTo(50);
+			expect(second.get(111)?.rssBytes).toBe(4096);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	// --- Crash regression: the sampler must NEVER throw/reject (#533, #620) ---
+
+	it("RESOLVES (never rejects) when spawn throws SYNCHRONOUSLY — the spawn UNKNOWN crash vector", async () => {
+		fakeSpawn = () => {
+			// This is exactly what pidusage's unguarded internal spawn does under
+			// Windows handle/commit pressure: throw `spawn UNKNOWN` synchronously.
+			const err = new Error("spawn UNKNOWN") as Error & {
+				errno: number;
+				code: string;
+				syscall: string;
+			};
+			err.errno = -4094;
+			err.code = "UNKNOWN";
+			err.syscall = "spawn";
+			throw err;
+		};
+
+		await expect(sampleProcesses([111])).resolves.toBeInstanceOf(Map);
+		const result = await sampleProcesses([111]);
+		expect(result.size).toBe(0);
+	});
+
+	it("RESOLVES when the child emits an async 'error' event (e.g. ENOENT)", async () => {
+		fakeSpawn = () => makeFakeChild({ emitError: true });
+		await expect(sampleProcesses([111])).resolves.toEqual(new Map());
+	});
+
+	it("RESOLVES when the child exits non-zero with garbage stdout", async () => {
+		fakeSpawn = () =>
+			makeFakeChild({ stdout: "not-a-csv-line\r\n<<broken>>\r\n", code: 1 });
+		await expect(sampleProcesses([111])).resolves.toEqual(new Map());
+	});
+
+	it("returns an empty map and never spawns for an empty pid list", async () => {
+		const spy = vi.fn(() => makeFakeChild({ stdout: "" }));
+		fakeSpawn = spy;
+		const result = await sampleProcesses([]);
+		expect(result.size).toBe(0);
+		expect(spy).not.toHaveBeenCalled();
+	});
+});
+
+describe("resource-sampler: fire-and-forget CIM spawns are unref'd (#1155)", () => {
+	// Mirrors tests/clients/instance-reaper-unref.test.ts's shape (#1153/#1160):
+	// a piped, `data`-listener-attached child re-references the libuv loop even
+	// after `child.unref()` unless its stdout pipe is unref'd too — this module
+	// has TWO such spawns (sampleProcessesWindows's CIM query, and
+	// findDescendantPidsWindows's descendant-tree CIM query used by
+	// startSpawnUsageSampler on Windows), and both must be unref'd.
+	beforeEach(() => {
+		pidusageMock.mockReset();
+		__resetWindowsCpuHistoryForTests();
+		setPlatform("win32");
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it("sampleProcesses (sampleProcessesWindows) unrefs its CIM child + stdout", async () => {
+		const spawned: ReturnType<typeof makeFakeChild>[] = [];
+		fakeSpawn = () => {
+			const child = makeFakeChild({ stdout: "111,4096,0,0\r\n", code: 0 });
+			spawned.push(child);
+			return child;
+		};
+
+		await sampleProcesses([111]);
+
+		expect(spawned.length).toBeGreaterThanOrEqual(1);
+		for (const child of spawned) {
+			expect(child.unref).toHaveBeenCalled();
+			expect(child.stdout.unref).toHaveBeenCalled();
+		}
+	});
+
+	it("startSpawnUsageSampler (findDescendantPidsWindows) unrefs its CIM child + stdout", async () => {
+		vi.useFakeTimers();
+		const spawned: ReturnType<typeof makeFakeChild>[] = [];
+		fakeSpawn = () => {
+			// Every call here is the descendant-lookup query (pid,parentPid CSV) —
+			// empty output resolves to no descendants, which is fine; the point is
+			// only to observe the spawned child's unref calls.
+			const child = makeFakeChild({ stdout: "", code: 0 });
+			spawned.push(child);
+			return child;
+		};
+
+		const sampler = startSpawnUsageSampler(999, 100);
+		await vi.advanceTimersByTimeAsync(0); // flush the immediate tick
+		sampler.stop();
+
+		expect(spawned.length).toBeGreaterThanOrEqual(1);
+		for (const child of spawned) {
+			expect(child.unref).toHaveBeenCalled();
+			expect(child.stdout.unref).toHaveBeenCalled();
+		}
+	});
+});
+
 describe("startSpawnUsageSampler", () => {
 	beforeEach(() => {
 		pidusageMock.mockReset();
+		// Force POSIX so the tick samples the bare pid via pidusage (no CIM
+		// descendant lookup) — keeps these focused on the accumulate/bracket
+		// logic; the Windows sampling path is covered above.
+		setPlatform("linux");
 		vi.useFakeTimers();
 	});
 

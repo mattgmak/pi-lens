@@ -3,9 +3,20 @@ import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { setupTestEnvironment } from "./test-utils.js";
 
+const ensureTool = vi.fn();
+const findNodeToolBinary = vi.fn();
+
+vi.mock("../../clients/installer/index.js", () => ({
+	ensureTool,
+	resetPathWalkMemo: vi.fn(),
+	// Seam probes route through this on cached hits (#1203); default spawnable.
+	isSpawnableCommand: vi.fn(async () => true),
+}));
+vi.mock("../../clients/package-manager.js", () => ({ findNodeToolBinary }));
+
 vi.mock("../../clients/safe-spawn.js", () => ({
 	safeSpawnAsync: vi.fn(async () => ({
-		error: null,
+		error: undefined,
 		status: 0,
 		stdout: "",
 		stderr: "",
@@ -16,6 +27,63 @@ describe("jscpd-client", () => {
 	beforeEach(async () => {
 		const safeSpawnMod = await import("../../clients/safe-spawn.js");
 		vi.mocked(safeSpawnMod.safeSpawnAsync).mockClear();
+		vi.mocked(safeSpawnMod.safeSpawnAsync).mockResolvedValue({ error: undefined, status: 0, stdout: "", stderr: "" });
+		ensureTool.mockReset();
+		findNodeToolBinary.mockReset();
+		const helpers = await import("../../clients/dispatch/runners/utils/runner-helpers.js");
+		helpers.resetDispatchAvailabilityState();
+		findNodeToolBinary.mockResolvedValue(null);
+	});
+
+	it("uses the managed executable after PATH installation", async () => {
+		const { JscpdClient } = await import("../../clients/jscpd-client.js");
+		const safeSpawnMod = await import("../../clients/safe-spawn.js");
+		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-jscpd-managed-");
+		const managed = "/fake/managed/jscpd";
+		try {
+			fs.writeFileSync(path.join(tmpDir, "src.ts"), "const x = 1;\n");
+			ensureTool.mockResolvedValue(managed);
+			vi.mocked(safeSpawnMod.safeSpawnAsync)
+				.mockResolvedValueOnce({
+					error: Object.assign(new Error("not found"), { code: "ENOENT" }),
+					failure: "spawn",
+					spawnFailure: { kind: "tool-not-found" } as never,
+					status: 1,
+					stdout: "",
+					stderr: "",
+				})
+				.mockResolvedValue({ error: undefined, status: 0, stdout: "", stderr: "" });
+			const result = await new JscpdClient().scan(tmpDir);
+			expect(result.success).toBe(true);
+			expect(vi.mocked(safeSpawnMod.safeSpawnAsync).mock.calls[1]?.[0]).toBe(
+				managed,
+			);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("suppresses failed installs until the session resets", async () => {
+		const { JscpdClient } = await import("../../clients/jscpd-client.js");
+		const safeSpawnMod = await import("../../clients/safe-spawn.js");
+		vi.mocked(safeSpawnMod.safeSpawnAsync).mockResolvedValue({
+			error: Object.assign(new Error("not found"), { code: "ENOENT" }),
+			failure: "spawn",
+			spawnFailure: { kind: "tool-not-found" } as never,
+			status: 1,
+			stdout: "",
+			stderr: "",
+		});
+		const client = new JscpdClient();
+		expect(await client.ensureAvailable()).toBe(false);
+		expect(ensureTool).toHaveBeenCalledTimes(1);
+		await client.ensureAvailable();
+		expect(ensureTool).toHaveBeenCalledTimes(1);
+		const helpers = await import("../../clients/dispatch/runners/utils/runner-helpers.js");
+		helpers.resetDispatchAvailabilityState();
+		ensureTool.mockResolvedValue("jscpd");
+		expect(await client.ensureAvailable()).toBe(true);
+		expect(ensureTool).toHaveBeenCalledTimes(2);
 	});
 
 	it("scans when source exists in nested directories", async () => {
@@ -35,9 +103,16 @@ describe("jscpd-client", () => {
 					minTokens: number,
 					isTsProject: boolean,
 				) => Promise<unknown>;
-				available: boolean;
+				ensureAvailable: () => Promise<boolean>;
 			};
-			client.available = true;
+			await client.ensureAvailable();
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockClear();
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockResolvedValue({
+				error: undefined,
+				status: 0,
+				stdout: "",
+				stderr: "",
+			});
 
 			await client.scan(tmpDir, 5, 50, true);
 
@@ -75,9 +150,10 @@ describe("jscpd-client", () => {
 					success: boolean;
 					clones: unknown[];
 				}>;
-				available: boolean;
+				ensureAvailable: () => Promise<boolean>;
 			};
-			client.available = true;
+			await client.ensureAvailable();
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockClear();
 
 			const result = await client.scan(tmpDir, 5, 50, true);
 
@@ -107,13 +183,50 @@ describe("jscpd-client", () => {
 					success: boolean;
 					clones: unknown[];
 				}>;
-				available: boolean;
+				ensureAvailable: () => Promise<boolean>;
 			};
-			client.available = true;
+			await client.ensureAvailable();
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockClear();
 
 			const result = await client.scan(tmpDir, 5, 50, true);
 
 			expect(result.success).toBe(true);
+			expect(result.clones).toEqual([]);
+			expect(safeSpawnMod.safeSpawnAsync).not.toHaveBeenCalled();
+		} finally {
+			cleanup();
+		}
+	});
+
+	// #747/#250 — internal root contract: belt-and-braces refusal so a future
+	// caller that doesn't guard the root can't spawn a whole-$HOME jscpd walk.
+	it("refuses to scan a root at/above the home directory without spawning (#747)", async () => {
+		const { JscpdClient } = await import("../../clients/jscpd-client.js");
+		const safeSpawnMod = await import("../../clients/safe-spawn.js");
+
+		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-jscpd-");
+		try {
+			const srcFile = path.join(tmpDir, "src", "index.ts");
+			fs.mkdirSync(path.dirname(srcFile), { recursive: true });
+			fs.writeFileSync(srcFile, "export const x = 1;\n");
+
+			const client = new JscpdClient(false) as unknown as {
+				scan: (
+					cwd: string,
+					minLines: number,
+					minTokens: number,
+					isTsProject: boolean,
+					options?: { homeDir?: string },
+				) => Promise<{ success: boolean; clones: unknown[] }>;
+				ensureAvailable: () => Promise<boolean>;
+			};
+			await client.ensureAvailable();
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockClear();
+
+			// cwd IS the home directory.
+			const result = await client.scan(tmpDir, 5, 50, true, { homeDir: tmpDir });
+
+			expect(result.success).toBe(false);
 			expect(result.clones).toEqual([]);
 			expect(safeSpawnMod.safeSpawnAsync).not.toHaveBeenCalled();
 		} finally {
@@ -152,9 +265,10 @@ describe("jscpd-client", () => {
 						minTokens: number,
 						isTsProject: boolean,
 					) => Promise<unknown>;
-					available: boolean;
+					ensureAvailable: () => Promise<boolean>;
 				};
-				client.available = true;
+				await client.ensureAvailable();
+				vi.mocked(safeSpawnMod.safeSpawnAsync).mockClear();
 
 				await client.scan(tmpDir, 5, 50, false);
 
@@ -188,9 +302,10 @@ describe("jscpd-client", () => {
 					minTokens: number,
 					isTsProject: boolean,
 				) => Promise<{ success: boolean; clones: unknown[] }>;
-				available: boolean;
+				ensureAvailable: () => Promise<boolean>;
 			};
-			client.available = true;
+			await client.ensureAvailable();
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockClear();
 
 			const result = await client.scan(tmpDir, 5, 50, false);
 
@@ -223,9 +338,10 @@ describe("jscpd-client", () => {
 					minTokens: number,
 					isTsProject: boolean,
 				) => Promise<unknown>;
-				available: boolean;
+				ensureAvailable: () => Promise<boolean>;
 			};
-			client.available = true;
+			await client.ensureAvailable();
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockClear();
 
 			await client.scan(tmpDir, 5, 50, true);
 
@@ -260,9 +376,10 @@ describe("jscpd-client", () => {
 					minTokens: number,
 					isTsProject: boolean,
 				) => Promise<unknown>;
-				available: boolean;
+				ensureAvailable: () => Promise<boolean>;
 			};
-			client.available = true;
+			await client.ensureAvailable();
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockClear();
 
 			await client.scan(tmpDir, 5, 50, false);
 

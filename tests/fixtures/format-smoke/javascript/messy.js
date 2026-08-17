@@ -1,2 +1,8 @@
-const   x=1 ;
-console.log(   x )
+const obj = {
+  a:1,
+  b : 2
+};
+function f() {
+  return   obj . a ;
+}
+console.log(   f() )

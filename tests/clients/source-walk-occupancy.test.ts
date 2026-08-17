@@ -19,6 +19,7 @@ import { detectProjectLanguageProfileAsync } from "../../clients/language-profil
 import { collectSourceFilesAsync } from "../../clients/source-filter.js";
 import { countSourceFilesWithinLimitAsync } from "../../clients/startup-scan.js";
 import { generateSourceTree, measureMaxSyncBlockMs } from "../support/perf-harness.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 // Generous trip-wire: the walkers yield in ~tens of ms; the regression we guard
 // against (a non-yielding walk) is ~0.8-1.5s at this scale, so 300ms catches it with a wide margin while
@@ -38,7 +39,7 @@ beforeAll(() => {
 }, 60_000);
 
 afterAll(() => {
-	fs.rmSync(tmpDir, { recursive: true, force: true });
+	removeTempDirSync(tmpDir);
 });
 
 beforeEach(() => {

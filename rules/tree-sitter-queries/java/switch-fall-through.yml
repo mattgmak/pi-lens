@@ -29,11 +29,13 @@ description: |
   ```
 
 query: |
-  (switch_statement
+  (switch_expression
     body: (switch_block
-      (switch_label) @LABEL
-      (expression_statement)*
-      (switch_label) @NEXT_LABEL))
+      (switch_block_statement_group
+        (switch_label) @LABEL
+        (expression_statement)+)
+      (switch_block_statement_group
+        (switch_label) @NEXT_LABEL)))
 
 metavars:
   - LABEL

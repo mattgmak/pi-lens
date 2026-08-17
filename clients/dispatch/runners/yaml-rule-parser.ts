@@ -16,6 +16,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import yaml from "../../deps/js-yaml.js";
+import { BoundedLruCache } from "../../bounded-cache.js";
 
 // --- Types ---
 
@@ -61,6 +62,17 @@ export interface YamlRule {
 	// through unchanged. Without it, `matches: <name>` can't resolve and the
 	// rule silently produces zero matches (#663).
 	utils?: Record<string, YamlRuleCondition>;
+	/**
+	 * Skip this rule on files whose path (relative to the project root,
+	 * forward-slashed) matches any of these glob patterns — e.g. a
+	 * `scripts` directory glob plus a `logger.ts` basename glob for a
+	 * debug-output rule that's expected to fire in CLI entry points and the
+	 * logging sink itself (#965). Mirrors the tree-sitter query loader's
+	 * `ignore_paths` field (`clients/tree-sitter-query-loader.ts`) — same
+	 * shape/matching, kept as a separate opt-in per-rule field rather than a
+	 * blanket path exclusion so most rules are unaffected.
+	 */
+	ignores?: string[];
 }
 
 interface CachedRules {
@@ -98,10 +110,10 @@ export const MAX_BLOCKING_RULE_COMPLEXITY = 8;
 
 // --- Caches ---
 
-const rulesCache = new Map<string, CachedRules>();
-const blockingRulesCache = new Map<string, CachedRules>();
-const contentRulesCache = new Map<string, ContentCachedRules>();
-const contentBlockingRulesCache = new Map<string, ContentCachedRules>();
+const rulesCache = new BoundedLruCache<string, CachedRules>(64);
+const blockingRulesCache = new BoundedLruCache<string, CachedRules>(64);
+const contentRulesCache = new BoundedLruCache<string, ContentCachedRules>(64);
+const contentBlockingRulesCache = new BoundedLruCache<string, ContentCachedRules>(64);
 
 // --- Public API ---
 

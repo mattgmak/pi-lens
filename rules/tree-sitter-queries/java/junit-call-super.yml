@@ -28,10 +28,12 @@ description: |
 query: |
   (method_declaration
     (modifiers
-      (annotation
-        name: (identifier) @OVERRIDE (#eq? @OVERRIDE "Override")))
-    name: (identifier) @METHOD (#match? @METHOD "^(setUp|tearDown|setUpBeforeClass|tearDownAfterClass)$")
-    body: (block) @BODY)
+      (marker_annotation
+        name: (identifier) @OVERRIDE))
+    name: (identifier) @METHOD
+    body: (block) @BODY
+    (#eq? @OVERRIDE "Override")
+    (#match? @METHOD "^(setUp|tearDown|setUpBeforeClass|tearDownAfterClass)$"))
 
 metavars:
   - OVERRIDE

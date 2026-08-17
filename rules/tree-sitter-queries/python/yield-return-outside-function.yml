@@ -29,9 +29,6 @@ query: |
     (expression_statement
       (yield) @STATEMENT))
   (module
-    (expression_statement
-      (yield_expression) @STATEMENT))
-  (module
     (return_statement) @STATEMENT)
 
 metavars:

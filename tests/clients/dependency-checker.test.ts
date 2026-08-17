@@ -15,6 +15,7 @@ import {
 	buildMadgeArgs,
 	parseMadgeSkips,
 } from "../../clients/dependency-checker.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 describe("buildMadgeArgs", () => {
 	let tmp: string;
@@ -23,7 +24,7 @@ describe("buildMadgeArgs", () => {
 		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pilens-madge-"));
 	});
 	afterEach(() => {
-		fs.rmSync(tmp, { recursive: true, force: true });
+		removeTempDirSync(tmp);
 	});
 
 	it("always scans mjs/cjs alongside ts/tsx/js/jsx", () => {

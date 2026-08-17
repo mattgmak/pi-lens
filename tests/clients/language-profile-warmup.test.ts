@@ -68,4 +68,45 @@ describe("collectSourceFilesForWarmup (#250)", () => {
 			env.cleanup();
 		}
 	});
+
+	it("does not let data/doc files ahead in walk order exhaust the code budget (#894 review)", async () => {
+		const env = setupTestEnvironment("pi-lens-warmup-priority-");
+		try {
+			// Root-level files are consumed before subdirectories in this walker,
+			// so the json pile fills first — with a single shared budget of 3 the
+			// walk would stop before ever reaching src/ and present.jsts would
+			// flip false.
+			for (let i = 0; i < 6; i++) {
+				createTempFile(env.tmpDir, `locale${i}.json`, `{"n": ${i}}\n`);
+			}
+			createTempFile(env.tmpDir, "src/a.ts", "export const a = 1;\n");
+			createTempFile(env.tmpDir, "src/b.ts", "export const b = 1;\n");
+
+			const files = (await collectSourceFilesForWarmup(env.tmpDir, 3)).map(
+				(f) => f.replace(/\\/g, "/"),
+			);
+
+			// Code kinds fill their own budget — both .ts files survive …
+			expect(files.some((f) => f.endsWith("/src/a.ts"))).toBe(true);
+			expect(files.some((f) => f.endsWith("/src/b.ts"))).toBe(true);
+			// … while the non-code category stays capped at the same budget, so
+			// json presence is still detected without unbounded collection.
+			expect(files.filter((f) => f.endsWith(".json"))).toHaveLength(3);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("includes .dart files (#880)", async () => {
+		const env = setupTestEnvironment("pi-lens-warmup-dart-");
+		try {
+			createTempFile(env.tmpDir, "lib/main.dart", "void main() {}\n");
+			const files = (await collectSourceFilesForWarmup(env.tmpDir)).map((f) =>
+				f.replace(/\\/g, "/"),
+			);
+			expect(files.some((f) => f.endsWith("/lib/main.dart"))).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
 });

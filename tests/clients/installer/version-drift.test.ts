@@ -73,6 +73,13 @@ const mockFsReadFile = vi.hoisted(() => vi.fn());
 const mockFsStat = vi.hoisted(() => vi.fn());
 const mockFsWriteFile = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const mockFsMkdir = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const mockFsOpen = vi.hoisted(() =>
+	vi.fn().mockResolvedValue({
+		writeFile: vi.fn().mockResolvedValue(undefined),
+		close: vi.fn().mockResolvedValue(undefined),
+	}),
+);
+const mockFsRm = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const mockFsAppendFile = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const mockFsChmod = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 
@@ -83,6 +90,8 @@ vi.mock("node:fs/promises", () => ({
 		stat: mockFsStat,
 		writeFile: mockFsWriteFile,
 		mkdir: mockFsMkdir,
+		open: mockFsOpen,
+		rm: mockFsRm,
 		appendFile: mockFsAppendFile,
 		chmod: mockFsChmod,
 	},
@@ -91,6 +100,8 @@ vi.mock("node:fs/promises", () => ({
 	stat: mockFsStat,
 	writeFile: mockFsWriteFile,
 	mkdir: mockFsMkdir,
+	open: mockFsOpen,
+	rm: mockFsRm,
 	appendFile: mockFsAppendFile,
 	chmod: mockFsChmod,
 }));
@@ -200,6 +211,7 @@ function fakeAccess(...allowed: string[]): void {
 const savedPiLensHome = process.env.PI_LENS_HOME;
 
 beforeEach(() => {
+	delete process.env.PI_LENS_DISABLE_TOOL_INSTALL;
 	delete process.env.PI_LENS_HOME;
 	vi.clearAllMocks();
 	spawnCalls.length = 0;
@@ -211,6 +223,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	process.env.PI_LENS_DISABLE_TOOL_INSTALL = "1";
 	if (savedPiLensHome === undefined) delete process.env.PI_LENS_HOME;
 	else process.env.PI_LENS_HOME = savedPiLensHome;
 	vi.useRealTimers();
@@ -267,6 +280,17 @@ describe("version-pin drift detection (#589)", () => {
 		expect(second).toBe(JSCPD_BIN);
 		// In-memory resolvedPathCache fast path — no new spawn on the second call.
 		expect(spawnCalls).toHaveLength(0);
+	});
+
+	it("evicts a cached positive when the resolved binary is deleted", async () => {
+		fakeAccess(JSCPD_BIN);
+		versionOutput.value = `${JSCPD_PINNED_VERSION}\n`;
+		expect(await ensureTool("jscpd")).toBe(JSCPD_BIN);
+
+		fakeAccess();
+		process.env.PI_LENS_DISABLE_TOOL_INSTALL = "1";
+		expect(await ensureTool("jscpd")).toBeUndefined();
+		expect(mockFsAccess).toHaveBeenCalledWith(JSCPD_BIN);
 	});
 
 	it("skips drift detection entirely for an unpinned npm tool (madge)", async () => {

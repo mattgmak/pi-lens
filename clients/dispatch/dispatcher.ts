@@ -14,6 +14,7 @@
  * - BaselineStore: Track pre-existing issues for delta mode
  */
 
+import { logExtension } from "../extension-log.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { FileKind } from "../file-kinds.js";
@@ -24,15 +25,24 @@ import { isTestFile } from "../file-utils.js";
 import { getPrimaryDispatchGroup } from "../language-policy.js";
 import { resolveLanguageRootForFile } from "../language-profile.js";
 import { logLatency } from "../latency-logger.js";
+import { isSpawnableCommand } from "../installer/index.js";
 import { normalizeMapKey } from "../path-utils.js";
 import { loadPiLensProjectConfig } from "../project-lens-config.js";
 import { RUNTIME_CONFIG, getRunnerTimeoutFloorMs } from "../runtime-config.js";
 import { safeSpawnAsync } from "../safe-spawn.js";
 import { classifyDiagnostic } from "./diagnostic-taxonomy.js";
+import {
+	classifyProbeFailure,
+	logAvailabilityDecision,
+	startHostStallSampler,
+	transientRetryDelayMs,
+} from "./runners/utils/availability-policy.js";
 import type { FactStore } from "./fact-store.js";
+import { applyDispositions } from "../diagnostic-dispositions.js";
 import { applyInlineSuppressions } from "./inline-suppressions.js";
 import { getToolPlan } from "./plan.js";
 import { resolveRunnerPath } from "./runner-context.js";
+import { applyRulePolicy, rulePolicyMapFromConfig } from "./rule-policy.js";
 import { getToolProfile } from "./tool-profile.js";
 import type {
 	Diagnostic,
@@ -96,7 +106,44 @@ export function normalizeCacheKey(cmd: string): string {
 	return `session.toolCache.${normalized}`;
 }
 
-async function checkToolAvailability(
+/** Probe budget for the generic `hasTool` availability check, ms. */
+const TOOL_PROBE_TIMEOUT_MS = 5000;
+
+/**
+ * Session fact holding the epoch ms after which a TRANSIENT verdict for a
+ * command may be re-probed. Kept beside the boolean fact so both share the
+ * session's lifetime — no second global to reset (#1476).
+ */
+function transientRetryKey(command: string): string {
+	return `${normalizeCacheKey(command)}.retryAt`;
+}
+
+/**
+ * Consecutive transient verdicts for a command, so the cooldown ESCALATES the
+ * way the policy documents (30 s, 60 s, 120 s … capped at 5 min) instead of
+ * sitting flat at 30 s.
+ *
+ * This is the highest-traffic availability consumer in the product. A flat
+ * cooldown here means a permanently sick host is re-probed every 30 s per
+ * command for the whole session — ten times the storm the policy claims to
+ * bound, and the one place the bound matters most. `createAvailabilityChecker`
+ * tracks the same counter; this keeps the two seams telling one story.
+ */
+function transientAttemptsKey(command: string): string {
+	return `${normalizeCacheKey(command)}.transientAttempts`;
+}
+
+/**
+ * Is `command` usable right now? Cached per session.
+ *
+ * Latch policy (#1467/#1476): a `false` from a genuine absence is durable and
+ * is remembered for the session. A `false` from a TIMED-OUT probe is not — this
+ * is the highest-traffic availability consumer in the codebase, and caching a
+ * host stall here silently disabled a healthy tool for every later dispatch in
+ * the session. A transient verdict instead holds only for a bounded cooldown,
+ * which also stops a sick host from being re-probed on every dispatch.
+ */
+export async function checkToolAvailability(
 	command: string,
 	facts: FactStore,
 ): Promise<boolean> {
@@ -105,13 +152,76 @@ async function checkToolAvailability(
 	if (cached !== undefined) {
 		return cached;
 	}
+	const retryAt = facts.getSessionFact<number>(transientRetryKey(command));
+	if (retryAt !== undefined && Date.now() < retryAt) return false;
+	// A command that isn't even on disk can't pass a --version probe; the ~μs
+	// stat/PATH walk saves a guaranteed-to-fail spawn round-trip per cold tool.
+	if (!(await isSpawnableCommand(command))) {
+		facts.setSessionFact(key, false);
+		return false;
+	}
 	try {
-		const result = await safeSpawnAsync(command, ["--version"], {
-			timeout: 5000,
+		// The budget is enforced by a HOST-side timer, so measure the loop stall
+		// that overlapped the window and let the shared classifier read it.
+		const sampler = startHostStallSampler();
+		const startedAt = Date.now();
+		let result: Awaited<ReturnType<typeof safeSpawnAsync>>;
+		let hostStallMs: number;
+		try {
+			result = await safeSpawnAsync(command, ["--version"], {
+				timeout: TOOL_PROBE_TIMEOUT_MS,
+			});
+		} finally {
+			hostStallMs = sampler.stop();
+		}
+		const elapsedMs = Date.now() - startedAt;
+		if (result.status === 0) {
+			facts.setSessionFact(key, true);
+			// The tool answered: retire the cooldown facts rather than leaving a
+			// stale retry deadline behind a `true`.
+			facts.setSessionFact(transientRetryKey(command), 0);
+			facts.setSessionFact(transientAttemptsKey(command), 0);
+			logAvailabilityDecision({
+				tool: command,
+				verdict: "available",
+				outcome: "success",
+				cause: "ok",
+				elapsedMs,
+				latched: true,
+				hostStallMs,
+				budgetMs: TOOL_PROBE_TIMEOUT_MS,
+			});
+			return true;
+		}
+		// `missing` for anything unclassified preserves the pre-#1476 meaning of
+		// a non-zero exit: durable, cached for the session.
+		const { outcome, cause } = classifyProbeFailure(result, {
+			hostStallMs,
+			unclassifiedFailureOutcome: "missing",
 		});
-		const available = result.status === 0;
-		facts.setSessionFact(key, available);
-		return available;
+		let retryAfterMs: number | undefined;
+		if (outcome === "transient") {
+			const attempts =
+				(facts.getSessionFact<number>(transientAttemptsKey(command)) ?? 0) + 1;
+			facts.setSessionFact(transientAttemptsKey(command), attempts);
+			retryAfterMs = transientRetryDelayMs(attempts, cause);
+			facts.setSessionFact(transientRetryKey(command), Date.now() + retryAfterMs);
+		} else {
+			facts.setSessionFact(key, false);
+			facts.setSessionFact(transientAttemptsKey(command), 0);
+		}
+		logAvailabilityDecision({
+			tool: command,
+			verdict: "unavailable",
+			outcome,
+			cause,
+			elapsedMs,
+			latched: outcome !== "transient",
+			hostStallMs,
+			...(retryAfterMs !== undefined && { retryAfterMs }),
+			budgetMs: TOOL_PROBE_TIMEOUT_MS,
+		});
+		return false;
 	} catch {
 		facts.setSessionFact(key, false);
 		return false;
@@ -147,9 +257,19 @@ export function createDispatchContext(
 	facts: FactStore,
 	blockingOnly?: boolean,
 	modifiedRanges?: import("./types.js").ModifiedRange[],
+	/** Authoritative workspace root; `cwd` may be a nested language root. */
+	projectRoot?: string,
+	/** Ordered per-file pipeline token, when this is a post-write dispatch. */
+	writeIndex?: number,
+	/** Runtime telemetry identity, when known (#1448) — threaded to the
+	 * worklog append; see DispatchContext.telemetryModel's doc. */
+	telemetryModel?: string,
+	telemetryProvider?: string,
 ): DispatchContext {
 	const absoluteFilePath = resolveRunnerPath(cwd, filePath);
-	const normalizedProjectRoot = normalizeMapKey(path.resolve(cwd));
+	const normalizedProjectRoot = normalizeMapKey(
+		path.resolve(projectRoot ?? cwd),
+	);
 	const normalizedCwd = normalizeMapKey(
 		resolveLanguageRootForFile(absoluteFilePath, cwd),
 	);
@@ -174,13 +294,22 @@ export function createDispatchContext(
 		projectConfig,
 		blockingOnly,
 		modifiedRanges,
+		writeIndex,
+		telemetryModel,
+		telemetryProvider,
 
 		async hasTool(command: string): Promise<boolean> {
 			return checkToolAvailability(command, facts);
 		},
 
 		log(message: string): void {
-			console.error(`[dispatch] ${message}`);
+			// #1333: pi owns the terminal — a runner advisory must never be a raw
+			// write. Every DispatchContext.log line lands in extension.log instead.
+			logExtension({
+				subsystem: "dispatch",
+				message,
+				metadata: { filePath: normalizedFilePath, kind },
+			});
 		},
 	};
 }
@@ -653,6 +782,7 @@ async function runGroup(
 			result.status,
 			result.diagnostics.length,
 			duration,
+			ctx.writeIndex,
 		);
 
 		diagnostics.push(...result.diagnostics);
@@ -749,21 +879,66 @@ export async function dispatchForFile(
 	// Apply delta mode ONCE across the full diagnostic set.
 	// This avoids partial-baseline corruption when processing multiple groups.
 	const dedupedDiagnostics = dedupeOverlappingDiagnostics(allDiagnostics);
-	const dockerOverlapSuppressed =
-		suppressTrivyConfigDockerOverlap(dedupedDiagnostics);
-	const overlapSuppressed = suppressLintOverlapsWithLsp(dockerOverlapSuppressed);
 	const fileContent =
 		ctx.facts.getFileFact<string>(ctx.filePath, "file.content") ?? "";
-	const inlineSuppressed = applyInlineSuppressions(
-		overlapSuppressed,
-		fileContent,
+	// Project rule policy (`.pi-lens.json` `rules.<id>.disable`/`select`).
+	//
+	// Resolved from `ctx.projectRoot` (falling back to `ctx.cwd`), NOT
+	// `ctx.projectConfig` — `ctx.projectConfig` is loaded from the nested
+	// LANGUAGE root (`resolveLanguageRootForFile`), so in a monorepo where a
+	// package directory has its own `.pi-lens.json`, `discoverPiLensProjectConfig`'s
+	// upward walk stops there and never sees a repo-root policy.
+	// `lens_diagnostics` loads its policy map from `runtime.projectRoot`; using
+	// the same root here keeps the two surfaces in agreement. `ctx.projectConfig`
+	// itself is untouched — thresholds and mutation flags keep their existing
+	// language-root resolution.
+	const rulePolicy = rulePolicyMapFromConfig(
+		loadPiLensProjectConfig(ctx.projectRoot ?? ctx.cwd).rules,
 	);
-	let visibleDiagnostics = inlineSuppressed;
+	// The output-only filter pipeline: LSP/docker overlap suppression + inline
+	// `pi-lens-ignore` + agent/user dispositions + project rule policy. Applied
+	// AFTER dedupe so the pi renderer, widget, and delta all see one filtered
+	// set. #690: dispositions drop false-positive/suppress marks and anything
+	// deferred this session (flagged marks stay; lens_diagnostics tags them at
+	// render time). #1030: the disposition anchor + store MUST key off the
+	// PROJECT ROOT, not ctx.cwd — the mark tool writes dispositions under
+	// runtime.projectRoot, so reading from ctx.cwd (the nested language root in
+	// a monorepo) opened a different diagnostic-dispositions.json and silently
+	// no-op'd every mark under a nested marker.
+	//
+	// #1087: "silencing is not fixing" applies to the WHOLE class, not just the
+	// policy member. This single pipeline is applied identically to the live set
+	// AND (below) to the delta baseline, so a finding persistently dropped by
+	// ANY layer — overlap, inline suppression, disposition, or policy — is
+	// absent from both sides of the delta and never oscillates into `fixed`
+	// (which `trackAgentFixed` would otherwise inflate forever). The stored
+	// baseline remains the unfiltered `dedupedDiagnostics`, so editing a
+	// project's policy/suppressions never resets or corrupts the user-authored
+	// delta baseline — the filtering is re-derived on read for both sides.
+	const applyOutputFilters = (diags: Diagnostic[]): Diagnostic[] => {
+		const dockerOverlap = suppressTrivyConfigDockerOverlap(diags);
+		const overlap = suppressLintOverlapsWithLsp(dockerOverlap);
+		const inline = applyInlineSuppressions(overlap, fileContent);
+		const disposition = applyDispositions(
+			inline,
+			ctx.projectRoot ?? ctx.cwd,
+			ctx.filePath,
+			fileContent,
+		);
+		return applyRulePolicy(disposition, rulePolicy);
+	};
+	let visibleDiagnostics = applyOutputFilters(dedupedDiagnostics);
 	let resolvedCount = 0;
 	if (ctx.deltaMode && previousBaseline) {
+		// Silencing a rule is not fixing it. The stored baseline is deliberately
+		// unfiltered (below), so compare against a fully-filtered view of it
+		// through the SAME pipeline — otherwise every persistently-suppressed
+		// finding sits in `fixed` on every dispatch and inflates the agent's
+		// resolved tally (trackAgentFixed) forever. Only `fixed` changes:
+		// filtered-out ids are absent from `after` either way.
 		const filtered = filterDelta(
 			visibleDiagnostics,
-			previousBaseline,
+			applyOutputFilters(previousBaseline),
 			(d) => d.id,
 		);
 		visibleDiagnostics = promoteDeltaUnusedToBlockers(filtered.new);
@@ -783,11 +958,16 @@ export async function dispatchForFile(
 	);
 	const fixedItems = visibleDiagnostics.filter((d) => d.semantic === "fixed");
 
-	// Append fixed and fixable diagnostics to the persistent worklog
+	// Append fixed and fixable diagnostics to the persistent worklog, attributed
+	// to the runtime's active model/provider when known (#1448).
+	const worklogIdentity = {
+		model: ctx.telemetryModel,
+		provider: ctx.telemetryProvider,
+	};
 	if (fixedItems.length > 0) {
 		import("../fix-worklog.js")
 			.then(({ appendToWorklog }) => {
-				appendToWorklog(ctx.cwd, fixedItems, true);
+				appendToWorklog(ctx.cwd, fixedItems, true, worklogIdentity);
 			})
 			.catch(() => {});
 	}
@@ -795,7 +975,7 @@ export async function dispatchForFile(
 	if (fixableWarnings.length > 0) {
 		import("../fix-worklog.js")
 			.then(({ appendToWorklog }) => {
-				appendToWorklog(ctx.cwd, fixableWarnings, false);
+				appendToWorklog(ctx.cwd, fixableWarnings, false, worklogIdentity);
 			})
 			.catch(() => {});
 	}

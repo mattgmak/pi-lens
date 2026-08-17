@@ -3,8 +3,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { getProjectDataDir } from "../../clients/file-utils.js";
-import { KnipClient } from "../../clients/knip-client.js";
-import { setupTestEnvironment } from "./test-utils.js";
+import { getToolEnvironment } from "../../clients/installer/index.js";
+import {
+	KnipClient,
+	readOverridePinnedPackageNames,
+} from "../../clients/knip-client.js";
+import { removeTempDirSync, setupTestEnvironment } from "./test-utils.js";
 
 vi.mock("../../clients/safe-spawn.js", () => ({
 	safeSpawnAsync: vi.fn(async () => ({
@@ -31,8 +35,29 @@ describe("knip-client", () => {
 			await client.runAnalyze(tmpDir);
 
 			expect(safeSpawnMod.safeSpawnAsync).toHaveBeenCalled();
-			const [, args] = vi.mocked(safeSpawnMod.safeSpawnAsync).mock.calls[0] ?? [];
+			const [command, args, spawnOptions] =
+				vi.mocked(safeSpawnMod.safeSpawnAsync).mock.calls[0] ?? [];
+			expect(command).toBe("knip");
 			expect(args).toContain("--cache");
+			expect(spawnOptions?.cwd).toBe(tmpDir);
+
+			// Control-flow coverage for #1199: runAnalyze() must construct the
+			// exact child environment before calling safeSpawnAsync. The project
+			// .bin is first, while the installer-provided managed entries remain
+			// present behind it for Windows PATH/PATHEXT resolution.
+			const separator = process.platform === "win32" ? ";" : ":";
+			const projectBin = path.join(tmpDir, "node_modules", ".bin");
+			const childPath = spawnOptions?.env?.PATH ?? spawnOptions?.env?.Path ?? "";
+			const childPathEntries = childPath.split(separator);
+			const managedPath = (await getToolEnvironment()).PATH ?? "";
+			const managedEntries = managedPath.split(separator);
+			expect(childPathEntries[0]).toBe(projectBin);
+			for (const managedEntry of managedEntries.slice(0, 2)) {
+				expect(childPathEntries).toContain(managedEntry);
+			}
+			if (process.platform === "win32") {
+				expect(spawnOptions?.env?.Path).toBe(spawnOptions?.env?.PATH);
+			}
 
 			const cacheLocationIndex = (args as string[]).indexOf("--cache-location");
 			expect(cacheLocationIndex).toBeGreaterThan(-1);
@@ -91,7 +116,7 @@ describe("knip-client", () => {
 
 			expect(client.resolveProjectRoot(nested, home)).toBeNull();
 		} finally {
-			fs.rmSync(tmpRoot, { recursive: true, force: true });
+			removeTempDirSync(tmpRoot);
 		}
 	});
 
@@ -113,7 +138,7 @@ describe("knip-client", () => {
 
 			expect(client.resolveProjectRoot(home, home)).toBeNull();
 		} finally {
-			fs.rmSync(tmpRoot, { recursive: true, force: true });
+			removeTempDirSync(tmpRoot);
 		}
 	});
 
@@ -155,7 +180,7 @@ describe("knip-client", () => {
 			const resolved = client.resolveProjectRoot(nested);
 			expect(resolved).not.toBe(nested);
 		} finally {
-			fs.rmSync(tmpRoot, { recursive: true, force: true });
+			removeTempDirSync(tmpRoot);
 		}
 	});
 
@@ -190,7 +215,7 @@ describe("knip-client", () => {
 			expect(result.summary).toMatch(/skipped|no project/i);
 			expect(runSpy).not.toHaveBeenCalled();
 		} finally {
-			fs.rmSync(tmpRoot, { recursive: true, force: true });
+			removeTempDirSync(tmpRoot);
 			vi.restoreAllMocks();
 		}
 	});
@@ -345,6 +370,91 @@ describe("knip-client", () => {
 		expect(result.issues).toHaveLength(1);
 		expect(result.unlistedDeps).toHaveLength(1);
 		expect(result.unlistedDeps[0].name).toBe("@acme/pkg");
+	});
+
+	it("readOverridePinnedPackageNames collects overrides/resolutions/pnpm.overrides keys (#968)", () => {
+		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-knip-overrides-");
+		try {
+			fs.writeFileSync(
+				path.join(tmpDir, "package.json"),
+				JSON.stringify({
+					name: "demo",
+					overrides: { "brace-expansion": "^2.0.0" },
+					resolutions: { protobufjs: "^7.6.5" },
+					pnpm: { overrides: { "nested-pkg": { "sub-pkg": "^1.0.0" } } },
+				}),
+			);
+
+			const names = readOverridePinnedPackageNames(tmpDir);
+			expect(names.has("brace-expansion")).toBe(true);
+			expect(names.has("protobufjs")).toBe(true);
+			expect(names.has("nested-pkg")).toBe(true);
+			expect(names.has("sub-pkg")).toBe(true);
+			expect(names.has("unrelated-pkg")).toBe(false);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("readOverridePinnedPackageNames degrades to an empty set on missing/malformed package.json", () => {
+		const tmpRoot = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-knip-overrides-missing-"),
+		);
+		try {
+			expect(readOverridePinnedPackageNames(tmpRoot).size).toBe(0);
+		} finally {
+			removeTempDirSync(tmpRoot);
+		}
+	});
+
+	it("does not report an unused devDependency that's also an overrides-only security pin (#968)", async () => {
+		const { tmpDir, cleanup } = setupTestEnvironment(
+			"pi-lens-knip-overrides-e2e-",
+		);
+		try {
+			fs.writeFileSync(
+				path.join(tmpDir, "package.json"),
+				JSON.stringify({
+					name: "demo",
+					overrides: { "brace-expansion": "^2.0.0" },
+					devDependencies: { "brace-expansion": "^2.0.0", "real-unused": "^1.0.0" },
+				}),
+			);
+
+			const safeSpawnMod = await import("../../clients/safe-spawn.js");
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockResolvedValueOnce({
+				error: null,
+				status: 0,
+				stdout: JSON.stringify({
+					issues: [
+						{
+							file: "package.json",
+							devDependencies: [
+								{ name: "brace-expansion" },
+								{ name: "real-unused" },
+							],
+						},
+					],
+				}),
+				stderr: "",
+			} as never);
+
+			const client = new KnipClient(false) as unknown as {
+				runAnalyze: (d: string) => Promise<{
+					unusedDeps: Array<{ name: string; type: string }>;
+					issues: unknown[];
+				}>;
+			};
+			const result = await client.runAnalyze(tmpDir);
+
+			// The overrides-pinned dep is dropped; a genuinely unused devDependency
+			// with no overrides entry still gets reported.
+			expect(result.unusedDeps.map((d) => d.name)).toEqual(["real-unused"]);
+			expect(result.issues).toHaveLength(1);
+		} finally {
+			cleanup();
+			vi.restoreAllMocks();
+		}
 	});
 
 	it("routes enumMembers into unusedExports (grouped format)", () => {

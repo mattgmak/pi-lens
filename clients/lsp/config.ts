@@ -47,8 +47,12 @@
  * clients/lsp/server.ts (e.g. "rust", "nix", "bash", "python", "go", "ts").
  */
 
+import { logExtension } from "../extension-log.js";
+import { notifyUserDegradation } from "../user-notify.js";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { BoundedLruCache } from "../bounded-cache.js";
+import { getGlobalPiLensDir } from "../file-utils.js";
 import { launchLSP } from "./launch.js";
 import {
 	createRootDetector,
@@ -103,29 +107,100 @@ interface RegisteredLSPConfig {
 
 const CONFIG_PATHS = [".pi-lens/lsp.json", ".pi-lens.json", "pi-lsp.json"];
 
+function warnInvalidLSPConfig(configPath: string, error: unknown): void {
+	const reason = error instanceof Error ? error.message : String(error);
+	const message = `ignoring invalid LSP config ${configPath}: ${reason}`;
+	logExtension({
+		subsystem: "lsp-config",
+		level: "warn",
+		message,
+		metadata: { configPath, reason },
+	});
+	// HUMAN-audience too: the user's own lsp.json is being ignored (#1333).
+	notifyUserDegradation(`pi-lens: ${message}`);
+}
+
+async function readLSPConfig(configPath: string): Promise<LSPConfig | undefined> {
+	let content: string;
+	try {
+		content = await fs.readFile(configPath, "utf-8");
+	} catch (error) {
+		if (
+			error instanceof Error &&
+			"code" in error &&
+			error.code === "ENOENT"
+		) {
+			return undefined;
+		}
+		warnInvalidLSPConfig(configPath, error);
+		return undefined;
+	}
+
+	try {
+		const parsed = JSON.parse(content) as unknown;
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+			throw new TypeError("expected a JSON object");
+		}
+		return parsed as LSPConfig;
+	} catch (error) {
+		warnInvalidLSPConfig(configPath, error);
+		return undefined;
+	}
+}
+
+function mergeLSPConfigs(
+	globalConfig: LSPConfig,
+	projectConfig: LSPConfig,
+): LSPConfig {
+	const merged: LSPConfig = { ...globalConfig, ...projectConfig };
+
+	const servers = { ...globalConfig.servers, ...projectConfig.servers };
+	if (Object.keys(servers).length > 0) merged.servers = servers;
+
+	const serverOverrides = {
+		...globalConfig.serverOverrides,
+		...projectConfig.serverOverrides,
+	};
+	if (Object.keys(serverOverrides).length > 0) {
+		merged.serverOverrides = serverOverrides;
+	}
+
+	if (!Object.hasOwn(projectConfig, "disabledServers")) {
+		merged.disabledServers = globalConfig.disabledServers;
+	}
+	if (!Object.hasOwn(projectConfig, "warmFiles")) {
+		merged.warmFiles = globalConfig.warmFiles;
+	}
+
+	return merged;
+}
+
 /**
- * Load LSP configuration from file
+ * Load LSP configuration, with project settings overriding machine-global
+ * settings from ~/.pi-lens/lsp.json.
  */
 export async function loadLSPConfig(cwd: string): Promise<LSPConfig> {
+	let projectConfig: LSPConfig | undefined;
 	let dir = path.resolve(cwd);
 	while (true) {
 		for (const configPath of CONFIG_PATHS) {
 			const fullPath = path.join(dir, configPath);
-			try {
-				const content = await fs.readFile(fullPath, "utf-8");
-				const config = JSON.parse(content) as LSPConfig;
-				return config;
-			} catch {
-				// File doesn't exist or is invalid, try next
+			const config = await readLSPConfig(fullPath);
+			if (config) {
+				projectConfig = config;
+				break;
 			}
 		}
+		if (projectConfig) break;
 
 		const parent = path.dirname(dir);
 		if (parent === dir) break;
 		dir = parent;
 	}
 
-	return {};
+	const globalConfig =
+		(await readLSPConfig(path.join(getGlobalPiLensDir(), "lsp.json"))) ?? {};
+	return mergeLSPConfigs(globalConfig, projectConfig ?? {});
 }
 
 // --- Custom Server Factory ---
@@ -162,7 +237,7 @@ const EMPTY_CONFIG: RegisteredLSPConfig = {
 	serverOverrides: new Map(),
 };
 
-const workspaceConfigs = new Map<string, RegisteredLSPConfig>();
+const workspaceConfigs = new BoundedLruCache<string, RegisteredLSPConfig>(32);
 /** In-flight config initialization promises to prevent duplicate concurrent loads */
 const configInFlight = new Map<string, Promise<void>>();
 

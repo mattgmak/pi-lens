@@ -16,6 +16,7 @@ import {
 	sha256,
 	sidecarPathFor,
 } from "../../scripts/download-grammars.js";
+import { removeTempDirSync } from "../clients/test-utils.js";
 
 const FILE = "tree-sitter-example.wasm";
 const HASH = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
@@ -40,7 +41,7 @@ function writeSidecar(dir: string, version: string, hash: string): void {
 }
 
 afterEach(() => {
-	for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+	for (const d of dirs.splice(0)) removeTempDirSync(d);
 });
 
 describe("sha256", () => {

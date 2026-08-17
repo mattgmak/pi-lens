@@ -21,18 +21,13 @@ description: |
   ```
 
 query: |
-  (function_declaration
-    parameters: (formal_parameters
-      (identifier) @PARAM1
-      (identifier) @PARAM2))
-  (arrow_function
-    parameters: (formal_parameters
-      (identifier) @PARAM1
-      (identifier) @PARAM2))
+  (formal_parameters
+    (_ pattern: (_) @PARAM1)
+    (_ pattern: (_) @NAME))
 
 metavars:
   - PARAM1
-  - PARAM2
+  - NAME
 
 post_filter: same_param_name
 

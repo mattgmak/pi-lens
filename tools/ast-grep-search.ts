@@ -18,6 +18,7 @@ import {
 	synthesizeRule,
 } from "../clients/ast-grep-yaml-synth.js";
 import type { SearchReadLocation } from "../clients/search-read-registration.js";
+import { isAtOrAboveHomeDir } from "../clients/path-utils.js";
 import { compactRenderResult } from "./render-compact.js";
 import { combineAbortSignals } from "../clients/deadline-utils.js";
 import { LANGUAGES } from "./shared.js";
@@ -61,11 +62,14 @@ function toSearchReads(matches: AstGrepMatch[]): SearchReadLocation[] {
 	return out;
 }
 
-// Default and ceiling for matches returned per call. `maxMatches` lets a caller
+// Default and ceilings for agent-facing search inputs. `maxMatches` lets a caller
 // trade volume for completeness within these bounds (the default preserves the
-// historical page size).
+// historical page size). Explicit path lists are capped like the other bounded
+// multi-file tools, while a single directory path remains a valid project scope.
 const DEFAULT_PAGE_SIZE = 50;
 const MAX_PAGE_SIZE = 200;
+const MAX_PATHS = 200;
+const AST_GREP_SEARCH_TIMEOUT_MS = 30_000;
 
 /**
  * Compact, file-grouped rendering for high-volume searches (refs #345). Instead
@@ -280,19 +284,20 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 		label: "AST Search",
 		description:
 			"Search code using AST-aware pattern matching. IMPORTANT: Use specific AST patterns, NOT text search.\n\n" +
-			"✅ GOOD patterns (single AST node):\n" +
-			"  - function $NAME() { $$$BODY }     (function declaration)\n" +
-			"  - fetchMetrics($ARGS)               (function call)\n" +
-			'  - import { $NAMES } from "$PATH"   (import statement)\n' +
-			"  - console.log($MSG)                  (method call)\n\n" +
+			"✅ GOOD patterns (complete AST shapes; $$$ accepts zero or more nodes):\n" +
+			"  - function $NAME($$$ARGS) { $$$BODY } (function declaration)\n" +
+			"  - fetchMetrics($$$ARGS)             (call with any arguments)\n" +
+			'  - import { $$$NAMES } from "module-name" (exact string-literal import)\n' +
+			"  - console.log($MSG)                 (method call)\n\n" +
 			"❌ BAD patterns (multiple nodes / raw text):\n" +
-			'  - it"test name"                    (missing parens - use it($TEST))\n' +
-			"  - console.log without args          (incomplete code)\n" +
+			'  - it"test name"                     (missing parens - use it($TEST))\n' +
+			"  - console.log without args           (incomplete code)\n" +
 			"  - arbitrary text without code structure\n\n" +
-			"Always prefer specific patterns with context over bare identifiers. " +
+			'Metavariables match AST nodes, not text inside quoted string literals: `from "$PATH"` matches the literal text $PATH. Use an exact quoted string for a known import, or grep for wildcard text. ' +
 			"Use 'paths' to scope to specific files/folders. " +
-			"Avoid 'selector' unless you know the exact AST node kind; it narrows search roots and does not extract fields. " +
-			"Use 'context' to show surrounding lines. If zero matches, retry once with a simpler AST pattern, then use ast_grep_dump on a small representative snippet before falling back to grep.",
+			"Use 'nodeKind' to find every node of a known AST kind, or 'ast_grep_dump' first when the kind is unknown. " +
+			"Avoid 'selector' unless you know the exact AST node kind; it narrows matching and does not extract fields. " +
+			'If this tool is inactive, call pi_lens_activate_tools with tools=["ast_grep_search"]; activation takes effect next turn. If zero matches, retry once with a simpler AST pattern, then use ast_grep_dump on a small representative snippet before falling back to grep.',
 		promptSnippet: "AST-aware structural code search",
 		renderResult: compactRenderResult<{
 			matchCount?: number;
@@ -323,7 +328,7 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 			pattern: Type.Optional(
 				Type.String({
 					description:
-						"AST pattern (use function/class/call context, not text). Required unless `rule` is provided.",
+						"AST pattern (use function/class/call context, not text). Required unless `rule` or `nodeKind` is provided. Do not put metavariables inside quoted string literals; they match literally.",
 				}),
 			),
 			lang: Type.String({
@@ -332,7 +337,8 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 			}),
 			paths: Type.Optional(
 				Type.Array(Type.String(), {
-					description: "Specific files/folders to search",
+					maxItems: MAX_PATHS,
+					description: `Specific files/folders to search (max ${MAX_PATHS} entries)`,
 				}),
 			),
 			selector: Type.Optional(
@@ -346,6 +352,12 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 					description: "Show N lines before/after each match for context",
 				}),
 			),
+			nodeKind: Type.Optional(
+				Type.String({
+					description:
+						"Expert grammar-specific escape hatch: find every node of this exact AST kind (for example `call_expression`) without writing a pattern. Node kinds are not universal across languages; use ast_grep_dump to discover them. Mutually exclusive with `pattern` and `rule`; can be combined with structural constraints.",
+				}),
+			),
 			insideKind: Type.Optional(
 				Type.String({
 					description:
@@ -355,7 +367,13 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 			hasKind: Type.Optional(
 				Type.String({
 					description:
-						'Restrict matches to nodes that contain a descendant of this AST node kind. Example: `hasKind: "await_expression"` finds the pattern only when it contains an await inside it.',
+						'Restrict matches to nodes whose immediate child has this AST node kind (ast-grep default stopBy: neighbor). Example: `hasKind: "await_expression"`.',
+				}),
+			),
+			hasDescendantKind: Type.Optional(
+				Type.String({
+					description:
+						"Restrict matches to nodes containing this AST node kind anywhere in their descendants. Explicit recursive form (`stopBy: end`); use this instead of `hasKind` when nesting is not immediate.",
 				}),
 			),
 			follows: Type.Optional(
@@ -418,8 +436,10 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 			// tool-call one. Honor both so a broad search cancels on Escape.
 			const abortSignal = combineAbortSignals(_signal, ctx.signal);
 			const startedAt = Date.now();
+			const deadlineAt = startedAt + AST_GREP_SEARCH_TIMEOUT_MS;
 			const {
 				paths,
+				nodeKind,
 				selector,
 				context,
 				skip,
@@ -429,6 +449,7 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 				rule,
 				insideKind,
 				hasKind,
+				hasDescendantKind,
 				follows,
 				precedes,
 				validateOnly,
@@ -436,6 +457,7 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 				pattern?: string;
 				lang?: string;
 				paths?: string[];
+				nodeKind?: string;
 				selector?: string;
 				context?: number;
 				skip?: number;
@@ -445,15 +467,19 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 				rule?: string;
 				insideKind?: string;
 				hasKind?: string;
+				hasDescendantKind?: string;
 				follows?: string;
 				precedes?: string;
 				validateOnly?: boolean;
 			};
 			const pattern = typeof params.pattern === "string" ? params.pattern : "";
 			const rawLang = typeof params.lang === "string" ? params.lang : "";
+			const normalizedNodeKind =
+				typeof nodeKind === "string" ? nodeKind.trim() : "";
 			const skipOffset = Math.max(0, Math.floor(skip ?? 0));
 			const lang = rawLang.replace(/^"|"$/g, "");
 			const searchPathsCount = paths?.length ?? 1;
+			const executionOptions = { signal: abortSignal, deadlineAt };
 
 			function logOutcome(
 				outcome: AstGrepToolOutcome,
@@ -510,7 +536,24 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 
 			try {
 				const rawRule = typeof rule === "string" ? rule : undefined;
-				const hasRawRule = !!rawRule?.trim();
+				const hasRawRule = Boolean(rawRule?.trim());
+				const hasPattern = Boolean(pattern.trim());
+				const hasNodeKind = normalizedNodeKind.length > 0;
+				const rawPaths = params.paths;
+				if (
+					rawPaths !== undefined &&
+					(!Array.isArray(rawPaths) ||
+						rawPaths.length > MAX_PATHS ||
+						rawPaths.some((value) => typeof value !== "string"))
+				) {
+					const errorRaw = `paths must contain at most ${MAX_PATHS} string entries`;
+					logOutcome("error", { errorRaw });
+					return {
+						content: [{ type: "text" as const, text: `Error: ${errorRaw}` }],
+						isError: true,
+						details: {},
+					};
+				}
 				const rawRuleError = rawRuleValidationError(rawRule);
 				if (rawRuleError) {
 					logOutcome("error", { errorRaw: rawRuleError });
@@ -523,11 +566,16 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 					};
 				}
 
-				if (!pattern.trim() && !hasRawRule) {
-					logOutcome("error", { errorRaw: "pattern is required" });
+				if (!hasPattern && !hasRawRule && !hasNodeKind) {
+					logOutcome("error", {
+						errorRaw: "pattern is required unless rule or nodeKind is provided",
+					});
 					return {
 						content: [
-							{ type: "text" as const, text: "Error: pattern is required" },
+							{
+								type: "text" as const,
+								text: "Error: pattern is required unless rule or nodeKind is provided",
+							},
 						],
 						isError: true,
 						details: {},
@@ -575,7 +623,11 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 				}
 				if (abortSignal?.aborted) return abortError();
 
-				if (!hasRawRule && looksLikeRuleYamlOrPlainText(pattern)) {
+				if (
+					!hasRawRule &&
+					hasPattern &&
+					looksLikeRuleYamlOrPlainText(pattern)
+				) {
 					logOutcome("error", {
 						errorRaw:
 							"pattern looks like rule YAML or plain text (rejected pre-spawn)",
@@ -592,6 +644,46 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 					};
 				}
 
+				// #747/#250: only guard the DEFAULTED-cwd case. Explicit `paths` are
+				// what the user asked to search — never second-guessed. But when no
+				// paths are given we fall back to `ctx.cwd`, and if that resolves at or
+				// above $HOME a full structural scan of the entire home tree would be
+				// spawned. Refuse and tell the caller how to scope it.
+				if (!paths?.length && isAtOrAboveHomeDir(ctx.cwd || ".")) {
+					logOutcome("error", {
+						errorRaw: "defaulted cwd resolves at or above home directory",
+					});
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text: `Refused: no \`paths\` given and the working directory (${
+									ctx.cwd || "."
+								}) resolves at or above the home directory — searching it would scan every unrelated tree under your home. Pass explicit \`paths\`, or run from a project directory.`,
+							},
+						],
+						isError: true,
+						details: {},
+					};
+				}
+				if (hasNodeKind && hasPattern) {
+					const errorRaw = "nodeKind cannot be combined with pattern";
+					logOutcome("error", { errorRaw });
+					return {
+						content: [{ type: "text" as const, text: `Error: ${errorRaw}` }],
+						isError: true,
+						details: {},
+					};
+				}
+				if (hasNodeKind && hasRawRule) {
+					const errorRaw = "nodeKind cannot be combined with rule";
+					logOutcome("error", { errorRaw });
+					return {
+						content: [{ type: "text" as const, text: `Error: ${errorRaw}` }],
+						isError: true,
+						details: {},
+					};
+				}
 				const searchPaths = paths?.length ? paths : [ctx.cwd || "."];
 				const PAGE_SIZE = Math.max(
 					1,
@@ -607,14 +699,24 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 				let effectiveRule = hasRawRule ? rawRule : undefined;
 				if (
 					!effectiveRule &&
-					hasStructuralIntent({ insideKind, hasKind, follows, precedes })
+					(hasNodeKind ||
+						hasStructuralIntent({
+							nodeKind: normalizedNodeKind,
+							insideKind,
+							hasKind,
+							hasDescendantKind,
+							follows,
+							precedes,
+						}))
 				) {
 					try {
 						effectiveRule = synthesizeRule({
-							pattern,
+							pattern: hasPattern ? pattern : undefined,
+							nodeKind: hasNodeKind ? normalizedNodeKind : undefined,
 							lang,
 							insideKind,
 							hasKind,
+							hasDescendantKind,
 							follows,
 							precedes,
 						});
@@ -635,10 +737,11 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 
 				if (validateOnly) {
 					const validation = effectiveRule?.trim()
-						? await astGrepClient.validateRule(effectiveRule)
+						? await astGrepClient.validateRule(effectiveRule, executionOptions)
 						: await astGrepClient.validatePattern(pattern, lang, {
 								selector,
 								strictness,
+								...executionOptions,
 							});
 					if (!validation.valid) {
 						logOutcome("error", { errorRaw: validation.error });
@@ -678,6 +781,7 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 					const ruleResult = await astGrepClient.searchWithRule(
 						effectiveRule,
 						searchPaths,
+						executionOptions,
 					);
 					if (abortSignal?.aborted) return abortError();
 					if (ruleResult.error) {
@@ -698,7 +802,7 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 					const hasMore = afterSkip.length > PAGE_SIZE;
 					const output = groupByFile
 						? formatGroupedByFile(page)
-						: astGrepClient.formatMatches(page);
+						: astGrepClient.formatMatches(page, false, false, PAGE_SIZE);
 					const paginationNote =
 						hasMore && page.length > 0
 							? `\n\n(Showing ${page.length} of ${ruleResult.matches.length - skipOffset} remaining matches. Use skip=${skipOffset + PAGE_SIZE} for the next page.)`
@@ -735,6 +839,7 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 					selector,
 					context,
 					strictness,
+					...executionOptions,
 				});
 				if (abortSignal?.aborted) return abortError();
 
@@ -756,7 +861,7 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 
 				const output = groupByFile
 					? formatGroupedByFile(page)
-					: astGrepClient.formatMatches(page);
+					: astGrepClient.formatMatches(page, false, false, PAGE_SIZE);
 				const hint =
 					page.length === 0 && !result.error
 						? getPatternHint(pattern, lang, selector)

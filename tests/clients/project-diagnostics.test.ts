@@ -18,12 +18,13 @@ import { govulncheckResultToProjectDiagnostics } from "../../clients/project-dia
 import { trivyResultToProjectDiagnostics } from "../../clients/project-diagnostics/runner-adapters/trivy.js";
 import { opengrepResultToProjectDiagnostics } from "../../clients/project-diagnostics/runner-adapters/opengrep.js";
 import { deadCodeResultToProjectDiagnostics } from "../../clients/project-diagnostics/runner-adapters/dead-code.js";
-import { extractCachedProjectDiagnostics } from "../../clients/project-diagnostics/extractors.js";
+import { callGraphImpactToProjectDiagnostics } from "../../clients/project-diagnostics/runner-adapters/call-graph-impact.js";
 import { scanProjectDiagnostics } from "../../clients/project-diagnostics/scanner.js";
 import type {
 	ProjectDiagnosticsDeltaReport,
 	ProjectDiagnosticsSnapshot,
 } from "../../clients/project-diagnostics/types.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 let tmp: string;
 let previousDataDir: string | undefined;
@@ -37,7 +38,7 @@ beforeEach(() => {
 afterEach(() => {
 	if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 	else process.env.PILENS_DATA_DIR = previousDataDir;
-	fs.rmSync(tmp, { recursive: true, force: true });
+	removeTempDirSync(tmp);
 });
 
 function snapshot(
@@ -92,6 +93,10 @@ describe("project diagnostics cache", () => {
 	});
 
 	it("ignores stale cache versions", () => {
+		// Deliberately pinned to the literal 0, below PROJECT_DIAGNOSTICS_CACHE_VERSION,
+		// to exercise the stale-version rejection path itself (the #1082/#1106
+		// vacuous-fixture class: a future bump to 0 would silently un-exercise this).
+		expect(PROJECT_DIAGNOSTICS_CACHE_VERSION).not.toBe(0);
 		saveProjectDiagnosticsSnapshot(tmp, snapshot({ version: 0 }));
 		expect(loadProjectDiagnosticsSnapshot(tmp)).toBeUndefined();
 	});
@@ -127,6 +132,10 @@ describe("project diagnostics cache", () => {
 	});
 
 	it("ignores stale delta report versions", () => {
+		// Deliberately pinned to the literal 0, below PROJECT_DIAGNOSTICS_CACHE_VERSION,
+		// to exercise the stale-version rejection path itself (the #1082/#1106
+		// vacuous-fixture class: a future bump to 0 would silently un-exercise this).
+		expect(PROJECT_DIAGNOSTICS_CACHE_VERSION).not.toBe(0);
 		writeProjectDiagnosticsDeltaReport(tmp, deltaReport({ version: 0 }));
 		expect(loadProjectDiagnosticsDeltaReport(tmp)).toBeUndefined();
 	});
@@ -306,6 +315,73 @@ describe("project diagnostics adapters", () => {
 		]);
 		// Same member set → emitted once (one diagnostic per file, not per anchor).
 		expect(diags).toHaveLength(2);
+	});
+
+	it("maps call-graph impact findings to non-blocking diagnostics on the CALLER's file, with no line", () => {
+		const diags = callGraphImpactToProjectDiagnostics(tmp, [
+			{
+				calleeKey: "src/b.ts:changedFn",
+				results: [
+					{ symbolKey: "src/a.ts:directCaller", depth: 1, severity: "WillBreak" },
+					{ symbolKey: "src/c.ts:indirectCaller", depth: 2, severity: "MayBreak" },
+					{ symbolKey: "src/d.ts:farCaller", depth: 3, severity: "Review" },
+				],
+			},
+		]);
+
+		// Review tier is dropped — too diluted at that BFS depth to attribute
+		// to a specific caller (mirrors formatImpact's own count-only treatment).
+		expect(diags).toHaveLength(2);
+
+		const willBreak = diags.find((d) => d.rule === "call-graph:willbreak");
+		expect(willBreak).toMatchObject({
+			filePath: path.join(tmp, "src/a.ts"),
+			severity: "warning",
+			semantic: "warning",
+			tool: "call-graph",
+			runner: "call-graph",
+			source: "project-scan",
+		});
+		expect(willBreak?.line).toBeUndefined();
+		expect(willBreak?.message).toContain("directCaller");
+		expect(willBreak?.message).toContain("changedFn");
+
+		const mayBreak = diags.find((d) => d.rule === "call-graph:maybreak");
+		expect(mayBreak).toMatchObject({
+			filePath: path.join(tmp, "src/c.ts"),
+			severity: "info",
+			semantic: "warning",
+		});
+		expect(mayBreak?.line).toBeUndefined();
+
+		// Never escalates to this codebase's hard-stop tier (#533 honesty) —
+		// impact() has no type info, so a resolved caller is never a CONFIRMED
+		// break.
+		expect(diags.every((d) => d.semantic !== "blocking")).toBe(true);
+	});
+
+	it("dedupes the same caller reached via multiple edited symbols, keeping the higher severity", () => {
+		const diags = callGraphImpactToProjectDiagnostics(tmp, [
+			{
+				calleeKey: "src/b.ts:changedFnOne",
+				results: [
+					{ symbolKey: "src/a.ts:sharedCaller", depth: 2, severity: "MayBreak" },
+				],
+			},
+			{
+				calleeKey: "src/b.ts:changedFnTwo",
+				results: [
+					{ symbolKey: "src/a.ts:sharedCaller", depth: 1, severity: "WillBreak" },
+				],
+			},
+		]);
+
+		expect(diags).toHaveLength(1);
+		expect(diags[0]).toMatchObject({
+			filePath: path.join(tmp, "src/a.ts"),
+			severity: "warning", // WillBreak wins over the earlier MayBreak hit
+			rule: "call-graph:willbreak",
+		});
 	});
 
 	it("maps gitleaks secrets to BLOCKING diagnostics", () => {
@@ -495,218 +571,6 @@ describe("project diagnostics adapters", () => {
 	});
 });
 
-describe("extractCachedProjectDiagnostics (registry)", () => {
-	function cacheManagerWith(data: Record<string, unknown>) {
-		return {
-			readCache: (key: string) =>
-				data[key] ? { data: data[key] } : null,
-		} as unknown as import("../../clients/cache-manager.js").CacheManager;
-	}
-
-	it("reads each analyzer's cache and reports which runners contributed", () => {
-		const cm = cacheManagerWith({
-			"jscpd-ts": {
-				success: true,
-				duplicatedLines: 5,
-				totalLines: 50,
-				percentage: 10,
-				clones: [
-					{ fileA: "a.ts", startA: 1, fileB: "b.ts", startB: 2, lines: 5, tokens: 9 },
-				],
-			},
-			gitleaks: {
-				success: true,
-				scannedAt: "",
-				findings: [{ ruleId: "x", file: "c.ts", startLine: 3 }],
-			},
-			madge: { circular: [{ file: "d.ts", path: ["d.ts", "e.ts"] }], count: 1 },
-			govulncheck: {
-				success: true,
-				scannedAt: "",
-				findings: [{ osv: "GO-1", trace: [{ filename: "m.go", line: 2 }] }],
-			},
-			trivy: {
-				success: true,
-				scannedAt: "",
-				secrets: [],
-				licenses: [],
-				findings: [
-					{ vulnerabilityId: "CVE-1", pkgName: "p", severity: "LOW", target: "go.sum" },
-				],
-			},
-			"dead-code-python": {
-				success: true,
-				language: "python",
-				summary: "",
-				unusedExports: [
-					{ category: "export", kind: "func", name: "x", file: "z.py", line: 9 },
-				],
-				unusedFiles: [],
-				unusedDeps: [],
-				unlistedDeps: [],
-			},
-			opengrep: {
-				success: true,
-				scannedAt: "",
-				findings: [
-					{
-						checkId: "python.lang.security.audit.subprocess-shell-true",
-						path: "f.py",
-						startLine: 3,
-						startCol: 1,
-						endLine: 3,
-						endCol: 5,
-						message: "shell=True is dangerous",
-						severity: "ERROR",
-					},
-				],
-			},
-		});
-
-		const { diagnostics, runners } = extractCachedProjectDiagnostics(cm, tmp);
-
-		// jscpd 2 + gitleaks 1 + madge 2 + govulncheck 1 + trivy 1 + dead-code 1 + opengrep 1 = 9
-		expect(diagnostics).toHaveLength(9);
-		expect(runners.sort()).toEqual([
-			"dead-code",
-			"gitleaks",
-			"govulncheck",
-			"jscpd",
-			"madge",
-			"opengrep",
-			"trivy",
-		]);
-	});
-
-	it("prefers jscpd-ts over jscpd, and skips analyzers with no cache", () => {
-		const cm = cacheManagerWith({
-			jscpd: {
-				success: true,
-				duplicatedLines: 1,
-				totalLines: 1,
-				percentage: 1,
-				clones: [
-					{ fileA: "a.ts", startA: 1, fileB: "b.ts", startB: 2, lines: 5, tokens: 9 },
-				],
-			},
-		});
-		const { runners } = extractCachedProjectDiagnostics(cm, tmp);
-		expect(runners).toEqual(["jscpd"]);
-	});
-
-	it("returns nothing when no analyzer has cached results", () => {
-		const { diagnostics, runners } = extractCachedProjectDiagnostics(
-			cacheManagerWith({}),
-			tmp,
-		);
-		expect(diagnostics).toEqual([]);
-		expect(runners).toEqual([]);
-	});
-
-	// #533: a cache-key miss must be reported as `cold`, distinct from an
-	// analyzer that ran and legitimately found nothing (which would still have
-	// written a cache entry — see runtime-session.ts's writeCache calls, always
-	// fired with the full result object even when empty).
-	it("reports every unhit analyzer as cold, never silently as clean", () => {
-		const { diagnostics, runners, cold } = extractCachedProjectDiagnostics(
-			cacheManagerWith({}),
-			tmp,
-		);
-		expect(diagnostics).toEqual([]);
-		expect(runners).toEqual([]);
-		expect(cold.sort()).toEqual(
-			[
-				"knip",
-				"jscpd",
-				"madge",
-				"gitleaks",
-				"govulncheck",
-				"trivy",
-				"dead-code",
-				"opengrep",
-				"test-runner",
-			].sort(),
-		);
-	});
-
-	// #628 item 4: cache-only extractor for the per-edit test-runner findings —
-	// same shape as every other row here (readCache, adapt, never relaunch).
-	it("adapts cached test-runner findings into per-file diagnostics", () => {
-		const cm = cacheManagerWith({
-			"test-runner-findings": {
-				content: "[Tests] ✗ 1/2 failed — vitest",
-				stale: false,
-				results: [
-					{
-						file: "src/foo.test.ts",
-						sourceFile: "src/foo.ts",
-						runner: "vitest",
-						passed: 1,
-						failed: 1,
-						skipped: 0,
-						failures: [
-							{ name: "does the thing", message: "expected 1 to be 2" },
-						],
-						duration: 12,
-					},
-				],
-			},
-		});
-
-		const { diagnostics, runners } = extractCachedProjectDiagnostics(cm, tmp);
-		expect(runners).toContain("test-runner");
-		const testDiag = diagnostics.find((d) => d.tool === "test-runner");
-		expect(testDiag).toBeDefined();
-		expect(testDiag?.filePath).toBe("src/foo.test.ts");
-		expect(testDiag?.message).toContain("does the thing");
-		expect(testDiag?.message).toContain("expected 1 to be 2");
-		expect(testDiag?.semantic).toBe("blocking");
-	});
-
-	it("does not surface a test-runner diagnostic for an all-passing cached result", () => {
-		const cm = cacheManagerWith({
-			"test-runner-findings": {
-				content: "",
-				stale: false,
-				results: [
-					{
-						file: "src/foo.test.ts",
-						sourceFile: "src/foo.ts",
-						runner: "vitest",
-						passed: 3,
-						failed: 0,
-						skipped: 0,
-						failures: [],
-						duration: 12,
-					},
-				],
-			},
-		});
-
-		const { diagnostics, runners } = extractCachedProjectDiagnostics(cm, tmp);
-		expect(diagnostics.filter((d) => d.tool === "test-runner")).toEqual([]);
-		// No findings contributed, but the cache entry existed — not cold either
-		// way (checked implicitly: runners list just doesn't include it here).
-		expect(runners).not.toContain("test-runner");
-	});
-
-	it("does not mark an analyzer cold once it has a cache entry, clean or not", () => {
-		const { cold } = extractCachedProjectDiagnostics(
-			cacheManagerWith({
-				jscpd: {
-					success: true,
-					duplicatedLines: 0,
-					totalLines: 10,
-					percentage: 0,
-					clones: [],
-				},
-			}),
-			tmp,
-		);
-		expect(cold).not.toContain("jscpd");
-	});
-});
-
 describe("scanProjectDiagnostics", () => {
 	it("caps source collection before scanning", async () => {
 		const srcDir = path.join(tmp, "src-cap");
@@ -813,6 +677,45 @@ describe("scanProjectDiagnostics", () => {
 				}),
 			]),
 		);
+	});
+
+	it("preserves phase-major diagnostic ordering in the merged file pass (#896)", async () => {
+		const srcDir = path.join(tmp, "src");
+		fs.mkdirSync(srcDir, { recursive: true });
+		const filePath = path.join(srcDir, "combined.ts");
+		fs.writeFileSync(
+			filePath,
+			[
+				"function inner(value: number) { return value; }",
+				"function wrapper(value: number) {",
+				"  return inner(value);",
+				"}",
+				'function notify() { alert("hi"); }',
+			].join("\n"),
+		);
+
+		const result = await scanProjectDiagnostics({
+			cwd: tmp,
+			tier: "cheap",
+			maxFiles: 10,
+		});
+
+		const factIndex = result.diagnostics.findIndex(
+			(d) => d.filePath === filePath && d.runner === "fact-rules",
+		);
+		const astGrepIndex = result.diagnostics.findIndex(
+			(d) =>
+				d.filePath === filePath &&
+				d.runner === "ast-grep-napi" &&
+				d.rule === "no-alert",
+		);
+		expect(factIndex).toBeGreaterThanOrEqual(0);
+		expect(astGrepIndex).toBeGreaterThan(factIndex);
+		expect(result.runners).toEqual([
+			"tree-sitter",
+			"fact-rules",
+			"ast-grep-napi",
+		]);
 	});
 
 	it("excludes ignored/excluded files from the ast-grep scan (#308)", async () => {

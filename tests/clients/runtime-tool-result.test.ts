@@ -5,13 +5,91 @@ import { CacheManager } from "../../clients/cache-manager.js";
 import { readChangesSince } from "../../clients/project-changes.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleToolResult } from "../../clients/runtime-tool-result.js";
-import { setupTestEnvironment } from "./test-utils.js";
+import { createTempFile, setupTestEnvironment } from "./test-utils.js";
+
+const logLatency = vi.hoisted(() => vi.fn());
+vi.mock("../../clients/latency-logger.js", () => ({ logLatency }));
 
 vi.mock("../../clients/pipeline.js", () => ({
 	runPipeline: vi.fn(),
 }));
 
 describe("bash grep searchReads registration", () => {
+	it("registers bash reads only from a successful tool result", async () => {
+		const env = setupTestEnvironment("pi-lens-bash-read-result-");
+		try {
+			const filePath = path.join(env.tmpDir, "sample.ts");
+			fs.writeFileSync(filePath, "one\ntwo\nthree\n");
+			const recordRead = vi.fn();
+			const base = {
+				getFlag: () => false,
+				dbg: () => {},
+				runtime: Object.assign(new RuntimeCoordinator(), {
+					projectRoot: env.tmpDir,
+				}),
+				cacheManager: new CacheManager(false),
+				biomeClient: {},
+				ruffClient: {},
+				metricsClient: {},
+				resetLSPService: () => {},
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+				readGuard: { recordRead },
+			} as any;
+			await handleToolResult({
+				...base,
+				event: {
+					toolName: "bash",
+					input: { command: `cat ${filePath}` },
+					content: [{ type: "text", text: "one\\ntwo\\nthree" }],
+				},
+			});
+			expect(recordRead).toHaveBeenCalledWith(
+				expect.objectContaining({ filePath, effectiveOffset: 1 }),
+			);
+			recordRead.mockClear();
+			await handleToolResult({
+				...base,
+				event: {
+					toolName: "bash",
+					isError: true,
+					input: { command: `cat ${filePath}` },
+					content: [{ type: "text", text: "permission denied" }],
+				},
+			});
+			expect(recordRead).not.toHaveBeenCalled();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not register grep output from a failed bash result", async () => {
+		const env = setupTestEnvironment("pi-lens-bash-failed-grep-");
+		try {
+			const filePath = path.join(env.tmpDir, "sample.ts");
+			fs.writeFileSync(filePath, "one\ntwo\nthree\n");
+			const recordRead = vi.fn();
+			const base = {
+				getFlag: () => false,
+				dbg: () => {},
+				runtime: Object.assign(new RuntimeCoordinator(), { projectRoot: env.tmpDir }),
+				cacheManager: new CacheManager(false),
+				biomeClient: {}, ruffClient: {}, metricsClient: {}, resetLSPService: () => {},
+				agentBehaviorRecord: () => [], formatBehaviorWarnings: () => "",
+				readGuard: { recordRead },
+			} as any;
+			await handleToolResult({
+				...base,
+				event: {
+					toolName: "bash", isError: true,
+					input: { command: `grep -n two ${filePath}; false` },
+					content: [{ type: "text", text: `${filePath}:2:two` }],
+				},
+			});
+			expect(recordRead).not.toHaveBeenCalled();
+		} finally { env.cleanup(); }
+	});
+
 	it("records grep -n output lines as read-guard search reads", async () => {
 		const env = setupTestEnvironment("pi-lens-grep-search-reads-");
 		try {
@@ -304,6 +382,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 			fs.mkdirSync(path.dirname(filePath), { recursive: true });
 			fs.writeFileSync(filePath, "export const x = 1;\n");
 			const deferFormat = vi.fn();
+			const deferMutation = vi.fn();
 
 			await handleToolResult({
 				event: {
@@ -331,6 +410,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 					lastCascadeOutput: "",
 					cachedExports: new Map(),
 					deferFormat,
+					deferMutation,
 				},
 				cacheManager: {
 					addModifiedRange: () => {},
@@ -350,8 +430,311 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				expect.any(String),
 				"edit",
 				env.tmpDir,
+				undefined,
+			);
+			expect(deferMutation).toHaveBeenCalledWith(
+				filePath,
+				expect.any(String),
+				"edit",
+				env.tmpDir,
+				"autofix",
+				undefined,
 			);
 		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("returns authoritative full content after immediate write autofix", async () => {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		const env = setupTestEnvironment("pi-lens-runtime-tool-post-mutation-");
+		try {
+			const filePath = createTempFile(env.tmpDir, "src/app.ts", "const value = 1;\n");
+			vi.mocked(runPipeline).mockResolvedValue({
+				output: "",
+				hasBlockers: false,
+				isError: false,
+				fileModified: true,
+				changedFiles: [filePath],
+				postMutation: { filePath, content: fs.readFileSync(filePath, "utf-8"), source: "autofix" },
+			});
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const returned = await handleToolResult({
+				event: { toolName: "write", input: { path: filePath }, content: [{ type: "text", text: "base" }] },
+				getFlag: () => false,
+				dbg: () => {}, runtime,
+				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) },
+				biomeClient: {}, ruffClient: {}, metricsClient: {}, resetLSPService: () => {},
+				agentBehaviorRecord: () => [], formatBehaviorWarnings: () => "",
+			} as any);
+			expect(returned?.content.at(-1)?.text).toContain(fs.readFileSync(filePath, "utf-8"));
+			expect(returned?.content.at(-1)?.text).toContain("authoritative");
+		} finally { env.cleanup(); }
+	});
+
+	it("runs bash synthetic writes immediately and returns authoritative content", async () => {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		const env = setupTestEnvironment("pi-lens-runtime-tool-bash-write-");
+		try {
+			const filePath = createTempFile(env.tmpDir, "bash.ts", "const bash = true;\n");
+			vi.mocked(runPipeline).mockImplementation(async (ctx) => ({
+				output: "", hasBlockers: false, isError: false, fileModified: true,
+				changedFiles: [filePath],
+				postMutation: ctx.autofixMode === "immediate"
+					? { filePath, content: fs.readFileSync(filePath, "utf-8"), source: "autofix" }
+					: undefined,
+			}));
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const returned = await handleToolResult({
+				event: { toolName: "bash", input: { command: `echo x > "${filePath}"` }, content: [{ type: "text", text: "bash ok" }] },
+				getFlag: () => false, dbg: () => {}, runtime,
+				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) },
+				biomeClient: {}, ruffClient: {}, metricsClient: {}, resetLSPService: () => {},
+				agentBehaviorRecord: () => [], formatBehaviorWarnings: () => "",
+			} as any);
+			expect(vi.mocked(runPipeline).mock.calls[0][0].autofixMode).toBe("immediate");
+			expect(returned?.content.some((part) => part.text?.includes("authoritative"))).toBe(true);
+		} finally { env.cleanup(); }
+	});
+
+	it("shares one authoritative-content budget across a multi-file bash write", async () => {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		const env = setupTestEnvironment("pi-lens-runtime-tool-bash-budget-");
+		try {
+			// Each file's post-fix content fits the per-attachment cap (2 MiB) on
+			// its own, but the pair exceeds it — the second attachment must
+			// degrade to the re-read warning instead of inflating the aggregate
+			// tool result without bound.
+			const bigContent = "x".repeat(1.5 * 1024 * 1024);
+			const fileA = createTempFile(env.tmpDir, "budget-a.ts", bigContent);
+			const fileB = createTempFile(env.tmpDir, "budget-b.ts", bigContent);
+			vi.mocked(runPipeline).mockImplementation(async (ctx) => ({
+				output: "", hasBlockers: false, isError: false, fileModified: true,
+				changedFiles: [ctx.filePath],
+				postMutation: { filePath: ctx.filePath, content: bigContent, source: "autofix" },
+			}));
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const returned = await handleToolResult({
+				event: { toolName: "bash", input: { command: `echo x > "${fileA}"; echo x > "${fileB}"` }, content: [] },
+				getFlag: () => false, dbg: () => {}, runtime,
+				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) },
+				biomeClient: {}, ruffClient: {}, metricsClient: {}, resetLSPService: () => {},
+				agentBehaviorRecord: () => [], formatBehaviorWarnings: () => "",
+			} as any);
+			const authoritative = returned?.content.filter((part) =>
+				part.text?.startsWith("pi-lens applied autofix to"),
+			);
+			const warnings = returned?.content.filter((part) =>
+				part.text?.includes("aggregate authoritative content"),
+			);
+			expect(authoritative).toHaveLength(1);
+			expect(warnings).toHaveLength(1);
+		} finally { env.cleanup(); }
+	});
+
+	it("demotes a bash write followed by an edit through the handler", async () => {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		const formatEventsPublish = await import("../../clients/format-events-publish.js");
+		const env = setupTestEnvironment("pi-lens-runtime-tool-bash-edit-");
+		try {
+			const filePath = createTempFile(env.tmpDir, "bash-edit.ts", "let value = 1;\n");
+			vi.mocked(runPipeline).mockResolvedValue({ output: "", hasBlockers: false, isError: false, fileModified: false });
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const emit = vi.fn();
+			formatEventsPublish.wireFormatEventsBusEmitter(emit);
+			const base = {
+				getFlag: () => false, dbg: () => {}, runtime,
+				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) },
+				biomeClient: {}, ruffClient: {}, metricsClient: {}, resetLSPService: () => {},
+				agentBehaviorRecord: () => [], formatBehaviorWarnings: () => "",
+			} as any;
+			await handleToolResult({ ...base, event: { toolName: "bash", input: { command: `echo x > "${filePath}"` }, content: [] } });
+			fs.writeFileSync(filePath, "let value = 2;\n");
+			await handleToolResult({ ...base, event: { toolName: "edit", input: { path: filePath }, content: [] } });
+			expect(vi.mocked(runPipeline).mock.calls.map((call) => call[0].autofixMode)).toEqual(["immediate", "deferred"]);
+			expect(runtime.consumeDeferredFormatFiles()[0].kinds).toEqual(new Set(["format", "autofix"]));
+			expect(emit.mock.calls.at(-1)?.[1]).toMatchObject({ kinds: ["autofix", "format"] });
+		} finally {
+			formatEventsPublish._resetFormatEventsPublishForTests();
+			env.cleanup();
+		}
+	});
+
+	it("clears already-fixed state through an alias spelling on edit", async () => {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		const env = setupTestEnvironment("pi-lens-runtime-tool-fixed-alias-");
+		try {
+			const filePath = createTempFile(env.tmpDir, "src/alias.ts", "let alias = 1;\n");
+			let aliasPath = filePath.toUpperCase();
+			if (!fs.existsSync(aliasPath)) {
+				aliasPath = path.join(env.tmpDir, "alias-link.ts");
+				fs.symlinkSync(filePath, aliasPath, "file");
+			}
+			const runtime = new RuntimeCoordinator(); runtime.projectRoot = env.tmpDir;
+			runtime.recordMutationToolReceipt(filePath, "write");
+			runtime.fixedThisTurn.add(filePath);
+			vi.mocked(runPipeline).mockImplementation(async (_ctx, deps) => {
+				expect(deps.fixedThisTurn.has(filePath)).toBe(false);
+				return { output: "", hasBlockers: false, isError: false, fileModified: false };
+			});
+			await handleToolResult({
+				event: { toolName: "edit", input: { path: aliasPath }, content: [] }, getFlag: () => false, dbg: () => {}, runtime,
+				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) }, biomeClient: {}, ruffClient: {}, metricsClient: {}, resetLSPService: () => {}, agentBehaviorRecord: () => [], formatBehaviorWarnings: () => "",
+			} as any);
+			expect(vi.mocked(runPipeline)).toHaveBeenCalledTimes(1);
+		} finally { env.cleanup(); }
+	});
+
+	it("queues format with deferred autofix under --immediate-format", async () => {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		const env = setupTestEnvironment("pi-lens-runtime-tool-immediate-format-");
+		try {
+			const filePath = createTempFile(env.tmpDir, "flag.ts", "let flag = 1;\n");
+			vi.mocked(runPipeline).mockResolvedValue({ output: "", hasBlockers: false, isError: false, fileModified: false });
+			const runtime = new RuntimeCoordinator(); runtime.projectRoot = env.tmpDir;
+			await handleToolResult({
+				event: { toolName: "edit", input: { path: filePath }, content: [] },
+				getFlag: (name: string) => name === "immediate-format", dbg: () => {}, runtime,
+				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) },
+				biomeClient: {}, ruffClient: {}, metricsClient: {}, resetLSPService: () => {},
+				agentBehaviorRecord: () => [], formatBehaviorWarnings: () => "",
+			} as any);
+			expect(runtime.consumeDeferredFormatFiles()[0].kinds).toEqual(new Set(["autofix", "format"]));
+		} finally { env.cleanup(); }
+	});
+
+	it("does not attach authoritative content above the LSP byte limit", async () => {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		const env = setupTestEnvironment("pi-lens-runtime-tool-large-content-");
+		try {
+			logLatency.mockClear();
+			const boundaryPath = createTempFile(env.tmpDir, "boundary.ts", "x\n");
+			const filePath = createTempFile(env.tmpDir, "large.ts", "x\n");
+			const boundaryContent = "x".repeat(2 * 1024 * 1024);
+			const content = `${boundaryContent}x`;
+			vi.mocked(runPipeline)
+				.mockResolvedValueOnce({ output: "", hasBlockers: false, isError: false, fileModified: true, changedFiles: [boundaryPath], postMutation: { filePath: boundaryPath, content: boundaryContent, source: "autofix" } })
+				.mockResolvedValueOnce({ output: "", hasBlockers: false, isError: false, fileModified: true, changedFiles: [filePath], postMutation: { filePath, content, source: "autofix" } });
+			const runtime = new RuntimeCoordinator(); runtime.projectRoot = env.tmpDir;
+			const boundaryReturned = await handleToolResult({
+				event: { toolName: "write", input: { path: boundaryPath }, content: [] }, getFlag: () => false, dbg: () => {}, runtime,
+				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) }, biomeClient: {}, ruffClient: {}, metricsClient: {}, resetLSPService: () => {}, agentBehaviorRecord: () => [], formatBehaviorWarnings: () => "",
+			} as any);
+			const returned = await handleToolResult({
+				event: { toolName: "write", input: { path: filePath }, content: [] }, getFlag: () => false, dbg: () => {}, runtime,
+				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) }, biomeClient: {}, ruffClient: {}, metricsClient: {}, resetLSPService: () => {}, agentBehaviorRecord: () => [], formatBehaviorWarnings: () => "",
+			} as any);
+			expect(boundaryReturned?.content.some((part) => part.text?.includes(boundaryContent))).toBe(true);
+			expect(returned?.content.some((part) => part.text?.includes(content))).toBe(false);
+			expect(returned?.content.at(-1)?.text).toContain("too large to attach");
+			expect(logLatency).toHaveBeenCalledWith(expect.objectContaining({
+				phase: "authoritative_content_attachment_decision",
+				metadata: expect.objectContaining({ bytes: boundaryContent.length, decision: "attached" }),
+			}));
+			expect(logLatency).toHaveBeenCalledWith(expect.objectContaining({
+				phase: "authoritative_content_attachment_decision",
+				metadata: expect.objectContaining({ bytes: content.length, decision: "size-capped" }),
+			}));
+		} finally { env.cleanup(); }
+	});
+
+	it("publishes pilens:format:queued only when deferFormat reports a NEW queue entry (#673)", async () => {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		vi.mocked(runPipeline).mockResolvedValue({
+			output: "✓ no blockers",
+			hasBlockers: false,
+			isError: false,
+			fileModified: false,
+		});
+		const formatEventsPublish = await import(
+			"../../clients/format-events-publish.js"
+		);
+
+		const env = setupTestEnvironment("pi-lens-runtime-tool-format-queued-");
+		try {
+			const filePath = path.join(env.tmpDir, "src", "app.ts");
+			fs.mkdirSync(path.dirname(filePath), { recursive: true });
+			fs.writeFileSync(filePath, "export const x = 1;\n");
+
+			const emit = vi.fn();
+			formatEventsPublish.wireFormatEventsBusEmitter(emit);
+
+			const baseDeps = {
+				getFlag: () => false,
+				dbg: () => {},
+				cacheManager: {
+					addModifiedRange: () => {},
+					readTurnState: () => ({}),
+				},
+				biomeClient: {},
+				ruffClient: {},
+				testRunnerClient: {},
+				metricsClient: {},
+				resetLSPService: () => {},
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+			};
+			const runtimeStub = {
+				projectRoot: env.tmpDir,
+				setTelemetryIdentity: () => {},
+				updateGitGuardStatus: () => {},
+				appendCascadeResult: () => {},
+				recordInlineBlockers: () => {},
+				clearInlineBlockers: () => {},
+				nextWriteIndex: () => 1,
+				turnIndex: 1,
+				telemetryModel: "test-model",
+				telemetrySessionId: "test-session",
+				fixedThisTurn: new Set<string>(),
+				reportedThisTurn: new Set<string>(),
+				formatPipelineCrashNotice: () => "",
+				lastCascadeOutput: "",
+				cachedExports: new Map(),
+			};
+
+			// First touch: deferFormat reports a NEW entry -> publish fires.
+			await handleToolResult({
+				event: {
+					toolName: "edit",
+					input: { path: filePath },
+					details: { diff: "+  1 export const x = 1;" },
+					content: [{ type: "text", text: "base" }],
+				},
+				runtime: { ...runtimeStub, deferFormat: () => true },
+				...baseDeps,
+			} as any);
+
+			expect(emit).toHaveBeenCalledTimes(1);
+			expect(emit).toHaveBeenCalledWith(
+				"pilens:format:queued",
+				expect.objectContaining({
+					v: 1,
+					source: "pi-lens",
+					tool: "edit",
+					filePath: filePath.replace(/\\/g, "/"),
+				}),
+			);
+
+			// Second touch (re-edit before agent_end): deferFormat reports a
+			// re-touch (not new) -> no second publish, avoiding event spam.
+			await handleToolResult({
+				event: {
+					toolName: "edit",
+					input: { path: filePath },
+					details: { diff: "+  1 export const x = 2;" },
+					content: [{ type: "text", text: "base" }],
+				},
+				runtime: { ...runtimeStub, deferFormat: () => false },
+				...baseDeps,
+			} as any);
+
+			expect(emit).toHaveBeenCalledTimes(1);
+		} finally {
+			formatEventsPublish._resetFormatEventsPublishForTests();
 			env.cleanup();
 		}
 	});
@@ -765,7 +1148,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				formatBehaviorWarnings: () => "",
 			} as any);
 
-			expect(resetLSPService).toHaveBeenCalledWith({ fast: true });
+			expect(resetLSPService).toHaveBeenCalledWith({ fast: true, reason: "pipeline_crash" });
 		} finally {
 			env.cleanup();
 		}

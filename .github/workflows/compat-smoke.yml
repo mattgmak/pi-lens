@@ -34,7 +34,8 @@ name: Subagent-extension compat smoke (nightly)
 
 on:
   schedule:
-    - cron: "0 10 * * *" # nightly 10:00 UTC (offset from tool-smoke/grammar-health's ~06:00-09:2x band)
+    # Nightly 10:00 UTC, offset from the tool-smoke/grammar-health band.
+    - cron: "0 10 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -50,18 +51,19 @@ jobs:
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
           node-version: "22"
 
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
-      - name: Build (in-place, for the lib unit tests) + dist (for Layer B's install)
+      - name: >-
+          Build in-place for lib tests + dist for Layer B's install
         run: |
           npm run build
           npm run build:dist
@@ -72,7 +74,11 @@ jobs:
       - name: Install pi
         run: |
           set -uxo pipefail
-          npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+          # Pinned deliberately (bump by hand when a newer pi release is
+          # verified — see #731).
+          # pi-lens-ignore: zizmor:adhoc-packages
+          npm install -g --ignore-scripts \
+            @earendil-works/pi-coding-agent@0.80.10
           echo "$(npm prefix -g)/bin" >> "$GITHUB_PATH"
 
       - name: Layer A — pinned-contract verification (no pi, no LLM)
@@ -94,29 +100,55 @@ jobs:
       # existing open alert issue by title before creating a new one so
       # repeated nightly failures refresh one issue instead of piling up.
       - name: Alert on contract drift (create-or-update tracking issue)
-        if: steps.layer_a.outcome == 'failure' || steps.layer_b.outcome == 'failure'
+        if: >-
+          steps.layer_a.outcome == 'failure' || steps.layer_b.outcome == 'failure'
+        env:
+          LAYER_A_OUTCOME: ${{ steps.layer_a.outcome }}
+          LAYER_B_OUTCOME: ${{ steps.layer_b.outcome }}
+          LAYER_A_VERSIONS: >-
+            ${{ steps.layer_a.outputs.versions ||
+            'unavailable (Layer A install did not complete)' }}
         run: |
           set -uo pipefail
           TITLE="compat-smoke: third-party contract drift detected"
           BODY_FILE="$RUNNER_TEMP/compat-smoke-alert-body.md"
           {
-            echo "The nightly [subagent-extension compat smoke](https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) detected a drift in one of the pinned third-party contracts pi-lens's subagent-compatibility features (#473/#474/#475) depend on."
+            echo "The nightly [subagent-extension compat smoke](https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})" \
+              "detected drift in a pinned third-party contract used by" \
+              "pi-lens's subagent-compatibility features (#473/#474/#475)."
             echo ""
-            echo "- Layer A (pinned-contract verification): **${{ steps.layer_a.outcome }}**"
-            echo "- Layer B (real-pi behavioral smoke): **${{ steps.layer_b.outcome }}**"
-            echo "- Installed versions this run: ${{ steps.layer_a.outputs.versions || 'unavailable (Layer A install did not complete)' }}"
+            echo "- Layer A (pinned-contract verification):" \
+              "**${LAYER_A_OUTCOME}**"
+            echo "- Layer B (real-pi behavioral smoke): **${LAYER_B_OUTCOME}**"
+            echo "- Installed versions this run: ${LAYER_A_VERSIONS}"
             echo ""
-            echo "See the [run log](https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) for which specific check(s) failed, and \`docs/subagent-compat.md\` for what each check verifies and which file:contract it maps back to."
+            echo "See the [run log](https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})" \
+              "for failed checks, and \`docs/subagent-compat.md\` for the" \
+              "contracts and files each check verifies."
             echo ""
-            echo "_This issue is auto-refreshed by the nightly compat-smoke workflow — do not close it manually while the underlying check is still failing; closing it only suppresses the body refresh, the next failing run will reopen a duplicate search miss. Once the drift is resolved (either upstream reverts, or pi-lens is updated to match), close it._"
+            echo "_This issue is auto-refreshed by the nightly compat-smoke" \
+              "workflow — do not close it while the check is failing. Once" \
+              "drift is resolved (upstream revert or pi-lens update)," \
+              "close it._"
           } > "$BODY_FILE"
 
-          EXISTING_ISSUE="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$TITLE\"" --json number,title --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)"
+          EXISTING_ISSUE="$(
+            gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+              --search "in:title \"$TITLE\"" --json number,title \
+              --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1
+          )"
           if [ -n "$EXISTING_ISSUE" ]; then
             echo "updating existing issue #$EXISTING_ISSUE"
-            gh issue edit "$EXISTING_ISSUE" --repo "$GITHUB_REPOSITORY" --body-file "$BODY_FILE"
-            gh issue comment "$EXISTING_ISSUE" --repo "$GITHUB_REPOSITORY" --body "Still failing as of this run: Layer A=${{ steps.layer_a.outcome }}, Layer B=${{ steps.layer_b.outcome }} (versions: ${{ steps.layer_a.outputs.versions || 'unavailable' }})."
+            gh issue edit "$EXISTING_ISSUE" \
+              --repo "$GITHUB_REPOSITORY" --body-file "$BODY_FILE"
+            COMMENT="Still failing: Layer A=${LAYER_A_OUTCOME},"
+            COMMENT+=" Layer B=${LAYER_B_OUTCOME}"
+            COMMENT+=" (versions: ${LAYER_A_VERSIONS})."
+            gh issue comment "$EXISTING_ISSUE" --repo "$GITHUB_REPOSITORY" \
+              --body "$COMMENT"
           else
             echo "creating new alert issue"
-            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file "$BODY_FILE" --label "area:session,area:lsp,area:tests"
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" \
+              --body-file "$BODY_FILE" \
+              --label "area:session,area:lsp,area:tests"
           fi

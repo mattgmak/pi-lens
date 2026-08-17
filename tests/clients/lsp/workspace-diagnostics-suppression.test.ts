@@ -25,6 +25,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { removeTempDirSync } from "../test-utils.js";
 
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
@@ -67,7 +68,7 @@ describe("runWorkspaceDiagnostics — auxiliary inline-suppression (#586)", () =
 		delete process.env.PI_LENS_LSP_WORKSPACE_PULL;
 		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "wsd-nosemgrep-"));
 	});
-	afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
+	afterEach(() => removeTempDirSync(tmp));
 
 	it("drops a `// nosemgrep`-suppressed finding from the sweep (generic wiring, non-opengrep server)", async () => {
 		const suppressed = path.join(tmp, "suppressed.py");

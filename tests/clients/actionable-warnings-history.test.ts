@@ -7,6 +7,7 @@ import {
 	getActionableWarningsHistoryPath,
 	type ActionableWarningsReport,
 } from "../../clients/actionable-warnings.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 vi.mock("../../clients/lsp/index.js", () => ({
 	getLSPService: () => ({ supportsLSP: () => false }),
@@ -19,7 +20,7 @@ beforeEach(() => {
 	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-aw-hist-"));
 	env = {
 		tmpDir,
-		cleanup: () => fs.rmSync(tmpDir, { recursive: true, force: true }),
+		cleanup: () => removeTempDirSync(tmpDir),
 	};
 	previousDataDir = process.env.PILENS_DATA_DIR;
 	process.env.PILENS_DATA_DIR = path.join(tmpDir, "data");

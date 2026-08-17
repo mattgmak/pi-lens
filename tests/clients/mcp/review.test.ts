@@ -13,6 +13,7 @@ import {
 	resolveRebuildScript,
 	summarizeScan,
 } from "../../../clients/mcp/review.js";
+import { removeTempDirSync } from "../test-utils.js";
 
 describe("resolveRebuildScript", () => {
 	it("selects build:dist for a server running from a dist layout", () => {
@@ -70,7 +71,7 @@ describe("analyzeFileFresh", () => {
 		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-fresh-"));
 	});
 	afterAll(() => {
-		fs.rmSync(tmpDir, { recursive: true, force: true });
+		removeTempDirSync(tmpDir);
 	});
 
 	function writeWorker(name: string, body: string): string {

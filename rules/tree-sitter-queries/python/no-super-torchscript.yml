@@ -17,18 +17,14 @@ description: |
   ✅ FIX: Use composition or avoid TorchScript for this class
 
 query: |
-  (function_definition
-    (decorator
-      (call
-        function: (identifier) @DEC (#match? @DEC "^(torch\.jit\.script|jit\.script)$")))
-    body: (block
-      (call
-        function: (identifier) @FUNC (#eq? @FUNC "super")) @CALL))
+  (call
+    function: (identifier) @FUNC (#eq? @FUNC "super")) @CALL
 
 metavars:
-  - DEC
   - FUNC
   - CALL
+
+post_filter: torchscript_super_call
 
 tags:
   - reliability

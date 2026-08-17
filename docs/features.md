@@ -2,7 +2,7 @@
 
 ### LSP Support
 
-pi-lens includes **37 language server definitions** (including two cross-cutting *auxiliary* scanners that attach alongside the file's language server — Opengrep for security, and ast-grep for structural rules in projects with an `sgconfig.y[a]ml` — see below). LSP is **enabled by default** (`--lsp` or no flag). Servers are auto-discovered from PATH, project `node_modules`, and managed installs. When a server is not installed, pi-lens offers an interactive install prompt.
+pi-lens includes **42 language server definitions** (including four cross-cutting *auxiliary* scanners that attach alongside the file's language server — Opengrep, ast-grep, zizmor, and typos — see below). LSP is **enabled by default**; use `--no-lsp` to disable it for a session. Servers are auto-discovered from PATH, project `node_modules`, and managed installs. When a server is not installed, pi-lens offers an interactive install prompt.
 
 **LSP Idle Management:** LSP servers shut down after 240 seconds of inactivity (no files modified) to free resources. The timer resets when you resume editing, preventing cold-start penalties during active development.
 
@@ -34,6 +34,40 @@ Detection rules:
 - **Biome-default**: for JS/TS files without Prettier or Biome config, Biome is used as the default formatter
 - **Ruff-default**: for Python files without Black config, Ruff format is used when available
 
+Repositories can disable all immediate and deferred auto-format mutations with
+`format.enabled: false` in `.pi-lens.json`. Likewise,
+`autofix.enabled: false` disables the separate pipeline fixer phase while
+keeping formatter detection, lint dispatch, LSP synchronization, and
+diagnostics available.
+
+**Auto-fix timing depends on the tool.** A `write` (new file, full overwrite,
+or a bash-authored write like `sed -i`/a redirect) still gets pipeline autofix
+immediately, in the same tool result; when it changes the file, the result
+carries the full authoritative post-fix content (capped at 2 MiB per file, one
+shared budget across a multi-file bash write — past that it degrades to a
+re-read warning). An `edit` defers autofix to `agent_end`, where it joins the
+same per-file deferred-mutation queue as deferred formatting — one coalesced
+record per file (`kinds: {autofix, format}`), autofix draining before format
+so the final state is formatter-stable. A `write` immediately followed by an
+`edit` on the same file in the same turn demotes the write's autofix to
+deferred too. See `clients/pipeline.ts`, `clients/runtime-tool-result.ts`, and
+`clients/runtime-agent-end.ts`.
+
+Deferred formatting (the `agent_end` default) runs with **bounded
+concurrency**: at most three formatter subprocesses in flight at once, with
+results applied in admission order and cooperative yields between files, so a
+large batch of queued files can't stall the event loop or the turn-end pass.
+
+### Commit/Push Guard (Experimental)
+
+`--lens-guard` (also `guard.enabled: true` in `~/.pi-lens/config.json`) opts
+into blocking `git commit`/`git push` while unresolved pi-lens blockers exist.
+Detection covers normalized wrapper launchers, shell-escaped and
+keyword/combined-flag verb forms, and shell substitutions, while literal text
+in non-executing contexts remains allowed. Off by default; see
+[docs/agent-guide.md](agent-guide.md) and [docs/settings.md](settings.md) for
+the full behavior and honest limits.
+
 ### Review Graph - Cascade Diagnostics
 
 pi-lens builds a review graph (`file → symbol → dependency`) during session and uses it at turn end to render an impact cascade: which files were affected by a change and how diagnostics propagated through the dependency graph. Nodes track kind, language, and export status; edges track contains/imports/calls/references.
@@ -51,7 +85,8 @@ Coverage is tracked across multiple reads: two reads of lines 1–100 and 101–
 
 Override for a single edit: `/lens-allow-edit <path>`
 
-Configure behavior with `--no-read-guard` to disable entirely, or set mode to `warn` instead of `block`.
+Configure behavior with `--no-read-guard` to disable it entirely, or use the
+read-guard configuration to select `warn` instead of `block` where supported.
 
 ### Module Report + Read Symbol (Read Substitute)
 
@@ -116,7 +151,7 @@ At `turn_end`, pi-lens writes `.pi-lens/cache/actionable-warnings.json` summariz
 
 **Conservative autofix (`agent_end`):**
 
-When `actionableWarnings.autoFix.enabled` is set in global config (or `--lens-actionable-warning-autofix`), pi-lens applies LSP quickfixes from the report at `agent_end`. Safety gates:
+When `actionableWarnings.autoFix.enabled` is set in global or project config (or `--lens-actionable-warning-autofix`), pi-lens applies LSP quickfixes from the report at `agent_end`. A project can explicitly disable this mutation with `actionableWarnings.autoFix.enabled: false` without disabling the report. Safety gates:
 
 - Re-fetches code actions from the live LSP server at fix time (stale actions are skipped)
 - Skips any warning with zero or multiple eligible actions (ambiguity is not resolved)
@@ -133,7 +168,7 @@ When `actionableWarnings.autoFix.enabled` is set in global config (or `--lens-ac
 
 ### Bus Events — `pilens:files:touched` (#482)
 
-pi-lens writes files **outside the agent's own tool calls**: dispatch autofix (biome/ruff/eslint/stylelint/sqlfluff/rubocop/ktlint/rust-clippy/dart-fix/golangci-lint/detekt/ktfmt/markdownlint/oxlint --fix) and formatter runs (immediate or deferred-at-`agent_end`) both mutate files after the fact, and the conservative actionable-warnings autofix above applies LSP quickfixes the same way. Other extensions in the same session that track file mutations are otherwise blind to those writes.
+pi-lens writes files **outside the agent's own tool calls**: dispatch autofix (biome/ruff/eslint/stylelint/sqlfluff/rubocop/ktlint/ktfmt/rust-clippy/dart-fix/golangci-lint/detekt/markdownlint/oxlint --fix) mutates the file immediately for a `write` and at `agent_end` for a deferred `edit` (see "Formatters" above); formatter runs (immediate or deferred-at-`agent_end`) do the same; and the conservative actionable-warnings autofix above applies LSP quickfixes at `agent_end` the same way. Other extensions in the same session that track file mutations are otherwise blind to those writes — this event, published either way, is how they find out.
 
 pi-lens broadcasts them on pi's shared in-process event bus (`pi.events`, exposed to every extension via the `ExtensionAPI`) as a single named event:
 
@@ -310,9 +345,9 @@ pi-lens ships an MCP (Model Context Protocol) server so Claude Code — or any M
 | Layer | MCP tools | What they expose |
 |---|---|---|
 | **Per-edit** | `pilens_analyze`, `pilens_lsp_diagnostics`, `pilens_lsp_navigation`, `pilens_ast_grep_search`, `pilens_ast_grep_replace`, `pilens_module_report`, `pilens_read_symbol` | The fast pipeline (format → autofix → LSP diagnostics → parallel runners) plus the structured read-substitute pair. `analyze` accepts `mode: warm \| fresh` — `warm` reuses the server's in-process LSP, `fresh` forks a worker that loads freshly-built code from disk so the result reflects the latest commit. |
-| **Per-turn** | `pilens_turn_end` | Drives the **real** `handleTurnEnd` (knip incremental, jscpd delta, dep-circular, cascade, tests, actionable+code-quality warnings) — not a re-implementation. Caller-supplied edited files are auto-registered into turn-state via `addModifiedRange`. |
-| **Per-session** | `pilens_session_start` | Drives the **real** `handleSessionStart` — full jscpd/knip/madge/govulncheck/gitleaks/trivy scans + complexity baselines + LSP warm + the **error-debt baseline** (tests/build pass-state) that powers green→red regression detection. |
-| **Project / observability** | `pilens_project_scan`, `pilens_diagnostics`, `pilens_health`, `pilens_latency`, `pilens_symbol_search` | Cheap project-wide scans, cached diagnostic state, latency telemetry, ranked identifier search (BM25 over the persisted word index — see [docs/word-index.md](word-index.md)). Cross-file blast radius now lives in `pilens_module_report`'s `blastRadius` option. |
+| **Per-turn** | `pilens_turn_end` | Drives the **real** `handleTurnEnd` (knip incremental, dep-circular, cascade, tests, actionable+code-quality warnings) — not a re-implementation. Caller-supplied edited files are auto-registered into turn-state via `addModifiedRange`. |
+| **Per-session** | `pilens_session_start` | Drives the **real** `handleSessionStart` — full jscpd/knip/madge/govulncheck/gitleaks/trivy scans + complexity baselines + LSP warm. The error-debt baseline is not currently populated by the production session-start path. |
+| **Project / observability** | `pilens_project_scan`, `pilens_diagnostics`, `pilens_health`, `pilens_latency`, `pilens_symbol_search` | Cheap project-wide scans, cached diagnostic state, latency telemetry, ranked identifier search (BM25 over the persisted word index — see [docs/word-index.md](word-index.md)). Cross-file blast radius now lives in `pilens_module_report`'s `blastRadius` option. `pilens_health` (and its pi-side `/lens-health` counterpart) also reports a bounded, process-local **degradation ledger** — trust refusals, mode suppressions, LSP breaker trips, formatter skips/failures, TypeScript/word-index/review-graph/project-snapshot idle evictions, WASM aborts, and diagnostics-timeout tallies — so silently degraded behavior stays visible instead of vanishing into a log. |
 | **Lifecycle / loop** | `pilens_rebuild` | Runs `npm run build:dist` so `pilens_analyze mode=fresh` reflects the latest commit. Makes the review loop self-contained: commit → `pilens_rebuild` → `pilens_analyze mode=fresh` → `pilens_latency`. |
 
 **Honest limits** (live-tested, documented in `mcp.md`):
@@ -334,5 +369,19 @@ claude mcp add --scope user pi-lens \
   -e PI_LENS_MCP_AUTO_SESSION=1 \
   -- node <repo>/dist/mcp/server.js
 ```
+
+**Hooks** (`settings.json`) close the loop: PostToolUse = per-edit, Stop = per-turn.
+
+```json
+{ "hooks": {
+  "PostToolUse": [
+    { "matcher": "Edit|Write",
+      "hooks": [ { "type": "command", "command": "pi-lens-analyze --hook" } ] } ],
+  "Stop": [
+    { "hooks": [ { "type": "command", "command": "pi-lens-analyze --turn-end", "timeout": 60 } ] } ]
+} }
+```
+
+The per-edit hook falls back to a cold local analysis when no server is up; the `Stop` hook is **warm-server-only** because only the server process owns the session state and pending turn work. It skips with a single stderr line when unavailable. Workspace IPC requests are ordered, so a timed-out PostToolUse client cannot let `Stop` overtake analysis still running in the server. `SubagentStop` is deliberately not registered because subagent edits already reach turn-state through PostToolUse.
 
 The full design + tier-by-tier progress (and known limits) lives in [`docs/mcp.md`](docs/mcp.md). Status: **experimental** — the foundation is solid (transport, warm LSP, lifecycle handlers wired), but the surface is still maturing. Use the pi extension for production agent work; reach for the MCP server for debugging, dogfooding, and direct Claude Code access.

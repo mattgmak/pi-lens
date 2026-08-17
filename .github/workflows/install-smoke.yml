@@ -61,18 +61,20 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         pm: [npm, pnpm, bun, yarn]
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
           node-version: "22"
 
       - name: Setup pnpm
         if: matrix.pm == 'pnpm'
-        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
-          version: 11.7.0
+          version: 11.21.0
 
       - name: Setup bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -82,12 +84,18 @@ jobs:
       - name: Setup yarn (classic — hoists to node_modules like npm)
         if: matrix.pm == 'yarn'
         shell: bash
-        run: npm i -g yarn@1
+        # --ignore-scripts: yarn's own postinstall isn't needed for the classic
+        # CLI to function as the package manager under test.
+        # pi-lens-ignore: zizmor:adhoc-packages
+        run: npm i -g --ignore-scripts yarn@1.22.22
 
       - name: Build + pack the current repo
         shell: bash
         run: |
           set -euxo pipefail
+          # No --ignore-scripts here (S6505): this `npm ci` is OUR OWN package's
+          # install — the `prepare` script (grammar download + dist build) must
+          # run for the pack below to emit a working tarball.
           npm ci
           # prepare script builds dist; pack emits a tarball of the real files[] set.
           # `npm pack --silent` prints ONLY the tarball name to stdout — but the
@@ -107,6 +115,7 @@ jobs:
           # build-scripts gap we measure); that's expected, so don't let it fail
           # the step — the selftest below is the real gate.
           case "${{ matrix.pm }}" in
+            # pi-lens-ignore: zizmor:adhoc-packages
             npm)  npm  install "$TARBALL" ;;
             pnpm) pnpm add     "$TARBALL" || echo "::notice::pnpm exit $? (blocked build scripts — expected)" ;;
             bun)  bun  add     "$TARBALL" || echo "::notice::bun exit $? (blocked build scripts — expected)" ;;
@@ -141,18 +150,20 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         pi_install: [npm-global, pnpm-global, bun-global, curl]
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7 # for the RPC driver
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 # for the RPC driver
+        with:
+          persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
           node-version: "22"
 
       - name: Setup pnpm
         if: matrix.pi_install == 'pnpm-global'
-        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
-          version: 11.7.0
+          version: 11.21.0
 
       - name: Setup bun
         if: matrix.pi_install == 'bun-global'
@@ -164,9 +175,13 @@ jobs:
         shell: bash
         run: |
           set -uxo pipefail
-          PKG="@earendil-works/pi-coding-agent"
+          # Pinned deliberately (bump by hand when a newer pi release is
+          # verified — see #731): keeps a token-bearing CI job from pulling an
+          # arbitrary newest-on-registry version of a third-party package.
+          PKG="@earendil-works/pi-coding-agent@0.80.10"
           case "${{ matrix.pi_install }}" in
             npm-global)
+              # pi-lens-ignore: zizmor:adhoc-packages
               npm install -g --ignore-scripts "$PKG"
               echo "$(npm prefix -g)/bin" >> "$GITHUB_PATH"
               echo "NPMCMD=npm" >> "$GITHUB_ENV" ;;
@@ -176,7 +191,9 @@ jobs:
               export PNPM_HOME="$HOME/.pnpm-global"; mkdir -p "$PNPM_HOME"
               export PATH="$PNPM_HOME:$PATH"
               pnpm config set global-bin-dir "$PNPM_HOME"
-              pnpm add -g "$PKG" || echo "::notice::pnpm add -g exit $? (blocked scripts?)"
+              # --ignore-scripts: pi's own lifecycle scripts aren't needed for
+              # this smoke test (same as the npm-global case above).
+              pnpm add -g --ignore-scripts "$PKG" || echo "::notice::pnpm add -g exit $? (blocked scripts?)"
               echo "$PNPM_HOME" >> "$GITHUB_PATH"
               echo "NPMCMD=pnpm" >> "$GITHUB_ENV" ;;
             bun-global)
@@ -188,7 +205,7 @@ jobs:
             curl)
               # Download then run (no pipe → no SIGPIPE/pipefail abort); the
               # installer ultimately `npm install -g`s pi when Node is present.
-              curl -fsSL --retry 3 --retry-delay 2 https://pi.dev/install.sh -o "$RUNNER_TEMP/pi-install.sh"
+              curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 https://pi.dev/install.sh -o "$RUNNER_TEMP/pi-install.sh"
               sh "$RUNNER_TEMP/pi-install.sh" < /dev/null || echo "::notice::installer exit $? (verifying pi next)"
               echo "$(npm prefix -g)/bin" >> "$GITHUB_PATH"
               echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -250,13 +267,32 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         pi_via: [mise-node, mise-npm-backend]
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7 # RPC driver
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 # RPC driver
+        with:
+          persist-credentials: false
 
-      - name: Install mise
+      - name: Install mise (pinned + checksum-verified)
         shell: bash
+        env:
+          # Pinned deliberately (bump by hand after checking
+          # https://github.com/jdx/mise/releases and recomputing the sha256
+          # below — see #731): avoids `curl | sh`-ing an unpinned, unverified
+          # installer script straight off the network.
+          MISE_INSTALL_VERSION: v2026.7.7
+          MISE_INSTALL_SHA256: 0b98c2dc48edc807be860a76e14209afcfe36684c591f92337c5d9ff909e7740
         run: |
           set -uxo pipefail
-          curl -fsSL https://mise.run | sh
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            -o "$RUNNER_TEMP/mise-install.sh" \
+            "https://github.com/jdx/mise/releases/download/${MISE_INSTALL_VERSION}/install.sh"
+          # sha256sum (Linux) vs shasum -a 256 (macOS default) — both runner
+          # images ship one or the other; prefer sha256sum when present.
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "${MISE_INSTALL_SHA256}  $RUNNER_TEMP/mise-install.sh" | sha256sum -c -
+          else
+            echo "${MISE_INSTALL_SHA256}  $RUNNER_TEMP/mise-install.sh" | shasum -a 256 -c -
+          fi
+          sh "$RUNNER_TEMP/mise-install.sh"
           # Expose the mise binary AND its shim dir so later steps see the
           # mise-managed node/npm/pnpm/pi as shims (realpath-through-shim = the
           # #285 trigger). No `mise activate` — that PATH-injects the real bins and
@@ -281,7 +317,10 @@ jobs:
         shell: bash
         run: |
           set -uxo pipefail
-          npm install -g pnpm
+          # Pinned deliberately (bump by hand — see #731): avoids an
+          # unpinned global install pulling an arbitrary newest pnpm.
+          # pi-lens-ignore: zizmor:adhoc-packages
+          npm install -g --ignore-scripts pnpm@11.15.1
           mise reshim
           pnpm --version
 
@@ -289,10 +328,13 @@ jobs:
         shell: bash
         run: |
           set -uxo pipefail
-          PKG="@earendil-works/pi-coding-agent"
+          # Pinned deliberately (bump by hand when a newer pi release is
+          # verified — see #731).
+          PKG="@earendil-works/pi-coding-agent@0.80.10"
           case "${{ matrix.pi_via }}" in
             mise-node)
               # node from mise; pi as a plain npm-global under that node.
+              # pi-lens-ignore: zizmor:adhoc-packages
               npm install -g --ignore-scripts "$PKG" ;;
             mise-npm-backend)
               # pi through mise's own npm backend — pi behind a mise tool-shim, the

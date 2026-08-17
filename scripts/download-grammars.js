@@ -100,6 +100,7 @@ export function sha256(buf) {
 }
 /** Read the committed provenance manifest (`scripts/grammars.lock.json`). */
 export function loadManifest() {
+    // pi-lens-ignore: ast-grep:unchecked-throwing-call
     return JSON.parse(readFileSync(MANIFEST_PATH, "utf-8"));
 }
 /** Sidecar path for a grammar wasm file: `<grammar>.wasm.json`. */

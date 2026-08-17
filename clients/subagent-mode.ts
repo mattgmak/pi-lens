@@ -77,6 +77,7 @@ export interface SubagentIdentity {
 	runId?: string;
 	agentName?: string;
 	marker?: SubagentMarker;
+	parentPid?: number;
 }
 
 /**
@@ -88,9 +89,25 @@ export interface SubagentIdentity {
 export function getSubagentIdentity(): SubagentIdentity | undefined {
 	const runId = process.env.PI_SUBAGENT_RUN_ID || undefined;
 	const agentName = process.env.PI_SUBAGENT_CHILD_AGENT || undefined;
-	if (runId === undefined && agentName === undefined) return undefined;
-	const { marker } = classifySubagentSession();
-	return { runId, agentName, marker };
+	const parentPidRaw = process.env.PI_SUBAGENT_PARENT_PID || undefined;
+	const parsedParentPid =
+		parentPidRaw === undefined ? undefined : Number(parentPidRaw);
+	const parentPid =
+		parsedParentPid !== undefined &&
+		Number.isSafeInteger(parsedParentPid) &&
+		parsedParentPid > 0
+			? parsedParentPid
+			: undefined;
+	const classification = classifySubagentSession();
+	if (
+		runId === undefined &&
+		agentName === undefined &&
+		parentPid === undefined &&
+		!classification.isSubagent
+	) {
+		return undefined;
+	}
+	return { runId, agentName, marker: classification.marker, parentPid };
 }
 
 /** Human-readable degradation notice surfaced once per session when subagent

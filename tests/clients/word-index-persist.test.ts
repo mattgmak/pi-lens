@@ -7,7 +7,8 @@
  */
 
 import * as fs from "node:fs";
-import { afterEach, describe, expect, it } from "vitest";
+import { gunzipSync } from "node:zlib";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	buildWordIndex,
 	flushWordIndexPersistsForTests,
@@ -16,11 +17,26 @@ import {
 import { getProjectSnapshotPath } from "../../clients/project-snapshot.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
+/** Read the (now gzip, #958) snapshot body a persist wrote. */
+function readSnapshotBody(snapshotPath: string): {
+	wordIndex: { files: string[] };
+} {
+	return JSON.parse(gunzipSync(fs.readFileSync(snapshotPath)).toString("utf-8"));
+}
+
 const cleanups: Array<() => void> = [];
+beforeEach(() => {
+	// #958: the snapshot body is written by a worker thread by default; force
+	// the synchronous writer so a flushed debounce lands the gz body on disk
+	// deterministically (this suite tests the WORD-INDEX debounce, not the
+	// snapshot worker offload).
+	process.env.PI_LENS_SNAPSHOT_PERSIST_SYNC = "1";
+});
 afterEach(() => {
 	flushWordIndexPersistsForTests();
 	while (cleanups.length) cleanups.pop()?.();
 	process.env.PI_LENS_WORD_INDEX_PERSIST_DEBOUNCE_MS = "0";
+	delete process.env.PI_LENS_SNAPSHOT_PERSIST_SYNC;
 });
 
 function makeEnv() {
@@ -47,7 +63,7 @@ describe("word-index debounced persist (#348 phase 2)", () => {
 
 		const snapshotPath = getProjectSnapshotPath(env.tmpDir);
 		expect(await waitForFile(snapshotPath)).toBe(true);
-		const raw = JSON.parse(fs.readFileSync(snapshotPath, "utf-8"));
+		const raw = readSnapshotBody(snapshotPath);
 		expect(raw.wordIndex).toBeDefined();
 	});
 
@@ -67,7 +83,7 @@ describe("word-index debounced persist (#348 phase 2)", () => {
 
 		flushWordIndexPersistsForTests();
 		expect(await waitForFile(snapshotPath)).toBe(true);
-		const raw = JSON.parse(fs.readFileSync(snapshotPath, "utf-8"));
+		const raw = readSnapshotBody(snapshotPath);
 		// Only the LAST scheduled index should have been written (coalesced).
 		expect(
 			raw.wordIndex.files.some((f: string) => f.includes("a4.ts")),

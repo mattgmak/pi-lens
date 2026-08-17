@@ -15,8 +15,14 @@
  *     reports at the same line (`suppressTrivyConfigDockerOverlap`), so trivy
  *     only adds the security checks hadolint lacks.
  *
- * Deferred (tracked on #131): Terraform (tflint overlap), Helm chart rendering,
- * Docker Compose, CloudFormation.
+ *   - **Terraform**: the `.tf` language files themselves — trivy evaluates
+ *     the Terraform language directly, so no content gate is needed (unlike
+ *     the yaml/k8s heuristic above). Terragrunt (`.hcl`) is deliberately
+ *     excluded: trivy has no terragrunt support, and terragrunt config is
+ *     covered by the terragrunt runner instead.
+ *
+ * Deferred (tracked on #131): Helm chart rendering, Docker Compose,
+ * CloudFormation.
  *
  * Gating: the same explicit `trivy.enabled` opt-in as the session-scan modes —
  * trivy is opt-in, period. (Misconfig needs only the small policy bundle, not
@@ -41,7 +47,11 @@ import type {
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
-import { createAvailabilityChecker } from "./utils/runner-helpers.js";
+import {
+	createAvailabilityChecker,
+	resolveAvailableOrInstall,
+} from "./utils/runner-helpers.js";
+import { spawnFailedWithNoOutput } from "./utils/spawn-outcome.js";
 
 const trivy = createAvailabilityChecker("trivy", ".exe");
 
@@ -130,7 +140,7 @@ export function parseTrivyConfigOutput(
 
 const trivyConfigRunner: RunnerDefinition = {
 	id: "trivy-config",
-	appliesTo: ["docker", "yaml"],
+	appliesTo: ["docker", "yaml", "terraform"],
 	priority: PRIORITY.GENERAL_ANALYSIS,
 	enabledByDefault: true,
 	skipTestFiles: false,
@@ -162,8 +172,7 @@ const trivyConfigRunner: RunnerDefinition = {
 		if (await trivy.isAvailableAsync(cwd)) {
 			cmd = trivy.getCommand(cwd);
 		} else {
-			const { ensureTool } = await import("../../installer/index.js");
-			const managed = await ensureTool("trivy");
+			const managed = await resolveAvailableOrInstall(trivy, "trivy", cwd);
 			if (managed) cmd = managed;
 		}
 		if (!cmd) return { status: "skipped", diagnostics: [], semantic: "none" };
@@ -184,7 +193,7 @@ const trivyConfigRunner: RunnerDefinition = {
 			{ cwd, timeout: 60_000 },
 		);
 
-		if (result.error && !result.stdout) {
+		if (spawnFailedWithNoOutput(result)) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 

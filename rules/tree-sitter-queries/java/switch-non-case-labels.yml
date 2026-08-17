@@ -27,10 +27,11 @@ description: |
   ```
 
 query: |
-  (switch_statement
+  (switch_expression
     body: (switch_block
-      (labeled_statement
-        (identifier) @LABEL) @LABELED_STMT))
+      (switch_block_statement_group
+        (labeled_statement
+          (identifier) @LABEL) @LABELED_STMT)))
 
 metavars:
   - LABEL

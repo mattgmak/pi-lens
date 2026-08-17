@@ -7,6 +7,8 @@ import {
 	markTreeSitterWasmAborted,
 } from "../../clients/tree-sitter-shared.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
+import { getDegradationSummary, resetDegradationLedger } from "../../clients/degradation-ledger.js";
+import { TreeSitterClient } from "../../clients/tree-sitter-client.js";
 
 /**
  * After an unrecoverable Emscripten abort() the shared TreeSitterClient is
@@ -23,9 +25,18 @@ const cleanups: Array<() => void> = [];
 afterEach(() => {
 	while (cleanups.length) cleanups.pop()?.();
 	_resetSharedTreeSitterClientForTests(); // un-poison the singleton
+	resetDegradationLedger();
 });
 
 describe("tree-sitter wasm-abort degradation (shared client)", () => {
+	it("records the process-poisoning WASM abort once", () => {
+		const client = new TreeSitterClient();
+		client.reportWasmAbort(new Error("Aborted(native code called abort())"));
+		client.reportWasmAbort(new Error("Aborted(second symptom)"));
+		expect(getDegradationSummary()).toEqual([
+			expect.objectContaining({ kind: "wasm-abort", count: 1, latestReasons: [{ subject: "web-tree-sitter", reason: "Aborted(native code called abort())" }] }),
+		]);
+	});
 	it("module_report returns an unavailable report instead of throwing", async () => {
 		const env = setupTestEnvironment("pi-lens-tsabort-mr-");
 		cleanups.push(env.cleanup);

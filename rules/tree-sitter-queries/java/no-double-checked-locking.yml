@@ -28,18 +28,20 @@ description: |
 
 query: |
   (if_statement
-    condition: (binary_expression
-      left: (identifier) @FIELD
-      operator: ("==")
-      right: ("null"))
+    condition: (condition
+      (binary_expression
+        left: (identifier) @FIELD
+        "=="
+        (null_literal) @NULL))
     consequence: (block
       (synchronized_statement
         body: (block
           (if_statement
-            condition: (binary_expression
-              left: (identifier) @FIELD2
-              operator: ("==")
-              right: ("null")))))))
+            condition: (condition
+              (binary_expression
+                left: (identifier) @FIELD2
+                "=="
+                (null_literal) @NULL2)))))))
 
 metavars:
   - FIELD

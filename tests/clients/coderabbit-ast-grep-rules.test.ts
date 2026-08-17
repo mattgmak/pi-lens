@@ -1,7 +1,11 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import yaml from "js-yaml";
+import * as yaml from "js-yaml";
+import { resolveAstGrepNativeExe } from "../../clients/lsp/wait-policy/index.js";
+import { safeSpawn } from "../../clients/safe-spawn.js";
+import { getAstGrepRuleSources } from "../../clients/sgconfig.js";
+import { setupTestEnvironment } from "./test-utils.js";
 
 const CODERABBIT_ROOT = path.join(
 	process.cwd(),
@@ -92,4 +96,65 @@ describe("vendored CodeRabbit ast-grep rules", () => {
 		expect(unsafeUtilityIds).toEqual([]);
 		expect(unresolvedRefs).toEqual([]);
 	});
+
+	it("parses and runs every sgconfig-shipped rule through the real engine", () => {
+		const source = getAstGrepRuleSources(process.cwd()).find(
+			(entry) => entry.origin === "bundled" && entry.tier === "secondary",
+		);
+		expect(source?.dir).toBe(CODERABBIT_RULES_DIR);
+		expect(collectRuleFiles(source!.dir)).toHaveLength(184);
+
+		const env = setupTestEnvironment("pi-lens-coderabbit-smoke-");
+		try {
+			const fixtures = path.join(env.tmpDir, "fixtures");
+			fs.mkdirSync(fixtures);
+			const extensions = [
+				"c",
+				"cpp",
+				"cs",
+				"go",
+				"html",
+				"java",
+				"js",
+				"kt",
+				"php",
+				"py",
+				"rb",
+				"rs",
+				"scala",
+				"swift",
+				"ts",
+			];
+			for (const extension of extensions) {
+				fs.writeFileSync(path.join(fixtures, `empty.${extension}`), "");
+			}
+			const relativeRuleDir = path
+				.relative(env.tmpDir, source!.dir)
+				.replace(/\\/g, "/");
+			const configPath = path.join(env.tmpDir, "sgconfig.yml");
+			fs.writeFileSync(
+				configPath,
+				`ruleDirs:\n  - ${JSON.stringify(relativeRuleDir)}\n`,
+			);
+			const astGrepExe = resolveAstGrepNativeExe();
+			expect(astGrepExe).toBeDefined();
+
+			// #902: was `execFileSync(..., { shell: true })`-adjacent raw spawn.
+			// `astGrepExe` is already an absolute path resolved via
+			// `require.resolve` (no PATH/PATHEXT walk needed), but routing it
+			// through `safeSpawn` (shared with production, `clients/safe-spawn.ts`)
+			// keeps a single spawn strategy for every ast-grep invocation in this
+			// test tree (single source of truth, #883) instead of a second,
+			// hand-rolled one here.
+			const result = safeSpawn(
+				astGrepExe!,
+				["scan", "--config", configPath, fixtures],
+				{ cwd: env.tmpDir },
+			);
+			expect(result.error, result.stderr).toBeUndefined();
+			expect(result.status, result.stderr).toBe(0);
+		} finally {
+			env.cleanup();
+		}
+	}, 30_000);
 });

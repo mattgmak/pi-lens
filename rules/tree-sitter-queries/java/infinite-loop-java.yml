@@ -25,11 +25,11 @@ description: |
 
 query: |
   (while_statement
-    condition: (true) @COND
+    condition: (condition (true) @COND)
     body: (block) @BODY)
   (for_statement
-    condition: (null)
-    body: (block) @BODY)
+    !condition
+    (block) @BODY)
 
 metavars:
   - COND

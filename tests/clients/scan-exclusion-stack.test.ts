@@ -23,7 +23,8 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { resetProjectLensConfigCache } from "../../clients/project-lens-config.js";
 import { collectSourceFiles } from "../../clients/source-filter.js";
-import { TreeSitterClient } from "../../clients/tree-sitter-client.js";
+import { getSharedTreeSitterClient } from "../../clients/tree-sitter-shared.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 let tmpDir: string;
 
@@ -63,7 +64,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-	fs.rmSync(tmpDir, { recursive: true, force: true });
+	removeTempDirSync(tmpDir);
 	resetProjectLensConfigCache();
 });
 
@@ -102,7 +103,7 @@ function surfaces(): Surface[] {
 			collect: () =>
 				// collectFiles is private; the walk needs no grammars loaded.
 				// biome-ignore lint/suspicious/noExplicitAny: private method under test
-				(new TreeSitterClient() as any).collectFiles(tmpDir, "typescript"),
+				(getSharedTreeSitterClient()! as any).collectFiles(tmpDir, "typescript"),
 			// Language-scoped by design — only the requested language's files.
 			mustInclude: ["src/real.ts"],
 			excludesTests: false,

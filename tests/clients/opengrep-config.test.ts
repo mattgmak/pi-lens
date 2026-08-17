@@ -7,6 +7,7 @@ import {
 	normalizeOpengrepConfigArg,
 	resolveOpengrepConfig,
 } from "../../clients/opengrep-config.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 let tmp: string;
 
@@ -15,7 +16,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-	fs.rmSync(tmp, { recursive: true, force: true });
+	removeTempDirSync(tmp);
 });
 
 describe("opengrep config resolution", () => {

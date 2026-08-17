@@ -19,11 +19,13 @@
 
 import type { LSPDiagnostic } from "../lsp/client.js";
 import { shouldDegradeAuxiliaryLsp } from "../lsp-budget.js";
+import { isSubagentSession } from "../subagent-mode.js";
+import type { FileRole } from "../file-role.js";
 import { findLocalOpengrepConfig } from "../opengrep-config.js";
 import { findLocalTyposConfig } from "../typos-config.js";
 import { findLocalZizmorConfig } from "../zizmor-config.js";
 import { classifyDefect } from "./diagnostic-taxonomy.js";
-import type { DefectClass, OutputSemantic } from "./types.js";
+import type { DefectClass, Diagnostic, OutputSemantic } from "./types.js";
 
 export interface AuxiliaryLspProfile {
 	/** LSPServerInfo.id of the auxiliary server. */
@@ -51,6 +53,12 @@ export interface AuxiliaryLspProfile {
 	 *  the finding. Distinct from pi-lens's own `# pi-lens-ignore` — this honors the
 	 *  suppression syntax the tool's own users already know. */
 	isSuppressed?: (d: LSPDiagnostic, content: string) => boolean;
+	/** Drop this profile's findings on files with `fileRole: "test"` (#687).
+	 *  Mirrors a runner's own `skipTestFiles` — needed here too because a
+	 *  profile's diagnostics may arrive via the auxiliary LSP surface instead
+	 *  of (or as well as) an in-process runner, and that surface has no
+	 *  per-runner test-file gating of its own. */
+	skipTestFiles?: boolean;
 }
 
 /**
@@ -91,6 +99,36 @@ export function isNosemgrepSuppressed(
 	);
 }
 
+/**
+ * zizmor's own native inline suppression: `# zizmor: ignore[audit-id[,audit-id]]`
+ * on the finding's own line (https://docs.zizmor.sh/usage/#ignoring-results —
+ * zizmor calls this "inline ignores"). Honoring it here mirrors
+ * `isNosemgrepSuppressed` for Opengrep — a per-finding suppression path a repo
+ * can reach for even without its own `zizmor.yml` (#971): e.g. a `# zizmor:
+ * ignore[artipacked]` on a checkout-only job's `actions/checkout` step, or
+ * `# zizmor: ignore[adhoc-packages]` on a `npm pack` tarball's local install
+ * line, both cases the audit has no way to tell "checkout-only, no artifact
+ * upload" or "this is testing our own just-built tarball" apart from a
+ * remote-package install without this local, human-authored signal.
+ */
+const ZIZMOR_IGNORE_RE = /#\s*zizmor:\s*ignore\[([^\]]+)\]/i;
+export function isZizmorIgnoreSuppressed(
+	d: LSPDiagnostic,
+	content: string,
+): boolean {
+	const startLine = d.range?.start?.line; // 0-based
+	if (startLine == null) return false;
+	const line = content.split("\n")[startLine];
+	if (!line) return false;
+	const match = ZIZMOR_IGNORE_RE.exec(line);
+	if (!match) return false;
+	const ruleId = String(d.code ?? "").toLowerCase();
+	return match[1]
+		.split(",")
+		.map((s) => s.trim().toLowerCase())
+		.includes(ruleId);
+}
+
 // #277 R7: every profile below used this exact same rule (ERROR-severity
 // findings block only when the workspace opted into curated/authored rules;
 // everything else stays advisory) — shared here instead of copy-pasted per
@@ -128,6 +166,11 @@ export const AUXILIARY_LSP_PROFILES: readonly AuxiliaryLspProfile[] = [
 		sourceMatch: /ast[-_]?grep/i,
 		killSwitchFlag: "no-ast-grep",
 		enabledByDefault: true,
+		// Matches the in-process ast-grep-napi runner's own `skipTestFiles: true`
+		// (#687) — that flag stops applying the moment the ast-grep binary is
+		// present, since the napi runner then skips entirely in favor of this
+		// LSP surface, which had no test-file gating of its own.
+		skipTestFiles: true,
 		// The ast-grep LSP runs either the repo's own sgconfig (when present) or
 		// pi-lens's shipped baseline sgconfig. In both cases the rule severity is
 		// deliberate, so preserve ast-grep's severity semantics: ERROR can block,
@@ -153,6 +196,11 @@ export const AUXILIARY_LSP_PROFILES: readonly AuxiliaryLspProfile[] = [
 		semantic: blockOnErrorWhenAllowed,
 		defectClass: (d) =>
 			classifyDefect(String(d.code ?? ""), "zizmor", d.message ?? ""),
+		// Honor zizmor's own native per-finding suppression (#971) — a documented
+		// escape hatch for a workflow-context judgment call the audit itself has no
+		// way to make (checkout-only vs. artifact-uploading job; a locally-built
+		// tarball install vs. an arbitrary remote package).
+		isSuppressed: isZizmorIgnoreSuppressed,
 	},
 	{
 		serverId: "typos",
@@ -188,7 +236,12 @@ export type GetFlag = (flag: string) => boolean | string | undefined;
  * per-file: once over budget, this session never spawns its auxiliary fleet,
  * rather than flip-flopping file to file. */
 export function enabledAuxiliaryLspServerIds(getFlag: GetFlag): string[] {
-	if (shouldDegradeAuxiliaryLsp()) return [];
+	// #449 slice 2 (budget): skip auxiliaries when machine-wide LSP budget is
+	// exceeded. #713 (subagent light mode): reuse the same seam — a subagent
+	// session also skips auxiliaries; the parent session already runs them on
+	// the same cwd. PI_LENS_SUBAGENT_FULL=1 restores full behavior via
+	// isSubagentSession() returning false.
+	if (shouldDegradeAuxiliaryLsp() || isSubagentSession()) return [];
 	return AUXILIARY_LSP_PROFILES.flatMap((p) =>
 		p.enabledByDefault &&
 		!(p.killSwitchFlag && getFlag(p.killSwitchFlag) === true)
@@ -246,10 +299,84 @@ export function isAuxiliaryDiagnosticSuppressed(
  * equivalent) suppresses a finding identically whether it's seen via the
  * per-edit dispatch runner or a standalone diagnostics query — previously
  * only the former honored it (#586).
+ *
+ * #692: `opts.fileRole` additionally drops a diagnostic whose auxiliary
+ * profile declares `skipTestFiles` (e.g. ast-grep, #687) when the file is a
+ * test file — the per-edit dispatch runner (`clients/dispatch/runners/lsp.ts`)
+ * has applied this gate since #687/#688 via its own inline check; the
+ * `runWorkspaceDiagnostics` workspace sweep (`clients/lsp/index.ts`) called
+ * this function WITHOUT ever passing a fileRole, so ast-grep findings on test
+ * files that are suppressed per-edit reappeared wholesale in every
+ * `mode=full` sweep. Omitting `opts` (or `opts.fileRole`) keeps every existing
+ * 2-arg call site's behavior byte-for-byte unchanged.
  */
 export function applyAuxiliarySuppressions(
 	diagnostics: readonly LSPDiagnostic[],
 	content: string,
+	opts?: { fileRole?: FileRole },
 ): LSPDiagnostic[] {
-	return diagnostics.filter((d) => !isAuxiliaryDiagnosticSuppressed(d, content));
+	return diagnostics.filter((d) => {
+		if (isAuxiliaryDiagnosticSuppressed(d, content)) return false;
+		if (opts?.fileRole === "test") {
+			const profile = findAuxiliaryProfileForSource(d.source);
+			if (profile?.skipTestFiles) return false;
+		}
+		return true;
+	});
+}
+
+/**
+ * #692: shared aux re-tag implementation — extracted from the per-edit
+ * dispatch runner (`clients/dispatch/runners/lsp.ts`) so a scan/sweep path
+ * that reconciles LSP diagnostics into widget state (`lens_diagnostics
+ * mode=full`, `lsp_diagnostics`) gives its auxiliary-sourced findings
+ * (ast-grep, opengrep, zizmor, typos) the SAME tool re-tag, semantic policy,
+ * and defect-class classification the per-edit path always has — previously
+ * only the per-edit runner ran this loop, so a scan-reconciled aux finding
+ * kept `tool: "lsp"` and lost its curated-repo-rules `blockingAllowed`
+ * context entirely (#692).
+ *
+ * `diagnostics` and `rawLspDiags` must be the SAME length and index-aligned —
+ * `convertLspDiagnostics` maps its input 1:1, so this holds for every caller
+ * that passes it the same array it just converted. Mutates and returns the
+ * SURVIVING subset of `diagnostics` (native-inline-suppressed and
+ * `skipTestFiles`-dropped entries removed), mirroring the per-edit runner's
+ * prior inline behavior exactly.
+ */
+export function retagAuxiliaryDiagnostics(
+	diagnostics: Diagnostic[],
+	rawLspDiags: readonly LSPDiagnostic[],
+	content: string,
+	ctx: { cwd: string; fileRole: FileRole },
+): Diagnostic[] {
+	const blockingAllowedByProfile = new Map<AuxiliaryLspProfile, boolean>();
+	const suppressedIndices = new Set<number>();
+	for (let i = 0; i < diagnostics.length; i++) {
+		const profile = findAuxiliaryProfileForSource(rawLspDiags[i]?.source);
+		if (!profile) continue;
+		if (profile.skipTestFiles && ctx.fileRole === "test") {
+			suppressedIndices.add(i);
+			continue;
+		}
+		if (isAuxiliaryDiagnosticSuppressed(rawLspDiags[i], content)) {
+			suppressedIndices.add(i);
+			continue;
+		}
+		let blockingAllowed = blockingAllowedByProfile.get(profile);
+		if (blockingAllowed === undefined) {
+			blockingAllowed = profile.allowBlocking?.(ctx.cwd) ?? false;
+			blockingAllowedByProfile.set(profile, blockingAllowed);
+		}
+		const d = diagnostics[i];
+		d.tool = profile.tool;
+		d.semantic = profile.semantic(rawLspDiags[i], { blockingAllowed });
+		if (d.semantic !== "blocking" && d.severity === "error") {
+			d.severity = "warning";
+		}
+		const defectClass = profile.defectClass?.(rawLspDiags[i]);
+		if (defectClass) d.defectClass = defectClass;
+	}
+	return suppressedIndices.size
+		? diagnostics.filter((_, i) => !suppressedIndices.has(i))
+		: diagnostics;
 }

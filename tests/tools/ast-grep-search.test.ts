@@ -1,3 +1,4 @@
+import * as os from "node:os";
 import { describe, expect, it, vi } from "vitest";
 import {
 	_telemetryClassificationErrorForTest,
@@ -17,6 +18,21 @@ function makeClient(
 		formatMatches: () => "",
 		...overrides,
 	} as Parameters<typeof createAstGrepSearchTool>[0];
+}
+
+type SearchDetails = {
+	matchLocations?: Array<{
+		file: string;
+		line: number;
+		endLine: number;
+		readSlice: { path: string; offset: number; limit: number };
+	}>;
+	suggestedDump?: { tool: string; lang: string };
+	searchReads?: Array<{ file: string; startLine: number; endLine: number }>;
+};
+
+function asSearchDetails(details: unknown): SearchDetails {
+	return details as SearchDetails;
 }
 
 describe("ast_grep_search tool", () => {
@@ -55,6 +71,16 @@ describe("ast_grep_search tool", () => {
 			expect(langSchema.enum).toContain("typescript");
 			expect(langSchema.enum).toContain("python");
 			expect(langSchema.enum).toContain("rust");
+		});
+
+		it("advertises nodeKind and recursive hasDescendantKind", () => {
+			const tool = createAstGrepSearchTool(makeClient());
+			const properties = (
+				tool.parameters as { properties: Record<string, unknown> }
+			).properties;
+			expect(properties).toHaveProperty("nodeKind");
+			expect(properties).toHaveProperty("hasDescendantKind");
+			expect((properties.paths as { maxItems?: number }).maxItems).toBe(200);
 		});
 	});
 
@@ -114,6 +140,45 @@ describe("ast_grep_search tool", () => {
 		expect(search).not.toHaveBeenCalled();
 	});
 
+	// #747/#250: only the DEFAULTED-cwd case is guarded. Explicit `paths` are
+	// exactly what the user asked to search and are never second-guessed.
+	describe("defaulted-cwd home ceiling (#747)", () => {
+		it("refuses when no paths are given and cwd is at/above home", async () => {
+			const search = vi.fn();
+			const tool = createAstGrepSearchTool(makeClient({ search }));
+			const result = await tool.execute(
+				"h1",
+				{ pattern: "console.log($MSG)", lang: "typescript" },
+				new AbortController().signal,
+				null,
+				{ cwd: os.homedir() },
+			);
+
+			expect(result.isError).toBe(true);
+			expect(String(result.content[0].text)).toContain("Refused");
+			expect(String(result.content[0].text)).toContain("paths");
+			expect(search).not.toHaveBeenCalled();
+		});
+
+		it("does NOT refuse when explicit paths are given, even at home", async () => {
+			const search = vi.fn().mockResolvedValue({ matches: [] });
+			const tool = createAstGrepSearchTool(makeClient({ search }));
+			await tool.execute(
+				"h2",
+				{
+					pattern: "console.log($MSG)",
+					lang: "typescript",
+					paths: [os.homedir()],
+				},
+				new AbortController().signal,
+				null,
+				{ cwd: os.homedir() },
+			);
+
+			expect(search).toHaveBeenCalled();
+		});
+	});
+
 	describe("structural-intent parameters (Phase 3)", () => {
 		it("routes to searchWithRule when insideKind is set", async () => {
 			const searchWithRule = vi
@@ -158,6 +223,125 @@ describe("ast_grep_search tool", () => {
 			expect(calledYaml).toContain("inside:");
 			expect(calledYaml).toContain("method_definition");
 			expect(calledYaml).toContain("stopBy: end");
+		});
+
+		it("supports a language-agnostic nodeKind search through YAML synthesis", async () => {
+			const searchWithRule = vi
+				.fn()
+				.mockResolvedValue({ matches: [], totalMatches: 0 });
+			const tool = createAstGrepSearchTool(makeClient({ searchWithRule }));
+			await tool.execute(
+				"node-kind",
+				{ lang: "python", nodeKind: "call", hasDescendantKind: "await" },
+				new AbortController().signal,
+				null,
+				{ cwd: "." },
+			);
+			const yaml = searchWithRule.mock.calls[0][0] as string;
+			expect(yaml).toContain("language: Python");
+			expect(yaml).toContain("kind: call");
+			expect(yaml).toContain("has:");
+			expect(yaml).toContain("kind: await");
+		});
+
+		it("rejects ambiguous nodeKind plus pattern or raw rule", async () => {
+			const searchWithRule = vi.fn();
+			const search = vi.fn();
+			const tool = createAstGrepSearchTool(
+				makeClient({ searchWithRule, search }),
+			);
+			const patternConflict = await tool.execute(
+				"node-kind-pattern-conflict",
+				{ lang: "go", nodeKind: "call_expression", pattern: "foo()" },
+				new AbortController().signal,
+				null,
+				{ cwd: "." },
+			);
+			const ruleConflict = await tool.execute(
+				"node-kind-rule-conflict",
+				{
+					lang: "rust",
+					nodeKind: "call_expression",
+					rule: "id: r\nlanguage: Rust\nrule:\n  kind: call_expression",
+				},
+				new AbortController().signal,
+				null,
+				{ cwd: "." },
+			);
+			expect(String(patternConflict.content[0].text)).toContain(
+				"cannot be combined with pattern",
+			);
+			expect(String(ruleConflict.content[0].text)).toContain(
+				"cannot be combined with rule",
+			);
+			expect(search).not.toHaveBeenCalled();
+		});
+
+		it("rejects explicit path lists above the bounded cap", async () => {
+			const search = vi.fn();
+			const tool = createAstGrepSearchTool(makeClient({ search }));
+			const result = await tool.execute(
+				"too-many-paths",
+				{
+					lang: "typescript",
+					pattern: "foo()",
+					paths: Array.from({ length: 201 }, (_, index) => `src/${index}.ts`),
+				},
+				new AbortController().signal,
+				null,
+				{ cwd: "." },
+			);
+			expect(result.isError).toBe(true);
+			expect(String(result.content[0].text)).toContain("at most 200");
+			expect(search).not.toHaveBeenCalled();
+		});
+
+		it("forwards the combined signal and shared deadline to generated searches", async () => {
+			const searchWithRule = vi
+				.fn()
+				.mockResolvedValue({ matches: [], totalMatches: 0 });
+			const tool = createAstGrepSearchTool(makeClient({ searchWithRule }));
+			const controller = new AbortController();
+
+			await tool.execute(
+				"signal-deadline",
+				{
+					lang: "typescript",
+					nodeKind: "call_expression",
+					paths: ["src"],
+				},
+				controller.signal,
+				null,
+				{ cwd: "." },
+			);
+
+			const options = searchWithRule.mock.calls[0]?.[2] as {
+				signal?: AbortSignal;
+				deadlineAt?: number;
+			};
+			expect(options.signal).toBe(controller.signal);
+			expect(options.deadlineAt).toBeGreaterThan(Date.now());
+		});
+
+		it("forwards the combined signal and shared deadline to normal searches", async () => {
+			const search = vi.fn().mockResolvedValue({ matches: [] });
+			const tool = createAstGrepSearchTool(makeClient({ search }));
+			const controller = new AbortController();
+
+			await tool.execute(
+				"signal-deadline-normal",
+				{ pattern: "foo($X)", lang: "typescript", paths: ["src"] },
+				controller.signal,
+				null,
+				{ cwd: "." },
+			);
+
+			const options = search.mock.calls[0]?.[3] as {
+				signal?: AbortSignal;
+				deadlineAt?: number;
+			};
+			expect(options.signal).toBe(controller.signal);
+			expect(options.deadlineAt).toBeGreaterThan(Date.now());
 		});
 
 		it("routes to normal search when no structural params", async () => {
@@ -259,7 +443,10 @@ describe("ast_grep_search tool", () => {
 
 			expect(result.isError).toBeUndefined();
 			expect(result.details).toMatchObject({ mode: "rule", valid: true });
-			expect(validateRule).toHaveBeenCalledWith(rule);
+			expect(validateRule).toHaveBeenCalledWith(
+				rule,
+				expect.objectContaining({ deadlineAt: expect.any(Number) }),
+			);
 			expect(searchWithRule).not.toHaveBeenCalled();
 		});
 
@@ -450,7 +637,11 @@ describe("ast_grep_search tool", () => {
 				null,
 				{ cwd: "." },
 			);
-			expect(searchWithRule).toHaveBeenCalledWith(expect.any(String), ["src/"]);
+			expect(searchWithRule).toHaveBeenCalledWith(
+				expect.any(String),
+				["src/"],
+				expect.objectContaining({ deadlineAt: expect.any(Number) }),
+			);
 		});
 
 		it("returns read handles and no dump suggestion for YAML-rule matches", async () => {
@@ -482,7 +673,7 @@ describe("ast_grep_search tool", () => {
 				{ cwd: "." },
 			);
 
-			expect(result.details.matchLocations).toEqual([
+			expect(asSearchDetails(result.details).matchLocations).toEqual([
 				{
 					file: "src/rule.ts",
 					line: 5,
@@ -490,7 +681,7 @@ describe("ast_grep_search tool", () => {
 					readSlice: { path: "src/rule.ts", offset: 2, limit: 7 },
 				},
 			]);
-			expect(result.details.suggestedDump).toBeUndefined();
+			expect(asSearchDetails(result.details).suggestedDump).toBeUndefined();
 		});
 
 		it("suggests ast_grep_dump for YAML-rule zero matches", async () => {
@@ -511,8 +702,8 @@ describe("ast_grep_search tool", () => {
 				{ cwd: "." },
 			);
 
-			expect(result.details.matchLocations).toEqual([]);
-			expect(result.details.suggestedDump).toMatchObject({
+			expect(asSearchDetails(result.details).matchLocations).toEqual([]);
+			expect(asSearchDetails(result.details).suggestedDump).toMatchObject({
 				tool: "ast_grep_dump",
 				lang: "typescript",
 			});
@@ -540,7 +731,7 @@ describe("ast_grep_search tool", () => {
 		expect(result.isError).toBeUndefined();
 		expect(search).toHaveBeenCalledOnce();
 		expect(String(result.content[0].text)).toContain("1 match");
-		expect(result.details.suggestedDump).toBeUndefined();
+		expect(asSearchDetails(result.details).suggestedDump).toBeUndefined();
 	});
 
 	it("returns read handles for matched locations", async () => {
@@ -571,7 +762,7 @@ describe("ast_grep_search tool", () => {
 			{ cwd: "." },
 		);
 
-		expect(result.details.matchLocations).toEqual([
+		expect(asSearchDetails(result.details).matchLocations).toEqual([
 			{
 				file: "src/a.ts",
 				line: 10,
@@ -579,10 +770,10 @@ describe("ast_grep_search tool", () => {
 				readSlice: { path: "src/a.ts", offset: 8, limit: 7 },
 			},
 		]);
-		expect(result.details.searchReads).toEqual([
+		expect(asSearchDetails(result.details).searchReads).toEqual([
 			{ file: "src/a.ts", startLine: 10, endLine: 12 },
 		]);
-		expect(result.details.suggestedDump).toBeUndefined();
+		expect(asSearchDetails(result.details).suggestedDump).toBeUndefined();
 	});
 
 	it("clamps and caps readSlice context", async () => {
@@ -607,7 +798,7 @@ describe("ast_grep_search tool", () => {
 			{ cwd: "." },
 		);
 
-		expect(result.details.matchLocations).toEqual([
+		expect(asSearchDetails(result.details).matchLocations).toEqual([
 			{
 				file: "src/near-top.ts",
 				line: 1,
@@ -643,7 +834,7 @@ describe("ast_grep_search tool", () => {
 			{ cwd: "." },
 		);
 
-		expect(result.details.matchLocations).toEqual([
+		expect(asSearchDetails(result.details).matchLocations).toEqual([
 			{
 				file: "src/default.ts",
 				line: 10,
@@ -675,7 +866,7 @@ describe("ast_grep_search tool", () => {
 			{ cwd: "." },
 		);
 
-		expect(result.details.matchLocations).toEqual([
+		expect(asSearchDetails(result.details).matchLocations).toEqual([
 			{
 				file: "src/no-margin.ts",
 				line: 10,
@@ -701,8 +892,8 @@ describe("ast_grep_search tool", () => {
 			{ cwd: "." },
 		);
 
-		expect(result.details.matchLocations).toEqual([]);
-		expect(result.details.searchReads).toEqual([]);
+		expect(asSearchDetails(result.details).matchLocations).toEqual([]);
+		expect(asSearchDetails(result.details).searchReads).toEqual([]);
 	});
 
 	it("returns clear errors for missing or unsafe pattern/lang inputs", async () => {
@@ -821,7 +1012,7 @@ describe("ast_grep_search tool", () => {
 		);
 
 		expect(String(result.content[0].text)).toContain("ast_grep_dump");
-		expect(result.details.suggestedDump).toMatchObject({
+		expect(asSearchDetails(result.details).suggestedDump).toMatchObject({
 			tool: "ast_grep_dump",
 			lang: "typescript",
 		});
@@ -897,6 +1088,37 @@ describe("ast_grep_search tool", () => {
 			expect(result.details).toMatchObject({ matchCount: 2, hasMore: true });
 			// pagination step follows maxMatches, not the default 50
 			expect(String(result.content[0].text)).toContain("skip=2");
+		});
+
+		it("passes maxMatches above the formatter's historical 50-item default", async () => {
+			const matches = Array.from({ length: 60 }, (_, i) => matchAt("a.ts", i));
+			const formatMatches = vi.fn(
+				(page: unknown[]) => `formatted-${page.length}`,
+			);
+			const tool = createAstGrepSearchTool(
+				makeClient({
+					search: vi.fn().mockResolvedValue({ matches }),
+					formatMatches,
+				}),
+			);
+			const result = await tool.execute(
+				"m2-large",
+				{ pattern: "foo($X)", lang: "typescript", maxMatches: 60 },
+				new AbortController().signal,
+				null,
+				{ cwd: "." },
+			);
+			expect(String(result.content[0].text)).toContain("formatted-60");
+			expect(result.details).toMatchObject({
+				matchCount: 60,
+				totalMatches: 60,
+			});
+			expect(formatMatches).toHaveBeenCalledWith(
+				expect.any(Array),
+				false,
+				false,
+				60,
+			);
 		});
 
 		it("clamps maxMatches below 1 up to 1", async () => {

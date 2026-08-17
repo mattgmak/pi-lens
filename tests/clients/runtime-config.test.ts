@@ -7,6 +7,7 @@ import {
 	_resetRunnerTimeoutFloorCacheForTests,
 	getRunnerTimeoutFloorMs,
 } from "../../clients/runtime-config.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 const tmpDirs: string[] = [];
 let previousConfigPath: string | undefined;
@@ -41,7 +42,7 @@ afterEach(() => {
 	else process.env.PI_LENS_RUNNER_TIMEOUT_FLOOR_MS = previousFloor;
 	_resetRunnerTimeoutFloorCacheForTests();
 	for (const dir of tmpDirs.splice(0)) {
-		fs.rmSync(dir, { recursive: true, force: true });
+		removeTempDirSync(dir);
 	}
 });
 

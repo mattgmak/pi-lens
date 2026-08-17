@@ -3,6 +3,7 @@
  * Extracts definitions and references from source files
  */
 
+import { logTreeSitterDiagnostic } from "./tree-sitter-logger.js";
 import * as path from "node:path";
 import { loadWebTreeSitter } from "./deps/web-tree-sitter.js";
 import type { Symbol, SymbolKind, SymbolRef } from "./symbol-types.js";
@@ -461,6 +462,62 @@ const SYMBOL_QUERIES: Record<string, { defs: string; refs: string }> = {
 // symbol-extraction coverage to the grammar set we actually ship.
 SYMBOL_QUERIES.tsx = SYMBOL_QUERIES.typescript;
 
+// The javascript grammar shares TypeScript's EXECUTABLE node types
+// (function_declaration, arrow_function, variable_declarator, class_declaration,
+// method_definition, call_expression, member_expression, new_expression) but
+// NOT its type-level ones: interface_declaration, type_alias_declaration and
+// type_identifier do not exist in it, and a class name is a plain (identifier),
+// not a (type_identifier). A query naming a missing node type fails to COMPILE
+// outright (probed: "Bad node name 'type_identifier'"), so — unlike tsx — the
+// TypeScript defs/refs cannot be aliased; javascript gets the same queries minus
+// the type-only patterns. module-report resolves .js/.mjs/.cjs/.jsx to this
+// grammar via the shared EXT_TO_LANG (#887); interface/type symbols are a
+// TypeScript-language feature, so nothing is lost on real JS.
+SYMBOL_QUERIES.javascript = {
+	defs: `
+      ;; Function declarations: function foo(params) { }
+      (function_declaration
+        name: (identifier) @funcName
+        parameters: (formal_parameters) @funcParams
+        body: (statement_block) @funcBody) @funcDef
+
+      ;; Arrow functions: const foo = (params) => { }
+      (variable_declarator
+        name: (identifier) @arrowName
+        value: (arrow_function
+          parameters: (formal_parameters) @arrowParams
+          body: (_) @arrowBody)) @arrowDef
+
+      ;; Class declarations: class Foo { } — (identifier) name on this grammar.
+      (class_declaration
+        name: (identifier) @className) @classDef
+
+      ;; Method definitions: class Foo { bar() { } }
+      (method_definition
+        name: (property_identifier) @methodName
+        parameters: (formal_parameters) @methodParams) @methodDef
+    `,
+	refs: `
+      ;; Function/method calls: foo() or obj.bar()
+      (call_expression
+        function: (identifier) @callIdent) @callRef
+
+      (call_expression
+        function: (member_expression
+          object: (_)
+          property: (property_identifier) @callMethod)) @callMethodRef
+
+      ;; New expressions: new Foo()
+      (new_expression
+        constructor: (identifier) @newIdent) @newRef
+    `,
+};
+
+/** Language keys with symbol queries; used by fixture drift guards. */
+export function getSymbolQueryLanguages(): readonly string[] {
+	return Object.keys(SYMBOL_QUERIES);
+}
+
 // Per-language import-source extraction (#249). Optional and independent of
 // SYMBOL_QUERIES: a language without an entry simply yields no imports (its
 // symbols still extract). Each query captures the import source text as
@@ -554,6 +611,11 @@ const IMPORT_QUERIES: Record<string, string> = {
     `,
 };
 
+// import/export ... from "..." have the same (import_statement source: (string))
+// / (export_statement source: (string)) shape on the javascript grammar
+// (validated — compiles + captures), so the typescript query applies unchanged.
+IMPORT_QUERIES.javascript = IMPORT_QUERIES.typescript;
+
 export interface ImportRef {
 	/** Raw import source (quotes/whitespace stripped), e.g. "os.path", "fmt". */
 	source: string;
@@ -565,6 +627,12 @@ export interface ExtractedSymbols {
 	symbols: Symbol[];
 	refs: SymbolRef[];
 	imports: ImportRef[];
+	/** Query availability is explicit so a missing grammar/query is not a clean zero. */
+	coverage?: {
+		definitions: "complete" | "unavailable";
+		references: "complete" | "unavailable";
+		imports: "complete" | "unavailable";
+	};
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: tree-sitter match type
@@ -596,7 +664,7 @@ export class TreeSitterSymbolExtractor {
 
 	async init(): Promise<boolean> {
 		try {
-			// Get language from client
+			if (!(await this.client.isLanguageSupported(this.languageId))) return false;
 			const language = this.client.getLanguage(this.languageId);
 			if (!language) return false;
 
@@ -632,10 +700,14 @@ export class TreeSitterSymbolExtractor {
 			}
 			return Boolean(this.defQuery || this.importQuery);
 		} catch (err) {
-			console.error(
-				`[symbol-extractor] Failed to init ${this.languageId}:`,
-				err,
-			);
+			this.client.reportWasmAbort(err);
+			logTreeSitterDiagnostic({
+				subsystem: "symbol-extractor",
+				languageId: this.languageId,
+				message: `Failed to init ${this.languageId}: ${
+					err instanceof Error ? err.message : String(err)
+				}`,
+			});
 			return false;
 		}
 	}
@@ -645,9 +717,13 @@ export class TreeSitterSymbolExtractor {
 		try {
 			return new Query(language, src);
 		} catch (err) {
-			console.error(
-				`[symbol-extractor] ${this.languageId} ${label} query failed: ${(err as Error).message}`,
-			);
+			if (this.client.reportWasmAbort(err)) throw err;
+			logTreeSitterDiagnostic({
+				subsystem: "symbol-extractor",
+				languageId: this.languageId,
+				message: `${this.languageId} ${label} query failed: ${(err as Error).message}`,
+				metadata: { query: label },
+			});
 			return null;
 		}
 	}
@@ -669,7 +745,7 @@ export class TreeSitterSymbolExtractor {
 		// Extract definitions (guarded — a language's defs query may have failed to
 		// compile while its imports query succeeded, or vice versa).
 		if (this.defQuery) {
-			for (const match of this.defQuery.matches(tree.rootNode)) {
+			for (const match of this.queryMatches(this.defQuery, tree.rootNode)) {
 				const symbol = this.parseDefMatch(match, relativePath, content);
 				if (symbol) symbols.push(symbol);
 			}
@@ -677,7 +753,7 @@ export class TreeSitterSymbolExtractor {
 
 		// Extract references
 		if (this.refQuery) {
-			for (const match of this.refQuery.matches(tree.rootNode)) {
+			for (const match of this.queryMatches(this.refQuery, tree.rootNode)) {
 				const ref = this.parseRefMatch(match, relativePath);
 				if (ref) refs.push(ref);
 			}
@@ -686,13 +762,31 @@ export class TreeSitterSymbolExtractor {
 		// Extract imports (optional — only for languages with an IMPORT_QUERIES entry)
 		const imports: ImportRef[] = [];
 		if (this.importQuery) {
-			for (const match of this.importQuery.matches(tree.rootNode)) {
+			for (const match of this.queryMatches(this.importQuery, tree.rootNode)) {
 				const ref = parseImportMatch(match);
 				if (ref) imports.push(ref);
 			}
 		}
 
-		return { symbols, refs, imports };
+		return {
+			symbols,
+			refs,
+			imports,
+			coverage: {
+				definitions: this.defQuery ? "complete" : "unavailable",
+				references: this.refQuery ? "complete" : "unavailable",
+				imports: this.importQuery ? "complete" : "unavailable",
+			},
+		};
+	}
+
+	private queryMatches(query: any, rootNode: any): any[] {
+		try {
+			return query.matches(rootNode);
+		} catch (error) {
+			this.client.reportWasmAbort(error);
+			throw error;
+		}
 	}
 
 	// biome-ignore lint/suspicious/noExplicitAny: Match type
@@ -1001,20 +1095,30 @@ export class TreeSitterSymbolExtractor {
 	private parseRefMatch(match: any, filePath: string): SymbolRef | null {
 		let name: string | undefined;
 		let refNode: { startPosition: { row: number; column: number } } | undefined;
+		let referenceKind: SymbolRef["referenceKind"] = "unknown";
 
 		for (const capture of match.captures) {
+			const captureName = String(capture.name);
 			if (
-				capture.name.endsWith("Ident") ||
-				capture.name.endsWith("Method") ||
-				capture.name.endsWith("Field")
+				captureName.endsWith("Ident") ||
+				captureName.endsWith("Method") ||
+				captureName.endsWith("Field")
 			) {
 				name = capture.node.text;
 				// biome-ignore lint/suspicious/noExplicitAny: Node type
 				refNode = capture.node as any;
+				if (captureName.startsWith("type")) referenceKind = "type";
+				else if (captureName.startsWith("call") || captureName.startsWith("new")) {
+					referenceKind = "call";
+				}
 			}
-			if (capture.name.endsWith("Ref") && !refNode) {
+			if (captureName.endsWith("Ref") && !refNode) {
 				// biome-ignore lint/suspicious/noExplicitAny: Node type
 				refNode = capture.node as any;
+				if (captureName.startsWith("type")) referenceKind = "type";
+				else if (captureName.startsWith("call") || captureName.startsWith("new")) {
+					referenceKind = "call";
+				}
 			}
 		}
 
@@ -1022,9 +1126,11 @@ export class TreeSitterSymbolExtractor {
 
 		return {
 			symbolId: `${filePath}:${name}`, // Will be resolved later
+			symbolName: name,
 			filePath,
 			line: refNode.startPosition.row + 1,
 			column: refNode.startPosition.column + 1,
+			referenceKind,
 		};
 	}
 

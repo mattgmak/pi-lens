@@ -10,6 +10,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { resolveImportToFiles } from "../../../clients/review-graph/import-resolvers.js";
+import { clearModuleGraphCache } from "../../../clients/review-graph/workspace-modules.js";
 import { setupTestEnvironment } from "../test-utils.js";
 
 let root: string;
@@ -79,6 +80,53 @@ describe("relative-path resolvers (ruby/zig/bash/dart)", () => {
 	it("never resolves outside cwd", () => {
 		write("lib/a.rb");
 		expect(resolveRel("ruby", "lib/a.rb", "../../../../etc/passwd")).toEqual([]);
+	});
+});
+
+describe("jsts resolver — source-twin preference (#694)", () => {
+	it("prefers the .ts source twin over a compiled .js sibling for an explicit .js specifier", () => {
+		write("src/a.ts", "import { b } from './b.js';\n");
+		write("src/b.ts", "export const b = 1;\n");
+		write("src/b.js", "exports.b = 1;\n"); // the compiled artifact
+		expect(resolveRel("jsts", "src/a.ts", "./b.js")).toEqual(["src/b.ts"]);
+	});
+
+	it("prefers the .tsx source twin over a compiled .js sibling", () => {
+		write("src/a.ts", "import { B } from './b.js';\n");
+		write("src/b.tsx", "export const B = () => null;\n");
+		write("src/b.js", "exports.B = () => null;\n");
+		expect(resolveRel("jsts", "src/a.ts", "./b.js")).toEqual(["src/b.tsx"]);
+	});
+
+	it("falls back to the compiled .js when no source twin exists (pure-JS project)", () => {
+		write("src/a.ts", "import { b } from './b.js';\n");
+		write("src/b.js", "exports.b = 1;\n");
+		expect(resolveRel("jsts", "src/a.ts", "./b.js")).toEqual(["src/b.js"]);
+	});
+
+	it("prefers .mts over a compiled .mjs sibling", () => {
+		write("src/a.ts", "import { b } from './b.mjs';\n");
+		write("src/b.mts", "export const b = 1;\n");
+		write("src/b.mjs", "export const b = 1;\n");
+		expect(resolveRel("jsts", "src/a.ts", "./b.mjs")).toEqual(["src/b.mts"]);
+	});
+
+	it("prefers .cts over a compiled .cjs sibling", () => {
+		write("src/a.ts", "import { b } from './b.cjs';\n");
+		write("src/b.cts", "export const b = 1;\n");
+		write("src/b.cjs", "module.exports.b = 1;\n");
+		expect(resolveRel("jsts", "src/a.ts", "./b.cjs")).toEqual(["src/b.cts"]);
+	});
+
+	it("resolves an extensionless specifier to the .ts source (no compiled twin involved)", () => {
+		write("src/a.ts", "import { b } from './b';\n");
+		write("src/b.ts", "export const b = 1;\n");
+		expect(resolveRel("jsts", "src/a.ts", "./b")).toEqual(["src/b.ts"]);
+	});
+
+	it("bare package specifiers stay unresolved", () => {
+		write("src/a.ts");
+		expect(resolveRel("jsts", "src/a.ts", "react")).toEqual([]);
 	});
 });
 
@@ -158,6 +206,70 @@ describe("java resolver", () => {
 		expect(
 			resolveRel("java", "src/main/java/com/ex/A.java", "java.util.List"),
 		).toEqual([]);
+	});
+});
+
+describe("jsts resolver — workspace-package bare specifiers (#775)", () => {
+	beforeEach(() => clearModuleGraphCache());
+	afterEach(() => clearModuleGraphCache());
+
+	it("resolves a bare specifier matching a sibling npm-workspace package to its entry file", () => {
+		write(
+			"package.json",
+			JSON.stringify({ name: "root", workspaces: ["packages/*"] }),
+		);
+		write(
+			"packages/b/package.json",
+			JSON.stringify({ name: "@scope/b", main: "src/index.ts" }),
+		);
+		write("packages/b/src/index.ts", "export const b = 1;\n");
+		write("packages/a/src/index.ts", "import { b } from '@scope/b';\n");
+
+		expect(resolveRel("jsts", "packages/a/src/index.ts", "@scope/b")).toEqual([
+			"packages/b/src/index.ts",
+		]);
+	});
+
+	it("resolves a workspace-package subpath import within the package dir", () => {
+		write(
+			"package.json",
+			JSON.stringify({ name: "root", workspaces: ["packages/*"] }),
+		);
+		write("packages/b/package.json", JSON.stringify({ name: "@scope/b" }));
+		write("packages/b/src/utils.ts", "export const util = 1;\n");
+		write("packages/a/src/index.ts", "import { util } from '@scope/b/src/utils';\n");
+
+		expect(
+			resolveRel("jsts", "packages/a/src/index.ts", "@scope/b/src/utils"),
+		).toEqual(["packages/b/src/utils.ts"]);
+	});
+
+	it("falls back to package.json main when no explicit index file exists", () => {
+		write(
+			"package.json",
+			JSON.stringify({ name: "root", workspaces: ["packages/*"] }),
+		);
+		write(
+			"packages/b/package.json",
+			JSON.stringify({ name: "@scope/b", main: "lib/entry.js" }),
+		);
+		write("packages/b/lib/entry.js", "module.exports.b = 1;\n");
+		write("packages/a/src/index.ts", "import { b } from '@scope/b';\n");
+
+		expect(resolveRel("jsts", "packages/a/src/index.ts", "@scope/b")).toEqual([
+			"packages/b/lib/entry.js",
+		]);
+	});
+
+	it("a non-workspace bare specifier still resolves to [] (external) even inside a workspace repo", () => {
+		write(
+			"package.json",
+			JSON.stringify({ name: "root", workspaces: ["packages/*"] }),
+		);
+		write("packages/b/package.json", JSON.stringify({ name: "@scope/b" }));
+		write("packages/a/src/index.ts", "import React from 'react';\n");
+
+		expect(resolveRel("jsts", "packages/a/src/index.ts", "react")).toEqual([]);
 	});
 });
 

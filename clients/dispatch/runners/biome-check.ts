@@ -7,11 +7,10 @@
  */
 
 import * as path from "node:path";
-import { resolvePackagePath } from "../../package-root.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import {
+	biomeConfigArgs,
 	getAutofixCapability,
-	getBiomeConfigPath,
 	getJstsLintPolicyForCwd,
 } from "../../tool-policy.js";
 import { PRIORITY } from "../priorities.js";
@@ -95,13 +94,10 @@ const biomeCheckJsonRunner: RunnerDefinition = {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
-		// Build config path — use user's if exists, else pi-lens config
-		const userConfigPath = getBiomeConfigPath(cwd);
-		const configArg = [
-			"--config-path=" +
-				(userConfigPath ??
-					resolvePackagePath(import.meta.url, "config/biome/core.jsonc")),
-		];
+		// Shared config-args seam (#1247): `biomeClient.fixFileAsync` consumes
+		// the same builder, so the user's config / package fallback applies on
+		// `lint --write` too.
+		const configArg = biomeConfigArgs(cwd);
 
 		// Run biome lint (diagnostics only - format is handled separately)
 		const checkResult = await safeSpawnAsync(

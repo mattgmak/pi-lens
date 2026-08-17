@@ -9,6 +9,10 @@
 import { createRequire } from "node:module";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+	TreeSitterClient,
+	type TreeSitterParseCacheStats,
+} from "../../clients/tree-sitter-client.js";
 
 const _require = createRequire(import.meta.url);
 
@@ -60,10 +64,10 @@ describe("tree-sitter-client wasm resolution", () => {
 	});
 
 	it("TreeSitterClient.isAvailable returns true when grammars are installed", async () => {
-		const { TreeSitterClient } = await import(
-			"../../clients/tree-sitter-client.js"
+		const { getSharedTreeSitterClient } = await import(
+			"../../clients/tree-sitter-shared.js"
 		);
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		expect(client.isAvailable()).toBe(true);
 	});
 
@@ -82,12 +86,167 @@ describe("tree-sitter-client wasm resolution", () => {
 			}),
 		}));
 
-		const { TreeSitterClient } = await import(
-			"../../clients/tree-sitter-client.js"
+		const { getSharedTreeSitterClient } = await import(
+			"../../clients/tree-sitter-shared.js"
 		);
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		// resolvePackagePath fallback should still find the grammars
 		expect(client.isAvailable()).toBe(true);
+	});
+
+	it("records parser invocation time and failures", async () => {
+		const client = new TreeSitterClient();
+		const state = client as unknown as {
+			parsers: Map<string, { parse: () => never }>;
+		};
+		state.parsers.set("typescript", {
+			parse: () => {
+				throw new Error("parse failed");
+			},
+		});
+
+		await expect(
+			client.parseFile("virtual.ts", "typescript", "const x = 1;"),
+		).resolves.toBeNull();
+		expect(client.getParseCacheStats()).toMatchObject({
+			parserInvocations: 1,
+			parserFailures: 1,
+		});
+		expect(client.getParseCacheStats().parserDurationMs).toBeGreaterThanOrEqual(
+			0,
+		);
+	});
+
+	it("keeps a replaced tree alive until its direct caller resumes", async () => {
+		const client = new TreeSitterClient();
+		const trees: Array<{
+			delete: ReturnType<typeof vi.fn>;
+			rootNode: { type: string };
+		}> = [];
+		const state = client as unknown as {
+			parsers: Map<
+				string,
+				{ parse: (content: string) => (typeof trees)[number] }
+			>;
+		};
+		state.parsers.set("typescript", {
+			parse: () => {
+				const tree = { delete: vi.fn(), rootNode: { type: "program" } };
+				trees.push(tree);
+				return tree;
+			},
+		});
+
+		let firstWasAlive = false;
+		const first = client
+			.parseFile("same.ts", "typescript", "const value = 1;")
+			.then((tree) => {
+				firstWasAlive =
+					tree?.rootNode.type === "program" &&
+					!trees[0].delete.mock.calls.length;
+			});
+		const second = client.parseFile(
+			"same.ts",
+			"typescript",
+			"const value = 2;",
+		);
+		await Promise.all([first, second]);
+
+		expect(firstWasAlive).toBe(true);
+		for (let i = 0; i < 6; i++) await Promise.resolve();
+		expect(trees[0].delete).toHaveBeenCalledTimes(1);
+	});
+
+	it("reports an abort thrown by a cache-safe consumer", async () => {
+		const onWasmAbort = vi.fn();
+		const client = new TreeSitterClient(false, onWasmAbort);
+		const state = client as unknown as {
+			parsers: Map<string, { parse: () => { rootNode: { type: string } } }>;
+		};
+		state.parsers.set("typescript", {
+			parse: () => ({ rootNode: { type: "program" } }),
+		});
+
+		await expect(
+			client.withParsedTree(
+				"virtual.ts",
+				"typescript",
+				"const value = 1;",
+				() => {
+					throw new Error("Aborted()");
+				},
+			),
+		).rejects.toThrow("Aborted()");
+		expect(onWasmAbort).toHaveBeenCalledTimes(1);
+		expect(client.isAvailable()).toBe(false);
+	});
+
+	it("isolates overlapping parse-cache measurements", async () => {
+		const client = new TreeSitterClient();
+		const state = client as unknown as {
+			parsers: Map<string, { parse: () => { rootNode: { type: string } } }>;
+		};
+		state.parsers.set("typescript", {
+			parse: () => ({ rootNode: { type: "program" } }),
+		});
+
+		let releaseA: () => void = () => {};
+		let releaseB: () => void = () => {};
+		const gateA = new Promise<void>((resolve) => {
+			releaseA = resolve;
+		});
+		const gateB = new Promise<void>((resolve) => {
+			releaseB = resolve;
+		});
+		let statsA: TreeSitterParseCacheStats | undefined;
+		let statsB: TreeSitterParseCacheStats | undefined;
+		const measurementA = client.withParseCacheMeasurement(
+			async () => {
+				await gateA;
+				await client.parseFile("a.ts", "typescript", "const a = 1;");
+			},
+			(stats) => {
+				statsA = stats;
+			},
+		);
+		const measurementB = client.withParseCacheMeasurement(
+			async () => {
+				await gateB;
+				await client.parseFile("b.ts", "typescript", "const b = 1;");
+			},
+			(stats) => {
+				statsB = stats;
+			},
+		);
+
+		releaseA();
+		releaseB();
+		await Promise.all([measurementA, measurementB]);
+
+		expect(statsA).toMatchObject({ lookups: 1, sets: 1, parserInvocations: 1 });
+		expect(statsB).toMatchObject({ lookups: 1, sets: 1, parserInvocations: 1 });
+		expect(client.getParseCacheStats()).toMatchObject({
+			lookups: 2,
+			sets: 2,
+			parserInvocations: 2,
+		});
+	});
+
+	it("completes a measurement when the measured work fails", async () => {
+		const client = new TreeSitterClient();
+		let measured: TreeSitterParseCacheStats | undefined;
+
+		await expect(
+			client.withParseCacheMeasurement(
+				async () => {
+					throw new Error("work failed");
+				},
+				(stats) => {
+					measured = stats;
+				},
+			),
+		).rejects.toThrow("work failed");
+		expect(measured).toMatchObject({ lookups: 0, parserInvocations: 0 });
 	});
 
 	it("re-evaluates when grammarsDir was initially unresolved (no cached-empty)", async () => {
@@ -96,11 +255,11 @@ describe("tree-sitter-client wasm resolution", () => {
 		// Force that state, then assert isAvailable recovers against the real fs
 		// (bundled grammars/ and/or web-tree-sitter/grammars are present) rather
 		// than staying stuck on the empty cache.
-		const { TreeSitterClient } = await import(
-			"../../clients/tree-sitter-client.js"
+		const { getSharedTreeSitterClient } = await import(
+			"../../clients/tree-sitter-shared.js"
 		);
 		// biome-ignore lint/suspicious/noExplicitAny: poke privates for the regression
-		const client = new TreeSitterClient() as any;
+		const client = getSharedTreeSitterClient() as any;
 		client.grammarsDir = "";
 		client._bundledGrammarsDir = undefined;
 

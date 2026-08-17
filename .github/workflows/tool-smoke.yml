@@ -31,11 +31,11 @@ jobs:
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
           node-version: '22'
 
@@ -44,7 +44,7 @@ jobs:
       # tflint/terraform-ls/rust-analyzer) are fetched by the harness's own
       # --install; ubuntu-latest ships rustup/cargo so rust-analyzer can load.
       # yamllint disable-line rule:line-length
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
 
@@ -53,16 +53,16 @@ jobs:
       # nightly (the harness already treats an unavailable tool as ⚠, not a
       # failure), so each is continue-on-error.
       # yamllint disable-line rule:line-length
-      - uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         continue-on-error: true
         with:
           distribution: temurin
           java-version: '21'
-      - uses: ruby/setup-ruby@d45b1a4e94b71acab930e56e79c6aa188764e7f9 # v1
+      - uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1
         continue-on-error: true
         with:
           ruby-version: '3.3'
-      - uses: dart-lang/setup-dart@65eb853c7ba17dde3be364c3d2858773e7144260 # v1
+      - uses: dart-lang/setup-dart@7654d458321ee25acccccfdb86cd48bd95768ff1 # v1.8.0
         continue-on-error: true
       - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240
         continue-on-error: true
@@ -104,8 +104,8 @@ jobs:
       # Tier 3 (version-less/silent — the budget-wait case, #458). Merges into the
       # same matrix's clean-behavior column (same dev/ci src + merge-guard as
       # characterize). Best-effort: always exits 0, per-server hard timeouts.
-      # #529: also compares each observed clean-behavior against server-strategies
-      # .ts's hand-set `silentOnClean` marker and logs any mismatch to this step's
+      # #529: also compares each observed clean-behavior against wait-policy
+      # /strategies.ts's hand-set `silentOnClean` marker and logs any mismatch to this step's
       # output + a "## silentOnClean drift" footnote in the matrix doc — telemetry
       # only, NEVER a build/CI gate (this step's own continue-on-error covers the
       # probe already; the drift check can't fail the job either way).

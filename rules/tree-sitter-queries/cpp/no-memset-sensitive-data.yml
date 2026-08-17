@@ -2,10 +2,10 @@
 # Detects memset used to clear sensitive data
 id: no-memset-sensitive-data
 name: memset Should Not Be Used to Delete Sensitive Data
-severity: error
+severity: warning
 category: security
 defect_class: security
-inline_tier: blocking
+inline_tier: warning
 language: cpp
 
 message: "memset should not be used to delete sensitive data — use SecureZeroMemory or explicit_bzero"
@@ -28,10 +28,16 @@ description: |
 query: |
   (call_expression
     function: (identifier) @FUNC (#eq? @FUNC "memset")
-    arguments: (argument_list) @ARGS)
+    arguments: (argument_list
+      (_) @DEST
+      (_) @VALUE
+      (_) @SIZE) @ARGS)
 
 metavars:
   - FUNC
+  - DEST
+  - VALUE
+  - SIZE
   - ARGS
 
 post_filter: memset_for_sensitive_data

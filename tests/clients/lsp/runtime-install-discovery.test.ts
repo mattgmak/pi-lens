@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as os from "node:os";
 import * as path from "node:path";
+import { removeTempDirSync } from "../test-utils.js";
 
 // Drive the candidate-resolution chain without touching disk/toolchains: mock
 // the launch primitive (reject-all → we just capture every candidate tried) and
@@ -31,6 +32,8 @@ import { ensureTool } from "../../../clients/installer/index.js";
 
 const isWin = process.platform === "win32";
 const sep = (...parts: string[]) => path.join(...parts);
+const toolNotFound = (message = "not found") =>
+	Object.assign(new Error(message), { kind: "tool-not-found" as const });
 
 describe("canonical-bin candidates (#241)", () => {
 	const savedGopath = process.env.GOPATH;
@@ -83,7 +86,7 @@ describe("runtime-install / discovery server wiring (#241)", () => {
 		logLatency.mockReset();
 		// Reject every candidate so resolveAndLaunch exhausts the list; we only
 		// inspect WHICH commands it tried. allowInstall:false keeps installs off.
-		launchLSP.mockRejectedValue(new Error("not found"));
+		launchLSP.mockRejectedValue(toolNotFound());
 	});
 
 	const triedCommands = () => launchLSP.mock.calls.map((c) => String(c[0]));
@@ -155,7 +158,7 @@ describe("runtime-install / discovery server wiring (#241)", () => {
 			expect(res).toBeDefined();
 		} finally {
 			process.chdir(oldCwd);
-			fs.rmSync(tmp, { recursive: true, force: true });
+			removeTempDirSync(tmp);
 			vi.mocked(ensureTool).mockReset();
 			vi.mocked(ensureTool).mockResolvedValue(undefined);
 		}
@@ -172,7 +175,7 @@ describe("runtime-install / discovery server wiring (#241)", () => {
 			if (command === globalPyrightLangserver) {
 				return { kill: vi.fn() } as never;
 			}
-			throw new Error(`not found: ${command}`);
+			throw toolNotFound(`not found: ${command}`);
 		});
 
 		try {
@@ -210,8 +213,7 @@ describe("runtime-install / discovery server wiring (#241)", () => {
 				`--jvm-arg=-javaagent:${jar}`,
 			);
 		} finally {
-			const fs = await import("node:fs");
-			fs.rmSync(tmp, { recursive: true, force: true });
+			removeTempDirSync(tmp);
 		}
 	});
 });

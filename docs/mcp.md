@@ -1,6 +1,6 @@
 # pi-lens as an MCP server — implementation plan
 
-> Local working doc. **Not committed.** Tracks the design + progress for exposing
+> Local working doc. Tracks the design + progress for exposing
 > pi-lens to Claude (Claude Code) as an MCP server, built so a *real review loop*
 > can be created (Claude commits → Claude measures the commit's actual impact,
 > not inferred from logs the user pastes).
@@ -17,7 +17,7 @@
 
 The host coupling is **thin**. Everything under `clients/` operates on
 `(filePath, content, cwd)` — the host SDK (`@earendil-works/pi-coding-agent`) is
-imported **only** in `index.ts` (the pi adapter), `commands/`, and tests.
+imported **only** in `index.ts` (the pi adapter) and tests.
 
 Confirmed reuse points:
 
@@ -244,12 +244,12 @@ Initial assumption ("knip/jscpd are booboo-only") was **wrong**. Verified:
 |-------|---------|------|
 | per-edit | `dispatchLintWithResult` | LSP, tree-sitter, ast-grep, fact-rules, biome/ruff/eslint/oxlint |
 | per-turn | `handleTurnEnd` (`runtime-turn.ts`) | **knip** (`:298`), **jscpd** (incremental, `getFilesForJscpd`), **madge/dep circular** (`:426`), **cascade merge** (`:175`), **tests** (`:461`), actionable/code-quality warnings aggregation, project-diagnostics delta |
-| per-session | `handleSessionStart` (`runtime-session.ts`) | **jscpd full scan** (`:505`), knip, type-coverage, dep, govulncheck, gitleaks, todo, complexity baselines, dominant-language **LSP warm** (#203), **error-debt baseline** (tests/build pass-state) |
+| per-session | `handleSessionStart` (`runtime-session.ts`) | **jscpd full scan** (`:505`), knip, type-coverage, dep, govulncheck, gitleaks, todo, complexity baselines, dominant-language **LSP warm** (#203). The production path does not currently populate the error-debt baseline. |
 
-The MCP server invokes **none** of the lifecycle handlers — only the per-edit
-layer. That is precisely why knip / jscpd / cascade / actionable+code-quality
-warnings / baselines are all absent, and why the first analyze (and every
-`fresh`) pays a cold LSP (no session-start warm ran).
+The initial MCP implementation invoked **none** of the lifecycle handlers —
+only the per-edit layer. The shipped server now exposes `pilens_session_start`
+and `pilens_turn_end`, which drive the real handlers; `fresh` analysis still
+pays a cold LSP because it starts a new worker without session-start warming.
 
 ## Revised recommendation — drive the real lifecycle, don't re-plumb
 
@@ -272,7 +272,8 @@ Rather than re-implementing knip/jscpd/cascade/warnings as bespoke MCP tools,
 **run pi's own handlers**:
 
 - `pilens_session_start` (or auto-init on first call) → `handleSessionStart` →
-  jscpd/knip/type-cov/dep full scan + **error-debt baseline** + LSP warm (also
+  jscpd/knip/type-cov/dep full scan + LSP warm (the error-debt baseline is not
+  currently populated by the production session-start path; this also
   fixes D at the source).
 - `pilens_turn_end` → `handleTurnEnd` → knip/jscpd incremental + cascade + dep +
   tests + the actionable/code-quality aggregation.
@@ -281,12 +282,13 @@ Rather than re-implementing knip/jscpd/cascade/warnings as bespoke MCP tools,
 This reconstructs the genuine **edit → turn → session** loop and answers the
 knip/jscpd/cascade/warnings questions "for free" (same code pi runs). Cost: wire
 the `deps` bundle the handlers need — `loadBootstrapClients()` (host-neutral) +
-`getFlag`/`notify` stubs + a `RuntimeCoordinator`. `index.ts`'s `session_start`/
-`turn_end` wiring is the exact template; coupling stays thin.
+`getFlag`/`notify` stubs + a `RuntimeCoordinator`. This was the original wiring
+cost; `index.ts`'s `session_start`/`turn_end` wiring remains the exact template
+and the shipped `clients/mcp/session.ts` keeps the coupling thin.
 
-The killer unlock: with the **error-debt baseline** from session_start, the MCP
-can report "did this change flip tests/build green→red" — the regression delta
-pitched as the real debug signal, currently impossible because no baseline runs.
+An error-debt baseline would allow the MCP to report whether a change flipped
+tests/build from green to red, but the production session-start path does not
+currently populate that baseline, so this regression delta is not available.
 
 ### Plan: Tier 1 then Tier 2
 
@@ -335,9 +337,8 @@ needed for `fresh` (new process) and for files outside the warmed dominant langu
       session unit tests; live `pilens_session_start` smoke confirmed end-to-end.
   - This exposes the previously-absent layers: knip dead-code, jscpd duplication,
     dep-circular, tests, cascade, actionable/code-quality aggregation (turn_end);
-    LSP warm + error-debt + complexity baselines + project scans (session_start).
-  - **The green→red delta**: session_start sets `runtime.errorDebtBaseline`
-    (tests/build pass-state); turn_end writes the pending check against it.
+    LSP warm + complexity baselines + project scans (session_start). The
+    error-debt baseline remains unpopulated by the production session-start path.
 - [ ] Tier 2 follow-ups: have warm `pilens_analyze` auto-register edited files into
       turn-state (so `turn_end` needs no explicit file list); surface the error-debt
       green→red delta directly in the turn_end result; let session_start optionally
@@ -377,13 +378,18 @@ be exercised + debugged directly through Claude Code without running pi.
   Wire it in Claude Code `settings.json`:
 
   ```json
-  { "hooks": { "PostToolUse": [
-    { "matcher": "Edit|Write",
-      "hooks": [ { "type": "command", "command": "pi-lens-analyze --hook" } ] } ] } }
+  { "hooks": {
+    "PostToolUse": [
+      { "matcher": "Edit|Write",
+        "hooks": [ { "type": "command", "command": "pi-lens-analyze --hook" } ] } ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "pi-lens-analyze --turn-end", "timeout": 60 } ] } ]
+  } }
   ```
 
   (the cold-LSP fix means the type-check is honestly reported as skipped, not a
-  false clean; the agent pulls `pilens_analyze` warm when it wants types.)
+  false clean; the agent pulls `pilens_analyze` warm when it wants types. The
+  `Stop` half is the per-turn pass — see the bullet below.)
 
 - [ ] **booboo** full-codebase review tool (`/lens-booboo` → handleBooboo:
   complexity, AI-slop, TODOs, dead-code, dupes, type-coverage).
@@ -409,6 +415,34 @@ be exercised + debugged directly through Claude Code without running pi.
   project. 5 IPC unit tests (path stability, named-pipe round-trip, no-server +
   error → undefined fallback); live-proven (server "warm analyze" log fired,
   bin returned the diagnostic). Removes the one real weakness of the push half.
+- [x] **Stop hook → per-turn pass** (#538) — the `pi-lens-analyze` bin gains a
+  turn-end mode (`--turn-end`, or a Claude Code `Stop` payload on stdin), the
+  analogue of pi's `agent_end`: incremental knip/madge, dep-circular,
+  cascade-to-dependents, tests, actionable-warnings aggregation. PostToolUse has
+  already accumulated the edited files into turn-state by the time `Stop` fires,
+  so the hook passes no files and clears any inherited pi `sessionId` — turn-
+  end's stale-session eviction leaves the registered worklist alone. The request is a
+  tagged route (`{route:"turn-end"}`, own schema version) on the **workspace**
+  socket, not the PID-scoped one: a Stop hook knows its cwd, never the server's
+  pid. It rides in ahead of the parse, so it inherits the #535 build-staleness
+  gate for free, and an untagged analyze request on the same socket is byte-for-
+  byte unchanged. All workspace IPC requests share one server-side queue, so a
+  timed-out PostToolUse client cannot let `Stop` overtake analysis still running
+  in the server, and concurrent turn-ends cannot race the turn-state clear.
+  **Warm-only, no cold fallback**: only the server process owns the session state
+  and pending turn work, so a local pass would report a false clean — no warm
+  server means one stderr line, silent stdout, exit 0.
+  The client waits 55s so it gives up inside Claude Code's 60s hook timeout.
+  `SubagentStop` is deliberately NOT registered: subagent edits already fire
+  PostToolUse into the shared turn-state, the consume bridges are one-shot (a
+  subagent pass would eat the main agent's findings into a transcript nobody
+  reads), and the fan-out would multiply the heavy pass. Visibility, honestly:
+  Stop-hook stdout is user-visible in transcript mode (Ctrl-R), NOT model
+  context — blockers still gate commits through the retained lens-guard record,
+  and a `decision:"block"` render is a follow-up. Tests run fire-and-forget
+  inside turn-end, so the `Tests:` section you see is the *previous* turn's
+  failures. Unit, bin, and live-route smoke tests cover transport, ordering,
+  rendering, and spawned-server behavior.
 
 ## Transport decision — RESOLVED: hand-roll (zero new deps)
 

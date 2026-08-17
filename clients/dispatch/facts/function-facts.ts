@@ -1,4 +1,5 @@
 import type { FactProvider } from "../fact-provider-types.js";
+import { isJstsFactFile } from "../../file-kinds.js";
 import { findOwnerName } from "../../symbol-containment.js";
 import {
 	extractFactsFromTree,
@@ -40,6 +41,15 @@ export interface FunctionSummary {
 	isPassThroughWrapper: boolean;
 	passThroughTarget?: string;
 	isBoundaryWrapper: boolean;
+	/**
+	 * The function/method declaration has an explicit `: Promise<...>` return
+	 * type annotation. An `async` function with no `await` but a declared
+	 * Promise return type is usually there to satisfy an interface/type
+	 * contract (e.g. implementing `ApiKeyAuth.resolve(): Promise<Result>`
+	 * with a synchronous body) — `async` can't be dropped without breaking
+	 * the signature, so it isn't noise (#970).
+	 */
+	hasExplicitPromiseReturnType?: boolean;
 	/** McCabe cyclomatic complexity (branches + 1) */
 	cyclomaticComplexity: number;
 	/** Maximum control-flow nesting depth within the function */
@@ -127,14 +137,28 @@ function getParameters(node: TsNode): TsNode[] {
 	return (fp.children ?? []).filter(
 		(c: TsNode) =>
 			c &&
-			(c.type === "required_parameter" ||
+			(c.type === "identifier" ||
+				c.type === "required_parameter" ||
 				c.type === "optional_parameter" ||
-				c.type === "rest_pattern"),
+				c.type === "rest_pattern" ||
+				c.type === "assignment_pattern" ||
+				// Plain JavaScript's grammar places a top-level destructured
+				// parameter directly as an object_pattern/array_pattern child
+				// of formal_parameters — no required_parameter wrapper (the TS
+				// grammar always wraps every parameter, destructured or not,
+				// which is why the wrapper types above already covered TS).
+				// Without this, `function f({a, b})` counted 0 params in JS
+				// while the TS-annotated equivalent counted correctly (#1089 P3-4).
+				c.type === "object_pattern" ||
+				c.type === "array_pattern"),
 	);
 }
 
 function parameterName(param: TsNode): string {
-	return firstNamedChild(param)?.text ?? "";
+	// JavaScript's grammar keeps a leaf parameter as the identifier itself;
+	// there is no named child to unwrap. TypeScript parameter wrapper nodes still
+	// use their first named child (type annotation/default/rest target).
+	return param.type === "identifier" ? param.text : firstNamedChild(param)?.text ?? "";
 }
 
 function getFunctionName(node: TsNode): string {
@@ -298,6 +322,19 @@ function collectReceiverTypes(
 	return types;
 }
 
+/**
+ * Does this function/method declaration have an explicit `: Promise<...>`
+ * return type? The `type_annotation` for a return type is a DIRECT child of
+ * the function node itself (after `formal_parameters`, before the body) —
+ * distinct from a parameter's own `type_annotation`, which is nested inside
+ * `formal_parameters` and therefore invisible to `firstChildOfType` here.
+ */
+function hasExplicitPromiseReturnType(node: TsNode): boolean {
+	const returnType = firstChildOfType(node, "type_annotation");
+	if (!returnType) return false;
+	return /:\s*Promise\b/.test(returnType.text);
+}
+
 function hasAwaitInNode(node: TsNode): boolean {
 	let found = false;
 	walk(node, (n) => {
@@ -320,10 +357,10 @@ function hasReturnAwaitCall(node: TsNode): boolean {
 
 export const functionFactProvider: FactProvider = {
 	id: "fact.file.functions",
-	provides: ["file.functionSummaries"],
+	provides: ["file.functionSummaries", "file.functionFactsCoverage"],
 	requires: ["file.content"],
 	appliesTo(ctx) {
-		return /\.tsx?$/.test(ctx.filePath);
+		return isJstsFactFile(ctx.filePath);
 	},
 	async run(ctx, store) {
 		await extractFactsFromTree(
@@ -373,6 +410,7 @@ export const functionFactProvider: FactProvider = {
 						isPassThroughWrapper: passThrough.pass,
 						passThroughTarget: passThrough.target,
 						isBoundaryWrapper,
+						hasExplicitPromiseReturnType: hasExplicitPromiseReturnType(node),
 						cyclomaticComplexity: calcCyclomaticComplexity(body),
 						maxNestingDepth: calcMaxNestingDepth(body),
 						outgoingCalls: collectOutgoingCalls(body),
@@ -387,7 +425,9 @@ export const functionFactProvider: FactProvider = {
 						node.type === "class_declaration" ||
 						node.type === "interface_declaration"
 					) {
-						const nameNode = firstChildOfType(node, "type_identifier");
+						const nameNode =
+							firstChildOfType(node, "type_identifier") ??
+							firstChildOfType(node, "identifier");
 						if (nameNode) {
 							containers.push({
 								name: nameNode.text,
@@ -409,6 +449,7 @@ export const functionFactProvider: FactProvider = {
 
 				return { "file.functionSummaries": summaries };
 			},
+			"file.functionFactsCoverage",
 		);
 	},
 };

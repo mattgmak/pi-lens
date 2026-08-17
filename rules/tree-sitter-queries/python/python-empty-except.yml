@@ -21,7 +21,7 @@ description: |
 query: |
   (try_statement
     (except_clause
-      body: (block) @BODY))
+      (block) @BODY))
 
 metavars:
   - BODY

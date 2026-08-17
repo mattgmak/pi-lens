@@ -2,7 +2,7 @@
  * Fact-provider-specific tree-sitter helper (#402).
  *
  * The generic node-walk utilities (`walk`, `childrenOfType`, `firstChildOfType`,
- * `parseTreeSitterRoot`, `TsNode`) live in `clients/tree-sitter-shared.ts` so both
+ * `withTreeSitterRoot`, `TsNode`) live in `clients/tree-sitter-shared.ts` so both
  * the fact extractors and the complexity client share them. This module re-exports
  * them for the extractors and adds the FactProvider-specific `extractFactsFromTree`
  * shell.
@@ -10,7 +10,7 @@
 import {
 	childrenOfType,
 	firstChildOfType,
-	parseTreeSitterRoot,
+	withTreeSitterRoot,
 	type TsNode,
 	walk,
 } from "../../tree-sitter-shared.js";
@@ -24,8 +24,7 @@ export {
 	walk,
 };
 
-/** Parse `content` for `filePath` into a root node (or null). Alias of the shared helper. */
-export const parseFactTree = parseTreeSitterRoot;
+export const withFactTree = withTreeSitterRoot;
 
 /**
  * Provider shell for tree-sitter-backed fact extractors: read `file.content`,
@@ -39,15 +38,20 @@ export async function extractFactsFromTree(
 	store: FactStore,
 	defaults: Record<string, unknown[]>,
 	extract: (root: TsNode, content: string) => Record<string, unknown[]>,
+	coverageFact?: string,
 ): Promise<void> {
-	const writeAll = (facts: Record<string, unknown[]>): void => {
+	const writeAll = (facts: Record<string, unknown[]>, complete: boolean): void => {
 		for (const key of Object.keys(defaults)) {
 			store.setFileFact(ctx.filePath, key, facts[key] ?? defaults[key]);
 		}
+		if (coverageFact) {
+			store.setFileFact(ctx.filePath, coverageFact, complete ? "complete" : "unavailable");
+		}
 	};
-	const content = store.getFileFact<string>(ctx.filePath, "file.content");
-	if (!content) return writeAll(defaults);
-	const root = await parseFactTree(ctx.filePath, content);
-	if (!root) return writeAll(defaults);
-	writeAll(extract(root, content));
+	const content = store.getFileFact<string | null>(ctx.filePath, "file.content");
+	if (content == null) return writeAll(defaults, false);
+	const parsed = await withFactTree(ctx.filePath, content, (root) =>
+		extract(root, content),
+	);
+	writeAll(parsed.parsed ? parsed.value : defaults, parsed.parsed);
 }

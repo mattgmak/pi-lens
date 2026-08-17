@@ -2,8 +2,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { TreeSitterClient } from "../../clients/tree-sitter-client.js";
+import { getSharedTreeSitterClient } from "../../clients/tree-sitter-shared.js";
 import { TreeSitterQueryLoader } from "../../clients/tree-sitter-query-loader.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 const tmpDirs: string[] = [];
 
@@ -27,13 +28,13 @@ async function getQuery(id: string) {
 
 afterAll(() => {
 	for (const dir of tmpDirs) {
-		fs.rmSync(dir, { recursive: true, force: true });
+		removeTempDirSync(dir);
 	}
 });
 
 describe("tree-sitter command injection rules", () => {
 	it("matches python command injection sink", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("python-command-injection");
 		const filePath = writeTempFile(
 			"py",
@@ -45,7 +46,7 @@ describe("tree-sitter command injection rules", () => {
 	});
 
 	it("does not match safe python subprocess invocation", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("python-command-injection");
 		const filePath = writeTempFile(
 			"py",
@@ -57,7 +58,7 @@ describe("tree-sitter command injection rules", () => {
 	});
 
 	it("matches go command injection sink", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("go-command-injection");
 		const filePath = writeTempFile(
 			"go",
@@ -69,7 +70,7 @@ describe("tree-sitter command injection rules", () => {
 	});
 
 	it("does not match safe go command invocation", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("go-command-injection");
 		const filePath = writeTempFile(
 			"go",
@@ -81,7 +82,7 @@ describe("tree-sitter command injection rules", () => {
 	});
 
 	it("matches ruby command injection sink", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("ruby-command-injection");
 		expect(query.language).toBe("ruby");
 		const filePath = writeTempFile("rb", `system(cmd)\n`);
@@ -91,7 +92,7 @@ describe("tree-sitter command injection rules", () => {
 	});
 
 	it("matches typescript command injection sink", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("ts-command-injection");
 		const filePath = writeTempFile(
 			"ts",
@@ -103,7 +104,7 @@ describe("tree-sitter command injection rules", () => {
 	});
 
 	it("does not match non-child-process exec-like calls", async () => {
-		const client = new TreeSitterClient();
+		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("ts-command-injection");
 		const filePath = writeTempFile("ts", `const tool = { exec: () => {} }; tool.exec();\n`);
 

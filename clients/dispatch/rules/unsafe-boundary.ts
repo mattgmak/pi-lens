@@ -57,6 +57,12 @@ function hasCatchCoverage(fn: FunctionSummary, catches: TryCatchSummary[]): bool
 		if (c.hasRethrow || c.hasLogging || c.catchParam === null) return true;
 		// Catch body contains a return statement → structured error result
 		if (/\breturn\b/.test(c.bodyText)) return true;
+		// Catch body falls back by mutating existing state (e.g. extending a
+		// validity window on refresh failure) instead of rethrowing/logging/
+		// returning. That's still a real handler — the exception doesn't
+		// escape uncaught — just expressed via assignment rather than one of
+		// the three shapes above (#969).
+		if (c.catchHasFallbackAssignment) return true;
 		return false;
 	});
 }

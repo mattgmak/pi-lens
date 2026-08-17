@@ -13,6 +13,7 @@ import {
 	shouldScanTrivy,
 	TrivyClient,
 } from "../../clients/trivy-client.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 let tmp: string;
 
@@ -22,7 +23,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-	fs.rmSync(tmp, { recursive: true, force: true });
+	removeTempDirSync(tmp);
 	resetProjectLensConfigCache();
 });
 
@@ -39,7 +40,7 @@ describe("hasAnyDependencyManifest", () => {
 			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-trivy-eco-"));
 			fs.writeFileSync(path.join(dir, manifest), "");
 			expect(hasAnyDependencyManifest(dir)).toBe(true);
-			fs.rmSync(dir, { recursive: true, force: true });
+			removeTempDirSync(dir);
 		}
 	});
 

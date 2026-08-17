@@ -7,6 +7,20 @@ on:
     branches: [master]
 
 jobs:
+  close-keyword-lint:
+    name: Close-keyword syntax
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Validate per-issue close keywords
+        run: node scripts/check-close-keywords.mjs --lint-pr
+
   lint-and-typecheck:
     name: Lint & type-check
     runs-on: ubuntu-latest
@@ -14,11 +28,11 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
           node-version: '22'
 
@@ -59,21 +73,39 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
           node-version: '22'
 
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
+      # The #448 CI-loud ast-grep-CLI guard (ast-grep-rule-tests.test.ts's
+      # "ast-grep CLI is installed in CI") depends on `ast-grep` resolving off
+      # PATH, which it does only implicitly today via `npm test`. Make that
+      # dependency explicit so a PATH regression fails here with a legible
+      # error instead of surfacing as an oblique test failure downstream.
+      - name: Verify ast-grep CLI is on PATH
+        run: npx ast-grep --version
+
       - name: Build
         run: npm run build
 
       - name: Run tests
+        env:
+          # Spawn-heavy MCP smokes retain a 20s local deadline but need room
+          # for loaded shared runners (#860).
+          PI_LENS_TEST_TIMEOUT_SCALE: '3'
+          # The #1101 machine-wide test-suite lock (scripts/with-test-lock.mjs)
+          # exists to serialize concurrent full-suite runs on a SHARED dev
+          # machine. CI runners are isolated (one job per VM), so there is
+          # never contention to serialize — skip it explicitly rather than
+          # relying on it being harmless.
+          PI_LENS_TEST_NO_LOCK: '1'
         run: npm test
 
   # Simulates pi's real install path: a `git:` install runs `npm install
@@ -88,11 +120,11 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
           node-version: '22'
 
@@ -168,11 +200,11 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
           node-version: '22'
 

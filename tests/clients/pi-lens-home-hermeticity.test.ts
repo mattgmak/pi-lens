@@ -17,6 +17,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { removeTempDirSync } from "./test-utils.js";
 
 const realGlobalDir = path.join(os.homedir(), ".pi-lens");
 const realRegistryPath = path.join(realGlobalDir, "instances.json");
@@ -32,7 +33,7 @@ describe("machine-global writers route through PI_LENS_HOME, never the real home
 	});
 
 	afterEach(() => {
-		fs.rmSync(overrideDir, { recursive: true, force: true });
+		removeTempDirSync(overrideDir);
 		delete process.env.PI_LENS_HOME;
 	});
 

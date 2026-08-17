@@ -1,3 +1,4 @@
+import { detectFileRole } from "../file-role.js";
 import { normalizeMapKey } from "../path-utils.js";
 import type { ModuleGraph } from "./workspace-modules.js";
 import {
@@ -128,6 +129,34 @@ export function computeImpactCascade(
 	const normalizedFile = normalizeMapKey(changedFile);
 	const fileNodeId = graph.fileNodes.get(normalizedFile);
 	if (!fileNodeId) {
+		// #1445: a missing node has two causes that look identical here but mean
+		// opposite things — "the graph SHOULD know this file but doesn't" (a real
+		// gap) versus "this file's role is excluded from the graph by design"
+		// (test files, #260 — every graph-admission chokepoint in builder.ts
+		// guards on this exact condition, `detectFileRole(file) === "test"`;
+		// reused verbatim here rather than a second role list). A test edit not
+		// cascading is expected behavior, not a graph failure, so it must not
+		// produce the "review graph was unavailable" advisory that misled agents
+		// into distrusting a healthy graph 19% of the time in dogfooding.
+		if (detectFileRole(normalizedFile) === "test") {
+			return {
+				filePath: normalizedFile,
+				changedSymbols: [],
+				directImporters: [],
+				directCallers: [],
+				neighborFiles: [],
+				riskFlags: [],
+				indeterminate: {
+					reason: "excluded_by_role",
+					detail:
+						"test-role file — excluded from the review graph by design (#260)",
+				},
+			};
+		}
+		// #1023: the changed file has no node in the graph — we CANNOT enumerate
+		// its dependents, so this empty result is "couldn't compute", NOT "nothing
+		// depends on it". Mark it indeterminate so callers surface an honest
+		// advisory instead of an all-clear (#533).
 		return {
 			filePath: normalizedFile,
 			changedSymbols: [],
@@ -135,6 +164,7 @@ export function computeImpactCascade(
 			directCallers: [],
 			neighborFiles: [],
 			riskFlags: [],
+			indeterminate: { reason: "missing_node" },
 		};
 	}
 

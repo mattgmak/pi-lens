@@ -2,10 +2,10 @@
 # Detects resources that should be closed (pre-Java 7 style)
 id: resources-closed
 name: Resources Should Be Closed
-severity: error
+severity: warning
 category: reliability
 defect_class: correctness
-inline_tier: blocking
+inline_tier: warning
 language: java
 
 message: "Resource '{{RESOURCE}}' should be closed in finally block"

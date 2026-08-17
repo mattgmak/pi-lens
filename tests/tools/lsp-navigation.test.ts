@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { removeTempDirSync } from "../clients/test-utils.js";
 
 const mocked = vi.hoisted(() => ({
 	service: null as unknown,
@@ -181,6 +182,26 @@ describe("lsp_navigation tool", () => {
 		});
 	});
 
+	it("passes the call's ctx.cwd to getFlag (#792 — MCP host must resolve per-request project config, not the process's launch cwd)", async () => {
+		const calls: Array<{ name: string; cwd: string | undefined }> = [];
+		const tool = createLspNavigationTool((name, cwd) => {
+			calls.push({ name, cwd });
+			return false;
+		});
+
+		await tool.execute(
+			"call-1",
+			{ operation: "capabilities" },
+			new AbortController().signal,
+			null,
+			{ cwd: "/some/other/project" },
+		);
+
+		expect(calls).toEqual([
+			{ name: "no-lsp", cwd: "/some/other/project" },
+		]);
+	});
+
 	it("allows incomingCalls without path when callHierarchyItem exists", async () => {
 		const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
 		const callHierarchyItem = {
@@ -277,12 +298,19 @@ describe("lsp_navigation tool", () => {
 		);
 
 		expect(result.isError).toBeUndefined();
-		expect(
-			(mocked.service as { executeCommand: ReturnType<typeof vi.fn> })
-				.executeCommand,
-		).toHaveBeenCalledWith(undefined, "_typescript.organizeImports", [
-			"file:///x.ts",
+		const executeCall = (
+			mocked.service as { executeCommand: ReturnType<typeof vi.fn> }
+		).executeCommand.mock.calls[0];
+		expect(executeCall?.slice(0, 3)).toEqual([
+			undefined,
+			"_typescript.organizeImports",
+			["file:///x.ts"],
 		]);
+		expect(executeCall?.[3]).toMatchObject({
+			correlationId: "exec-apply",
+			tool: "lsp_navigation",
+			source: "lsp-edit",
+		});
 	});
 
 	it("executeCommand refuses a command the server did not advertise", async () => {
@@ -604,7 +632,7 @@ describe("lsp_navigation tool", () => {
 					.workspaceSymbol,
 			).toHaveBeenCalledWith("normalizeMapKey", filePath);
 		} finally {
-			fs.rmSync(tmpDir, { recursive: true, force: true });
+			removeTempDirSync(tmpDir);
 		}
 	});
 
@@ -639,7 +667,7 @@ describe("lsp_navigation tool", () => {
 					.workspaceSymbol,
 			).toHaveBeenCalledTimes(2);
 		} finally {
-			fs.rmSync(tmpDir, { recursive: true, force: true });
+			removeTempDirSync(tmpDir);
 		}
 	});
 
@@ -693,7 +721,7 @@ describe("lsp_navigation tool", () => {
 			expect(String(result.content[0]?.text)).toContain("normalizeReport");
 			expect(String(result.content[0]?.text)).toContain('"kind":"method"');
 		} finally {
-			fs.rmSync(tmpDir, { recursive: true, force: true });
+			removeTempDirSync(tmpDir);
 		}
 	});
 
@@ -721,7 +749,7 @@ describe("lsp_navigation tool", () => {
 				strategy: "word-boundary",
 			});
 		} finally {
-			fs.rmSync(tmpDir, { recursive: true, force: true });
+			removeTempDirSync(tmpDir);
 		}
 	});
 
@@ -744,7 +772,7 @@ describe("lsp_navigation tool", () => {
 				(mocked.service as { references: ReturnType<typeof vi.fn> }).references,
 			).toHaveBeenCalledWith(filePath, 0, 17);
 		} finally {
-			fs.rmSync(tmpDir, { recursive: true, force: true });
+			removeTempDirSync(tmpDir);
 		}
 	});
 
@@ -770,7 +798,7 @@ describe("lsp_navigation tool", () => {
 				strategy: "case-insensitive",
 			});
 		} finally {
-			fs.rmSync(tmpDir, { recursive: true, force: true });
+			removeTempDirSync(tmpDir);
 		}
 	});
 
@@ -795,7 +823,7 @@ describe("lsp_navigation tool", () => {
 				(mocked.service as { references: ReturnType<typeof vi.fn> }).references,
 			).toHaveBeenCalledWith(filePath, 0, expectedCharacter0);
 		} finally {
-			fs.rmSync(tmpDir, { recursive: true, force: true });
+			removeTempDirSync(tmpDir);
 		}
 	});
 
@@ -822,7 +850,7 @@ describe("lsp_navigation tool", () => {
 				strategy: "fallback",
 			});
 		} finally {
-			fs.rmSync(tmpDir, { recursive: true, force: true });
+			removeTempDirSync(tmpDir);
 		}
 	});
 
@@ -852,7 +880,7 @@ describe("lsp_navigation tool", () => {
 			).toHaveBeenCalledWith(filePath, 0, 2);
 			expect(result.details?.columnResolution).toBeUndefined();
 		} finally {
-			fs.rmSync(tmpDir, { recursive: true, force: true });
+			removeTempDirSync(tmpDir);
 		}
 	});
 
@@ -876,7 +904,7 @@ describe("lsp_navigation tool", () => {
 				"references from usage sites can be partial",
 			);
 		} finally {
-			fs.rmSync(tmpDir, { recursive: true, force: true });
+			removeTempDirSync(tmpDir);
 		}
 	});
 
@@ -912,7 +940,7 @@ describe("lsp_navigation tool", () => {
 				other: 0,
 			});
 		} finally {
-			fs.rmSync(tmpDir, { recursive: true, force: true });
+			removeTempDirSync(tmpDir);
 		}
 	});
 
@@ -966,7 +994,7 @@ describe("lsp_navigation tool", () => {
 					.getDiagnostics,
 			).toHaveBeenCalledWith(filePath);
 		} finally {
-			fs.rmSync(tmpDir, { recursive: true, force: true });
+			removeTempDirSync(tmpDir);
 		}
 	});
 
@@ -1012,7 +1040,7 @@ describe("lsp_navigation tool", () => {
 			expect(String(result.content[0]?.text)).toContain("typescript");
 			expect(result.details?.resultCount).toBe(1);
 		} finally {
-			fs.rmSync(tmpDir, { recursive: true, force: true });
+			removeTempDirSync(tmpDir);
 		}
 	});
 
@@ -1069,7 +1097,48 @@ describe("lsp_navigation tool", () => {
 				"const newName = 1;\nconsole.log(newName);\n",
 			);
 		} finally {
-			fs.rmSync(tmpDir, { recursive: true, force: true });
+			removeTempDirSync(tmpDir);
+		}
+	});
+
+	it("returns an error and terminal failed mutation outcome when apply is true cannot write", async () => {
+		const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
+		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-nav-fail-"));
+		const filePath = path.join(tmpDir, "missing.ts");
+		(
+			mocked.service as { rename: ReturnType<typeof vi.fn> }
+		).rename = vi.fn().mockResolvedValue({
+			changes: {
+				[pathToFileURL(filePath).href]: [
+					{
+						range: {
+							start: { line: 0, character: 0 },
+							end: { line: 0, character: 0 },
+						},
+						newText: "new",
+					},
+				],
+			},
+		});
+		try {
+			const result = await tool.execute(
+				"rename-fail",
+				{
+					operation: "rename",
+					path: filePath,
+					line: 1,
+					character: 1,
+					newName: "new",
+					apply: true,
+				},
+				new AbortController().signal,
+				null,
+				{ cwd: tmpDir },
+			);
+			expect(result.isError).toBe(true);
+			expect(result.details?.failureKind).toBe("lsp_error");
+		} finally {
+			removeTempDirSync(tmpDir);
 		}
 	});
 });

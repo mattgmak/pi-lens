@@ -46,17 +46,25 @@
  * - GitHub releases (platform-specific binaries → ~/.pi-lens/bin/)
  */
 
+import { logExtension } from "../extension-log.js";
 import { spawn } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, statSync, unlinkSync } from "node:fs";
 import fs from "node:fs/promises";
 import https from "node:https";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import { BoundedLruCache } from "../bounded-cache.js";
+import { isFullyQualified } from "../path-utils.js";
+import {
+	assertInstallAllowed,
+	projectTrustDenialReason,
+} from "../project-trust.js";
 
 const _installerRequire = createRequire(import.meta.url);
 import { createGunzip } from "node:zlib";
-import { isTestMode } from "../env-utils.js";
+import { logSessionStart } from "../sessionstart-logger.js";
+import { commitDurableStoreAsync } from "../durable-store.js";
 import { getGlobalPiLensDir } from "../file-utils.js";
 import {
 	allAvailableGlobalBinDirs,
@@ -64,9 +72,136 @@ import {
 	pmBinary,
 	resolveNodePackageManager,
 } from "../package-manager.js";
+import {
+	resetSafeSpawnWindowsCommandCache,
+	safeSpawnAsync,
+} from "../safe-spawn.js";
 
 // Global installation directory for pi-lens tools
 const TOOLS_DIR = path.join(getGlobalPiLensDir(), "tools");
+const INSTALL_LOCK_PATH = path.join(TOOLS_DIR, ".install.lock");
+const activeInstallLocks = new Set<string>();
+let installLockExitCleanupRegistered = false;
+
+/**
+ * The managed tools tree, for callers that need to tell a path `getToolPath()`
+ * returned from the managed install apart from a global/PATH hit (the tool
+ * registry is this module's business — don't re-derive `<pi-lens home>/tools`).
+ */
+export function getManagedToolsDir(): string {
+	return TOOLS_DIR;
+}
+
+interface InstallLockOwner {
+	pid: number;
+	createdAt: number;
+}
+
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+async function acquireInstallLock(): Promise<{
+	release?: () => Promise<void>;
+	reason?: string;
+}> {
+	await fs.mkdir(TOOLS_DIR, { recursive: true });
+	// #946 review F2: the waiter's bound must exceed the owner's install bound
+	// (PI_LENS_INSTALL_TIMEOUT_MS, default 120s) — a 30s waiter gave up on a
+	// legitimate slow install and reported the tool unavailable for the whole
+	// session even though it arrived seconds later.
+	const timeoutMs =
+		Number(process.env.PI_LENS_INSTALL_LOCK_TIMEOUT_MS) || 150_000;
+	const deadline = Date.now() + timeoutMs;
+	let lastOwner = "unknown owner";
+
+	while (Date.now() < deadline) {
+		try {
+			const handle = await fs.open(INSTALL_LOCK_PATH, "wx");
+			await handle.writeFile(
+				JSON.stringify({ pid: process.pid, createdAt: Date.now() }),
+			);
+			await handle.close();
+			activeInstallLocks.add(INSTALL_LOCK_PATH);
+			if (!installLockExitCleanupRegistered) {
+				installLockExitCleanupRegistered = true;
+				process.once("exit", () => {
+					for (const lockPath of activeInstallLocks) {
+						try {
+							unlinkSync(lockPath);
+						} catch {
+							// Best effort; the next owner verifies this PID is dead.
+						}
+					}
+				});
+			}
+			let released = false;
+			return {
+				release: async () => {
+					if (released) return;
+					released = true;
+					activeInstallLocks.delete(INSTALL_LOCK_PATH);
+					await fs.rm(INSTALL_LOCK_PATH, { force: true });
+				},
+			};
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			try {
+				const owner = JSON.parse(
+					await fs.readFile(INSTALL_LOCK_PATH, "utf8"),
+				) as InstallLockOwner;
+				lastOwner = `pid=${owner.pid} createdAt=${owner.createdAt}`;
+				// #946 review F1: PID liveness alone cannot detect a hard-killed
+				// owner whose PID Windows has recycled — that lock would poison
+				// every future install with a full-timeout wait. A lock older
+				// than any legitimate install (owner install bound + slack) is
+				// stale regardless of what the PID now points at.
+				const maxAgeMs =
+					(Number(process.env.PI_LENS_INSTALL_TIMEOUT_MS) || 120_000) +
+					60_000;
+				const expired =
+					Number.isFinite(owner.createdAt) &&
+					Date.now() - owner.createdAt > maxAgeMs;
+				if (
+					expired ||
+					(Number.isInteger(owner.pid) &&
+						owner.pid > 0 &&
+						!isProcessAlive(owner.pid))
+				) {
+					await fs.rm(INSTALL_LOCK_PATH, { force: true });
+					continue;
+				}
+			} catch (readError) {
+				lastOwner = "unreadable owner";
+				// An unreadable/empty lock has no createdAt to age out — fall
+				// back to the file's own mtime for the max-age check so it is
+				// eventually recoverable (#946 review F1/F6).
+				try {
+					const stat = await fs.stat(INSTALL_LOCK_PATH);
+					const maxAgeMs =
+						(Number(process.env.PI_LENS_INSTALL_TIMEOUT_MS) || 120_000) +
+						60_000;
+					if (Date.now() - stat.mtimeMs > maxAgeMs) {
+						await fs.rm(INSTALL_LOCK_PATH, { force: true });
+						continue;
+					}
+				} catch {
+					// stat raced a release — loop and retry acquisition.
+				}
+				void readError;
+			}
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+	}
+	return {
+		reason: `timed out after ${timeoutMs}ms waiting for shared tools install lock (${lastOwner})`,
+	};
+}
 
 // Directory for GitHub-downloaded binaries
 const GITHUB_BIN_DIR = path.join(getGlobalPiLensDir(), "bin");
@@ -74,29 +209,30 @@ const GITHUB_BIN_DIR = path.join(getGlobalPiLensDir(), "bin");
 // Debug flag - set via PI_LENS_DEBUG=1 or --debug
 const DEBUG =
 	process.env.PI_LENS_DEBUG === "1" || process.argv.includes("--debug");
-const SESSIONSTART_LOG_DIR = getGlobalPiLensDir();
-const SESSIONSTART_LOG = path.join(SESSIONSTART_LOG_DIR, "sessionstart.log");
+
+/** Test-only platform seam for Windows resource-layout coverage on Linux CI. */
+function installerPlatform(): NodeJS.Platform {
+	const override = process.env.PI_LENS_TEST_PLATFORM;
+	if (override === "win32" || override === "linux") {
+		return override;
+	}
+	return process.platform;
+}
 
 /**
  * Log debug messages only when DEBUG is enabled
  */
 function debugLog(...args: unknown[]): void {
 	if (DEBUG) {
-		console.error("[auto-install:debug]", ...args);
-	}
-}
-
-function logSessionStart(msg: string): void {
-	if (isTestMode()) {
-		return;
-	}
-	const line = `[${new Date().toISOString()}] ${msg}\n`;
-	void fs
-		.mkdir(SESSIONSTART_LOG_DIR, { recursive: true })
-		.then(() => fs.appendFile(SESSIONSTART_LOG, line))
-		.catch(() => {
-			// best-effort logging
+		// #1333: DEBUG gate preserved; sink is extension.log, never the TUI.
+		logExtension({
+			subsystem: "auto-install",
+			level: "debug",
+			message: args
+				.map((arg) => (typeof arg === "string" ? arg : JSON.stringify(arg)))
+				.join(" "),
 		});
+	}
 }
 
 // --- Tool Definitions ---
@@ -218,7 +354,9 @@ export interface PlatformPackageSpec {
  * the copy-pasted `if (platform === "linux") return arch === "arm64" ? … : …`
  * ladder that several release entries repeat verbatim. Each platform maps to its
  * `x64` (default) and optional `arm64` asset substring; a missing platform or
- * arch ⇒ unsupported (`undefined`), exactly as the hand-written ladders behaved.
+ * arch ⇒ unsupported (`undefined`). Arches outside x64/arm64 (ia32, ppc64, …)
+ * are unsupported too — no release entry ships a 32-bit or exotic asset, and
+ * handing back the x64 substring there would install an unrunnable binary.
  */
 function archAssetMatch(table: {
 	linux?: { x64?: string; arm64?: string };
@@ -226,11 +364,19 @@ function archAssetMatch(table: {
 	win32?: { x64?: string; arm64?: string };
 }): (platform: string, arch: string) => string | undefined {
 	return (platform, arch) => {
-		const entry = table[platform as "linux" | "darwin" | "win32"];
-		if (!entry) return undefined;
-		return arch === "arm64" ? entry.arm64 : entry.x64;
+		if (arch !== "x64" && arch !== "arm64") return undefined;
+		return table[platform as "linux" | "darwin" | "win32"]?.[arch];
 	};
 }
+
+// Go-style `<os>_<arch>.zip` release assets, shared verbatim by tflint and
+// terraform-ls — both entries carried byte-identical ladders, down to the asset
+// strings themselves.
+const OS_ARCH_ZIP_ASSETS = {
+	linux: { x64: "linux_amd64.zip", arm64: "linux_arm64.zip" },
+	darwin: { x64: "darwin_amd64.zip", arm64: "darwin_arm64.zip" },
+	win32: { x64: "windows_amd64.zip", arm64: "windows_arm64.zip" },
+};
 
 export const TOOLS: ToolDefinition[] = [
 	// Core LSP servers
@@ -249,7 +395,11 @@ export const TOOLS: ToolDefinition[] = [
 		checkCommand: "tsc",
 		checkArgs: ["--version"],
 		installStrategy: "npm",
-		packageName: "typescript",
+		// The managed compiler serves the classic typescript-language-server
+		// fallback. TypeScript 7 removed lib/tsserver.js and is selected only from
+		// project-local installs through the native `tsc --lsp --stdio` path.
+		// Revisit when typescript-language-server supports TS 7 — refs #1436.
+		packageName: "typescript@5.9.3",
 		binaryName: "tsc",
 	},
 	{
@@ -390,6 +540,24 @@ export const TOOLS: ToolDefinition[] = [
 		binaryName: "bash-language-server",
 	},
 	{
+		id: "fish-lsp",
+		name: "Fish Language Server",
+		checkCommand: "fish-lsp",
+		checkArgs: ["--version"],
+		installStrategy: "npm",
+		packageName: "fish-lsp",
+		binaryName: "fish-lsp",
+	},
+	{
+		id: "cmake-language-server",
+		name: "CMake Language Server",
+		checkCommand: "cmake-language-server",
+		checkArgs: ["--version"],
+		installStrategy: "pip",
+		packageName: "cmake-language-server",
+		binaryName: "cmake-language-server",
+	},
+	{
 		id: "yaml-language-server",
 		name: "YAML Language Server",
 		checkCommand: "yaml-language-server",
@@ -442,6 +610,28 @@ export const TOOLS: ToolDefinition[] = [
 				if (platform === "win32") return "windows-x86_64.exe";
 				return undefined;
 			},
+		},
+	},
+	{
+		id: "helm",
+		name: "Helm",
+		checkCommand: "helm",
+		checkArgs: ["version", "--short"],
+		installStrategy: "github",
+		binaryName: "helm",
+		github: {
+			repo: "helm/helm",
+			assetMatch: (platform, arch) => {
+				// helm publishes per-OS archives: tar.gz for POSIX, zip for Windows.
+				const cpu = arch === "arm64" ? "arm64" : "amd64";
+				if (platform === "linux") return `linux-${cpu}.tar.gz`;
+				if (platform === "darwin") return `darwin-${cpu}.tar.gz`;
+				if (platform === "win32") return `windows-${cpu}.zip`;
+				return undefined;
+			},
+			// Release archives nest the executable under an OS/arch directory;
+			// the installer searches recursively and adds the Windows suffix.
+			binaryInArchive: "helm",
 		},
 	},
 	{
@@ -935,16 +1125,37 @@ export const TOOLS: ToolDefinition[] = [
 		binaryName: "tflint",
 		github: {
 			repo: "terraform-linters/tflint",
-			assetMatch: (platform, arch) => {
-				if (platform === "linux")
-					return arch === "arm64" ? "linux_arm64.zip" : "linux_amd64.zip";
-				if (platform === "darwin")
-					return arch === "arm64" ? "darwin_arm64.zip" : "darwin_amd64.zip";
-				if (platform === "win32")
-					return arch === "arm64" ? "windows_arm64.zip" : "windows_amd64.zip";
-				return undefined;
-			},
+			assetMatch: archAssetMatch(OS_ARCH_ZIP_ASSETS),
 			binaryInArchive: "tflint",
+		},
+	},
+	{
+		// Terragrunt ships a bare native binary per platform on GitHub releases.
+		// Windows arm64 uses the x64 binary through Windows' built-in emulation —
+		// there is no terragrunt_windows_arm64.exe upstream.
+		id: "terragrunt",
+		name: "terragrunt",
+		checkCommand: "terragrunt",
+		checkArgs: ["--version"],
+		installStrategy: "github",
+		binaryName: "terragrunt",
+		github: {
+			repo: "gruntwork-io/terragrunt",
+			assetMatch: archAssetMatch({
+				linux: {
+					x64: "terragrunt_linux_amd64",
+					arm64: "terragrunt_linux_arm64",
+				},
+				darwin: {
+					x64: "terragrunt_darwin_amd64",
+					arm64: "terragrunt_darwin_arm64",
+				},
+				win32: {
+					x64: "terragrunt_windows_amd64.exe",
+					arm64: "terragrunt_windows_amd64.exe",
+				},
+			}),
+			// bare binary — no binaryInArchive
 		},
 	},
 	{
@@ -1068,15 +1279,7 @@ export const TOOLS: ToolDefinition[] = [
 		github: {
 			repo: "hashicorp/terraform-ls",
 			hashiCorpReleaseProduct: "terraform-ls",
-			assetMatch: (platform, arch) => {
-				if (platform === "linux")
-					return arch === "arm64" ? "linux_arm64.zip" : "linux_amd64.zip";
-				if (platform === "darwin")
-					return arch === "arm64" ? "darwin_arm64.zip" : "darwin_amd64.zip";
-				if (platform === "win32")
-					return arch === "arm64" ? "windows_arm64.zip" : "windows_amd64.zip";
-				return undefined;
-			},
+			assetMatch: archAssetMatch(OS_ARCH_ZIP_ASSETS),
 			binaryInArchive: "terraform-ls",
 		},
 	},
@@ -1224,9 +1427,15 @@ export const TOOLS: ToolDefinition[] = [
 ];
 
 const ensureInFlight = new Map<string, Promise<string | undefined>>();
+const installFailureReasons = new Map<string, string>();
+
+/** Last honest install refusal/failure reason for callers that need diagnostics. */
+export function getInstallFailureReason(toolId: string): string | undefined {
+	return installFailureReasons.get(toolId);
+}
 
 // Session-lifetime cache: once a tool path is resolved, skip the process-spawn check on subsequent calls.
-const resolvedPathCache = new Map<string, string>();
+const resolvedPathCache = new BoundedLruCache<string, string>(256);
 
 // --- Persistent probe cache ---
 
@@ -1239,34 +1448,214 @@ interface ProbeCacheEntry {
 type ProbeCache = Record<string, ProbeCacheEntry>;
 
 const PROBE_CACHE_PATH = path.join(getGlobalPiLensDir(), "probe-cache.json");
+const PROBE_CACHE_LOCK_STALE_MS = 180_000;
 const PROBE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const PROBE_CACHE_FLUSH_LOCK_WAIT_MS = 250;
+const PROBE_CACHE_FLUSH_RETRY_DELAY_MS = 300;
+const PROBE_CACHE_FLUSH_RETRY_MAX_DELAY_MS = 30_000;
 
 let _probeCache: ProbeCache | null = null;
 let _probeCacheDirty = false;
 let _probeCacheFlushTimer: ReturnType<typeof setTimeout> | null = null;
+let _probeCacheWriteInFlight: Promise<ProbeCacheFlushResult> | null = null;
+let _probeCacheRetryAttempt = 0;
+let _probeCacheChangeGeneration = 0;
+// Read-modify-write deltas let a long-lived process merge with entries another
+// process discovered after this process's initial read. `null` is a deliberate
+// deletion (TTL/stale-path eviction), not an absent map value.
+const _probeCacheChanges = new Map<string, ProbeCacheEntry | null>();
+const _probeCacheChangeVersions = new Map<string, number>();
 
 async function readProbeCache(): Promise<ProbeCache> {
 	if (_probeCache !== null) return _probeCache;
 	try {
 		const raw = await fs.readFile(PROBE_CACHE_PATH, "utf-8");
-		_probeCache = JSON.parse(raw) as ProbeCache;
-	} catch {
+		const parsed: unknown = JSON.parse(raw);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+			throw new Error("probe-cache root is not an object");
+		}
+		_probeCache = parsed as ProbeCache;
+	} catch (err) {
+		const code = (err as NodeJS.ErrnoException | undefined)?.code;
+		if (code !== "ENOENT") {
+			logSessionStart(
+				`auto-install probe-cache: read failed (${code ?? "invalid"}); treating cache as unavailable`,
+			);
+		}
 		_probeCache = {};
 	}
 	return _probeCache;
 }
 
-function scheduleProbeFlush(): void {
+function markProbeCacheChange(toolId: string, entry: ProbeCacheEntry | null): void {
+	_probeCacheChanges.set(toolId, entry);
+	_probeCacheChangeVersions.set(toolId, ++_probeCacheChangeGeneration);
+	_probeCacheDirty = true;
+	scheduleProbeFlush();
+}
+
+function scheduleProbeFlush(delayMs = PROBE_CACHE_FLUSH_RETRY_DELAY_MS): void {
 	if (_probeCacheFlushTimer !== null) return;
 	_probeCacheFlushTimer = setTimeout(() => {
-		_probeCacheFlushTimer = null;
-		if (!_probeCacheDirty || _probeCache === null) return;
-		_probeCacheDirty = false;
-		void fs
-			.writeFile(PROBE_CACHE_PATH, JSON.stringify(_probeCache, null, 2))
-			.catch(() => {});
-	}, 300);
+		void flushProbeCache();
+	}, delayMs);
 	_probeCacheFlushTimer.unref?.();
+}
+
+function scheduleProbeFlushRetry(): void {
+	const delay = Math.min(
+		PROBE_CACHE_FLUSH_RETRY_MAX_DELAY_MS,
+		PROBE_CACHE_FLUSH_RETRY_DELAY_MS * 2 ** Math.min(_probeCacheRetryAttempt, 6),
+	);
+	_probeCacheRetryAttempt += 1;
+	scheduleProbeFlush(delay);
+}
+
+export type ProbeCacheFlushResult =
+	| "idle"
+	| "written"
+	| "written-with-pending"
+	| "deferred"
+	| "failed";
+
+type ProbeCacheFlushSnapshot = {
+	changes: Map<string, ProbeCacheEntry | null>;
+	versions: Map<string, number>;
+};
+
+function snapshotProbeCacheChanges(): ProbeCacheFlushSnapshot {
+	return {
+		changes: new Map(_probeCacheChanges),
+		versions: new Map(_probeCacheChangeVersions),
+	};
+}
+
+function deserializeProbeCache(contents: string | undefined): ProbeCache {
+	if (contents === undefined) return {};
+	const parsed: unknown = JSON.parse(contents);
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new Error("probe-cache root is not an object");
+	}
+	return parsed as ProbeCache;
+}
+
+function applyProbeCacheChanges(
+	disk: ProbeCache,
+	changes: Map<string, ProbeCacheEntry | null>,
+): void {
+	for (const [toolId, entry] of changes) {
+		if (entry === null) delete disk[toolId];
+		else disk[toolId] = entry;
+	}
+}
+
+/**
+ * Install-lifetime ageing belongs to the authoritative merge, not only to the
+ * lookup path: a sibling process may have left expired entries on disk since
+ * this process loaded its in-memory snapshot. The async durable-store lock
+ * supplies the probe cache's former quarantine/stale-owner recovery.
+ */
+function ageProbeCache(disk: ProbeCache): void {
+	const cutoff = Date.now() - PROBE_CACHE_TTL_MS;
+	for (const [toolId, entry] of Object.entries(disk)) {
+		if (!Number.isFinite(entry.cachedAt) || entry.cachedAt < cutoff) {
+			delete disk[toolId];
+		}
+	}
+}
+
+function publishProbeCacheWrite(
+	disk: ProbeCache,
+	snapshotVersions: Map<string, number>,
+): ProbeCacheFlushResult {
+	// Publish the sibling-process merge plus any updates that arrived during
+	// the write. Only an unchanged snapshot entry is retired.
+	const pendingAfterWrite = new Map(_probeCacheChanges);
+	_probeCache = disk;
+	for (const [toolId, entry] of pendingAfterWrite) {
+		if (entry === null) delete _probeCache[toolId];
+		else _probeCache[toolId] = entry;
+	}
+	for (const [toolId, version] of snapshotVersions) {
+		if (_probeCacheChangeVersions.get(toolId) === version) {
+			_probeCacheChanges.delete(toolId);
+			_probeCacheChangeVersions.delete(toolId);
+		}
+	}
+	_probeCacheDirty = _probeCacheChanges.size > 0;
+	_probeCacheRetryAttempt = 0;
+	return _probeCacheDirty ? "written-with-pending" : "written";
+}
+
+async function writeProbeCache(): Promise<ProbeCacheFlushResult> {
+	try {
+		// Snapshot versions before the awaited disk read/write. A new update for
+		// the same tool may arrive while the atomic write is in flight; its newer
+		// version must remain pending for the next flush.
+		const { changes, versions } = snapshotProbeCacheChanges();
+		let result: ProbeCacheFlushResult = "written";
+		const committed = await commitDurableStoreAsync({
+			path: PROBE_CACHE_PATH,
+			deserialize: deserializeProbeCache,
+			merge: (disk) => {
+				ageProbeCache(disk);
+				applyProbeCacheChanges(disk, changes);
+				return disk;
+			},
+			serialize: (disk) => JSON.stringify(disk, null, 2),
+			waitMs: PROBE_CACHE_FLUSH_LOCK_WAIT_MS,
+			retryMs: 25,
+			staleMs: PROBE_CACHE_LOCK_STALE_MS,
+			timeoutMessage: "Timed out waiting for probe-cache lock",
+			onContention: "skip-log",
+			logContention: () => {
+				logSessionStart(
+					"auto-install probe-cache: flush deferred because another process owns the lock",
+				);
+			},
+			afterWriteLocked: (disk) => {
+				result = publishProbeCacheWrite(disk, versions);
+			},
+		});
+		if (committed === undefined) {
+			scheduleProbeFlushRetry();
+			return "deferred";
+		}
+		return result;
+	} catch (err) {
+		// Keep dirty state so a later timer/explicit flush can retry. The error
+		// is logged without paths, source, or command text; an unavailable cache
+		// must never look like a clean empty cache to operators.
+		logSessionStart(
+			`auto-install probe-cache: flush failed (${(err as NodeJS.ErrnoException | undefined)?.code ?? "write error"}); pending update retained`,
+		);
+		scheduleProbeFlushRetry();
+		return "failed";
+	}
+}
+
+/** Await pending probe-cache persistence before a one-shot process exits. */
+export async function flushProbeCache(): Promise<ProbeCacheFlushResult> {
+	if (_probeCacheFlushTimer !== null) {
+		clearTimeout(_probeCacheFlushTimer);
+		_probeCacheFlushTimer = null;
+	}
+	// #946 review F4: if the 300ms timer's write already started, the dirty
+	// flag is false but the write may still be in flight — an immediate
+	// process.exit would truncate it. Always await the in-flight write.
+	if (_probeCacheWriteInFlight) {
+		await _probeCacheWriteInFlight;
+		if (!_probeCacheDirty) return "written";
+	}
+	if (!_probeCacheDirty || _probeCache === null) return "idle";
+
+	const write = writeProbeCache();
+	_probeCacheWriteInFlight = write;
+	try {
+		return await write;
+	} finally {
+		if (_probeCacheWriteInFlight === write) _probeCacheWriteInFlight = null;
+	}
 }
 
 function isAstGrepVersionOutput(output: string): boolean {
@@ -1275,11 +1664,19 @@ function isAstGrepVersionOutput(output: string): boolean {
 
 async function verifyAstGrepProbePath(binPath: string): Promise<boolean> {
 	return new Promise((resolve) => {
-		const proc = spawn(binPath, ["--version"], {
-			stdio: ["ignore", "pipe", "pipe"],
-			shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(binPath),
-			timeout: 5000,
-		});
+		let proc: ReturnType<typeof spawn>;
+		try {
+			proc = spawn(binPath, ["--version"], {
+				stdio: ["ignore", "pipe", "pipe"],
+				shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(binPath),
+				timeout: 5000,
+			});
+		} catch {
+			// SYNCHRONOUS spawn throw (Windows `spawn UNKNOWN`/EINVAL, the pidusage
+			// bug class, #533) — best-effort probe, resolve rather than reject.
+			resolve(false);
+			return;
+		}
 		let output = "";
 		proc.stdout?.on("data", (data) => (output += data));
 		proc.stderr?.on("data", (data) => (output += data));
@@ -1301,8 +1698,7 @@ export async function checkProbeCache(
 	if (Date.now() - entry.cachedAt > PROBE_CACHE_TTL_MS) {
 		logSessionStart(`auto-install probe-cache ${toolId}: miss (ttl expired)`);
 		delete cache[toolId];
-		_probeCacheDirty = true;
-		scheduleProbeFlush();
+		markProbeCacheChange(toolId, null);
 		return undefined;
 	}
 
@@ -1314,8 +1710,7 @@ export async function checkProbeCache(
 				`auto-install probe-cache ${toolId}: miss (mtime changed)`,
 			);
 			delete cache[toolId];
-			_probeCacheDirty = true;
-			scheduleProbeFlush();
+			markProbeCacheChange(toolId, null);
 			return undefined;
 		}
 		if (toolId === "ast-grep" && !(await verifyAstGrepProbePath(entry.path))) {
@@ -1323,8 +1718,7 @@ export async function checkProbeCache(
 				`auto-install probe-cache ${toolId}: miss (not ast-grep: ${entry.path})`,
 			);
 			delete cache[toolId];
-			_probeCacheDirty = true;
-			scheduleProbeFlush();
+			markProbeCacheChange(toolId, null);
 			return undefined;
 		}
 		return entry.path;
@@ -1333,8 +1727,7 @@ export async function checkProbeCache(
 			`auto-install probe-cache ${toolId}: miss (gone: ${entry.path})`,
 		);
 		delete cache[toolId];
-		_probeCacheDirty = true;
-		scheduleProbeFlush();
+		markProbeCacheChange(toolId, null);
 		return undefined;
 	}
 }
@@ -1347,13 +1740,13 @@ export async function updateProbeCache(
 	try {
 		const stat = await fs.stat(resolvedPath);
 		const cache = await readProbeCache();
-		cache[toolId] = {
+		const entry = {
 			path: resolvedPath,
 			mtimeMs: stat.mtimeMs,
 			cachedAt: Date.now(),
 		};
-		_probeCacheDirty = true;
-		scheduleProbeFlush();
+		cache[toolId] = entry;
+		markProbeCacheChange(toolId, entry);
 	} catch {
 		// best-effort
 	}
@@ -1363,9 +1756,15 @@ export async function updateProbeCache(
 export function resetProbeCacheStateForTesting(): void {
 	_probeCache = null;
 	_probeCacheDirty = false;
+	_probeCacheChanges.clear();
+	_probeCacheChangeVersions.clear();
+	_probeCacheChangeGeneration = 0;
+	_probeCacheRetryAttempt = 0;
 	resolvedPathCache.clear();
 	ensureInFlight.clear();
+	installFailureReasons.clear();
 	lastManagedInstallVersion.clear();
+	resetPathWalkMemo();
 	if (_probeCacheFlushTimer !== null) {
 		clearTimeout(_probeCacheFlushTimer);
 		_probeCacheFlushTimer = null;
@@ -1374,17 +1773,32 @@ export function resetProbeCacheStateForTesting(): void {
 
 // --- Check Functions ---
 
+const pathWalkMemo = new Map<string, boolean>();
+
+function hashSync(value: string): string {
+	let hash = 0x811c9dc5;
+	for (let i = 0; i < value.length; i += 1) {
+		hash ^= value.charCodeAt(i);
+		hash = Math.imul(hash, 0x01000193);
+	}
+	return (hash >>> 0).toString(16);
+}
+
+export function resetPathWalkMemo(): void {
+	pathWalkMemo.clear();
+}
+
 /**
  * Check if a command is available in PATH by walking PATH entries and
  * verifying each candidate is a real file with non-zero size.
  * Catches broken symlinks (stat throws ENOENT or returns size 0) without
  * spawning a process — ~μs per candidate vs ~50ms for which/where.
  */
-async function isCommandAvailable(
+export async function isCommandAvailable(
 	command: string,
 	_args?: string[],
 ): Promise<boolean> {
-	const isWindows = process.platform === "win32";
+	const isWindows = installerPlatform() === "win32";
 	const pathEnv =
 		process.env.PATH || process.env.Path || process.env.path || "";
 	const dirs = pathEnv.split(path.delimiter);
@@ -1412,6 +1826,27 @@ async function isCommandAvailable(
 	}
 
 	return false;
+}
+
+/**
+ * Can `command` even be spawned? Path-bearing commands stat the file directly;
+ * bare names walk PATH. ~μs either way — callers use this to skip a `--version`
+ * probe that is guaranteed to fail with a full spawn round-trip.
+ */
+export async function isSpawnableCommand(command: string): Promise<boolean> {
+	if (/[\\/]/.test(command)) {
+		try {
+			const stat = statSync(command);
+			return stat.isFile() && stat.size > 0;
+		} catch {
+			return false;
+		}
+	}
+	const memoKey = `${command}:${hashSync(process.env.PATH || "")}`;
+	if (pathWalkMemo.has(memoKey)) return pathWalkMemo.get(memoKey) ?? false;
+	const isSpawnable = await isCommandAvailable(command);
+	pathWalkMemo.set(memoKey, isSpawnable);
+	return isSpawnable;
 }
 
 // --- Verification Functions
@@ -1477,7 +1912,7 @@ async function verifyToolBinary(
 	onVersionOutput?: (output: string) => void,
 ): Promise<boolean> {
 	return new Promise((resolve) => {
-		const isWindows = process.platform === "win32";
+		const isWindows = installerPlatform() === "win32";
 		const hasKnownWindowsExt = /\.(cmd|exe|ps1)$/i.test(binPath);
 
 		// On Windows, resolve the best executable path:
@@ -1501,11 +1936,22 @@ async function verifyToolBinary(
 
 		// When shell:true (Windows .cmd), bake args into the command string to avoid DEP0190.
 		const spawnCmd = useShell ? `"${execPath}" --version` : execPath;
-		const proc = spawn(spawnCmd, useShell ? [] : ["--version"], {
-			timeout: 10000,
-			stdio: ["ignore", "pipe", "pipe"],
-			shell: useShell,
-		});
+		let proc: ReturnType<typeof spawn>;
+		try {
+			proc = spawn(spawnCmd, useShell ? [] : ["--version"], {
+				timeout: 10000,
+				stdio: ["ignore", "pipe", "pipe"],
+				shell: useShell,
+			});
+		} catch (err) {
+			// SYNCHRONOUS spawn throw (Windows `spawn UNKNOWN`/EINVAL, the pidusage
+			// bug class, #533) — best-effort verify, resolve rather than reject.
+			logSessionStart(
+				`auto-install verify: spawn threw for ${binPath} (${err instanceof Error ? err.message : String(err)})`,
+			);
+			resolve(false);
+			return;
+		}
 
 		let stdout = "";
 		let stderr = "";
@@ -1596,11 +2042,19 @@ export async function getAllToolStatuses(): Promise<ToolStatus[]> {
 			status.path = tool.checkCommand;
 			// Try to get version
 			const versionResult = await new Promise<string>((resolve) => {
-				const proc = spawn(tool.checkCommand, ["--version"], {
-					stdio: ["ignore", "pipe", "pipe"],
-					shell: process.platform === "win32",
-					timeout: 5000,
-				});
+				let proc: ReturnType<typeof spawn>;
+				try {
+					proc = spawn(tool.checkCommand, ["--version"], {
+						stdio: ["ignore", "pipe", "pipe"],
+						shell: process.platform === "win32",
+						timeout: 5000,
+					});
+				} catch {
+					// SYNCHRONOUS spawn throw (Windows `spawn UNKNOWN`/EINVAL, the
+					// pidusage bug class, #533) — best-effort, resolve empty version.
+					resolve("");
+					return;
+				}
 				let out = "";
 				proc.stdout?.on("data", (d) => (out += d));
 				proc.stderr?.on("data", (d) => (out += d));
@@ -1667,7 +2121,7 @@ export async function getAllToolStatuses(): Promise<ToolStatus[]> {
 			tool.binaryName || tool.id,
 		);
 		const localPath =
-			process.platform === "win32" ? `${localBase}.cmd` : localBase;
+			installerPlatform() === "win32" ? `${localBase}.cmd` : localBase;
 		try {
 			await fs.access(localPath);
 			if (await verifyToolBinary(localPath)) {
@@ -1739,7 +2193,7 @@ export function resolvePlatformPackageBinary(
 ): string | undefined {
 	const spec = tool.platformPackage;
 	if (!spec || !tool.packageName) return undefined;
-	const suffix = spec.suffixes[`${process.platform}-${process.arch}`];
+	const suffix = spec.suffixes[`${installerPlatform()}-${process.arch}`];
 	if (!suffix) return undefined;
 	const platformPkg = `${spec.base ?? tool.packageName}-${suffix}`;
 	try {
@@ -1757,7 +2211,7 @@ export function resolvePlatformPackageBinary(
 				_installerRequire.resolve(`${platformPkg}/package.json`),
 			);
 		}
-		const isWin = process.platform === "win32";
+		const isWin = installerPlatform() === "win32";
 		for (const bin of spec.binaries) {
 			for (const name of isWin ? [`${bin}.exe`, bin] : [bin]) {
 				const candidate = path.join(pkgDir, name);
@@ -1808,7 +2262,7 @@ export async function getToolPath(toolId: string): Promise<string | undefined> {
 		".bin",
 		tool.binaryName || tool.id,
 	);
-	if (process.platform === "win32") {
+	if (installerPlatform() === "win32") {
 		// Prefer .cmd over extensionless — Node.js can't execute POSIX shell scripts on Windows
 		const cmdPath = `${localBase}.cmd`;
 		try {
@@ -1837,16 +2291,18 @@ export async function getToolPath(toolId: string): Promise<string | undefined> {
 			// fall through to extensionless
 		}
 	}
-	try {
-		await fs.access(localBase);
-		if (await verifyToolBinary(localBase, recordVersion)) {
-			return localBase;
+	if (installerPlatform() !== "win32") {
+		try {
+			await fs.access(localBase);
+			if (await verifyToolBinary(localBase, recordVersion)) {
+				return localBase;
+			}
+			logSessionStart(
+				`auto-install verify: ${localBase} exists but is broken, will reinstall`,
+			);
+		} catch {
+			// fall through to global checks
 		}
-		logSessionStart(
-			`auto-install verify: ${localBase} exists but is broken, will reinstall`,
-		);
-	} catch {
-		// fall through to global checks
 	}
 
 	// npm/pnpm/bun: prefer the native per-platform binary directly. The main
@@ -1970,7 +2426,6 @@ async function findNpmGlobalToolPath(
 			? [
 					path.join(dir, `${binaryName}.cmd`),
 					path.join(dir, `${binaryName}.exe`),
-					path.join(dir, binaryName),
 				]
 			: [path.join(dir, binaryName)];
 
@@ -2101,10 +2556,18 @@ async function getPythonUserBaseCandidates(): Promise<string[]> {
 			const spawnCmd = isWin
 				? [probe.command, ...probe.args].join(" ")
 				: probe.command;
-			const proc = spawn(spawnCmd, isWin ? [] : probe.args, {
-				stdio: ["ignore", "pipe", "pipe"],
-				shell: isWin,
-			});
+			let proc: ReturnType<typeof spawn>;
+			try {
+				proc = spawn(spawnCmd, isWin ? [] : probe.args, {
+					stdio: ["ignore", "pipe", "pipe"],
+					shell: isWin,
+				});
+			} catch {
+				// SYNCHRONOUS spawn throw (Windows `spawn UNKNOWN`/EINVAL, the
+				// pidusage bug class, #533) — best-effort probe, resolve empty.
+				resolve("");
+				return;
+			}
 
 			let stdout = "";
 			proc.stdout?.on("data", (data: Buffer | string) => (stdout += data));
@@ -2197,11 +2660,19 @@ function runCommand(
 	cwd: string,
 ): Promise<boolean> {
 	return new Promise((resolve) => {
-		const proc = spawn(command, args, {
-			cwd,
-			stdio: "ignore",
-			shell: process.platform === "win32",
-		});
+		let proc: ReturnType<typeof spawn>;
+		try {
+			proc = spawn(command, args, {
+				cwd,
+				stdio: "ignore",
+				shell: process.platform === "win32",
+			});
+		} catch {
+			// SYNCHRONOUS spawn throw (Windows `spawn UNKNOWN`/EINVAL, the pidusage
+			// bug class, #533) — resolve false rather than reject/crash.
+			resolve(false);
+			return;
+		}
 		proc.on("exit", (code) => resolve(code === 0));
 		proc.on("error", () => resolve(false));
 	});
@@ -2250,7 +2721,7 @@ async function installGitHubTool(
 	}
 
 	const asset =
-		releaseJson.assets.find((a) => a.name.includes(assetSubstring)) ??
+		pickReleaseAsset(releaseJson.assets, assetSubstring) ??
 		deriveHashiCorpReleaseAsset(tool, releaseJson.tag_name, assetSubstring);
 	if (!asset) {
 		logSessionStart(
@@ -2642,25 +3113,16 @@ async function installArchiveTool(
 		const tarBin = isWindows
 			? `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\tar.exe`
 			: "tar";
-		const extracted = await new Promise<{ ok: boolean; stderr: string }>(
-			(resolve) => {
-				const proc = spawn(tarBin, tarArgs, {
-					cwd: TOOLS_DIR,
-					stdio: ["ignore", "ignore", "pipe"],
-				});
-				let stderr = "";
-				proc.stderr?.on("data", (d) => (stderr += d));
-				const timer = setTimeout(() => {
-					proc.kill();
-					resolve({ ok: false, stderr: "extraction timed out" });
-				}, 120_000);
-				proc.on("exit", (code) => {
-					clearTimeout(timer);
-					resolve({ ok: code === 0, stderr });
-				});
-				proc.on("error", (err) => resolve({ ok: false, stderr: err.message }));
-			},
-		);
+		const extractResult = await safeSpawnAsync(tarBin, tarArgs, {
+			cwd: TOOLS_DIR,
+			timeout: 120_000,
+			ignoreAmbientSignal: true,
+			lifetimeCoupled: true,
+		});
+		const extracted = {
+			ok: extractResult.status === 0,
+			stderr: extractResult.error?.message ?? extractResult.stderr,
+		};
 		await fs.rm(tmpArchive, { force: true });
 		if (!extracted.ok) {
 			logSessionStart(
@@ -2759,9 +3221,13 @@ async function installNpmTool(
 		}
 
 		// Resolve the package manager for the tools dir and build install args.
-		const isWindows = process.platform === "win32";
+		const isWindows = installerPlatform() === "win32";
 		const pm = await resolveNodePackageManager(TOOLS_DIR);
-		const pmCommand = pmBinary(pm);
+		const testNpmScript =
+			process.env.PI_LENS_TEST_MODE === "1"
+				? process.env.PI_LENS_TEST_NPM_SCRIPT
+				: undefined;
+		const pmCommand = testNpmScript ? process.execPath : pmBinary(pm);
 		// Use --ignore-scripts unless the package explicitly needs postinstall
 		// (e.g. biome downloads a platform-specific native binary via postinstall).
 		const needsScripts = NEEDS_POSTINSTALL.has(packageName);
@@ -2769,39 +3235,27 @@ async function installNpmTool(
 			ignoreScripts: !needsScripts,
 		});
 
-		const INSTALL_TIMEOUT_MS = 120_000;
+		const INSTALL_TIMEOUT_MS =
+			Number(process.env.PI_LENS_INSTALL_TIMEOUT_MS) || 120_000;
 		const runInstallAttempt = async (
 			args: string[],
-		): Promise<{ ok: boolean; stderr: string }> =>
-			new Promise((resolve) => {
-				const proc = spawn(pmCommand, args, {
-					cwd: TOOLS_DIR,
-					stdio: ["ignore", "pipe", "pipe"],
-					shell: isWindows, // Required for .cmd files on Windows
-				});
-
-				let stderr = "";
-				proc.stderr?.on("data", (data) => (stderr += data));
-
-				const timer = setTimeout(() => {
-					proc.kill();
-					resolve({
-						ok: false,
-						stderr: `install timed out after ${INSTALL_TIMEOUT_MS / 1000}s`,
-					});
-				}, INSTALL_TIMEOUT_MS);
-
-				proc.on("exit", (code) => {
-					clearTimeout(timer);
-					resolve({ ok: code === 0, stderr });
-				});
-				proc.on("error", (err) => {
-					clearTimeout(timer);
-					resolve({ ok: false, stderr: err.message });
-				});
+		): Promise<{ ok: boolean; stderr: string }> => {
+			const result = await safeSpawnAsync(pmCommand, args, {
+				cwd: TOOLS_DIR,
+				timeout: INSTALL_TIMEOUT_MS,
+				ignoreAmbientSignal: true,
+				lifetimeCoupled: true,
 			});
+			return {
+				ok: result.status === 0,
+				stderr: result.error?.message ?? result.stderr,
+			};
+		};
 
-		let outcome = await runInstallAttempt(baseInstallArgs);
+		let outcome = await runInstallAttempt([
+			...(testNpmScript ? [testNpmScript] : []),
+			...baseInstallArgs,
+		]);
 
 		// --legacy-peer-deps is npm-only; retry just npm's ERESOLVE failures.
 		const erResolve =
@@ -2818,17 +3272,24 @@ async function installNpmTool(
 			logSessionStart(
 				`auto-install npm ${packageName}: retry with --legacy-peer-deps after ERESOLVE`,
 			);
-			outcome = await runInstallAttempt(retryArgs);
+			outcome = await runInstallAttempt([
+				...(testNpmScript ? [testNpmScript] : []),
+				...retryArgs,
+			]);
 		}
 
 		if (!outcome.ok) {
 			throw new Error(`Failed to install ${packageName}: ${outcome.stderr}`);
 		}
 
-		const binPath = path.join(TOOLS_DIR, "node_modules", ".bin", binaryName);
+		// npm creates a command shim on Windows; retain that actual executable path
+		// rather than probing/storing the extensionless POSIX sibling.
+		const binBase = path.join(TOOLS_DIR, "node_modules", ".bin", binaryName);
+		const binPath =
+			installerPlatform() === "win32" ? `${binBase}.cmd` : binBase;
 
 		// Make executable on Unix
-		if (process.platform !== "win32") {
+		if (installerPlatform() !== "win32") {
 			try {
 				await fs.chmod(binPath, 0o750);
 			} catch {
@@ -2862,10 +3323,10 @@ async function installNpmTool(
 			try {
 				const packagePath = path.join(TOOLS_DIR, "node_modules", packageName);
 				await fs.rm(packagePath, { recursive: true, force: true });
-				await fs.rm(binPath, { force: true });
+				await fs.rm(binBase, { force: true });
 				if (isWindows) {
-					await fs.rm(`${binPath}.cmd`, { force: true });
-					await fs.rm(`${binPath}.ps1`, { force: true });
+					await fs.rm(`${binBase}.cmd`, { force: true });
+					await fs.rm(`${binBase}.ps1`, { force: true });
 				}
 			} catch {
 				/* ignore cleanup errors */
@@ -2916,42 +3377,36 @@ async function installPipTool(
 
 		let lastError = "";
 		for (const candidate of pipCandidates) {
-			const outcome = await new Promise<{ ok: boolean; error: string }>(
-				(resolve) => {
-					const proc = spawn(candidate.command, candidate.args, {
-						stdio: ["ignore", "pipe", "pipe"],
-						shell: isWindows, // Required for .cmd files on Windows
-					});
-
-					let stderr = "";
-					proc.stderr?.on("data", (data) => (stderr += data));
-
-					proc.on("exit", (code) => {
-						if (code === 0) {
-							resolve({ ok: true, error: "" });
-						} else {
-							resolve({ ok: false, error: stderr.trim() });
-						}
-					});
-
-					proc.on("error", (err) => {
-						resolve({ ok: false, error: err.message });
-					});
-				},
-			);
+			const pipResult = await safeSpawnAsync(candidate.command, candidate.args, {
+				timeout: 120_000,
+				ignoreAmbientSignal: true,
+				lifetimeCoupled: true,
+			});
+			const outcome = {
+				ok: pipResult.status === 0,
+				error: (pipResult.error?.message ?? pipResult.stderr).trim(),
+			};
 
 			if (outcome.ok) {
 				// Ensure user-level scripts directory is available in current process PATH.
 				// This helps tools installed via `pip install --user` become immediately callable.
 				const userBaseResult = await new Promise<string>((resolve) => {
-					const probe = spawn(
-						candidate.command,
-						["-m", "site", "--user-base"],
-						{
-							stdio: ["ignore", "pipe", "pipe"],
-							shell: isWindows,
-						},
-					);
+					let probe: ReturnType<typeof spawn>;
+					try {
+						probe = spawn(
+							candidate.command,
+							["-m", "site", "--user-base"],
+							{
+								stdio: ["ignore", "pipe", "pipe"],
+								shell: isWindows,
+							},
+						);
+					} catch {
+						// SYNCHRONOUS spawn throw (Windows `spawn UNKNOWN`/EINVAL, the
+						// pidusage bug class, #533) — best-effort probe, resolve empty.
+						resolve("");
+						return;
+					}
 					let stdout = "";
 					probe.stdout?.on("data", (data) => (stdout += data));
 					probe.on("exit", (code) => {
@@ -3037,24 +3492,19 @@ async function installGemTool(
 	packageName: string,
 ): Promise<string | undefined> {
 	try {
-		const isWindows = process.platform === "win32";
-		const outcome = await new Promise<{ ok: boolean; error: string }>(
-			(resolve) => {
-				const proc = spawn("gem", ["install", packageName, "--no-document"], {
-					stdio: ["ignore", "pipe", "pipe"],
-					shell: isWindows,
-				});
-
-				let stderr = "";
-				proc.stderr?.on("data", (data) => (stderr += data));
-				proc.on("exit", (code) => {
-					resolve({ ok: code === 0, error: stderr.trim() });
-				});
-				proc.on("error", (err) => {
-					resolve({ ok: false, error: err.message });
-				});
+		const gemResult = await safeSpawnAsync(
+			"gem",
+			["install", packageName, "--no-document"],
+			{
+				timeout: 120_000,
+				ignoreAmbientSignal: true,
+				lifetimeCoupled: true,
 			},
 		);
+		const outcome = {
+			ok: gemResult.status === 0,
+			error: (gemResult.error?.message ?? gemResult.stderr).trim(),
+		};
 
 		if (!outcome.ok) {
 			throw new Error(
@@ -3071,10 +3521,57 @@ async function installGemTool(
 	}
 }
 
+async function finishInstallAttempt(
+	toolId: string,
+	ok: boolean,
+	startedAt: number,
+): Promise<boolean> {
+	logSessionStart(
+		`auto-install ${toolId}: ${ok ? "success" : "failed"} (${Date.now() - startedAt}ms)`,
+	);
+	if (ok) {
+		// A prior availability probe may have cached ENOENT for this exact child
+		// PATH. Make a successful mutation visible immediately rather than waiting
+		// for the bounded negative-cache TTL or the next session reset (#1199).
+		resetSafeSpawnWindowsCommandCache();
+		// #1276: the madge managed-path memo is keyed only by projectRoot, but
+		// reads PATH/discovery/install state that a completed install can just
+		// have changed — drop it here too, right alongside the safe-spawn reset.
+		// AWAITED (not fire-and-forget): a caller that starts the next madge
+		// resolution the instant `installTool`/`ensureTool` resolves must observe
+		// the reset memo, not a stale pre-install one, and a rejected dynamic
+		// import must not become a silent unhandled rejection. Dynamic import
+		// avoids a static dependency-checker.js <-> installer/index.js cycle
+		// (dependency-checker.js already imports this module dynamically for the
+		// same reason).
+		try {
+			const { resetMadgeManagedPathMemo } = await import(
+				"../dependency-checker.js"
+			);
+			resetMadgeManagedPathMemo();
+		} catch (err) {
+			logSessionStart(
+				`auto-install ${toolId}: madge memo reset failed: ${(err as Error).message}`,
+			);
+		}
+	}
+	return ok;
+}
+
 /**
  * Install a tool by ID
  */
 export async function installTool(toolId: string): Promise<boolean> {
+	if (process.env.PI_LENS_DISABLE_TOOL_INSTALL === "1") {
+		installFailureReasons.set(
+			toolId,
+			"installation disabled by PI_LENS_DISABLE_TOOL_INSTALL=1",
+		);
+		logSessionStart(
+			`auto-install ${toolId}: refused — PI_LENS_DISABLE_TOOL_INSTALL=1`,
+		);
+		return false;
+	}
 	const tool = TOOLS.find((t) => t.id === toolId);
 	if (!tool) {
 		logSessionStart(`auto-install ${toolId}: unknown tool id`);
@@ -3091,61 +3588,37 @@ export async function installTool(toolId: string): Promise<boolean> {
 			case "npm": {
 				if (!tool.packageName || !tool.binaryName) return false;
 				const npmPath = await installNpmTool(tool.packageName, tool.binaryName);
-				const ok = npmPath !== undefined;
-				logSessionStart(
-					`auto-install ${tool.id}: ${ok ? "success" : "failed"} (${Date.now() - startedAt}ms)`,
-				);
-				return ok;
+				return finishInstallAttempt(tool.id, npmPath !== undefined, startedAt);
 			}
 
 			case "pip": {
 				if (!tool.packageName) return false;
 				const pipPath = await installPipTool(tool.packageName);
-				const ok = pipPath !== undefined;
-				logSessionStart(
-					`auto-install ${tool.id}: ${ok ? "success" : "failed"} (${Date.now() - startedAt}ms)`,
-				);
-				return ok;
+				return finishInstallAttempt(tool.id, pipPath !== undefined, startedAt);
 			}
 
 			case "gem": {
 				if (!tool.packageName) return false;
 				const gemPath = await installGemTool(tool.packageName);
-				const ok = gemPath !== undefined;
-				logSessionStart(
-					`auto-install ${tool.id}: ${ok ? "success" : "failed"} (${Date.now() - startedAt}ms)`,
-				);
-				return ok;
+				return finishInstallAttempt(tool.id, gemPath !== undefined, startedAt);
 			}
 
 			case "github": {
 				if (!tool.github) return false;
 				const ghPath = await installGitHubTool(tool);
-				const ok = ghPath !== undefined;
-				logSessionStart(
-					`auto-install ${tool.id}: ${ok ? "success" : "failed"} (${Date.now() - startedAt}ms)`,
-				);
-				return ok;
+				return finishInstallAttempt(tool.id, ghPath !== undefined, startedAt);
 			}
 
 			case "maven": {
 				if (!tool.maven) return false;
 				const mavenPath = await installMavenTool(tool);
-				const ok = mavenPath !== undefined;
-				logSessionStart(
-					`auto-install ${tool.id}: ${ok ? "success" : "failed"} (${Date.now() - startedAt}ms)`,
-				);
-				return ok;
+				return finishInstallAttempt(tool.id, mavenPath !== undefined, startedAt);
 			}
 
 			case "archive": {
 				if (!tool.archive) return false;
 				const archivePath = await installArchiveTool(tool);
-				const ok = archivePath !== undefined;
-				logSessionStart(
-					`auto-install ${tool.id}: ${ok ? "success" : "failed"} (${Date.now() - startedAt}ms)`,
-				);
-				return ok;
+				return finishInstallAttempt(tool.id, archivePath !== undefined, startedAt);
 			}
 
 			default:
@@ -3161,12 +3634,36 @@ export async function installTool(toolId: string): Promise<boolean> {
 }
 
 /**
- * Ensure a tool is installed (check first, install if missing)
+ * Ensure a tool is installed (check first, install if missing).
+ *
+ * #1334 S5: when the pi host has actively denied project trust, the INSTALL
+ * half is switched off here — the request degrades to the existing
+ * `allowInstall:false` discovery-only path rather than failing outright, so an
+ * already-present binary keeps working while nothing is downloaded or executed
+ * on behalf of an untrusted project. A host with no trust surface at all
+ * (`"unknown"`) is unaffected.
  */
 export async function ensureTool(
 	toolId: string,
 	opts?: { forceReinstall?: boolean; allowInstall?: boolean },
 ): Promise<string | undefined> {
+	if (
+		opts?.allowInstall !== false &&
+		!assertInstallAllowed(`managed tool ensure: ${toolId}`)
+	) {
+		logSessionStart(
+			`auto-install ensure ${toolId}: install gated — ${projectTrustDenialReason()}; discovery only`,
+		);
+		return ensureToolResolved(toolId, { ...opts, allowInstall: false });
+	}
+	return ensureToolResolved(toolId, opts);
+}
+
+async function ensureToolResolved(
+	toolId: string,
+	opts?: { forceReinstall?: boolean; allowInstall?: boolean },
+): Promise<string | undefined> {
+	installFailureReasons.delete(toolId);
 	const cacheResolvedPath = (result: string | undefined): string | undefined => {
 		if (result) {
 			resolvedPathCache.set(toolId, result);
@@ -3192,8 +3689,7 @@ export async function ensureTool(
 		try {
 			const probeCache = await readProbeCache();
 			delete probeCache[toolId];
-			_probeCacheDirty = true;
-			scheduleProbeFlush();
+			markProbeCacheChange(toolId, null);
 		} catch {
 			// best-effort
 		}
@@ -3204,9 +3700,28 @@ export async function ensureTool(
 			);
 			return cacheResolvedPath(await getToolPath(toolId));
 		}
+		if (process.env.PI_LENS_DISABLE_TOOL_INSTALL === "1") {
+			installFailureReasons.set(
+				toolId,
+				"installation disabled by PI_LENS_DISABLE_TOOL_INSTALL=1",
+			);
+			logSessionStart(
+				`auto-install ensure ${toolId}: refused — PI_LENS_DISABLE_TOOL_INSTALL=1`,
+			);
+			return undefined;
+		}
 
-		// Force download
-		const installed = await installTool(toolId);
+		const lock = await acquireInstallLock();
+		if (!lock.release) {
+			logSessionStart(`auto-install ensure ${toolId}: ${lock.reason}`);
+			return undefined;
+		}
+		let installed: boolean;
+		try {
+			installed = await installTool(toolId);
+		} finally {
+			await lock.release();
+		}
 		if (!installed) {
 			logSessionStart(
 				`auto-install ensure ${toolId}: force reinstall failed (${Date.now() - ensureStartMs}ms)`,
@@ -3226,7 +3741,23 @@ export async function ensureTool(
 
 	// Fast path 1: in-memory session cache — no I/O.
 	const cached = resolvedPathCache.get(toolId);
-	if (cached) return cached;
+	if (cached) {
+		if (!isFullyQualified(cached)) return cached;
+		try {
+			await fs.access(cached);
+			return cached;
+		} catch {
+			// The executor would report ENOENT for this cached positive. Evict it
+			// before discovery so the failure heals on this call, not after restart.
+		}
+		resolvedPathCache.delete(toolId);
+		const probeCache = await readProbeCache();
+		delete probeCache[toolId];
+		markProbeCacheChange(toolId, null);
+		logSessionStart(
+			`auto-install ensure ${toolId}: cached path disappeared; re-probing`,
+		);
+	}
 
 	// Fast path 2: persistent probe cache — fs.access + stat, no process spawn.
 	const diskCached = await checkProbeCache(toolId);
@@ -3305,8 +3836,37 @@ export async function ensureTool(
 			);
 			return undefined;
 		}
+		if (process.env.PI_LENS_DISABLE_TOOL_INSTALL === "1") {
+			installFailureReasons.set(
+				toolId,
+				"installation disabled by PI_LENS_DISABLE_TOOL_INSTALL=1",
+			);
+			logSessionStart(
+				`auto-install ensure ${toolId}: refused — PI_LENS_DISABLE_TOOL_INSTALL=1 (${Date.now() - ensureStartMs}ms)`,
+			);
+			return undefined;
+		}
 
-		const installed = await installTool(toolId);
+		const lock = await acquireInstallLock();
+		if (!lock.release) {
+			installFailureReasons.set(toolId, lock.reason ?? "install lock failed");
+			logSessionStart(`auto-install ensure ${toolId}: ${lock.reason}`);
+			return undefined;
+		}
+		let installed: boolean;
+		try {
+			// Cross-process double-check: the lock waiter may now observe the tool
+			// installed by its predecessor and must not run a second package manager.
+			const installedByPeer = await getToolPath(toolId);
+			if (installedByPeer) {
+				resolvedPathCache.set(toolId, installedByPeer);
+				void updateProbeCache(toolId, installedByPeer);
+				return installedByPeer;
+			}
+			installed = await installTool(toolId);
+		} finally {
+			await lock.release();
+		}
 		if (!installed) {
 			logSessionStart(
 				`auto-install ensure ${toolId}: unavailable (${Date.now() - ensureStartMs}ms)`,
@@ -3412,9 +3972,11 @@ export const GITHUB_TOOLS = [
 	"zizmor",
 	"typos-lsp",
 	"tflint",
+	"terragrunt",
 	"terraform-ls",
 	"zls",
 	"hadolint",
+	"helm",
 	"gitleaks",
 	"taplo",
 	"vale",
@@ -3467,6 +4029,36 @@ export function resolveGitHubArchiveBinaryCandidates(
 }
 
 type DownloadAsset = { name: string; browser_download_url: string };
+
+// Signature/checksum siblings a release publishes next to the real asset. A
+// bare-binary tool's substring IS the whole asset name, so `includes` alone
+// matches `<asset>.asc` too and would install a signature file as the binary.
+const ASSET_SIDECAR_SUFFIXES = [
+	".asc",
+	".sig",
+	".minisig",
+	".pem",
+	".cert",
+	".sbom",
+	".sha256",
+	".sha256sum",
+	".md5",
+];
+
+function isAssetSidecar(name: string): boolean {
+	const lower = name.toLowerCase();
+	return ASSET_SIDECAR_SUFFIXES.some((suffix) => lower.endsWith(suffix));
+}
+
+export function pickReleaseAsset<T extends { name: string }>(
+	assets: T[],
+	assetSubstring: string,
+): T | undefined {
+	return (
+		assets.find((a) => a.name === assetSubstring) ??
+		assets.find((a) => a.name.includes(assetSubstring) && !isAssetSidecar(a.name))
+	);
+}
 
 function deriveHashiCorpReleaseAsset(
 	tool: ToolDefinition,

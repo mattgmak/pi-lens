@@ -1,11 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createCwdCachedProbe } from "../../../../../clients/dispatch/runners/utils/runner-helpers.js";
+import {
+	createCwdCachedProbe,
+	resetDispatchAvailabilityState,
+} from "../../../../../clients/dispatch/runners/utils/runner-helpers.js";
 
 describe("createCwdCachedProbe (#120)", () => {
 	const probeFn = vi.fn();
 
 	beforeEach(() => {
 		probeFn.mockReset();
+		resetDispatchAvailabilityState();
 	});
 
 	it("runs the probe at most once per cwd across repeat callers", async () => {
@@ -64,5 +68,14 @@ describe("createCwdCachedProbe (#120)", () => {
 		expect(await probe("/tmp/project-f")).toBe(false);
 		expect(await probe("/tmp/project-f")).toBe(false);
 		expect(probeFn).toHaveBeenCalledTimes(1);
+	});
+
+	it("re-probes a stale negative after the session generation resets", async () => {
+		probeFn.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+		const probe = createCwdCachedProbe(probeFn);
+		expect(await probe("/tmp/project-g")).toBe(false);
+		resetDispatchAvailabilityState();
+		expect(await probe("/tmp/project-g")).toBe(true);
+		expect(probeFn).toHaveBeenCalledTimes(2);
 	});
 });

@@ -6,6 +6,7 @@ import {
 	_resetBaselineSgconfigForTests,
 	resolveBaselineSgconfig,
 } from "../../clients/sgconfig.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 /** Read the single `ruleDirs` entry out of a generated sgconfig.yml. */
 function soleRuleDir(configPath: string): string {
@@ -118,7 +119,7 @@ describe("ast-grep baseline sgconfig", () => {
 
 		afterEach(() => {
 			process.chdir(originalCwd);
-			fs.rmSync(scratchCwd, { recursive: true, force: true });
+			removeTempDirSync(scratchCwd);
 			_resetBaselineSgconfigForTests();
 		});
 

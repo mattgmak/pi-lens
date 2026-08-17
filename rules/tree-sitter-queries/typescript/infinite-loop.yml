@@ -24,10 +24,10 @@ description: |
 
 query: |
   (while_statement
-    condition: (true)
+    condition: (parenthesized_expression (true))
     body: (statement_block) @BODY)
   (for_statement
-    condition: (null)
+    condition: (empty_statement)
     body: (statement_block) @BODY)
 
 metavars:

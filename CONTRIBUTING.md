@@ -69,11 +69,11 @@ This avoids spending time on a direction the maintainers may not accept.
 ## How the codebase is organized
 
 | Area | Entry points | What lives there |
-|------|--------------|------------------|
+| ------ | -------------- | ------------------ |
 | Host adapters | `index.ts`, `mcp/server.ts` | pi extension entry and MCP mirror. New capabilities must go through `clients/lens-engine.ts` — never reach into internals from `mcp/server.ts`. |
 | Dispatch | `clients/dispatch/` | Runner registry, groups, diagnostics merging, cascade. |
 | Runners | `clients/dispatch/runners/*.ts` | One file per tool. Registered in `clients/dispatch/runners/index.ts`. |
-| LSP | `clients/lsp/server.ts`, `clients/lsp/config.ts`, `clients/lsp/server-strategies.ts` | Language server definitions, custom config, diagnostic strategies. |
+| LSP | `clients/lsp/server.ts`, `clients/lsp/config.ts`, `clients/lsp/wait-policy/strategies.ts` | Language server definitions, custom config, diagnostic strategies. |
 | Installers | `clients/installer/index.ts` | Auto-install registry for npm/pip/gem/GitHub/maven/archive tools. |
 | Formatters | `clients/formatters.ts` | Formatter selection and execution. |
 | Rules | `rules/ast-grep-rules/`, `rules/tree-sitter-queries/` | Static analysis rules. |
@@ -128,7 +128,7 @@ Language servers are defined in `clients/lsp/server.ts`.
 
 3. **If it's a primary server**, make sure `clients/lsp/config.ts` `getServersForFileWithConfig` will route files to it.
 
-4. **Add a diagnostic strategy** in `clients/lsp/server-strategies.ts` if the server has unusual push/pull behavior.
+4. **Add a diagnostic strategy** in `clients/lsp/wait-policy/strategies.ts` if the server has unusual push/pull behavior.
 
 5. **Add a smoke fixture** in `scripts/smoke-tools.mjs` `LSP_FIXTURES`.
    - `tests/clients/lsp/lsp-fixture-coverage.test.ts` fails if a registered non-auxiliary server has no fixture (or exemption).
@@ -148,7 +148,7 @@ Auxiliary servers are cross-cutting scanners (security, structural, secrets) tha
    - `killSwitchFlag` and `enabledByDefault`
    - `allowBlocking` and `semantic` policy
 3. Add a fixture with `auxiliaryServerIds` in `scripts/smoke-tools.mjs`.
-4. Add/update `SERVER_DIAGNOSTIC_STRATEGIES` in `clients/lsp/server-strategies.ts` if needed.
+4. Add/update `SERVER_DIAGNOSTIC_STRATEGIES` in `clients/lsp/wait-policy/strategies.ts` if needed.
 
 ## Adding a formatter
 
@@ -196,7 +196,8 @@ Tree-sitter rules live in `rules/tree-sitter-queries/<language>/`.
 1. Write a YAML query file. See `docs/custom-rules.md` and the `pi-lens-write-tree-sitter-rule` skill (`skills/pi-lens-write-tree-sitter-rule/SKILL.md`).
 2. Place it under the correct language directory (e.g. `rules/tree-sitter-queries/typescript/`).
 3. Disabled rules go in `rules/tree-sitter-queries/<language>-disabled/`.
-4. Add a test in `tests/clients/tree-sitter-*.test.ts`.
+4. Add a query-level test in `tests/clients/tree-sitter-*.test.ts` (real `runQueryOnFile` against a fixture).
+5. A rule-bug fix ships a real-runner regression test through `treeSitterRunner.run()` via `tests/support/real-runner-ctx.ts`. Prefer one suite-scoped `makeRealRunnerEnv`; batch related valid/invalid snippets and assert rule-specific lines. Query-level tests can't see dispatch behavior (`skip_test_files`, tiers, delta, cache round-trips). That's where #440 hid.
 
 ### Centralization note
 
@@ -252,7 +253,7 @@ pi-lens is released under the [MIT License](LICENSE). By contributing, you agree
 
 This project follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md). Please read it before participating.
 
-If you land a pull request or report an issue that gets resolved, we'll add you to the [contributors table](README.md#contributors-) via [all-contributors](https://allcontributors.org/). If the all-contributors bot is installed, maintainers can comment `@all-contributors please add @username for code,bug`; otherwise update `.all-contributorsrc` and regenerate the table with `npx all-contributors-cli generate`.
+If you land a pull request or report an issue that gets resolved, we'll add you to the [contributors table](README.md#contributors-) via [all-contributors](https://allcontributors.org/). If the all-contributors bot is installed, maintainers can comment `@all-contributors please add @username for code,bug`; otherwise update `.all-contributorsrc` and regenerate the table with `npx all-contributors-cli generate`. Keep `wrapperTemplate` absent from `.all-contributorsrc`: the CLI inserts invalid `</tr><br />` separators whenever that option is present.
 
 ## Questions?
 

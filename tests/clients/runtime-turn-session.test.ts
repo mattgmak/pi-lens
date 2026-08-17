@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { CacheManager } from "../../clients/cache-manager.js";
+import { snapshotAdvisoryProvenance } from "../../clients/advisory-provenance.js";
 import {
 	consumeSessionStartGuidance,
 	consumeTestFindings,
@@ -14,6 +15,10 @@ import {
 	cancelLSPIdleReset,
 	handleTurnEnd,
 } from "../../clients/runtime-turn.js";
+import {
+	checkCrossProcessLspBudget,
+	_resetLspBudgetDecisionForTests,
+} from "../../clients/lsp-budget.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
 const EMPTY_KNIP_RESULT = {
@@ -42,6 +47,7 @@ function makeTurnEndDeps(
 			ensureAvailable: async () => false,
 			analyze: async () => EMPTY_KNIP_RESULT,
 		},
+		deadCodeClients: [],
 		depChecker: { ensureAvailable: async () => false },
 		testRunnerClient: { getTestRunTarget: () => null },
 		resetLSPService: () => {},
@@ -53,6 +59,62 @@ function makeTurnEndDeps(
 // ── LSP idle reset ─────────────────────────────────────────────────────────────
 
 describe("LSP idle reset", () => {
+	it("uses the short idle timeout when the session-boundary budget is pressured", async () => {
+		const env = setupTestEnvironment("pi-lens-idle-budget-");
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		const resetLSPService = vi.fn();
+		const previousCeiling = process.env.PI_LENS_LSP_BUDGET_CEILING;
+		process.env.PI_LENS_LSP_BUDGET_CEILING = "1";
+		_resetLspBudgetDecisionForTests();
+
+		vi.useFakeTimers();
+		try {
+			await checkCrossProcessLspBudget({
+				registry: [
+					{
+						pid: 42,
+						startedAt: new Date().toISOString(),
+						projectRoot: env.tmpDir,
+						lspChildren: [
+							{
+								pid: 43,
+								serverId: "python",
+								command: "pyright-langserver",
+								spawnedAt: new Date().toISOString(),
+							},
+						],
+						lspChildCount: 1,
+						rssBytes: 1,
+						heartbeatAt: new Date().toISOString(),
+					},
+				],
+				isPidAlive: () => true,
+			});
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, {
+					ctxCwd: env.tmpDir,
+					resetLSPService,
+				}),
+			);
+
+			await vi.advanceTimersByTimeAsync(59_999);
+			expect(resetLSPService).not.toHaveBeenCalled();
+			await vi.advanceTimersByTimeAsync(1);
+			expect(resetLSPService).toHaveBeenCalledTimes(1);
+		} finally {
+			cancelLSPIdleReset();
+			_resetLspBudgetDecisionForTests();
+			vi.useRealTimers();
+			if (previousCeiling === undefined) {
+				delete process.env.PI_LENS_LSP_BUDGET_CEILING;
+			} else {
+				process.env.PI_LENS_LSP_BUDGET_CEILING = previousCeiling;
+			}
+			env.cleanup();
+		}
+	});
+
 	it("skips a pending idle reset after the session generation changes", async () => {
 		const env = setupTestEnvironment("pi-lens-idle-generation-");
 		const runtime = new RuntimeCoordinator();
@@ -338,6 +400,40 @@ describe("stale turn state eviction", () => {
 		env.cleanup();
 	});
 
+	it("retains a live foreign pi/MCP owner instead of consuming its worklist", async () => {
+		const env = setupTestEnvironment("pi-lens-foreign-live-");
+		const runtime = new RuntimeCoordinator();
+		runtime.setTelemetryIdentity({ sessionId: "session-current" });
+		const cacheManager = new CacheManager(false);
+		const filePath = path.join(env.tmpDir, "src/foreign.ts");
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+		fs.writeFileSync(filePath, "export const x = 1;\n");
+
+		cacheManager.addModifiedRange(
+			filePath,
+			{ start: 1, end: 1 },
+			false,
+			env.tmpDir,
+			"mcp-foreign",
+			"mcp",
+		);
+		const foreignState = cacheManager.readTurnState(env.tmpDir);
+		foreignState.owner!.pid = process.pid + 1;
+		cacheManager.writeTurnState(foreignState, env.tmpDir);
+		const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true as never);
+		try {
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, { ctxCwd: env.tmpDir }),
+			);
+			expect(Object.keys(cacheManager.readTurnState(env.tmpDir).files)).toEqual([
+				"src/foreign.ts",
+			]);
+		} finally {
+			killSpy.mockRestore();
+			env.cleanup();
+		}
+	});
+
 	it("keeps turn state written by the current session", async () => {
 		const env = setupTestEnvironment("pi-lens-same-session-");
 		const runtime = new RuntimeCoordinator();
@@ -476,6 +572,454 @@ describe("knip turn-end backoff", () => {
 			env.cleanup();
 		}
 	});
+
+	it("keeps the last good result when a run fails (#925 / #1467)", async () => {
+		const env = setupTestEnvironment("pi-lens-knip-cache-keep-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			const cacheManager = new CacheManager(false);
+			const filePath = path.join(env.tmpDir, "src/current.ts");
+			fs.mkdirSync(path.dirname(filePath), { recursive: true });
+			fs.writeFileSync(filePath, "export const x = 1;\n");
+			cacheManager.addModifiedRange(
+				filePath,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+			);
+			const good = {
+				...EMPTY_KNIP_RESULT,
+				success: true,
+				issues: [{ type: "export", name: "unusedThing", file: "src/old.ts" }],
+				unusedExports: [
+					{ type: "export", name: "unusedThing", file: "src/old.ts" },
+				],
+				summary: "Found 1 issues",
+			};
+			cacheManager.writeCache("knip", good, env.tmpDir);
+
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, {
+					ctxCwd: env.tmpDir,
+					knipClient: {
+						ensureAvailable: async () => false,
+						analyze: async () => ({
+							...EMPTY_KNIP_RESULT,
+							success: false,
+							failureKind: "unavailable-transient",
+							summary: "Knip availability probe timed out after 5528ms.",
+						}),
+					},
+				}),
+			);
+
+			// Pre-fix, this 194-byte failure record replaced the real findings and
+			// every reader afterwards served the failure as the answer.
+			const cached = cacheManager.readCache<typeof good>("knip", env.tmpDir);
+			expect(cached?.data.success).toBe(true);
+			expect(cached?.data.issues).toHaveLength(1);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not back off when the cached failure was an availability verdict", async () => {
+		const env = setupTestEnvironment("pi-lens-knip-availability-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			const cacheManager = new CacheManager(false);
+			const filePath = path.join(env.tmpDir, "src/current.ts");
+			fs.mkdirSync(path.dirname(filePath), { recursive: true });
+			fs.writeFileSync(filePath, "export const x = 1;\n");
+			cacheManager.addModifiedRange(
+				filePath,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+			);
+			cacheManager.writeCache(
+				"knip",
+				{
+					...EMPTY_KNIP_RESULT,
+					success: false,
+					failureKind: "unavailable-transient",
+					summary: "Knip availability probe timed out after 5528ms.",
+				},
+				env.tmpDir,
+			);
+			const analyze = vi.fn(async () => EMPTY_KNIP_RESULT);
+
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, {
+					ctxCwd: env.tmpDir,
+					knipClient: { ensureAvailable: async () => true, analyze },
+				}),
+			);
+
+			// knip never ran, so there is nothing to back off from — and backing
+			// off on the word "timed out" is how a probe verdict became permanent.
+			expect(analyze).toHaveBeenCalled();
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+// ── Call-graph impact delta persistence (#179 / #533) ────────────────────────
+
+describe("turn_end call-graph impact — persists to the delta report", () => {
+	// A tiny two-hop caller chain: editing foo.ts:doThing has a direct caller
+	// (bar.ts:callerFn → WillBreak) and an indirect caller (baz.ts:grandCaller →
+	// MayBreak). impact() BFS surfaces both; the adapter attributes them to the
+	// CALLER files. The turn-state key for the edited file is "src/foo.ts", so
+	// the call-graph callee key must be prefixed with that exact string.
+	function makeCallGraph(
+		coverage: Record<string, unknown> = {
+			totalEvidence: 2,
+			callsEvidence: 2,
+			referencesEvidence: 0,
+			eligibleEvidence: 2,
+			resolvedEvidence: 2,
+			unresolvedEvidence: 0,
+			typeOnlyEvidence: 0,
+			unsupportedEvidence: 0,
+			sameFileEvidence: 0,
+			duplicateEvidence: 0,
+			complete: true,
+			languages: { jsts: "complete" },
+		},
+	) {
+		return {
+			callees: new Map(),
+			callers: new Map<string, Set<string>>([
+				["src/foo.ts:doThing", new Set(["src/bar.ts:callerFn"])],
+				["src/bar.ts:callerFn", new Set(["src/baz.ts:grandCaller"])],
+			]),
+			edges: [],
+			inDegree: new Map(),
+			unresolvedRefs: 0,
+			totalRefs: 0,
+			coverage,
+			builtAt: new Date().toISOString(),
+		} as any;
+	}
+
+	function seedEditedFoo(env: ReturnType<typeof setupTestEnvironment>) {
+		const filePath = path.join(env.tmpDir, "src/foo.ts");
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+		fs.writeFileSync(filePath, "export function doThing() { return 1; }\n");
+		return filePath;
+	}
+
+	it("same-file evidence does not suppress valid cross-file impact", async () => {
+		const env = setupTestEnvironment("pi-lens-callgraph-same-file-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "cg-same-file-session" });
+			runtime.callGraph = makeCallGraph({
+				totalEvidence: 2,
+				callsEvidence: 2,
+				referencesEvidence: 0,
+				eligibleEvidence: 1,
+				resolvedEvidence: 1,
+				unresolvedEvidence: 0,
+				typeOnlyEvidence: 0,
+				unsupportedEvidence: 0,
+				sameFileEvidence: 1,
+				duplicateEvidence: 0,
+				complete: true,
+				languages: { jsts: "complete" },
+			});
+			const cacheManager = new CacheManager(false);
+			seedEditedFoo(env);
+			cacheManager.addModifiedRange(
+				path.join(env.tmpDir, "src/foo.ts"),
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+			);
+
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, { ctxCwd: env.tmpDir }),
+			);
+
+			const report = loadProjectDiagnosticsDeltaReport(env.tmpDir);
+			expect(report?.sources).toContain("call-graph");
+			expect(report?.diagnostics).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						runner: "call-graph",
+						filePath: path.join(env.tmpDir, "src/bar.ts"),
+					}),
+				]),
+			);
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+
+	it("persists call-graph diagnostics + source on a call-graph-ONLY turn (no knip delta)", async () => {
+		const env = setupTestEnvironment("pi-lens-callgraph-only-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "cg-only-session" });
+			runtime.callGraph = makeCallGraph();
+			const cacheManager = new CacheManager(false);
+			seedEditedFoo(env);
+			cacheManager.addModifiedRange(
+				path.join(env.tmpDir, "src/foo.ts"),
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+			);
+
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, { ctxCwd: env.tmpDir }),
+			);
+
+			// lens_diagnostics only ever reads the PERSISTED delta report — assert the
+			// call-graph findings actually reached disk (the #533 silent-vanish bug).
+			const report = loadProjectDiagnosticsDeltaReport(env.tmpDir);
+			expect(report, "delta report was not written at all").toBeDefined();
+			expect(report?.sources).toContain("call-graph");
+			expect(report?.diagnostics).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						runner: "call-graph",
+						rule: "call-graph:willbreak",
+						severity: "warning",
+						filePath: path.join(env.tmpDir, "src/bar.ts"),
+					}),
+				]),
+			);
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+
+	it("persists BOTH knip and call-graph entries on a mixed turn", async () => {
+		const env = setupTestEnvironment("pi-lens-callgraph-mixed-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "cg-mixed-session" });
+			runtime.callGraph = makeCallGraph();
+			const cacheManager = new CacheManager(false);
+			const filePath = seedEditedFoo(env);
+			cacheManager.addModifiedRange(
+				filePath,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+			);
+
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, {
+					ctxCwd: env.tmpDir,
+					knipClient: {
+						ensureAvailable: async () => true,
+						analyze: async () => ({
+							...EMPTY_KNIP_RESULT,
+							issues: [
+								{ type: "unlisted", name: "left-pad", file: filePath, line: 1 },
+							],
+						}),
+					},
+				}),
+			);
+
+			const report = loadProjectDiagnosticsDeltaReport(env.tmpDir);
+			expect(report).toBeDefined();
+			// Pre-fix, the report was serialized with only knip's entries and
+			// "call-graph" was appended afterwards → discarded. Both must survive.
+			expect(report?.sources).toEqual(
+				expect.arrayContaining(["knip", "call-graph"]),
+			);
+			expect(report?.diagnostics.some((d) => d.runner === "knip")).toBe(true);
+			expect(report?.diagnostics.some((d) => d.runner === "call-graph")).toBe(
+				true,
+			);
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+
+	// #1080: a call-graph caller that resolves to a KNOWN test file must be absent
+	// from BOTH the turn-end advisory text and the persisted call-graph delta, for
+	// call-graph-only AND mixed turns — a normal caller remains.
+	function makeCallGraphWithTestCaller() {
+		return {
+			callees: new Map(),
+			callers: new Map<string, Set<string>>([
+				[
+					"src/foo.ts:doThing",
+					new Set(["src/bar.ts:callerFn", "src/bar.test.ts:testCaller"]),
+				],
+			]),
+			edges: [],
+			inDegree: new Map(),
+			unresolvedRefs: 0,
+			totalRefs: 0,
+			coverage: {
+				totalEvidence: 2,
+				callsEvidence: 2,
+				referencesEvidence: 0,
+				eligibleEvidence: 2,
+				resolvedEvidence: 2,
+				unresolvedEvidence: 0,
+				typeOnlyEvidence: 0,
+				unsupportedEvidence: 0,
+				sameFileEvidence: 0,
+				duplicateEvidence: 0,
+				complete: true,
+				languages: { jsts: "complete" },
+			},
+			builtAt: new Date().toISOString(),
+		} as any;
+	}
+
+	it("excludes a test-file caller from advisory + delta on a call-graph-only turn (#1080)", async () => {
+		const env = setupTestEnvironment("pi-lens-callgraph-testrole-only-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "cg-testrole-only" });
+			runtime.callGraph = makeCallGraphWithTestCaller();
+			const cacheManager = new CacheManager(false);
+			seedEditedFoo(env);
+			cacheManager.addModifiedRange(
+				path.join(env.tmpDir, "src/foo.ts"),
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+			);
+
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, { ctxCwd: env.tmpDir }),
+			);
+
+			// Persisted delta: the normal caller's file remains; the test caller's does not.
+			const report = loadProjectDiagnosticsDeltaReport(env.tmpDir);
+			expect(report?.sources).toContain("call-graph");
+			const cgFiles = (report?.diagnostics ?? [])
+				.filter((d) => d.runner === "call-graph")
+				.map((d) => d.filePath);
+			expect(cgFiles).toContain(path.join(env.tmpDir, "src/bar.ts"));
+			expect(cgFiles).not.toContain(path.join(env.tmpDir, "src/bar.test.ts"));
+
+			// Advisory text: same exclusion.
+			const advisory =
+				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages?.[0]
+					?.content ?? "";
+			expect(advisory).toContain("Call-graph impact");
+			expect(advisory).toContain("bar.ts");
+			expect(advisory).not.toContain("bar.test.ts");
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+
+	it("excludes a test-file caller from the call-graph delta on a mixed turn (#1080)", async () => {
+		const env = setupTestEnvironment("pi-lens-callgraph-testrole-mixed-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "cg-testrole-mixed" });
+			runtime.callGraph = makeCallGraphWithTestCaller();
+			const cacheManager = new CacheManager(false);
+			const filePath = seedEditedFoo(env);
+			cacheManager.addModifiedRange(
+				filePath,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+			);
+
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, {
+					ctxCwd: env.tmpDir,
+					knipClient: {
+						ensureAvailable: async () => true,
+						analyze: async () => ({
+							...EMPTY_KNIP_RESULT,
+							issues: [
+								{ type: "unlisted", name: "left-pad", file: filePath, line: 1 },
+							],
+						}),
+					},
+				}),
+			);
+
+			const report = loadProjectDiagnosticsDeltaReport(env.tmpDir);
+			expect(report?.sources).toEqual(
+				expect.arrayContaining(["knip", "call-graph"]),
+			);
+			const cgFiles = (report?.diagnostics ?? [])
+				.filter((d) => d.runner === "call-graph")
+				.map((d) => d.filePath);
+			expect(cgFiles).toContain(path.join(env.tmpDir, "src/bar.ts"));
+			expect(cgFiles).not.toContain(path.join(env.tmpDir, "src/bar.test.ts"));
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+
+	it("does not emit impact findings for mixed supported/unsupported coverage", async () => {
+		const env = setupTestEnvironment("pi-lens-callgraph-partial-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "cg-partial-session" });
+			runtime.callGraph = makeCallGraph({
+				totalEvidence: 3,
+				callsEvidence: 3,
+				referencesEvidence: 0,
+				eligibleEvidence: 2,
+				resolvedEvidence: 2,
+				unresolvedEvidence: 0,
+				typeOnlyEvidence: 0,
+				unsupportedEvidence: 1,
+				duplicateEvidence: 0,
+				complete: false,
+				languages: { jsts: "complete", javascript: "unavailable" },
+			});
+			const cacheManager = new CacheManager(false);
+			const filePath = seedEditedFoo(env);
+			cacheManager.addModifiedRange(filePath, { start: 1, end: 1 }, false, env.tmpDir);
+
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, { ctxCwd: env.tmpDir }),
+			);
+
+			const report = loadProjectDiagnosticsDeltaReport(env.tmpDir);
+			expect(report?.sources ?? []).not.toContain("call-graph");
+			expect(report?.diagnostics ?? []).not.toEqual(
+				expect.arrayContaining([expect.objectContaining({ runner: "call-graph" })]),
+			);
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
 });
 
 // ── sessionId stamped into turn state ─────────────────────────────────────────
@@ -547,14 +1091,23 @@ describe("context injection framing", () => {
 	it("consumeTestFindings includes automated-check framing", () => {
 		const env = setupTestEnvironment("pi-lens-ctx-test-");
 		const cacheManager = new CacheManager(false);
+		const runtime = new RuntimeCoordinator();
+		const testFile = path.join(env.tmpDir, "sample.test.ts");
+		fs.writeFileSync(testFile, "test('sample', () => {});\n");
+		const provenance = snapshotAdvisoryProvenance({
+			cwd: env.tmpDir,
+			runtime,
+			generation: 1,
+			files: [{ path: testFile, role: "test" }],
+		});
 
 		cacheManager.writeCache(
 			"test-runner-findings",
-			{ content: "[Tests] ✗ 1/3 failed — vitest\n" },
+			{ content: "[Tests] ✗ 1/3 failed — vitest\n", provenance },
 			env.tmpDir,
 		);
 
-		const result = consumeTestFindings(cacheManager, env.tmpDir);
+		const result = consumeTestFindings(cacheManager, env.tmpDir, runtime);
 		expect(result).toBeDefined();
 		expect(result!.messages[0].content).toContain("not a user request");
 		expect(result!.messages[0].content).toContain("fix before continuing");
@@ -689,21 +1242,37 @@ describe("unresolved inline blocker re-surfacing", () => {
 	});
 
 	it("consumeInlineBlockers empties the map", () => {
-		const runtime = new RuntimeCoordinator();
-		runtime.recordInlineBlockers("/a/b.ts", "🔴 STOP");
-		runtime.recordInlineBlockers("/a/c.ts", "🔴 STOP 2");
-		const first = runtime.consumeInlineBlockers();
-		expect(first).toHaveLength(2);
-		const second = runtime.consumeInlineBlockers();
-		expect(second).toHaveLength(0);
+		const env = setupTestEnvironment("pi-lens-consume-blockers-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			const a = path.join(env.tmpDir, "b.ts");
+			const c = path.join(env.tmpDir, "c.ts");
+			fs.writeFileSync(a, "x\n");
+			fs.writeFileSync(c, "x\n");
+			runtime.recordInlineBlockers(a, "🔴 STOP");
+			runtime.recordInlineBlockers(c, "🔴 STOP 2");
+			const first = runtime.consumeInlineBlockers();
+			expect(first).toHaveLength(2);
+			const second = runtime.consumeInlineBlockers();
+			expect(second).toHaveLength(0);
+		} finally {
+			env.cleanup();
+		}
 	});
 
-	it("beginTurn clears pending inline blockers from previous turn", () => {
-		const runtime = new RuntimeCoordinator();
-		runtime.recordInlineBlockers("/a/x.ts", "🔴 STOP");
-		runtime.beginTurn();
-		const entries = runtime.consumeInlineBlockers();
-		expect(entries).toHaveLength(0);
+	it("beginTurn preserves unresolved inline blockers from previous turns", () => {
+		const env = setupTestEnvironment("pi-lens-beginturn-blockers-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			const file = path.join(env.tmpDir, "x.ts");
+			fs.writeFileSync(file, "x\n");
+			runtime.recordInlineBlockers(file, "🔴 STOP");
+			runtime.beginTurn();
+			const entries = runtime.getInlineBlockersSnapshot();
+			expect(entries).toHaveLength(1);
+		} finally {
+			env.cleanup();
+		}
 	});
 });
 
@@ -788,6 +1357,123 @@ describe("turn_end unified secret surfacing", () => {
 			expect(content).toContain("aws-access-token");
 			// Exactly one secrets blocker header.
 			expect(content.split("hardcoded secrets detected").length - 1).toBe(1);
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+// ── Dead-path gitleaks findings (#1461 slice 1 / #1460) ───────────────────────
+
+describe("turn_end gitleaks findings for deleted files", () => {
+	// The live #1460 shape: a gitleaks scan flags a path, the directory is
+	// deleted, and the finding is still inside the 30-minute TTL at turn_end.
+	// Before the fix it shipped as a 🔴 STOP blocker naming a file the agent
+	// cannot fix.
+	function setupSecretTurn(prefix: string) {
+		const env = setupTestEnvironment(prefix);
+		const runtime = new RuntimeCoordinator();
+		runtime.setTelemetryIdentity({ sessionId: "dead-path-session" });
+		const cacheManager = new CacheManager(false);
+		// An edited file that still exists — so provenance sees a live workspace
+		// and the advisory is never suppressed for the unrelated `allFilesDeleted`
+		// reason. This is exactly why #1419's guard answered "current".
+		const editedFile = path.join(env.tmpDir, "src/edited.ts");
+		fs.mkdirSync(path.dirname(editedFile), { recursive: true });
+		fs.writeFileSync(editedFile, "export const value = 1;\n");
+		cacheManager.addModifiedRange(
+			editedFile,
+			{ start: 1, end: 1 },
+			false,
+			env.tmpDir,
+			"dead-path-session",
+		);
+		return { env, runtime, cacheManager };
+	}
+
+	function writeGitleaksCache(
+		cacheManager: CacheManager,
+		cwd: string,
+		findings: Array<{ ruleId: string; file: string; startLine: number; description: string }>,
+	) {
+		cacheManager.writeCache(
+			"gitleaks",
+			{ success: true, scannedAt: "", findings },
+			cwd,
+		);
+	}
+
+	it("does NOT deliver a cached finding whose file was deleted after the scan", async () => {
+		const { env, runtime, cacheManager } = setupSecretTurn("pi-lens-dead-path-");
+		try {
+			const deletedDir = path.join(env.tmpDir, ".pi/smoke-research/data");
+			const deletedFile = path.join(deletedDir, "sources.json");
+			fs.mkdirSync(deletedDir, { recursive: true });
+			fs.writeFileSync(deletedFile, '{"key":"AKIA..."}\n');
+			writeGitleaksCache(cacheManager, env.tmpDir, [
+				{
+					ruleId: "generic-api-key",
+					file: deletedFile,
+					startLine: 1341,
+					description: "Detected a Generic API Key",
+				},
+			]);
+			// The deletion that the TTL cannot see.
+			fs.rmSync(path.join(env.tmpDir, ".pi"), { recursive: true, force: true });
+
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, { ctxCwd: env.tmpDir }),
+			);
+
+			const content =
+				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages?.[0]
+					?.content ?? "";
+			expect(content).not.toContain("hardcoded secrets detected");
+			expect(content).not.toContain("sources.json");
+			expect(content).not.toContain("generic-api-key");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("delivers live-path findings unchanged and drops only the dead ones", async () => {
+		const { env, runtime, cacheManager } = setupSecretTurn("pi-lens-mixed-path-");
+		try {
+			const liveFile = path.join(env.tmpDir, "src/config.ts");
+			fs.writeFileSync(liveFile, "const k = 'AKIA...';\n");
+			const deletedFile = path.join(env.tmpDir, "scratch/sources.json");
+			fs.mkdirSync(path.dirname(deletedFile), { recursive: true });
+			fs.writeFileSync(deletedFile, '{"key":"AKIA..."}\n');
+			writeGitleaksCache(cacheManager, env.tmpDir, [
+				{
+					ruleId: "generic-api-key",
+					file: deletedFile,
+					startLine: 1341,
+					description: "Detected a Generic API Key",
+				},
+				{
+					ruleId: "aws-access-token",
+					file: liveFile,
+					startLine: 42,
+					description: "AWS key",
+				},
+			]);
+			fs.rmSync(path.join(env.tmpDir, "scratch"), {
+				recursive: true,
+				force: true,
+			});
+
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, { ctxCwd: env.tmpDir }),
+			);
+
+			const content =
+				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages?.[0]
+					?.content ?? "";
+			expect(content).toContain("hardcoded secrets detected");
+			expect(content).toContain("src/config.ts:42");
+			expect(content).toContain("aws-access-token");
+			expect(content).not.toContain("sources.json");
 		} finally {
 			env.cleanup();
 		}
@@ -925,12 +1611,117 @@ describe("turn_end test runner — stale results are cached, not discarded", () 
 			const cached = cacheManager.readCache<{
 				content: string;
 				stale?: boolean;
+				superseded?: boolean;
+				provenance?: { files: unknown[] };
 			}>("test-runner-findings", env.tmpDir);
 
 			// The old behavior discarded this entirely (no cache entry at all).
 			expect(cached?.data?.content).toContain("[Tests] ✗ 0/1 passed");
 			expect(cached?.data?.stale).toBe(true);
+			expect(cached?.data?.superseded).toBe(true);
+			expect(cached?.data?.provenance?.files.length).toBeGreaterThan(0);
 			expect(cached?.data?.content).toContain("prior turn");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("marks a same-turn external rewrite superseded", async () => {
+		const env = setupTestEnvironment("pi-lens-test-rewrite-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "rewrite-session" });
+			const cacheManager = new CacheManager(false);
+			const srcFile = path.join(env.tmpDir, "src/foo.ts");
+			const testFile = path.join(env.tmpDir, "src/foo.test.ts");
+			fs.mkdirSync(path.dirname(srcFile), { recursive: true });
+			fs.writeFileSync(srcFile, "export const x = 1;\n");
+			fs.writeFileSync(testFile, "test('x', () => {});\n");
+			cacheManager.addModifiedRange(srcFile, { start: 1, end: 1 }, false, env.tmpDir, "rewrite-session");
+			let resolveRun!: (value: any) => void;
+			const run = new Promise<any>((resolve) => { resolveRun = resolve; });
+			await handleTurnEnd(makeTurnEndDeps(runtime, cacheManager, {
+				ctxCwd: env.tmpDir,
+				testRunnerClient: {
+					getTestRunTarget: () => ({ testFile, runner: "vitest", config: {}, strategy: "related" as const }),
+					runTestFileAsync: () => run,
+					formatResult: () => "rewrite failure",
+				},
+			}));
+			fs.writeFileSync(srcFile, "export const x = 2;\n");
+			resolveRun({ file: testFile, sourceFile: srcFile, runner: "vitest", passed: 0, failed: 1, skipped: 0, failures: [], duration: 1 });
+			await new Promise((resolve) => setImmediate(resolve));
+			const cached = cacheManager.readCache<{ superseded?: boolean; launchedFrom?: unknown; publishedAgainst?: unknown }>("test-runner-findings", env.tmpDir)?.data;
+			expect(runtime.turnIndex).toBe(0);
+			expect(cached).toMatchObject({ superseded: true });
+			expect(cached?.launchedFrom).toBeDefined();
+			expect(cached?.publishedAgainst).toBeDefined();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not let an older test generation overwrite a newer batch", async () => {
+		const env = setupTestEnvironment("pi-lens-test-generation-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "generation-session" });
+			const cacheManager = new CacheManager(false);
+			const srcFile = path.join(env.tmpDir, "src/foo.ts");
+			const testFile = path.join(env.tmpDir, "src/foo.test.ts");
+			fs.mkdirSync(path.dirname(srcFile), { recursive: true });
+			fs.writeFileSync(srcFile, "export const x = 1;\n");
+			fs.writeFileSync(testFile, "test('x', () => {});\n");
+			const resolvers: Array<(value: any) => void> = [];
+			const runner = {
+				getTestRunTarget: () => ({ testFile, runner: "vitest", config: {}, strategy: "related" as const }),
+				runTestFileAsync: () => new Promise<any>((resolve) => resolvers.push(resolve)),
+				formatResult: (result: { duration: number }) => `generation-${result.duration}`,
+			};
+			const fire = async () => {
+				cacheManager.addModifiedRange(srcFile, { start: 1, end: 1 }, false, env.tmpDir, "generation-session");
+				await handleTurnEnd(makeTurnEndDeps(runtime, cacheManager, { ctxCwd: env.tmpDir, testRunnerClient: runner }));
+			};
+			await fire();
+			await fire();
+			resolvers[1]!({ file: testFile, sourceFile: srcFile, runner: "vitest", passed: 0, failed: 1, skipped: 0, failures: [], duration: 2 });
+			await new Promise((resolve) => setImmediate(resolve));
+			resolvers[0]!({ file: testFile, sourceFile: srcFile, runner: "vitest", passed: 0, failed: 1, skipped: 0, failures: [], duration: 1 });
+			await new Promise((resolve) => setImmediate(resolve));
+			const cached = cacheManager.readCache<{ content: string; testRunGeneration: number }>("test-runner-findings", env.tmpDir)?.data;
+			expect(cached).toMatchObject({ content: "generation-2", testRunGeneration: 2 });
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("publishes a settling failure after an empty context delivery", async () => {
+		const env = setupTestEnvironment("pi-lens-test-empty-consume-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "empty-consume-session" });
+			const cacheManager = new CacheManager(false);
+			const srcFile = path.join(env.tmpDir, "src/foo.ts");
+			const testFile = path.join(env.tmpDir, "src/foo.test.ts");
+			fs.mkdirSync(path.dirname(srcFile), { recursive: true });
+			fs.writeFileSync(srcFile, "export const x = 1;\n");
+			fs.writeFileSync(testFile, "test('x', () => {});\n");
+			cacheManager.addModifiedRange(srcFile, { start: 1, end: 1 }, false, env.tmpDir, "empty-consume-session");
+			let resolveRun!: (value: any) => void;
+			const run = new Promise<any>((resolve) => { resolveRun = resolve; });
+			await handleTurnEnd(makeTurnEndDeps(runtime, cacheManager, {
+				ctxCwd: env.tmpDir,
+				testRunnerClient: {
+					getTestRunTarget: () => ({ testFile, runner: "vitest", config: {}, strategy: "related" as const }),
+					runTestFileAsync: () => run,
+					formatResult: () => "late failure",
+				},
+			}));
+			expect(consumeTestFindings(cacheManager, env.tmpDir, runtime)).toBeUndefined();
+			resolveRun({ file: testFile, sourceFile: srcFile, runner: "vitest", passed: 0, failed: 1, skipped: 0, failures: [], duration: 1 });
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(cacheManager.readCache<{ content: string }>("test-runner-findings", env.tmpDir)?.data?.content)
+				.toBe("late failure");
 		} finally {
 			env.cleanup();
 		}
@@ -994,6 +1785,103 @@ describe("turn_end test runner — stale results are cached, not discarded", () 
 		} finally {
 			env.cleanup();
 		}
+	});
+});
+
+// ── #1479: the turn-end line must not print a measurement it does not have ────
+//
+// `(0ms)` was printed both for a run that took under a millisecond and for one
+// nobody timed. Only the second is a defect, so these three cases pin BOTH
+// directions: a falsy check (`duration ? ... : "unmeasured"`) would satisfy the
+// unmeasured case and silently relabel a real zero, which is the mistake this
+// issue is about, one layer up.
+
+describe("turn_end test runner — unmeasured duration is not printed as 0ms", () => {
+	async function logLineFor(
+		durationField: Record<string, unknown>,
+		tmpPrefix: string,
+	): Promise<string> {
+		const env = setupTestEnvironment(tmpPrefix);
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "duration-session" });
+			const cacheManager = new CacheManager(false);
+
+			const srcFile = path.join(env.tmpDir, "src/foo.ts");
+			const testFile = path.join(env.tmpDir, "src/foo.test.ts");
+			fs.mkdirSync(path.dirname(srcFile), { recursive: true });
+			fs.writeFileSync(srcFile, "export const x = 1;\n");
+			fs.writeFileSync(testFile, "test('x', () => {});\n");
+			cacheManager.addModifiedRange(
+				srcFile,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+				"duration-session",
+			);
+
+			const lines: string[] = [];
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, {
+					ctxCwd: env.tmpDir,
+					dbg: (msg: string) => {
+						lines.push(msg);
+					},
+					testRunnerClient: {
+						getTestRunTarget: () => ({
+							testFile,
+							runner: "vitest",
+							config: {} as any,
+							strategy: "related" as const,
+						}),
+						runTestFileAsync: async () => ({
+							file: testFile,
+							sourceFile: srcFile,
+							runner: "vitest",
+							passed: 2,
+							failed: 0,
+							skipped: 0,
+							failures: [],
+							...durationField,
+						}),
+						formatResult: () => "",
+					},
+				}),
+			);
+			await new Promise((resolve) => setImmediate(resolve));
+
+			const line = lines.find((l) => l.includes("turn_end: test vitest"));
+			expect(line).toBeDefined();
+			return line as string;
+		} finally {
+			env.cleanup();
+		}
+	}
+
+	it("prints (unmeasured) when the runner reported no duration", async () => {
+		// No `duration` key at all — an emptyResult, a runner error, or a JSON
+		// payload with no readable suite timestamps all arrive in this shape.
+		const line = await logLineFor({}, "pi-lens-turn-unmeasured-");
+
+		expect(line).toContain("PASS 2p/0f (unmeasured)");
+		expect(line).not.toContain("0ms");
+	});
+
+	it("still prints (0ms) for a run that was measured at zero", async () => {
+		// pytest really does print `in 0.00s`, and a suite whose startTime
+		// equals its endTime really did run in under a millisecond. Those are
+		// measurements and must survive.
+		const line = await logLineFor({ duration: 0 }, "pi-lens-turn-zero-");
+
+		expect(line).toContain("PASS 2p/0f (0ms)");
+		expect(line).not.toContain("unmeasured");
+	});
+
+	it("prints the measured value unchanged for a normal run", async () => {
+		const line = await logLineFor({ duration: 137 }, "pi-lens-turn-measured-");
+
+		expect(line).toContain("PASS 2p/0f (137ms)");
+		expect(line).not.toContain("unmeasured");
 	});
 });
 

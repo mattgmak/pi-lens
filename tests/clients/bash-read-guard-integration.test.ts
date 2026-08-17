@@ -16,6 +16,7 @@ import {
 	extractWrittenPathsFromCommand,
 } from "../../clients/bash-file-access.js";
 import { createReadGuard } from "../../clients/read-guard.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 vi.mock("../../clients/read-guard-logger.js", () => ({
 	logReadGuardEvent: vi.fn(),
@@ -78,7 +79,7 @@ beforeEach(() => {
 	tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-brgi-"));
 });
 afterEach(() => {
-	fs.rmSync(tmp, { recursive: true, force: true });
+	removeTempDirSync(tmp);
 });
 
 describe("bash file access → read-guard", () => {

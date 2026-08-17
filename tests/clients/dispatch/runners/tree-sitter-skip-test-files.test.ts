@@ -6,58 +6,57 @@
  * REAL runner (real client + real query loader) so the isTestFile filter is under
  * test, not mocked away.
  */
-import * as fs from "node:fs";
-import * as path from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
-import { FactStore } from "../../../../clients/dispatch/fact-store.js";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import treeSitterRunner from "../../../../clients/dispatch/runners/tree-sitter.js";
-import { setupTestEnvironment } from "../../test-utils.js";
 
-const cleanups: Array<() => void> = [];
-afterAll(() => {
-	for (const c of cleanups) c();
-});
+// Keep unrelated fire-and-forget review-graph enrichment out of real-runner tests.
+vi.mock(
+	"../../../../clients/review-graph/service.js",
+	async (importOriginal) => ({
+		...(await importOriginal<
+			typeof import("../../../../clients/review-graph/service.js")
+		>()),
+		recordEntitySnapshotDiff: () => ({ added: [], removed: [], modified: [] }),
+	}),
+);
+import {
+	assertGrammarAvailable,
+	firedRuleIds,
+	makeRealRunnerEnv,
+	type RealRunnerEnv,
+} from "../../../support/real-runner-ctx.js";
 
-function ctxFor(filePath: string) {
-	return {
-		filePath,
-		cwd: path.dirname(filePath),
-		kind: "python",
-		fileRole: "source",
-		pi: { getFlag: () => undefined },
-		autofix: false,
-		deltaMode: true,
-		blockingOnly: false,
-		modifiedRanges: undefined,
-		facts: new FactStore(),
-		hasTool: async () => true,
-		log: () => {},
-	};
-}
+let env: RealRunnerEnv;
+afterAll(() => env?.cleanup());
 
-async function rulesFor(filePath: string): Promise<string[]> {
-	const result = await treeSitterRunner.run(ctxFor(filePath) as never);
-	return (result.diagnostics ?? []).map((d) => d.rule ?? d.id ?? "");
+async function rulesFor(
+	relPath: string,
+	content: string,
+): Promise<Set<string>> {
+	const { ctx } = env.addFile(relPath, content);
+	return firedRuleIds(await treeSitterRunner.run(ctx));
 }
 
 const ASSERT_SRC = "def f(x):\n    assert x > 0, 'x required'\n    return x\n";
 
 describe("tree-sitter runner — skip_test_files (#440)", () => {
-	it("flags python-assert-production in a production file", async () => {
-		const env = setupTestEnvironment("pi-lens-440-prod-");
-		cleanups.push(env.cleanup);
-		const fp = path.join(env.tmpDir, "app.py");
-		fs.writeFileSync(fp, ASSERT_SRC);
-		expect(await rulesFor(fp)).toContain("python-assert-production");
+	beforeAll(async () => {
+		env = makeRealRunnerEnv();
+		await assertGrammarAvailable("python");
 	});
 
+	it("flags python-assert-production in a production file", async () => {
+		expect(await rulesFor("app.py", ASSERT_SRC)).toContain(
+			"python-assert-production",
+		);
+	}, 30_000);
+
 	it("does NOT flag python-assert-production in a tests/ file", async () => {
-		const env = setupTestEnvironment("pi-lens-440-test-");
-		cleanups.push(env.cleanup);
-		const testsDir = path.join(env.tmpDir, "tests");
-		fs.mkdirSync(testsDir, { recursive: true });
-		const fp = path.join(testsDir, "test_app.py");
-		fs.writeFileSync(fp, "def test_ok():\n    assert 1 + 1 == 2\n");
-		expect(await rulesFor(fp)).not.toContain("python-assert-production");
-	});
+		expect(
+			await rulesFor(
+				"tests/test_app.py",
+				"def test_ok():\n    assert 1 + 1 == 2\n",
+			),
+		).not.toContain("python-assert-production");
+	}, 30_000);
 });

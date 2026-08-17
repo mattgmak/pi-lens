@@ -60,8 +60,6 @@ node scripts/playground-verify-rule.mjs rules/ast-grep-rules/rules/jsx-boolean-s
 node scripts/playground-verify-rule.mjs rules/ast-grep-rules/rules/no-console-except-error.yml \
   --code "ignored" --keep-chrome
 
-# Audit all our shipped rules (uses the default source — no per-rule expectations)
-node scripts/playground-verify-rule.mjs --all
 ```
 
 ### Output
@@ -161,8 +159,9 @@ auto-skipped when Google Chrome is not on `PATH` and
   reuses Chrome (~1.5s for the CDP attach + load + scrape). With
   `--keep-chrome`, multiple `playground-verify-rule.mjs` invocations
   share the same Chrome process.
-- The verifier does **not** parallelize — it's a single-rule smoke test.
-  For batch audits, run `--all` (TODO) or script the loop yourself.
+- The verifier does **not** parallelize — it's a single-rule smoke test. It has
+  no batch-audit flag; script a loop yourself if you need to check multiple
+  rules.
 
 ## Known limitations
 

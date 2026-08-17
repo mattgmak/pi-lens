@@ -5,6 +5,7 @@
  * with mocked dispatcher to avoid real tool spawning.
  */
 
+import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	dispatchLintWithResult,
@@ -12,8 +13,15 @@ import {
 	resetDispatchBaselines,
 	shouldDispatch,
 } from "../../../clients/dispatch/integration.js";
+import { normalizeMapKey } from "../../../clients/path-utils.js";
 
-// Mock dispatcher internals to avoid real runner execution
+// Mock dispatcher internals to avoid real runner execution. createDispatchContext
+// is wrapped (not replaced) — real implementation, but call-args are now
+// observable via vi.mocked(createDispatchContext).mock.calls. This is what
+// closes the options->createDispatchContext positional passthrough hop
+// (integration.ts:2202-2213): dispatchForFile being fully mocked meant a
+// severed telemetryModel/telemetryProvider passthrough there went unnoticed
+// by every existing case in this file.
 vi.mock("../../../clients/dispatch/dispatcher.js", async (importOriginal) => {
 	const mod =
 		await importOriginal<
@@ -22,6 +30,7 @@ vi.mock("../../../clients/dispatch/dispatcher.js", async (importOriginal) => {
 	return {
 		...mod,
 		dispatchForFile: vi.fn(),
+		createDispatchContext: vi.fn(mod.createDispatchContext),
 	};
 });
 
@@ -36,7 +45,10 @@ vi.mock("../../../clients/dispatch/fact-runner.js", async (importOriginal) => {
 	};
 });
 
-import { dispatchForFile } from "../../../clients/dispatch/dispatcher.js";
+import {
+	createDispatchContext,
+	dispatchForFile,
+} from "../../../clients/dispatch/dispatcher.js";
 import { runProviders } from "../../../clients/dispatch/fact-runner.js";
 
 const emptyDispatchResult = {
@@ -57,6 +69,7 @@ describe("Dispatch Integration", () => {
 		vi.mocked(dispatchForFile).mockReset();
 		vi.mocked(dispatchForFile).mockResolvedValue(emptyDispatchResult);
 		vi.mocked(runProviders).mockReset();
+		vi.mocked(createDispatchContext).mockClear();
 	});
 
 	describe("dispatchLintWithResult", () => {
@@ -188,6 +201,47 @@ describe("Dispatch Integration", () => {
 			expect(
 				vi.mocked(dispatchForFile).mock.calls.at(-1)?.[0].blockingOnly,
 			).toBe(false);
+		});
+
+		it("carries the authoritative workspace root separately from a language root", async () => {
+			await dispatchLintWithResult(
+				"app.ts",
+				"/repo/packages/pkg-a",
+				{ getFlag: () => false },
+				undefined,
+				undefined,
+				{ projectRoot: "/repo" },
+			);
+
+		const ctx = vi.mocked(dispatchForFile).mock.calls.at(-1)?.[0];
+		expect(ctx?.cwd).toBe(
+			normalizeMapKey(path.resolve("/repo/packages/pkg-a")),
+		);
+		expect(ctx?.projectRoot).toBe(normalizeMapKey(path.resolve("/repo")));
+		});
+
+		it("passes telemetryModel/telemetryProvider through to createDispatchContext (#1448)", async () => {
+			await dispatchLintWithResult(
+				"app.ts",
+				"/project",
+				{ getFlag: () => false },
+				undefined,
+				undefined,
+				{
+					telemetryModel: "claude-sonnet-4-5",
+					telemetryProvider: "anthropic",
+				},
+			);
+
+			const call = vi.mocked(createDispatchContext).mock.calls.at(-1);
+			// Positional args per createDispatchContext's signature: ...,
+			// projectRoot, writeIndex, telemetryModel, telemetryProvider.
+			expect(call?.[8]).toBe("claude-sonnet-4-5");
+			expect(call?.[9]).toBe("anthropic");
+
+			const ctx = vi.mocked(dispatchForFile).mock.calls.at(-1)?.[0];
+			expect(ctx?.telemetryModel).toBe("claude-sonnet-4-5");
+			expect(ctx?.telemetryProvider).toBe("anthropic");
 		});
 	});
 

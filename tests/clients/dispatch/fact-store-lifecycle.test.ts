@@ -17,6 +17,15 @@ describe("FactStore lifecycle contract", () => {
     expect(store.getSessionFact("session.toolCache.biome")).toBe(true);
   });
 
+  it("deleteFileFact releases one value while preserving sibling derived facts", () => {
+    const store = new FactStore();
+    store.setFileFact("src/a.ts", "file.content", "full source");
+    store.setFileFact("src/a.ts", "file.imports", [{ source: "./b" }]);
+    store.deleteFileFact("src/a.ts", "file.content");
+    expect(store.getFileFact("src/a.ts", "file.content")).toBeUndefined();
+    expect(store.getFileFact("src/a.ts", "file.imports")).toEqual([{ source: "./b" }]);
+  });
+
   it("store is fully usable after clearAll — re-population works", () => {
     const store = new FactStore();
     store.setFileFact("/src/a.ts", "content", "original");

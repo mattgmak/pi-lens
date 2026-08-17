@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
+	_setBeforeWarningStateLockForTests,
 	buildActionableWarningsReport,
 	checkActionableWarningsReportFresh,
 	createActionableWarningId,
@@ -11,6 +12,8 @@ import {
 	type ActionableWarningsReport,
 } from "../../clients/actionable-warnings.js";
 import type { Diagnostic } from "../../clients/dispatch/types.js";
+import { getProjectDataDir } from "../../clients/file-utils.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 vi.mock("../../clients/lsp/index.js", () => ({
 	getLSPService: () => ({
@@ -36,6 +39,59 @@ function makeWarning(filePath: string): Diagnostic {
 }
 
 describe("actionable warnings", () => {
+	it("preserves a sibling writer's concurrent suppression", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-aw-lock-"));
+		const filePath = path.join(cwd, "src", "a.ts");
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+		fs.writeFileSync(filePath, "console.log('x');\n");
+		const record = recordFromDispatchDiagnostic(makeWarning(filePath), cwd);
+		expect(record).toBeDefined();
+		try {
+			_setBeforeWarningStateLockForTests(() => {
+				const projectData = getProjectDataDir(cwd);
+				const suppressionPath = path.join(
+					projectData,
+					"cache",
+					"actionable-warning-state.json",
+				);
+				fs.mkdirSync(path.dirname(suppressionPath), { recursive: true });
+				fs.writeFileSync(
+					suppressionPath,
+					JSON.stringify({
+						warnings: {
+							[record!.id]: {
+								status: "suppressed",
+								reason: "writer B",
+							},
+						},
+					}),
+				);
+			});
+			await buildActionableWarningsReport({
+				cwd,
+				sessionId: "writer-a",
+				turnIndex: 1,
+				files: [filePath],
+				modifiedRangesByFile: new Map(),
+				dispatchWarnings: [record!],
+				includeLspCodeActions: false,
+			});
+			const persisted = JSON.parse(
+				fs.readFileSync(
+					path.join(getProjectDataDir(cwd), "cache", "actionable-warning-state.json"),
+					"utf8",
+				),
+			) as { warnings: Record<string, { status?: string; reason?: string }> };
+			expect(persisted.warnings[record!.id]).toMatchObject({
+				status: "suppressed",
+				reason: "writer B",
+			});
+		} finally {
+			_setBeforeWarningStateLockForTests(null);
+			removeTempDirSync(cwd);
+		}
+	});
+
 	it("creates stable ids for equivalent diagnostics", () => {
 		const cwd = path.join(os.tmpdir(), "project");
 		const filePath = path.join(cwd, "src", "a.ts");
@@ -142,7 +198,7 @@ describe("actionable warnings", () => {
 				"Fixable warnings introduced this turn: 1",
 			);
 		} finally {
-			fs.rmSync(cwd, { recursive: true, force: true });
+			removeTempDirSync(cwd);
 		}
 	});
 });

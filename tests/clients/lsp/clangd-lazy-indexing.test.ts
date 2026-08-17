@@ -6,23 +6,25 @@
  * context for api.hpp/api.cpp so apiSymbol can be found.
  */
 
-import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createLSPClient } from "../../../clients/lsp/client.js";
 import { launchLSP, stopLSP } from "../../../clients/lsp/launch.js";
+import { findCommand } from "../../../clients/safe-spawn.js";
 import { setupTestEnvironment } from "../test-utils.js";
 
-// Detect clangd availability at module load time
-const CLANGD: string | null = (() => {
-	try {
-		const bin = process.platform === "win32" ? "where clangd" : "which clangd";
-		return execSync(bin, { encoding: "utf8" }).trim() || null;
-	} catch {
-		return null;
-	}
-})();
+// Detect clangd availability at module load time.
+// #902: was `execSync("where clangd" / "which clangd", ...)` — execSync
+// always shells out (a fresh, uncached cmd.exe wrapper per call on Windows),
+// which intermittently failed to spawn at all under the process-creation
+// pressure of a full parallel test-suite run on windows-latest CI
+// (ENOENT/EAGAIN from the OS, not a real "clangd unavailable" signal).
+// `findCommand` (shared with production, `clients/safe-spawn.ts`) already
+// implements this exact where/which probe via the cached PATH+PATHEXT
+// resolution `safeSpawn` uses — reused here instead of a second, less
+// careful spawn strategy (single source of truth, #883).
+const CLANGD: string | null = findCommand("clangd");
 
 function createCompileCommandsJson(projectDir: string, files: string[]): void {
 	const entries = files.map((f) => ({

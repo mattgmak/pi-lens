@@ -7,6 +7,7 @@ import {
 	discoverJdkHome,
 	resolveJavaRuntimeEnv,
 } from "../../../clients/lsp/jvm-runtime.js";
+import { removeTempDirSync } from "../test-utils.js";
 
 const isWin = process.platform === "win32";
 const JAVA_EXE = isWin ? "java.exe" : "java";
@@ -50,7 +51,7 @@ describe("jvm-runtime — JDK discovery (#241)", () => {
 		if (savedJavaHome === undefined) delete process.env.JAVA_HOME;
 		else process.env.JAVA_HOME = savedJavaHome;
 		for (const dir of dirs.splice(0)) {
-			fs.rmSync(dir, { recursive: true, force: true });
+			removeTempDirSync(dir);
 		}
 	});
 
@@ -113,7 +114,7 @@ describe("jvm-runtime — resolveJavaRuntimeEnv (#241)", () => {
 		if (savedJavaHome === undefined) delete process.env.JAVA_HOME;
 		else process.env.JAVA_HOME = savedJavaHome;
 		for (const dir of dirs.splice(0)) {
-			fs.rmSync(dir, { recursive: true, force: true });
+			removeTempDirSync(dir);
 		}
 	});
 

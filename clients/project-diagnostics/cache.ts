@@ -1,6 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getProjectDataDir } from "../file-utils.js";
+import { writeFileAtomic } from "../atomic-write.js";
+import { readJsonCache } from "../json-cache-read.js";
 import type {
 	ProjectDiagnosticsDeltaReport,
 	ProjectDiagnosticsSnapshot,
@@ -19,19 +21,17 @@ function cachePath(cwd: string, fileName: string): string {
 export function loadProjectDiagnosticsSnapshot(
 	cwd: string,
 ): ProjectDiagnosticsSnapshot | undefined {
-	try {
-		const parsed = JSON.parse(
-			fs.readFileSync(cachePath(cwd, SNAPSHOT_CACHE_FILE), "utf-8"),
-		) as unknown;
-		if (!parsed || typeof parsed !== "object") return undefined;
-		const snapshot = parsed as ProjectDiagnosticsSnapshot;
-		if (snapshot.version !== PROJECT_DIAGNOSTICS_CACHE_VERSION)
-			return undefined;
-		if (!Array.isArray(snapshot.diagnostics)) return undefined;
-		return snapshot;
-	} catch {
-		return undefined;
-	}
+	return readJsonCache<ProjectDiagnosticsSnapshot>(
+		cachePath(cwd, SNAPSHOT_CACHE_FILE),
+		(parsed) => {
+			if (!parsed || typeof parsed !== "object") return undefined;
+			const snapshot = parsed as ProjectDiagnosticsSnapshot;
+			if (snapshot.version !== PROJECT_DIAGNOSTICS_CACHE_VERSION)
+				return undefined;
+			if (!Array.isArray(snapshot.diagnostics)) return undefined;
+			return snapshot;
+		},
+	);
 }
 
 export function saveProjectDiagnosticsSnapshot(
@@ -40,24 +40,23 @@ export function saveProjectDiagnosticsSnapshot(
 ): void {
 	const filePath = cachePath(cwd, SNAPSHOT_CACHE_FILE);
 	fs.mkdirSync(path.dirname(filePath), { recursive: true });
-	fs.writeFileSync(filePath, JSON.stringify(snapshot, null, 2));
+	writeFileAtomic(filePath, JSON.stringify(snapshot, null, 2));
 }
 
 export function loadProjectDiagnosticsDeltaReport(
 	cwd: string,
 ): ProjectDiagnosticsDeltaReport | undefined {
-	try {
-		const parsed = JSON.parse(
-			fs.readFileSync(cachePath(cwd, DELTA_CACHE_FILE), "utf-8"),
-		) as unknown;
-		if (!parsed || typeof parsed !== "object") return undefined;
-		const report = parsed as ProjectDiagnosticsDeltaReport;
-		if (report.version !== PROJECT_DIAGNOSTICS_CACHE_VERSION) return undefined;
-		if (!Array.isArray(report.diagnostics)) return undefined;
-		return report;
-	} catch {
-		return undefined;
-	}
+	return readJsonCache<ProjectDiagnosticsDeltaReport>(
+		cachePath(cwd, DELTA_CACHE_FILE),
+		(parsed) => {
+			if (!parsed || typeof parsed !== "object") return undefined;
+			const report = parsed as ProjectDiagnosticsDeltaReport;
+			if (report.version !== PROJECT_DIAGNOSTICS_CACHE_VERSION)
+				return undefined;
+			if (!Array.isArray(report.diagnostics)) return undefined;
+			return report;
+		},
+	);
 }
 
 export function writeProjectDiagnosticsDeltaReport(
@@ -66,7 +65,7 @@ export function writeProjectDiagnosticsDeltaReport(
 ): void {
 	const filePath = cachePath(cwd, DELTA_CACHE_FILE);
 	fs.mkdirSync(path.dirname(filePath), { recursive: true });
-	fs.writeFileSync(filePath, JSON.stringify(report, null, 2));
+	writeFileAtomic(filePath, JSON.stringify(report, null, 2));
 }
 
 /**

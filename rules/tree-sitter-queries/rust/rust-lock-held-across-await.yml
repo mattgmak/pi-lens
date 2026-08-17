@@ -20,12 +20,13 @@ query: |
     (let_declaration
       pattern: (identifier) @GUARD
       value: (await_expression
-        expression: (call_expression
+        (call_expression
           function: (field_expression
+            value: (_)
             field: (field_identifier) @LOCKFN))))
     (_)*
-    (await_expression) @LATER_AWAIT)
-  (#eq? @LOCKFN "lock")
+    (expression_statement (await_expression) @LATER_AWAIT)
+    (#eq? @LOCKFN "lock"))
 
 metavars:
   - GUARD

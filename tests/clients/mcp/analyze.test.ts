@@ -13,6 +13,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DispatchLatencyReport } from "../../../clients/dispatch/dispatcher.js";
+import { removeTempDirSync } from "../test-utils.js";
 
 vi.mock("../../../clients/dispatch/dispatcher.js", async (importOriginal) => {
 	const mod =
@@ -53,7 +54,10 @@ vi.mock("../../../clients/review-graph/service.js", () => ({
 	buildOrUpdateGraph: mockBuildOrUpdateGraph,
 }));
 
-import { dispatchForFile, getLatencyReports } from "../../../clients/dispatch/dispatcher.js";
+import {
+	dispatchForFile,
+	getLatencyReports,
+} from "../../../clients/dispatch/dispatcher.js";
 import { CacheManager } from "../../../clients/cache-manager.js";
 import { resetDispatchBaselines } from "../../../clients/dispatch/integration.js";
 import { getDiagnosticTracker } from "../../../clients/diagnostic-tracker.js";
@@ -101,8 +105,10 @@ const emptyResult = {
 
 let tmpDir: string;
 let tsFile: string;
+let previousDataDir: string | undefined;
 
 beforeEach(() => {
+	previousDataDir = process.env.PILENS_DATA_DIR;
 	resetDispatchBaselines();
 	clearWidgetState();
 	vi.mocked(dispatchForFile).mockReset();
@@ -113,12 +119,15 @@ beforeEach(() => {
 	mockSupportsLSP.mockReturnValue(false);
 	mockBuildOrUpdateGraph.mockClear();
 	tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-mcp-analyze-"));
+	process.env.PILENS_DATA_DIR = path.join(tmpDir, "data");
 	tsFile = path.join(tmpDir, "app.ts");
 	fs.writeFileSync(tsFile, "export const a = 1;\n");
 });
 
 afterEach(() => {
-	fs.rmSync(tmpDir, { recursive: true, force: true });
+	if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+	else process.env.PILENS_DATA_DIR = previousDataDir;
+	removeTempDirSync(tmpDir);
 });
 
 describe("analyzeFile", () => {
@@ -322,6 +331,95 @@ describe("analyzeFile", () => {
 		await analyzeFile(tsFile, tmpDir, { registerTurnState: true });
 		const turnState = new CacheManager().readTurnState(tmpDir);
 		expect(Object.keys(turnState.files).length).toBe(1);
+	});
+
+	it("claims a stale pi worklist with an explicit MCP owner without null-erasing it", async () => {
+		const cache = new CacheManager();
+		cache.addModifiedRange(
+			tsFile,
+			{ start: 1, end: 1 },
+			false,
+			tmpDir,
+			"stale-pi-session",
+		);
+		const stale = cache.readTurnState(tmpDir);
+		stale.owner!.lastSeen = new Date(Date.now() - 31 * 60_000).toISOString();
+		cache.writeTurnState(stale, tmpDir);
+		vi.mocked(dispatchForFile).mockResolvedValue(emptyResult);
+
+		await analyzeFile(tsFile, tmpDir, { registerTurnState: true });
+
+		const state = cache.readTurnState(tmpDir);
+		expect(state.sessionId).toMatch(/^mcp-/);
+		expect(state.owner).toMatchObject({ kind: "mcp" });
+	});
+
+	it("does not let a live foreign MCP owner consume or extend the worklist (#1262)", () => {
+		const cache = new CacheManager();
+		const first = path.join(tmpDir, "first.ts");
+		const second = path.join(tmpDir, "second.ts");
+		fs.writeFileSync(first, "export const first = 1;\n");
+		fs.writeFileSync(second, "export const second = 2;\n");
+		cache.addModifiedRange(first, { start: 1, end: 1 }, false, tmpDir, "mcp-live-a", "mcp");
+		const foreignState = cache.readTurnState(tmpDir);
+		foreignState.owner!.pid = process.pid + 1;
+		cache.writeTurnState(foreignState, tmpDir);
+		const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true as never);
+		try {
+			cache.addModifiedRange(second, { start: 1, end: 1 }, false, tmpDir, "mcp-live-b", "mcp");
+			const state = cache.readTurnState(tmpDir);
+			expect(Object.keys(state.files)).toEqual(["first.ts"]);
+			expect(cache.getTurnStateAccess(tmpDir, { kind: "mcp", id: "mcp-live-b" })).toBe("foreign-live");
+			const beforeCycle = state.turnCycles;
+			expect(cache.clearTurnState(tmpDir, { kind: "mcp", id: "mcp-live-b" })).toBe(false);
+			expect(cache.incrementTurnCycle(tmpDir, { kind: "mcp", id: "mcp-live-b" }).turnCycles).toBe(beforeCycle);
+			expect(cache.readTurnState(tmpDir).files).toHaveProperty("first.ts");
+		} finally {
+			killSpy.mockRestore();
+		}
+	});
+
+	it("allows a same-process session handoff to advance and clear turn state", () => {
+		const cache = new CacheManager();
+		const file = path.join(tmpDir, "same-process.ts");
+		fs.writeFileSync(file, "export const value = 1;\n");
+		cache.addModifiedRange(file, { start: 1, end: 1 }, false, tmpDir, "pi-old", "pi");
+
+		expect(
+			cache.incrementTurnCycle(tmpDir, { kind: "pi", id: "pi-new" }).turnCycles,
+		).toBe(1);
+		expect(cache.clearTurnState(tmpDir, { kind: "pi", id: "pi-new" })).toBe(true);
+		expect(cache.readTurnState(tmpDir).files).toEqual({});
+	});
+
+	it("preserves explicit writer ownership across pi/MCP handoffs (#1262)", () => {
+		const cache = new CacheManager();
+		const piFile = path.join(tmpDir, "pi.ts");
+		const mcpFile = path.join(tmpDir, "mcp.ts");
+		const sameSessionFile = path.join(tmpDir, "same-session.ts");
+		for (const file of [piFile, mcpFile, sameSessionFile]) {
+			fs.writeFileSync(file, "export const value = 1;\n");
+		}
+
+		cache.addModifiedRange(piFile, { start: 1, end: 1 }, false, tmpDir, "pi-a", "pi");
+		// A live MCP writer cannot consume or claim the pi worklist.
+		cache.addModifiedRange(mcpFile, { start: 1, end: 1 }, false, tmpDir, "mcp-a", "mcp");
+		expect(cache.readTurnState(tmpDir).files).not.toHaveProperty("mcp.ts");
+
+		// A repeated PostToolUse from the same MCP session extends its own worklist.
+		cache.addModifiedRange(sameSessionFile, { start: 1, end: 1 }, false, tmpDir, "pi-a", "pi");
+		expect(cache.readTurnState(tmpDir).files).toHaveProperty("same-session.ts");
+
+		// sessionId:null is non-claiming: it may append a file but never erases owner.
+		cache.addModifiedRange(mcpFile, { start: 1, end: 1 }, false, tmpDir, null, "mcp");
+		expect(cache.readTurnState(tmpDir).owner).toMatchObject({ kind: "pi", id: "pi-a" });
+
+		// A different pi session can replace the owner only after its heartbeat is stale.
+		const stale = cache.readTurnState(tmpDir);
+		stale.owner!.lastSeen = new Date(Date.now() - 31 * 60_000).toISOString();
+		cache.writeTurnState(stale, tmpDir);
+		cache.addModifiedRange(mcpFile, { start: 1, end: 1 }, false, tmpDir, "mcp-b", "mcp");
+		expect(cache.readTurnState(tmpDir).owner).toMatchObject({ kind: "mcp", id: "mcp-b" });
 	});
 
 	it("leaves turn-state untouched by default (#A)", async () => {

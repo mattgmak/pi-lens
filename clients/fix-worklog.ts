@@ -9,6 +9,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Diagnostic } from "./dispatch/types.js";
 import { getProjectDataDir } from "./file-utils.js";
+import { redactSecrets } from "./redact/secrets.js";
 
 // --- Types ---
 
@@ -23,6 +24,19 @@ export interface WorklogEntry {
 	fixable: boolean;
 	fixSuggestion?: string;
 	autoFixed: boolean;
+	/** Model/provider that produced the code this diagnostic fired against
+	 * (#1448). Optional — blank/omitted whenever the runtime doesn't know the
+	 * active identity (e.g. project-wide scans outside a live agent turn).
+	 * Old entries predate these fields entirely; readers must treat both as
+	 * optional. */
+	model?: string;
+	provider?: string;
+}
+
+/** Identity to attribute a worklog append to, when known. */
+export interface WorklogIdentity {
+	model?: string;
+	provider?: string;
 }
 
 // --- Paths ---
@@ -42,6 +56,7 @@ export function appendToWorklog(
 	cwd: string,
 	diagnostics: Diagnostic[],
 	autoFixed: boolean,
+	identity?: WorklogIdentity,
 ): void {
 	if (diagnostics.length === 0) return;
 
@@ -49,6 +64,8 @@ export function appendToWorklog(
 	try {
 		fs.mkdirSync(path.dirname(worklogPath), { recursive: true });
 		const timestamp = new Date().toISOString();
+		const model = identity?.model?.trim() || undefined;
+		const provider = identity?.provider?.trim() || undefined;
 		const lines =
 			diagnostics
 				.map((d) => {
@@ -63,11 +80,17 @@ export function appendToWorklog(
 						fixable: d.fixable ?? false,
 						fixSuggestion: d.fixSuggestion,
 						autoFixed,
+						model,
+						provider,
 					};
 					return JSON.stringify(entry);
 				})
 				.join("\n") + "\n";
-		fs.appendFileSync(worklogPath, lines, "utf8");
+		// Diagnostic messages can quote offending source lines (e.g. a
+		// secret-scanner finding), so scrub credential-shaped text before the
+		// worklog reaches disk — same boundary contract as the NDJSON loggers
+		// (#327). Replacements are JSON-string-safe, so each line stays parseable.
+		fs.appendFileSync(worklogPath, redactSecrets(lines), "utf8");
 	} catch {
 		// Non-fatal — worklog write failure should never surface to the agent
 	}
@@ -82,7 +105,13 @@ export function readWorklog(cwd: string): WorklogEntry[] {
 		return raw
 			.split(/\r?\n/)
 			.filter(Boolean)
-			.map((line) => JSON.parse(line) as WorklogEntry);
+			.flatMap((line) => {
+				try {
+					return [JSON.parse(line) as WorklogEntry];
+				} catch {
+					return [];
+				}
+			});
 	} catch {
 		return [];
 	}

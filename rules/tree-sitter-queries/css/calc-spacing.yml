@@ -21,15 +21,17 @@ description: |
   ```
 
 query: |
-  (call_expression
-    function: (function_name) @FUNC (#eq? @FUNC "calc")
-    arguments: (arguments
-      (binary_expression
-        operator: ("+" | "-") @OP) @EXPR))
+  ((call_expression
+    (function_name) @FUNC
+    (arguments
+      (_) @LEFT
+      (_) @RIGHT) @EXPR)
+    (#eq? @FUNC "calc"))
 
 metavars:
   - FUNC
-  - OP
+  - LEFT
+  - RIGHT
   - EXPR
 
 post_filter: calc_missing_spaces

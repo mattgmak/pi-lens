@@ -11,17 +11,72 @@
  * - Always convert backslashes to forward slashes for Map key consistency
  */
 
-import { existsSync, realpathSync } from "node:fs";
+import { type Dirent, existsSync, realpathSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { dirname, win32 } from "node:path";
+import { win32 } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { minimatch } from "./deps/minimatch.js";
 
 /**
- * Detect if a path is a Windows path (has drive letter or UNC prefix).
+ * Detect a positively Windows-shaped path, regardless of the host OS.
+ *
+ * A backslash anywhere in a path is not enough: it is a legal character in a
+ * POSIX filename. Only a drive-letter prefix (`X:`), a UNC root (`\\`), or a
+ * rooted backslash at position zero (`\`) selects Windows parsing.
  */
-function isWindowsPath(filePath: string): boolean {
-	return /^[A-Za-z]:/.test(filePath) || filePath.startsWith("\\\\");
+export function isWindowsPath(filePath: string): boolean {
+	return /^[A-Za-z]:/.test(filePath) || filePath.startsWith("\\");
+}
+
+/**
+ * Canonical backslash→forward-slash fold — the single sanctioned form of the
+ * `p.replace(/\\/g, "/")` idiom otherwise hand-rolled across the codebase
+ * (~138 sites, #1193). PURE separator normalization: it does NOT resolve,
+ * canonicalize, lowercase, or collapse repeated slashes — reach for
+ * `normalizeFilePath`/`normalizeMapKey`/`normalizeEphemeralMapKey` when a
+ * canonical map *key* (case-fold / realpath) is what you need. Consolidating on
+ * this funnels the scattered transform and makes a shape-2 lint/ast-grep rule
+ * possible for the first time: today a bare inline `.replace(/\\/g, "/")` is
+ * byte-identical to the sanctioned use so it can't be ruled (#1158); once
+ * everything routes through `toPosix`, an *un-migrated* inline `.replace`
+ * becomes detectable.
+ */
+export function toPosix(filePath: string): string {
+	return filePath.replace(/\\/g, "/");
+}
+
+/** Return whether `filePath` is fully qualified under Windows semantics. */
+export function isFullyQualifiedWin32(filePath: string): boolean {
+	return win32.isAbsolute(filePath) && win32.parse(filePath).root.length > 1;
+}
+
+/** Return whether `filePath` is fully qualified under POSIX semantics. */
+export function isFullyQualifiedPosix(filePath: string): boolean {
+	return path.posix.isAbsolute(filePath) && !isWindowsPath(filePath);
+}
+
+/**
+ * Return whether `filePath` is fully qualified under the host's semantics.
+ *
+ * In particular, `/foo` is rooted-relative under Win32 (ambient-drive
+ * dependent) but fully qualified under POSIX.
+ */
+export function isFullyQualified(filePath: string): boolean {
+	return process.platform === "win32"
+		? isFullyQualifiedWin32(filePath)
+		: isFullyQualifiedPosix(filePath);
+}
+
+/**
+ * Split a path into its non-empty segments on EITHER separator (`\` or `/`),
+ * regardless of the running OS — the shape-safe form of `p.split(path.sep)` /
+ * an inline `p.split(/[\\/]+/)`, which #1161/#1163 showed must not assume the
+ * host separator for a possibly-cross-shaped path. Drops empty segments
+ * (leading slash, drive-root, doubled separators).
+ */
+export function splitPathSegments(filePath: string): string[] {
+	return filePath.split(/[\\/]+/).filter(Boolean);
 }
 
 /**
@@ -92,7 +147,15 @@ function resolveNonExisting(filePath: string): string {
 			return base.endsWith("/") ? base + tail : `${base}/${tail}`;
 		}
 
-		const parent = dirname(current);
+		// Use win32.dirname (not the platform-default dirname) so a
+		// Windows-shaped path is parsed with win32 semantics regardless of the
+		// running OS — consistent with the win32.resolve/win32.normalize this
+		// branch already commits to. The platform-default POSIX dirname would
+		// find no separator in a win32-resolved "C:\repo\..." path (its only
+		// separators are backslashes), collapse to ".", stop the upward walk at
+		// cwd, and mangle the key on Linux CI (refs #1150, the #1024
+		// OS-divergence class).
+		const parent = win32.dirname(current);
 		if (parent === current) {
 			// Reached filesystem root without finding existing dir
 			// Fall back to full lowercase
@@ -119,6 +182,29 @@ export function uriToPath(uri: string): string {
 }
 
 /**
+ * Decode a file:// URI to an on-disk path WITHOUT map-key normalization.
+ *
+ * `uriToPath` runs its result through `normalizeFilePath`, which on win32
+ * lowercases the nonexistent tail of a path (see `resolveNonExisting`) and
+ * canonicalizes an existing path to its real casing. That is correct for Map
+ * keys, but DESTRUCTIVE for a real create/rename target: creating `NewFile.txt`
+ * would write `newfile.txt`, and a legitimate case-only rename would collapse
+ * to a no-op ("source and destination must differ"). Disk mutations must honor
+ * the caller's intended casing, so they resolve their target through this
+ * decode-only path while confinement/validation keep using the normalized
+ * `uriToPath`. Non-win32 is unaffected either way (normalizeFilePath is a
+ * near-identity there).
+ */
+export function uriToDiskPath(uri: string): string {
+	try {
+		return fileURLToPath(uri);
+	} catch {
+		// Not a valid file:// URI — treat as a plain path (matches uriToPath).
+		return uri;
+	}
+}
+
+/**
  * Convert a path to a file:// URI.
  * Does NOT normalize the path - URIs preserve original casing.
  */
@@ -132,6 +218,31 @@ export function pathToUri(filePath: string): string {
  */
 export function normalizeMapKey(filePath: string): string {
 	return normalizeFilePath(filePath);
+}
+
+/**
+ * Human-facing path relative to a project root when the file is inside it.
+ *
+ * Parses by path SHAPE, not host OS (refs #1150/#1152, shape-2 class #1163):
+ * a Windows-shaped `filePath` (drive-letter/UNC — e.g. a persisted call-graph
+ * symbol-key path `C:\repo\src\x.ts` rehydrated on a Linux CI run) is split
+ * with `win32.*` regardless of `process.platform`. The host-default
+ * `isAbsolute`/`relative` find no drive-letter anchor in a win32 path on POSIX:
+ * `path.isAbsolute("C:\\repo\\x.ts")` returns FALSE on Linux, short-circuiting
+ * to the raw absolute path instead of ever relativizing it — so a file that IS
+ * under the project root renders as a full absolute path on Linux but the
+ * expected `src/x.ts` on Windows (green-locally / wrong-on-CI, the #1024
+ * divergence class). `win32.*` on a native POSIX path (Windows never sees one;
+ * Linux native paths aren't Windows-shaped) is never selected, so same-OS
+ * native paths are unchanged either way.
+ */
+export function toProjectRelativePath(filePath: string, projectRoot: string): string {
+	const p = isWindowsPath(filePath) ? win32 : path;
+	if (!p.isAbsolute(filePath)) return filePath.replace(/\\/g, "/");
+	const relative = p.relative(p.resolve(projectRoot), filePath);
+	return relative && !relative.startsWith("..") && !p.isAbsolute(relative)
+		? relative.replace(/\\/g, "/")
+		: filePath.replace(/\\/g, "/");
 }
 
 /**
@@ -156,6 +267,10 @@ export function normalizeMapKey(filePath: string): string {
  * real-casing resolution actually matters.
  */
 export function normalizeEphemeralMapKey(filePath: string): string {
+	// Most hot-path keys on POSIX are already canonical slash-separated strings.
+	// Preserve that identity instead of allocating a replacement string for each
+	// file in a large diagnostics reconciliation.
+	if (process.platform !== "win32" && !filePath.includes("\\")) return filePath;
 	const slashed = filePath.replace(/\\/g, "/");
 	return process.platform === "win32" ? slashed.toLowerCase() : slashed;
 }
@@ -207,6 +322,35 @@ export function findNearestContaining(
 	for (const dir of walkUpDirs(startDir)) {
 		for (const name of candidates) {
 			if (existsSync(path.join(dir, name))) return dir;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Walk up from `startDir` and return the first matching FILE path (not just
+ * the containing directory) for any of `names`, first-match-wins within each
+ * directory in `names` order. Single source of truth for the "walk up
+ * looking for one of these config filenames" loop that `opengrep-config.ts`,
+ * `typos-config.ts`, `zizmor-config.ts`, and `sgconfig.ts` each hand-rolled
+ * independently (refs #680).
+ *
+ * Distinct from `findNearestContaining`, which returns the containing
+ * directory rather than the matched file path — use that one when the caller
+ * only needs "is one of these present nearby", not which file it is.
+ *
+ * @example
+ *   findLocalToolConfig(cwd, ["typos.toml", "_typos.toml", ".typos.toml"]);
+ *   // → "/repo/typos.toml" if present, else undefined
+ */
+export function findLocalToolConfig(
+	startDir: string,
+	names: readonly string[],
+): string | undefined {
+	for (const dir of walkUpDirs(startDir || process.cwd())) {
+		for (const name of names) {
+			const candidate = path.join(dir, name);
+			if (existsSync(candidate)) return candidate;
 		}
 	}
 	return undefined;
@@ -325,4 +469,37 @@ export function isExternalOrVendorFile(
 		? normalized.slice(rootNorm.length + 1)
 		: normalized;
 	return rel.split("/").some((seg) => VENDOR_DIR_NAMES.has(seg));
+}
+
+/**
+ * Shared marker-glob semantics for every "does this directory contain a file
+ * matching this glob" probe (#895 review): match against the entry NAME only,
+ * `dot: true` so dotfile markers match, `nocase` on win32 to match the
+ * filesystem (and the project ignore matcher). The three marker probes —
+ * language-profile.ts `hasProjectMarker`, workspace-topology.ts
+ * `hasBasenameMarker`, lsp/server.ts `markerExists` — must all route their
+ * glob matching through here rather than call minimatch with hand-copied
+ * options.
+ */
+export function nameMatchesMarkerGlob(name: string, pattern: string): boolean {
+	return minimatch(name, pattern, {
+		dot: true,
+		nocase: process.platform === "win32",
+	});
+}
+
+/**
+ * Files/symlinks-only marker-glob probe over a directory listing — a
+ * *directory* named like a marker (e.g. a `Foo.csproj/` dir) is not a project
+ * file (#201).
+ */
+export function direntsHaveMarkerGlobMatch(
+	entries: readonly Dirent[],
+	pattern: string,
+): boolean {
+	return entries.some(
+		(entry) =>
+			(entry.isFile() || entry.isSymbolicLink()) &&
+			nameMatchesMarkerGlob(entry.name, pattern),
+	);
 }

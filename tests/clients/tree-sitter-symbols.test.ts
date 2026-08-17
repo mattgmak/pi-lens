@@ -8,12 +8,13 @@
  * nodes in the review graph, surfaced only because nothing asserted extraction).
  */
 
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import {
 	grammarBlockReason,
 	LANGUAGE_TO_GRAMMAR,
 } from "../../clients/grammar-source.js";
-import { TreeSitterClient } from "../../clients/tree-sitter-client.js";
+import { getSharedTreeSitterClient } from "../../clients/tree-sitter-shared.js";
+import type { TreeSitterClient } from "../../clients/tree-sitter-client.js";
 import { TreeSitterSymbolExtractor } from "../../clients/tree-sitter-symbol-extractor.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
@@ -30,6 +31,14 @@ const CASES: Record<string, SymbolCase> = {
 		src: "export function foo(){}\nclass C{}\n",
 		expect: ["foo", "C"],
 	},
+	// #887: the javascript grammar lacks the TS type-level node types, so it has
+	// its own SYMBOL_QUERIES entry (typescript's fails to compile against it).
+	// A class name is a plain (identifier) here, not a (type_identifier).
+	javascript: {
+		file: "a.js",
+		src: "export function foo(){}\nconst bar = () => 1;\nclass C{}\n",
+		expect: ["foo", "bar", "C"],
+	},
 	python: { file: "a.py", src: "def go():\n    pass\n", expect: ["go"] },
 	rust: { file: "a.rs", src: "fn foo() {}\n", expect: ["foo"] },
 	go: { file: "a.go", src: "package m\nfunc foo() {}\n", expect: ["foo"] },
@@ -43,7 +52,11 @@ const CASES: Record<string, SymbolCase> = {
 		expect: ["Foo"],
 	},
 	swift: { file: "a.swift", src: "func foo() {}\n", expect: ["foo"] },
-	kotlin: { file: "A.kt", src: "fun foo() {}\nclass Bar {}\n", expect: ["foo", "Bar"] },
+	kotlin: {
+		file: "A.kt",
+		src: "fun foo() {}\nclass Bar {}\n",
+		expect: ["foo", "Bar"],
+	},
 	dart: { file: "a.dart", src: "int foo() => 1;\n", expect: ["foo"] },
 	php: { file: "a.php", src: "<?php\nfunction foo() {}\n", expect: ["foo"] },
 	ocaml: { file: "a.ml", src: "let foo x = x\n", expect: ["foo"] },
@@ -61,8 +74,36 @@ const CASES: Record<string, SymbolCase> = {
 
 let client: TreeSitterClient;
 beforeAll(async () => {
-	client = new TreeSitterClient();
+	client = getSharedTreeSitterClient()!;
 	await client.init();
+});
+
+describe("TreeSitterSymbolExtractor abort handling", () => {
+	it("stops query compilation after a WASM abort", () => {
+		const reportWasmAbort = vi.fn(() => true);
+		const client = { reportWasmAbort } as unknown as TreeSitterClient;
+		const extractor = new TreeSitterSymbolExtractor("typescript", client);
+		const compileQuery = (
+			extractor as unknown as {
+				compileQuery: (
+					Query: new () => never,
+					language: unknown,
+					src: string,
+					label: string,
+				) => unknown;
+			}
+		).compileQuery.bind(extractor);
+		class AbortingQuery {
+			constructor() {
+				throw new Error("Aborted()");
+			}
+		}
+
+		expect(() =>
+			compileQuery(AbortingQuery as never, {}, "(x)", "defs"),
+		).toThrow("Aborted()");
+		expect(reportWasmAbort).toHaveBeenCalledTimes(1);
+	});
 });
 
 describe("export-scope correctness (#256) — module exports vs function locals", () => {
@@ -171,7 +212,9 @@ describe("member visibility (#258) + function-local detection (#259)", () => {
 			const extractor = new TreeSitterSymbolExtractor("python", client);
 			await extractor.init();
 			const symbols = extractor.extract(tree!, fp, src).symbols;
-			expect(symbols.find((s) => s.name === "_internal")?.visibility).toBeUndefined();
+			expect(
+				symbols.find((s) => s.name === "_internal")?.visibility,
+			).toBeUndefined();
 		} finally {
 			env.cleanup();
 		}

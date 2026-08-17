@@ -27,6 +27,7 @@
  * values are read lazily at call time, not module load, and `Number(...)` is
  * gated through `Number.isFinite` before use.
  */
+import { BoundedLruCache } from "./bounded-cache.js";
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -108,7 +109,7 @@ export function probeSlowFs(rootDir: string): SlowFsProbeResult {
 
 /** Process-lifetime memo of the slow-FS verdict, keyed by normalized cwd so
  * `/` vs `\` inputs share one entry (see path-key invariant tests). */
-const slowFsVerdictCache = new Map<string, SlowFsProbeResult>();
+const slowFsVerdictCache = new BoundedLruCache<string, SlowFsProbeResult>(32);
 
 /**
  * Resolve (and memoize) the slow-FS verdict for `cwd`. Resolution order:

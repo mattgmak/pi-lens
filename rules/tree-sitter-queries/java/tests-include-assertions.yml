@@ -2,10 +2,10 @@
 # Detects JUnit tests without assertions
 id: tests-include-assertions
 name: Tests Should Include Assertions
-severity: error
+severity: warning
 category: maintainability
 defect_class: correctness
-inline_tier: blocking
+inline_tier: warning
 language: java
 
 message: "Test method should include at least one assertion"
@@ -26,10 +26,11 @@ description: |
 query: |
   (method_declaration
     (modifiers
-      (annotation
-        name: (identifier) @TEST (#match? @TEST "^(Test|ParameterizedTest|RepeatedTest)$")))
+      (marker_annotation
+        name: (identifier) @TEST))
     name: (identifier) @NAME
-    body: (block) @BODY)
+    body: (block) @BODY
+    (#match? @TEST "^(Test|ParameterizedTest|RepeatedTest)$"))
 
 metavars:
   - TEST

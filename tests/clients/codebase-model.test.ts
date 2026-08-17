@@ -4,10 +4,13 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	buildCodebaseModel,
+	CODEBASE_MODEL_VERSION,
 	loadCodebaseModel,
 	saveCodebaseModel,
 } from "../../clients/codebase-model.js";
 import type { FunctionCallGraph } from "../../clients/call-graph.js";
+import { getProjectDataDir } from "../../clients/file-utils.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 // ── Fixture ───────────────────────────────────────────────────────────────────
 
@@ -29,7 +32,7 @@ function makeGraph(
 
 let tmpDir: string;
 beforeEach(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-model-")); });
-afterEach(() => { fs.rmSync(tmpDir, { recursive: true, force: true }); });
+afterEach(() => { removeTempDirSync(tmpDir); });
 
 // ── buildCodebaseModel ────────────────────────────────────────────────────────
 
@@ -76,6 +79,17 @@ describe("buildCodebaseModel", () => {
 		expect(names).not.toContain("testHelper");
 		expect(names).not.toContain("bundled");
 		expect(names).toContain("realFn");
+	});
+
+	it("uses shared file-role classification for missed path-shape cases", () => {
+		const graph = makeGraph({
+			"/proj/test/fixture.ts:directoryTest": 5.0,
+			"C:\\repo\\tests\\fixture.ts:windowsTest": 4.0,
+			"/proj/src/generated/client.ts:generatedClient": 3.0,
+			"/proj/src/real.ts:realFn": 2.0,
+		});
+		const names = buildCodebaseModel(graph, "/proj").entries.map((entry) => entry.name);
+		expect(names).toEqual(["realFn"]);
 	});
 
 	it("deduplicates symbols by name across files", () => {
@@ -132,6 +146,21 @@ describe("buildCodebaseModel", () => {
 		expect(entry?.calledBy.length).toBeLessThanOrEqual(10);
 	});
 
+	it("parses canonical symbol ids with Windows drives and POSIX colons", () => {
+		const windowsModel = buildCodebaseModel(
+			makeGraph({ "C:\\repo\\src:svc.ts:run:method:27": 2.0 }),
+			"C:\\repo",
+		);
+		const posixModel = buildCodebaseModel(
+			makeGraph({ "/proj/dir:name.ts:Target:class:9": 1.0 }),
+			"/proj",
+		);
+		expect(windowsModel.entries.map((entry) => entry.name)).toEqual(["run"]);
+		expect(windowsModel.entries[0]?.kind).toBe("method");
+		expect(posixModel.entries.map((entry) => entry.name)).toEqual(["Target"]);
+		expect(posixModel.entries[0]?.kind).toBe("class");
+	});
+
 	it("infers class kind for PascalCase names", () => {
 		const graph = makeGraph({ "/proj/MyClass.ts:MyClass": 2.0 });
 		const model = buildCodebaseModel(graph, "/proj");
@@ -165,18 +194,42 @@ describe("saveCodebaseModel / loadCodebaseModel", () => {
 	it("round-trips the model correctly", () => {
 		process.env.PILENS_DATA_DIR = tmpDir;
 		const graph = makeGraph({ "/proj/src/foo.ts:bar": 3.0 });
-		const model = buildCodebaseModel(graph, "/proj");
-		saveCodebaseModel("/proj", model);
-		const loaded = loadCodebaseModel("/proj");
+		const identity = { reviewGraphVersion: "v8", reviewGraphSignature: "sig-model" };
+		const keyedModel = buildCodebaseModel(graph, "/proj", 1500, identity);
+		saveCodebaseModel("/proj", keyedModel);
+		const loaded = loadCodebaseModel("/proj", identity);
 		expect(loaded).toBeDefined();
-		expect(loaded?.entries).toHaveLength(model.entries.length);
-		expect(loaded?.totalTokens).toBe(model.totalTokens);
+		expect(loaded?.entries).toHaveLength(keyedModel.entries.length);
+		expect(loaded?.totalTokens).toBe(keyedModel.totalTokens);
+		expect(loaded?.version).toBe(CODEBASE_MODEL_VERSION);
+		delete process.env.PILENS_DATA_DIR;
+	});
+
+	it("invalidates a cache with a mismatched version", () => {
+		process.env.PILENS_DATA_DIR = tmpDir;
+		const identity = { reviewGraphVersion: "v8", reviewGraphSignature: "sig-model" };
+		const model = buildCodebaseModel(makeGraph({ "/proj/src/foo.ts:bar": 3.0 }), "/proj", 1500, identity);
+		saveCodebaseModel("/proj", model);
+		const cachePath = path.join(getProjectDataDir("/proj"), "cache", "codebase-model.json");
+		const oldFixture = { ...model, version: CODEBASE_MODEL_VERSION - 1 };
+		fs.writeFileSync(cachePath, JSON.stringify(oldFixture));
+		expect(loadCodebaseModel("/proj", identity)).toBeUndefined();
+		delete process.env.PILENS_DATA_DIR;
+	});
+
+	it("invalidates a cache with a mismatched review-graph identity", () => {
+		process.env.PILENS_DATA_DIR = tmpDir;
+		const savedIdentity = { reviewGraphVersion: "v8", reviewGraphSignature: "sig-model" };
+		const model = buildCodebaseModel(makeGraph({ "/proj/src/foo.ts:bar": 3.0 }), "/proj", 1500, savedIdentity);
+		saveCodebaseModel("/proj", model);
+		expect(loadCodebaseModel("/proj", { reviewGraphVersion: "v9", reviewGraphSignature: "sig-model" })).toBeUndefined();
+		expect(loadCodebaseModel("/proj", { reviewGraphVersion: "v8", reviewGraphSignature: "sig-new" })).toBeUndefined();
 		delete process.env.PILENS_DATA_DIR;
 	});
 
 	it("returns undefined for missing cache", () => {
 		process.env.PILENS_DATA_DIR = tmpDir;
-		expect(loadCodebaseModel("/nonexistent/path")).toBeUndefined();
+		expect(loadCodebaseModel("/nonexistent/path", { reviewGraphVersion: "v8", reviewGraphSignature: "sig-model" })).toBeUndefined();
 		delete process.env.PILENS_DATA_DIR;
 	});
 });

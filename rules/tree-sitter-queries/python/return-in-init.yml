@@ -35,8 +35,6 @@ metavars:
   - RETURN
   - RETURN_VAL
 
-post_filter: has_return_value
-
 tags:
   - reliability
   - python-specific

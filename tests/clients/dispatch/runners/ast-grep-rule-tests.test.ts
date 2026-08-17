@@ -24,9 +24,9 @@
 // nothing for "does this rule fire / not-fire" purposes.
 
 import { describe, expect, it } from "vitest";
-import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { safeSpawn } from "../../../../clients/safe-spawn.js";
 
 const RULES_ROOT = path.join(process.cwd(), "rules", "ast-grep-rules");
 const SGCONFIG_PATH = path.join(RULES_ROOT, ".sgconfig.yml");
@@ -36,21 +36,29 @@ const RULES_DIR = path.join(RULES_ROOT, "rules");
 // opt-in: skip the whole suite if the `ast-grep` CLI isn't on PATH. CI
 // installs it; the package is dev-only because users don't need it.
 function probeCli(): boolean {
-	try {
-		execFileSync("ast-grep", ["--version"], {
-			stdio: ["ignore", "ignore", "ignore"],
-			// shell:true so the Windows .cmd shim resolves through
-			// PATHEXT (mirrors ast-grep-catalog-rules.test.ts).
-			shell: true,
-		});
-		return true;
-	} catch {
-		return false;
-	}
+	// #902: was `execFileSync("ast-grep", ..., { shell: true })`. On Windows
+	// that spawns a fresh, uncached cmd.exe wrapper per call — under the
+	// process-creation pressure of a full parallel test-suite run
+	// (windows-latest CI) that intermittently failed to spawn at all
+	// (ENOENT/EAGAIN from the OS, not a real "ast-grep unavailable" signal).
+	// `safeSpawn` (shared with production, `clients/safe-spawn.ts`) resolves
+	// the command via a cached PATH+PATHEXT walk and only falls back to a
+	// pinned, validated cmd.exe wrapper for genuine `.cmd`/`.bat` shims —
+	// the same hardening #817 already gave the real dispatch spawn path,
+	// reused here instead of a second, less careful spawn strategy (single
+	// source of truth, #883).
+	const result = safeSpawn("ast-grep", ["--version"]);
+	return result.status === 0 && !result.error;
 }
 
 const cliAvailable = probeCli();
 const d = cliAvailable ? describe : describe.skip;
+
+// #448: a describe.skip on a missing CLI silently vanishes this whole
+// real-engine harness. Locally that's fine; in CI it must fail loud.
+it("ast-grep CLI is installed in CI", () => {
+	if (process.env.CI) expect(cliAvailable).toBe(true);
+});
 
 d("shipped ast-grep rules have fixture-style valid/invalid tests", () => {
 	// Every test file in `rule-tests/` must (1) parse, (2) target a rule
@@ -159,24 +167,37 @@ d("shipped ast-grep rules have fixture-style valid/invalid tests", () => {
 	});
 
 	it("ast-grep test reports all fixtures pass (valid/invalid coverage)", () => {
-		// shell:true so Windows .cmd shim resolves; -c explicit because
-		// pi-lens's internal runner uses `.sgconfig.yml` (with the dot)
-		// while ast-grep's default is `sgconfig.yml` (no dot).
-		let stdout = "";
-		let stderr = "";
-		let exitCode = 0;
-		try {
-			stdout = execFileSync(
-				"ast-grep",
-				["test", "-c", SGCONFIG_PATH, "--skip-snapshot-tests"],
-				{ encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], shell: true },
-			);
-		} catch (err) {
-			const e = err as { stdout?: string; stderr?: string; status?: number };
-			stdout = e.stdout ?? "";
-			stderr = e.stderr ?? "";
-			exitCode = e.status ?? -1;
-		}
+		// -c explicit because pi-lens's internal runner uses `.sgconfig.yml`
+		// (with the dot) while ast-grep's default is `sgconfig.yml` (no dot).
+		//
+		// #902: was `execFileSync(..., { shell: true })` — an extra, uncached
+		// cmd.exe wrapper per call that intermittently failed to spawn at all
+		// under the process-creation pressure of a full parallel test-suite
+		// run on windows-latest CI (ENOENT/EAGAIN from the OS, not a real
+		// CLI failure). `safeSpawn` (shared with production,
+		// `clients/safe-spawn.ts`) resolves the command via a cached
+		// PATH+PATHEXT walk and spawns the resolved .exe/.com directly, no
+		// shell in between — same hardening #817 already gave the real
+		// dispatch spawn path (single source of truth, #883).
+		//
+		// Explicit generous timeout (#902): this shells out to the ast-grep
+		// CLI to run every rule's whole valid/invalid fixture corpus in one
+		// process — solo it's under ~1s, but the default 5s vitest test
+		// timeout got tripped under parallel-suite CPU/NAPI contention (other
+		// forks competing for cores while this one spawns+waits on a child
+		// process). 60s matches the CLI-shellout precedent in
+		// ast-grep-playground-verify.test.ts. A real regression here is the
+		// CLI itself reporting failing rule(s) (asserted below), which still
+		// fails at any timeout — this only buys headroom against scheduling
+		// jitter delaying when the child process gets scheduled.
+		const spawned = safeSpawn(
+			"ast-grep",
+			["test", "-c", SGCONFIG_PATH, "--skip-snapshot-tests"],
+			{ timeout: 55_000 },
+		);
+		const stdout = spawned.stdout;
+		const stderr = spawned.stderr;
+		const exitCode = spawned.status ?? -1;
 		// ast-grep test prints a single dot per passing case; on
 		// failure it appends "N" (noisy) and "M" (missing) markers
 		// to the per-rule progress string and dumps per-case snippets
@@ -238,5 +259,5 @@ d("shipped ast-grep rules have fixture-style valid/invalid tests", () => {
 				: // All remaining failures are JSX CLI framework gaps — pass.
 					`All non-framework-gap rule fixtures pass; the ${cliFrameworkGap.size} JSX rule failure(s) (${Array.from(cliFrameworkGap).join(", ")}) are an ast-grep 0.42.0 CLI limitation (no jsx_* kind support in the pattern matcher), not rule bugs. napi + the production dispatch path fire them correctly.`,
 		).toBe(true);
-	});
+	}, 60_000);
 });

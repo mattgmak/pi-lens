@@ -7,6 +7,7 @@ import {
 	TurnSummaryCollector,
 } from "../../clients/turn-summary.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 describe("TurnSummaryCollector (#484)", () => {
 	it("is empty when nothing has been recorded", () => {
@@ -81,7 +82,7 @@ describe("TurnSummaryCollector (#484)", () => {
 		});
 
 		afterEach(() => {
-			fs.rmSync(tmpDir, { recursive: true, force: true });
+			removeTempDirSync(tmpDir);
 		});
 
 		it("merges events for the same file recorded with forward vs backslash separators", () => {

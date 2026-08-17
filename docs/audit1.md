@@ -68,7 +68,7 @@ This document records structural inconsistencies and centralization gaps found w
 
 **Files:**
 - `clients/dispatch/runners/lsp.ts` — `appliesTo` array lists ~35 file kinds
-- `clients/lsp/server.ts` — `LSP_SERVERS` currently has 40 entries
+- `clients/lsp/server.ts` — `LSP_SERVERS` currently has 42 entries
 
 **Impact:** Adding a new language server for a new file kind requires updating both `LSP_SERVERS` and the lsp runner's `appliesTo`. If they drift, the runner may skip files that have a configured server, or vice versa.
 
@@ -100,15 +100,15 @@ This document records structural inconsistencies and centralization gaps found w
 
 ---
 
-### 8. README server count is inconsistent with `LSP_SERVERS`
+### 8. README server count was inconsistent with `LSP_SERVERS` (resolved)
 
 **Files:**
-- `README.md` — claims "37 language server definitions (including two cross-cutting auxiliary scanners)"
-- `clients/lsp/server.ts` — `LSP_SERVERS` has 40 entries: 37 non-auxiliary + 3 auxiliary (`opengrep`, `ast-grep`, `zizmor`)
+- `README.md` — the original count was "37 language server definitions (including two cross-cutting auxiliary scanners)"
+- `clients/lsp/server.ts` — `LSP_SERVERS` currently has 42 entries: 38 primary + 4 auxiliary (`opengrep`, `ast-grep`, `zizmor`, `typos`)
 
 **Impact:** A contributor adding a server cannot tell what number to update, and users may be confused about which auxiliary scanners exist (the README names only Opengrep and ast-grep, omitting zizmor).
 
-**Recommended fix:** Update the README to say "40 language server definitions (37 primary + 3 auxiliary: opengrep, ast-grep, zizmor)" or similar. Consider generating the count in a nightly doc script.
+**Resolution:** The feature documentation now reports the current 42-entry registry and names all four auxiliary servers. Consider generating the count in a nightly doc script if this remains a recurring drift source.
 
 ---
 

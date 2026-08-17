@@ -2,6 +2,18 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { removeTempDirSync } from "../test-utils.js";
+
+const toolNotFound = (message = "ENOENT: command not found") =>
+	Object.assign(new Error(message), { kind: "tool-not-found" as const });
+
+const observedReadFileSync = vi.hoisted(() => vi.fn());
+const logSessionStart = vi.hoisted(() => vi.fn());
+vi.mock("node:fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs")>();
+	observedReadFileSync.mockImplementation(actual.readFileSync);
+	return { ...actual, readFileSync: observedReadFileSync };
+});
 
 // Set test mode to isolate logging from production logs
 process.env.PI_LENS_TEST_MODE = "1";
@@ -25,15 +37,86 @@ vi.mock("../../../clients/latency-logger.js", () => ({
 	resetLatencyLog: vi.fn(),
 }));
 
+vi.mock("../../../clients/sessionstart-logger.js", () => ({
+	logSessionStart,
+}));
+
 const dirs: string[] = [];
+
+const IS_WIN = process.platform === "win32";
+
+/**
+ * Build a fake managed tools tree for the classic TypeScript fallback (#1436):
+ * a project dir, a managed `node_modules/.bin` holding the wrapper and `tsc`,
+ * and a TypeScript package whose version and `lib/tsserver.js` the caller
+ * controls through `writeCompiler`. Each case then states only its own facts.
+ */
+function createManagedTypeScriptTree(label: string) {
+	const tmp = fs.mkdtempSync(path.join(os.tmpdir(), `pi-lens-ts-${label}-`));
+	dirs.push(tmp);
+	fs.writeFileSync(path.join(tmp, "package.json"), "{}\n");
+
+	const binDir = path.join(tmp, "managed", "node_modules", ".bin");
+	fs.mkdirSync(binDir, { recursive: true });
+	const lspPath = path.join(
+		binDir,
+		IS_WIN ? "typescript-language-server.cmd" : "typescript-language-server",
+	);
+	const tscPath = path.join(binDir, IS_WIN ? "tsc.cmd" : "tsc");
+	fs.writeFileSync(lspPath, "#!/usr/bin/env node\n");
+	fs.writeFileSync(tscPath, "#!/usr/bin/env node\n");
+
+	const typescriptDir = path.join(tmp, "managed", "node_modules", "typescript");
+	const tsserverPath = path.join(typescriptDir, "lib", "tsserver.js");
+
+	const writeCompiler = (version: string, withTsserver = false) => {
+		fs.mkdirSync(path.join(typescriptDir, "lib"), { recursive: true });
+		fs.writeFileSync(
+			path.join(typescriptDir, "package.json"),
+			`${JSON.stringify({ name: "typescript", version })}\n`,
+		);
+		if (withTsserver) {
+			fs.writeFileSync(tsserverPath, "// fake tsserver\n");
+		} else {
+			fs.rmSync(tsserverPath, { force: true });
+		}
+	};
+
+	/** Resolve `ensureTool` to this tree; `onForceReinstall` models the repair. */
+	const mockEnsureTool = (onForceReinstall?: () => void) => {
+		ensureTool.mockImplementation(
+			async (toolId: string, options?: { forceReinstall?: boolean }) => {
+				if (toolId === "typescript-language-server") return lspPath;
+				if (toolId !== "typescript") return undefined;
+				if (options?.forceReinstall) onForceReinstall?.();
+				return tscPath;
+			},
+		);
+	};
+
+	return { tmp, lspPath, tscPath, tsserverPath, writeCompiler, mockEnsureTool };
+}
+
+/** Resolve the mocked LSP launch with a stub process. */
+function mockLaunchedProcess(pid: number): void {
+	launchLSP.mockResolvedValue({
+		process: { killed: false } as never,
+		stdin: {} as never,
+		stdout: {} as never,
+		stderr: {} as never,
+		pid,
+	});
+}
 
 afterEach(() => {
 	for (const dir of dirs.splice(0)) {
-		fs.rmSync(dir, { recursive: true, force: true });
+		removeTempDirSync(dir);
 	}
 	delete process.env.PI_LENS_DISABLE_LSP_INSTALL;
 	ensureTool.mockReset();
 	launchLSP.mockReset();
+	observedReadFileSync.mockClear();
+	logSessionStart.mockClear();
 	vi.resetModules();
 });
 
@@ -109,7 +192,7 @@ describe("lsp server policy", () => {
 		expect(root).toBe(path.dirname(file));
 	});
 
-	it("falls back to file directory when css root markers are missing", async () => {
+	it("resolves css roots from the fixture marker", async () => {
 		const { CssServer } = await import("../../../clients/lsp/server.js");
 		const tmp = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-css-fallback-root-"),
@@ -118,10 +201,13 @@ describe("lsp server policy", () => {
 
 		const file = path.join(tmp, "cases", "styles.css");
 		fs.mkdirSync(path.dirname(file), { recursive: true });
+		// Pin the nearest marker inside the fixture. Windows test environments may
+		// have a package.json in a real user-profile ancestor of os.tmpdir().
+		fs.writeFileSync(path.join(tmp, "package.json"), "{}\n");
 		fs.writeFileSync(file, "body { color: red; }\n");
 
 		const root = await CssServer.root(file);
-		expect(root).toBe(path.dirname(file));
+		expect(root).toBe(tmp);
 	});
 
 	it("falls back to file directory when yaml root markers are missing", async () => {
@@ -273,7 +359,7 @@ describe("lsp server policy", () => {
 		);
 		dirs.push(tmp);
 
-		launchLSP.mockRejectedValue(new Error("ENOENT: command not found"));
+		launchLSP.mockRejectedValue(toolNotFound());
 
 		const spawned = await CSharpServer.spawn(tmp, { allowInstall: false });
 		expect(spawned).toBeUndefined();
@@ -363,6 +449,112 @@ describe("lsp server policy", () => {
 		expect(r2).toBe(tmp);
 	});
 
+	it("attaches fixture files to the outer project instead of fixture manifests (#1325)", async () => {
+		const { NearestRoot } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-fixture-root-"));
+		dirs.push(tmp);
+
+		const fixture = path.join(tmp, "tests", "fixtures", "nested-project");
+		const file = path.join(fixture, "src", "index.ts");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.mkdirSync(path.join(tmp, ".git"));
+		fs.writeFileSync(path.join(tmp, "package.json"), "{}\n");
+		fs.writeFileSync(path.join(fixture, "package.json"), "{}\n");
+		fs.writeFileSync(file, "export const value = 1;\n");
+
+		await expect(NearestRoot(["package.json"])(file)).resolves.toBe(tmp);
+	});
+
+	it("does not classify a testdata substring as a fixture segment (#1328)", async () => {
+		const { NearestRoot } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-testdata-segment-"));
+		dirs.push(tmp);
+
+		const project = path.join(tmp, "testdata-tools");
+		const file = path.join(project, "src", "index.ts");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.mkdirSync(path.join(tmp, ".git"));
+		fs.writeFileSync(path.join(tmp, "package.json"), "{}\n");
+		fs.writeFileSync(path.join(project, "package.json"), "{}\n");
+		fs.writeFileSync(file, "export const value = 1;\n");
+
+		await expect(NearestRoot(["package.json"])(file)).resolves.toBe(project);
+	});
+
+	it("memoizes project ignore globs until .gitignore changes (#1328)", async () => {
+		const { NearestRoot } = await import("../../../clients/lsp/server.js");
+		const { isPathIgnoredByProject } = await import("../../../clients/file-utils.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-ignore-cache-"));
+		dirs.push(tmp);
+
+		fs.mkdirSync(path.join(tmp, ".git"));
+		fs.writeFileSync(path.join(tmp, "package.json"), "{}\n");
+		const gitignore = path.join(tmp, ".gitignore");
+		fs.writeFileSync(gitignore, "generated/\n");
+		// Warm the independent authoritative matcher, then count only the cheap
+		// positive-glob precheck used by root resolution.
+		isPathIgnoredByProject(path.join(tmp, "warmup"), tmp, true);
+		observedReadFileSync.mockClear();
+		for (const name of ["one", "two", "three"]) {
+			const project = path.join(tmp, name);
+			const file = path.join(project, "index.ts");
+			fs.mkdirSync(project);
+			fs.writeFileSync(path.join(project, "package.json"), "{}\n");
+			fs.writeFileSync(file, "");
+			await NearestRoot(["package.json"])(file);
+		}
+		const gitignoreReads = () =>
+			observedReadFileSync.mock.calls.filter(
+				([file]) => path.resolve(String(file)) === gitignore,
+			).length;
+		expect(gitignoreReads()).toBe(1);
+
+		const touchedAt = new Date(Date.now() + 2_000);
+		fs.utimesSync(gitignore, touchedAt, touchedAt);
+		const changedProject = path.join(tmp, "four");
+		const changedFile = path.join(changedProject, "index.ts");
+		fs.mkdirSync(changedProject);
+		fs.writeFileSync(path.join(changedProject, "package.json"), "{}\n");
+		fs.writeFileSync(changedFile, "");
+		await NearestRoot(["package.json"])(changedFile);
+		// Both the precheck and the authoritative matcher invalidate. The first
+		// post-touch resolution therefore performs one fresh read for each cache.
+		expect(gitignoreReads()).toBe(3);
+	});
+
+	it("caches empty project ignore globs when .gitignore is absent (#1328)", async () => {
+		const { getProjectIgnoreGlobs } = await import("../../../clients/file-utils.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-no-gitignore-cache-"));
+		dirs.push(tmp);
+		const gitignore = path.join(tmp, ".gitignore");
+
+		expect(getProjectIgnoreGlobs(tmp)).toEqual([]);
+		expect(getProjectIgnoreGlobs(tmp)).toEqual([]);
+		expect(getProjectIgnoreGlobs(tmp)).toEqual([]);
+		expect(
+			observedReadFileSync.mock.calls.filter(
+				([file]) => path.resolve(String(file)) === gitignore,
+			),
+		).toHaveLength(1);
+	});
+
+	it("does not make a gitignored manifest directory an LSP root (#1325)", async () => {
+		const { NearestRoot } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-ignored-root-"));
+		dirs.push(tmp);
+
+		const generated = path.join(tmp, "generated");
+		const file = path.join(generated, "index.ts");
+		fs.mkdirSync(path.join(tmp, ".git"));
+		fs.mkdirSync(generated);
+		fs.writeFileSync(path.join(tmp, ".gitignore"), "generated/\n");
+		fs.writeFileSync(path.join(tmp, "package.json"), "{}\n");
+		fs.writeFileSync(path.join(generated, "package.json"), "{}\n");
+		fs.writeFileSync(file, "export const generated = true;\n");
+
+		await expect(NearestRoot(["package.json"])(file)).resolves.toBe(tmp);
+	});
+
 	it("deduplicates concurrent in-flight walks for the same directory", async () => {
 		const { NearestRoot } = await import("../../../clients/lsp/server.js");
 		const tmp = fs.mkdtempSync(
@@ -386,6 +578,10 @@ describe("lsp server policy", () => {
 		expect(results).toEqual([tmp, tmp, tmp, tmp]);
 	});
 
+	// Misses are deliberately NOT cached: the absent → present transition
+	// (agent scaffolds package.json/tsconfig.json mid-session) must be picked
+	// up on the next resolution without a process restart. Only hits are
+	// process-lifetime memos.
 	it("does not cache undefined — re-walks when root marker is later created", async () => {
 		const { NearestRoot } = await import("../../../clients/lsp/server.js");
 		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-root-nocache-"));
@@ -401,7 +597,7 @@ describe("lsp server policy", () => {
 		const r1 = await resolver(file);
 		expect(r1).toBeUndefined();
 
-		// Now create the marker — next call must detect it despite no cached entry.
+		// Marker created AFTER the first miss — the next walk must find it.
 		fs.writeFileSync(path.join(tmp, "package.json"), "{}");
 		const r2 = await resolver(file);
 		expect(r2).toBe(tmp);
@@ -452,6 +648,31 @@ describe("lsp server policy", () => {
 			const resolver = NearestRoot([".git"], undefined, stopDir);
 			const result = await resolver(file);
 			expect(result).toBeUndefined();
+		} finally {
+			cwdSpy.mockRestore();
+		}
+	});
+
+	it("clamps a marker root above the session cwd and logs once (#1373)", async () => {
+		const { NearestRoot } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-root-clamp-"));
+		dirs.push(tmp);
+
+		const project = path.join(tmp, "project");
+		const file = path.join(project, "nested", "doc.md");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(path.join(tmp, ".marksman.toml"), "[core]\n");
+		fs.writeFileSync(file, "# Doc\n");
+
+		const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(project);
+		try {
+			const resolver = NearestRoot([".marksman.toml"]);
+			await expect(resolver(file)).resolves.toBe(project);
+			await expect(resolver(file)).resolves.toBe(project);
+			expect(logSessionStart).toHaveBeenCalledTimes(1);
+			expect(logSessionStart).toHaveBeenCalledWith(
+				expect.stringContaining("lsp root clamped to session cwd"),
+			);
 		} finally {
 			cwdSpy.mockRestore();
 		}
@@ -508,6 +729,179 @@ describe("lsp server policy", () => {
 		expect(spawned).toBeUndefined();
 	});
 
+	// #1412 M1: a nested config root (e.g. cypress/tsconfig.json) with
+	// node_modules only at the REPO ROOT must still find the classic
+	// typescript-language-server wrapper AND tsserver.js by walking up from the
+	// LSP root — pre-fix this only checked <root> itself and degraded to
+	// managed download/no-LSP.
+	it("finds classic TypeScript tooling at an ancestor node_modules for a nested config root", async () => {
+		const { TypeScriptServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-ts-nested-root-"),
+		);
+		dirs.push(tmp);
+
+		const binDir = path.join(tmp, "node_modules", ".bin");
+		fs.mkdirSync(binDir, { recursive: true });
+		const isWin = process.platform === "win32";
+		const lspBin = path.join(
+			binDir,
+			isWin ? "typescript-language-server.cmd" : "typescript-language-server",
+		);
+		fs.writeFileSync(lspBin, "#!/usr/bin/env node\n");
+
+		const tsserverDir = path.join(tmp, "node_modules", "typescript", "lib");
+		fs.mkdirSync(tsserverDir, { recursive: true });
+		const tsserverPath = path.join(tsserverDir, "tsserver.js");
+		fs.writeFileSync(tsserverPath, "// fake tsserver\n");
+
+		const nestedRoot = path.join(tmp, "cypress");
+		fs.mkdirSync(nestedRoot, { recursive: true });
+		fs.writeFileSync(path.join(nestedRoot, "tsconfig.json"), "{}\n");
+
+		launchLSP.mockResolvedValue({
+			process: { killed: false } as never,
+			stdin: {} as never,
+			stdout: {} as never,
+			stderr: {} as never,
+			pid: 2222,
+		});
+
+		const spawned = await TypeScriptServer.spawn(nestedRoot);
+		expect(spawned).toBeDefined();
+		expect(launchLSP).toHaveBeenCalledWith(
+			lspBin,
+			["--stdio"],
+			expect.objectContaining({
+				cwd: nestedRoot,
+				env: expect.objectContaining({ TSSERVER_PATH: tsserverPath }),
+			}),
+		);
+	});
+
+	it("repairs an incompatible managed TypeScript compiler for the classic fallback", async () => {
+		const { TypeScriptServer, _resetClassicTsRepairForTests } = await import(
+			"../../../clients/lsp/server.js"
+		);
+		_resetClassicTsRepairForTests();
+		const tree = createManagedTypeScriptTree("managed-repair");
+		tree.writeCompiler("7.0.2");
+		tree.mockEnsureTool(() => tree.writeCompiler("5.9.3", true));
+		mockLaunchedProcess(3333);
+
+		const spawned = await TypeScriptServer.spawn(tree.tmp);
+
+		expect(spawned).toBeDefined();
+		expect(ensureTool).toHaveBeenCalledWith("typescript", {
+			allowInstall: true,
+		});
+		expect(ensureTool).toHaveBeenCalledWith("typescript", {
+			allowInstall: true,
+			forceReinstall: true,
+		});
+		// A refactor must not double-install: exactly one forced reinstall.
+		expect(
+			ensureTool.mock.calls.filter(
+				(call) => call[0] === "typescript" && call[1]?.forceReinstall === true,
+			),
+		).toHaveLength(1);
+		expect(launchLSP).toHaveBeenCalledWith(
+			tree.lspPath,
+			["--stdio"],
+			expect.objectContaining({
+				cwd: tree.tmp,
+				env: expect.objectContaining({ TSSERVER_PATH: tree.tsserverPath }),
+			}),
+		);
+		expect(logSessionStart).toHaveBeenCalledWith(
+			"lsp typescript: managed compiler resolved to TypeScript 7.0.2, which ships no tsserver.js; reinstalling pinned classic fallback",
+		);
+	});
+
+	// The once-guard: a repair that yields no tsserver.js must not retry on the
+	// next spawn. ensureTool caches successful installs, so only the FAILING
+	// path can loop — three call sites, each with a 120 s install timeout.
+	it("attempts the classic TypeScript repair at most once per process", async () => {
+		const { TypeScriptServer, _resetClassicTsRepairForTests } = await import(
+			"../../../clients/lsp/server.js"
+		);
+		_resetClassicTsRepairForTests();
+		const tree = createManagedTypeScriptTree("repair-once");
+		tree.writeCompiler("7.0.2");
+		// The reinstall does not produce a usable compiler (offline, partial).
+		tree.mockEnsureTool();
+		mockLaunchedProcess(4444);
+
+		const first = await TypeScriptServer.spawn(tree.tmp);
+		const second = await TypeScriptServer.spawn(tree.tmp);
+
+		expect(first?.initialization).toBeUndefined();
+		expect(second?.initialization).toBeUndefined();
+		expect(launchLSP).toHaveBeenCalledWith(
+			tree.lspPath,
+			["--stdio"],
+			expect.objectContaining({
+				env: expect.objectContaining({ TSSERVER_PATH: undefined }),
+			}),
+		);
+		expect(
+			ensureTool.mock.calls.filter(
+				(call) => call[0] === "typescript" && call[1]?.forceReinstall === true,
+			),
+		).toHaveLength(1);
+	});
+
+	// AC-5: discovery-only callers never mutate the tools tree, even when a
+	// discovered TypeScript 7 compiler is present. This reaches the repair
+	// branch's gate rather than short-circuiting on an undefined ensureTool.
+	it("never reinstalls the classic TypeScript compiler when install is disabled", async () => {
+		const { TypeScriptServer, _resetClassicTsRepairForTests } = await import(
+			"../../../clients/lsp/server.js"
+		);
+		_resetClassicTsRepairForTests();
+		const tree = createManagedTypeScriptTree("repair-disabled");
+		tree.writeCompiler("7.0.2");
+		tree.mockEnsureTool();
+		mockLaunchedProcess(5555);
+		process.env.PI_LENS_DISABLE_LSP_INSTALL = "1";
+
+		const spawned = await TypeScriptServer.spawn(tree.tmp);
+
+		expect(spawned?.initialization).toBeUndefined();
+		expect(ensureTool).toHaveBeenCalledWith("typescript", {
+			allowInstall: false,
+		});
+		expect(
+			ensureTool.mock.calls.filter((call) => call[1]?.forceReinstall === true),
+		).toHaveLength(0);
+		expect(logSessionStart).not.toHaveBeenCalledWith(
+			expect.stringContaining("reinstalling pinned classic fallback"),
+		);
+	});
+
+	// A bare `tsc` from PATH has no readable version and no adjacent package
+	// layout. Repairing there would force-reinstall over a healthy global 5.x.
+	it("skips the classic TypeScript repair for a bare PATH compiler", async () => {
+		const { TypeScriptServer, _resetClassicTsRepairForTests } = await import(
+			"../../../clients/lsp/server.js"
+		);
+		_resetClassicTsRepairForTests();
+		const tree = createManagedTypeScriptTree("repair-path-hit");
+		ensureTool.mockImplementation(async (toolId: string) => {
+			if (toolId === "typescript-language-server") return tree.lspPath;
+			if (toolId === "typescript") return "tsc";
+			return undefined;
+		});
+		mockLaunchedProcess(6666);
+
+		const spawned = await TypeScriptServer.spawn(tree.tmp);
+
+		expect(spawned?.initialization).toBeUndefined();
+		expect(
+			ensureTool.mock.calls.filter((call) => call[1]?.forceReinstall === true),
+		).toHaveLength(0);
+	});
+
 	it("skips PowerShell bash-language-server shim candidates on Windows", async () => {
 		const { BashServer } = await import("../../../clients/lsp/server.js");
 		const tmp = fs.mkdtempSync(
@@ -515,7 +909,7 @@ describe("lsp server policy", () => {
 		);
 		dirs.push(tmp);
 
-		launchLSP.mockRejectedValue(new Error("ENOENT: command not found"));
+		launchLSP.mockRejectedValue(toolNotFound());
 
 		const spawned = await BashServer.spawn(tmp, { allowInstall: false });
 		expect(spawned).toBeUndefined();
@@ -551,7 +945,7 @@ describe("lsp server policy", () => {
 		fs.writeFileSync(path.join(tmp, "package.json"), "{}\n");
 
 		process.env.PI_LENS_DISABLE_LSP_INSTALL = "1";
-		launchLSP.mockRejectedValue(new Error("ENOENT: command not found"));
+		launchLSP.mockRejectedValue(toolNotFound());
 
 		const spawned = await SvelteServer.spawn(tmp);
 		expect(spawned?.process).toBeUndefined();
@@ -565,7 +959,7 @@ describe("lsp server policy", () => {
 		dirs.push(tmp);
 		fs.writeFileSync(path.join(tmp, "package.json"), "{}\n");
 
-		launchLSP.mockRejectedValue(new Error("ENOENT: command not found"));
+		launchLSP.mockRejectedValue(toolNotFound());
 
 		const spawned = await SvelteServer.spawn(tmp, { allowInstall: false });
 		expect(spawned?.process).toBeUndefined();
@@ -658,7 +1052,7 @@ describe("lsp server policy", () => {
 					pid: 1234,
 				};
 			}
-			throw new Error(`unexpected command: ${command}`);
+			throw toolNotFound(`unexpected command: ${command}`);
 		});
 
 		const spawned = await PythonServer.spawn(tmp, { allowInstall: true });
@@ -677,6 +1071,70 @@ describe("lsp server policy", () => {
 					typeof command === "string" &&
 					(command.endsWith("pyright.cmd") || command === "pyright"),
 			),
+		).toBe(false);
+	});
+
+	it("falls back to `ty server` when pyright/basedpyright aren't found locally, without triggering an install", async () => {
+		const { PythonServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-ty-lsp-"));
+		dirs.push(tmp);
+
+		launchLSP.mockImplementation(async (command: string, args: string[]) => {
+			if (command === "ty" && args?.[0] === "server") {
+				return {
+					process: { killed: false } as never,
+					stdin: {} as never,
+					stdout: {} as never,
+					stderr: {} as never,
+					pid: 5678,
+				};
+			}
+			throw toolNotFound(`unexpected command: ${command}`);
+		});
+
+		const spawned = await PythonServer.spawn(tmp, { allowInstall: true });
+
+		expect(spawned).toBeDefined();
+		expect(spawned?.source).toBe("direct");
+		expect(spawned?.initialization).toBeUndefined();
+		// ty is PATH-only — never gated behind ensureTool/managed install.
+		expect(ensureTool).not.toHaveBeenCalled();
+		expect(
+			launchLSP.mock.calls.some(
+				([command, args]) =>
+					command === "ty" &&
+					Array.isArray(args) &&
+					args[0] === "server",
+			),
+		).toBe(true);
+	});
+
+	it("prefers a locally-found pyright over ty (opt-in fallback never wins when pyright is available)", async () => {
+		const { PythonServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-pyright-over-ty-"),
+		);
+		dirs.push(tmp);
+
+		launchLSP.mockImplementation(async (command: string) => {
+			if (command === "pyright-langserver") {
+				return {
+					process: { killed: false } as never,
+					stdin: {} as never,
+					stdout: {} as never,
+					stderr: {} as never,
+					pid: 4321,
+				};
+			}
+			throw toolNotFound(`unexpected command: ${command}`);
+		});
+
+		const spawned = await PythonServer.spawn(tmp, { allowInstall: true });
+
+		expect(spawned).toBeDefined();
+		expect(ensureTool).not.toHaveBeenCalled();
+		expect(
+			launchLSP.mock.calls.some(([command]) => command === "ty"),
 		).toBe(false);
 	});
 
@@ -710,7 +1168,7 @@ describe("lsp server policy", () => {
 					pid: 4321,
 				};
 			}
-			throw new Error(`unexpected command: ${command}`);
+			throw toolNotFound(`unexpected command: ${command}`);
 		});
 
 		const spawned = await TomlServer.spawn(tmp, { allowInstall: true });
@@ -739,7 +1197,7 @@ describe("lsp server policy", () => {
 					pid: 2468,
 				};
 			}
-			throw new Error(`unexpected command: ${command}`);
+			throw toolNotFound(`unexpected command: ${command}`);
 		});
 
 		const spawned = await KotlinServer.spawn(tmp, { allowInstall: true });
@@ -755,7 +1213,7 @@ describe("lsp server policy", () => {
 		ensureTool.mockResolvedValue(path.join(tmp, "bin", "zls.exe"));
 		launchLSP.mockImplementation(async (command: string) => {
 			if (command === "zls") {
-				throw new Error("ENOENT: command not found");
+				throw toolNotFound();
 			}
 			if (command.endsWith(path.join("bin", "zls.exe"))) {
 				return {
@@ -766,7 +1224,7 @@ describe("lsp server policy", () => {
 					pid: 9753,
 				};
 			}
-			throw new Error(`unexpected command: ${command}`);
+			throw toolNotFound(`unexpected command: ${command}`);
 		});
 
 		const spawned = await ZigServer.spawn(tmp, { allowInstall: true });
@@ -1001,7 +1459,14 @@ describe("lsp server policy", () => {
 			launchLSP.mockImplementation(async (command: string) => {
 				calls.push(`launch(${command})`);
 				if (calls.length <= 2) {
-					throw new Error("BROKEN");
+					throw Object.assign(new Error("tool not found"), {
+						kind: "tool-not-found",
+					});
+				}
+				if (command === "rust-analyzer") {
+					throw Object.assign(new Error("tool not found"), {
+						kind: "tool-not-found",
+					});
 				}
 				if (command === MANAGED) {
 					return {
@@ -1012,7 +1477,7 @@ describe("lsp server policy", () => {
 						pid: 9999,
 					};
 				}
-				throw new Error(`unexpected: ${command} (call #${calls.length})`);
+				throw toolNotFound(`unexpected: ${command} (call #${calls.length})`);
 			});
 
 			ensureTool.mockImplementation(

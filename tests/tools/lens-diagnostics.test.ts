@@ -1,9 +1,16 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createLensDiagnosticsTool } from "../../tools/lens-diagnostics.js";
+import { createLensDiagnosticMarkTool } from "../../tools/lens-diagnostic-mark.js";
+import { hashDiagnosticContent } from "../../clients/lsp/diagnostic-binding.js";
+import {
+	_resetDeferredForTests,
+	_resetStateCacheForTests,
+} from "../../clients/diagnostic-dispositions.js";
 import { resetProjectLensConfigCache } from "../../clients/project-lens-config.js";
+import { removeTempDirSync } from "../clients/test-utils.js";
 
 const projectDiagnosticsMocks = vi.hoisted(() => ({
 	scanProjectDiagnostics: vi.fn(),
@@ -122,7 +129,7 @@ function withIgnoredFixture<T>(fn: (cwd: string) => Promise<T>): Promise<T> {
 	);
 	resetProjectLensConfigCache();
 	return fn(cwd).finally(() => {
-		fs.rmSync(cwd, { recursive: true, force: true });
+		removeTempDirSync(cwd);
 		resetProjectLensConfigCache();
 	});
 }
@@ -501,6 +508,58 @@ describe("lens_diagnostics mode=full", () => {
 		});
 	});
 
+	it("uses an event-captured repaint when a server becomes ready mid-sweep (#798/#338)", async () => {
+		const repaint = vi.fn();
+		const capture = vi.fn(() => repaint);
+		let releaseSweep!: () => void;
+		const sweepReleased = new Promise<void>((resolve) => {
+			releaseSweep = resolve;
+		});
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn(
+				async (
+					_cwd: string,
+					options: { onServerReady?: () => void },
+				) => {
+					await sweepReleased;
+					options.onServerReady?.();
+					return [];
+				},
+			),
+		};
+		const tool = createLensDiagnosticsTool(
+			makeCacheManager({}) as any,
+			() => "/proj",
+			() => lspService as any,
+			async () => {},
+			undefined,
+			capture,
+		);
+		let sessionActive = true;
+		const ctx = {
+			cwd: "/proj",
+			get ui() {
+				if (!sessionActive) throw new Error("stale session context");
+				return {};
+			},
+		};
+
+		const execution = tool.execute(
+			"1",
+			{ mode: "full" },
+			undefined,
+			null,
+			ctx,
+		);
+		await vi.waitFor(() => expect(capture).toHaveBeenCalledWith(ctx));
+		sessionActive = false;
+		releaseSweep();
+		await expect(execution).resolves.toBeDefined();
+
+		expect(repaint).toHaveBeenCalledOnce();
+		expect(capture).toHaveBeenCalledOnce();
+	});
+
 	it("reconciles a confirmed per-file LSP result into the footer via reconcileScanDiagnostics (#571)", async () => {
 		const lspService = {
 			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([
@@ -542,6 +601,51 @@ describe("lens_diagnostics mode=full", () => {
 		expect(diags).toEqual([
 			expect.objectContaining({ message: "project-wide type error" }),
 		]);
+	});
+
+	it("does NOT reconcile a full-scan result whose fallback content binding mismatches disk (#1198)", async () => {
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-full-binding-mismatch-"),
+		);
+		const file = path.join(tmpDir, "stale.ts");
+		const oldContent = "const value = 1;\n";
+		try {
+			fs.writeFileSync(file, "const value = 2;\n");
+			const lspService = {
+				runWorkspaceDiagnostics: vi.fn().mockResolvedValue([
+					{
+						filePath: file,
+						diagnostics: [
+							{
+								severity: 1,
+								message: "stale diagnostic",
+								range: {
+									start: { line: 0, character: 0 },
+									end: { line: 0, character: 5 },
+								},
+								source: "ts",
+							},
+						],
+						contentHash: hashDiagnosticContent(oldContent),
+					},
+				]),
+			};
+
+			const result = await run(
+				makeTool({}, lspService),
+				{ mode: "full" },
+				tmpDir,
+			);
+
+			expect(reconcileScanDiagnosticsMock).not.toHaveBeenCalled();
+			expect(result.details).toMatchObject({
+				lspFilesConfirmed: 0,
+				lspFilesUnconfirmed: 1,
+			});
+			expect(String(result.content[0].text)).toContain("unconfirmed");
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
 	});
 
 	it("does NOT reconcile a timed-out per-file result into the footer (#571 / #570 dependency)", async () => {
@@ -843,7 +947,7 @@ describe("lens_diagnostics mode=full", () => {
 				(result.details as { totalBlocking?: number }).totalBlocking ?? 0,
 			).toBe(0);
 		} finally {
-			fs.rmSync(cwd, { recursive: true, force: true });
+			removeTempDirSync(cwd);
 			resetProjectLensConfigCache();
 		}
 	});
@@ -1117,6 +1221,95 @@ describe("lens_diagnostics mode=full", () => {
 		).toContain("knip");
 	});
 
+	it("mode=full renders failed analyzers as unknown, not clean (#925)", async () => {
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+		};
+		freshFetchMocks.fetchFreshProjectDiagnostics.mockResolvedValue({
+			diagnostics: [],
+			runners: [],
+			cold: [],
+			failed: [{ id: "knip", summary: "knip timed out" }],
+			timings: { knip: 30_000 },
+		});
+
+		const result = await run(makeTool({}, lspService), {
+			mode: "full",
+			refreshRunners: "cached",
+		});
+		const text = String(result.content[0].text);
+		expect(text).toContain("failed (ran, but no trustworthy result)");
+		expect(text).toContain("knip — knip timed out");
+		expect(text).toContain("NOT a clean verdict");
+		expect(
+			(result.details as { failedAnalyzers?: unknown[] }).failedAnalyzers,
+		).toEqual([{ id: "knip", summary: "knip timed out" }]);
+	});
+
+	// #1004 review follow-up (honesty gap, #533): unlike every other
+	// fresh-fetch analyzer (a FRESH whole-project scan each call), test-runner
+	// is cache-read only — its findings only ever reflect the (targeted,
+	// cascade-aware) test file(s) touched by the most recent edit's turn_end
+	// fire, never a whole-project run. When it's warm-with-findings this must
+	// be called out explicitly, not folded silently into `runners`/
+	// `diagnostics` alongside the genuinely-project-wide analyzers.
+	it("mode=full notes test-runner coverage is edit-scoped, not project-wide, whenever it contributed findings (#1004)", async () => {
+		mockSummaries.length = 0;
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+		};
+		projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot.mockReturnValue(
+			undefined,
+		);
+		freshFetchMocks.fetchFreshProjectDiagnostics.mockResolvedValue({
+			diagnostics: [
+				{
+					filePath: "/proj/src/a.test.ts",
+					line: 17,
+					severity: "error",
+					semantic: "blocking",
+					tool: "test-runner",
+					runner: "vitest",
+					rule: "test:vitest",
+					message: "foo works: expected true to be false",
+					source: "project-scan",
+				},
+			],
+			runners: ["test-runner"],
+			cold: [],
+			timings: {},
+		});
+
+		const result = await run(makeTool({}, lspService), {
+			mode: "full",
+			refreshRunners: "cached",
+		});
+
+		const text = String(result.content[0].text);
+		expect(text).toContain("edit-scoped");
+		expect(text).toContain("NOT a full-project run");
+	});
+
+	it("mode=full does NOT emit the test-runner edit-scoped caveat when test-runner didn't contribute", async () => {
+		mockSummaries.length = 0;
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+		};
+		freshFetchMocks.fetchFreshProjectDiagnostics.mockResolvedValue({
+			diagnostics: [],
+			runners: ["jscpd"],
+			cold: ["test-runner"],
+			timings: { jscpd: 5 },
+		});
+
+		const result = await run(makeTool({}, lspService), {
+			mode: "full",
+			refreshRunners: "cached",
+		});
+
+		expect(String(result.content[0].text)).not.toContain("edit-scoped");
+	});
+
 	it("mode=full without refreshRunners never reports cold extractors (they weren't requested)", async () => {
 		mockSummaries.length = 0;
 		const lspService = {
@@ -1148,6 +1341,9 @@ describe("lens_diagnostics mode=full", () => {
 			"/proj",
 			expect.anything(),
 			expect.anything(),
+			// #1413: full mode threads the runtime through for advisory
+			// provenance validation ({runtime: undefined} without a getRuntime).
+			expect.objectContaining({}),
 		);
 	});
 
@@ -1203,6 +1399,48 @@ describe("lens_diagnostics mode=full", () => {
 		expect(
 			(result.details as { analyzersAbortedIds?: string[] }).analyzersAbortedIds,
 		).toEqual(["trivy"]);
+	});
+
+	// #747: a fresh-fetch that refused an at-or-above-$HOME root reports ONE
+	// unsafe-root note, not seven per-analyzer "not applicable" reasons.
+	it("mode=full: an unsafe-root fresh-fetch renders the home-directory refusal, not the generic cold list (#747)", async () => {
+		mockSummaries.length = 0;
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+		};
+		freshFetchMocks.fetchFreshProjectDiagnostics.mockResolvedValue({
+			diagnostics: [],
+			runners: [],
+			cold: [
+				"knip",
+				"jscpd",
+				"madge",
+				"gitleaks",
+				"govulncheck",
+				"trivy",
+				"dead-code",
+			],
+			timings: {},
+			unsafeRoot: true,
+		});
+
+		const result = await run(makeTool({}, lspService), {
+			mode: "full",
+			refreshRunners: "cached",
+		});
+
+		const text = String(result.content[0].text);
+		expect(text).toContain("heavyweight analyzers skipped");
+		expect(text).toContain("at or above the home directory");
+		expect(text).not.toContain("not applicable / unavailable this run");
+		expect(
+			(result.details as { analyzersUnsafeRoot?: boolean }).analyzersUnsafeRoot,
+		).toBe(true);
+		// coldRunners still carries the full list so "did analyzer X contribute"
+		// checks keep working unchanged.
+		expect(
+			(result.details as { coldRunners?: string[] }).coldRunners,
+		).toContain("jscpd");
 	});
 
 	// #613: fetchFreshProjectDiagnostics used to be `await`ed only AFTER the LSP
@@ -1432,6 +1670,45 @@ describe("lens_diagnostics mode=all", () => {
 		mockSummaries.length = 0;
 		const result = await run(makeTool(), { mode: "all" });
 		expect(String(result.content[0].text)).toContain("No files diagnosed");
+	});
+
+	it("reports clean after a same-file backslash reconcile clears a forward-slash blocker (#1020)", async () => {
+		// Exercise the SOURCE fix end-to-end through the tool: drive the REAL
+		// widget-state (bypassing this file's module mock via importActual), record
+		// a stale blocker under the forward-slash form, then reconcile the SAME file
+		// clean under the backslash form — the exact mixed-key split that made
+		// mode=all replay a resolved blocker. Bridge the real summaries into the
+		// tool's mocked `getFileDiagnosticSummaries` so the tool sees precisely what
+		// the fixed widget state exposes.
+		const realWS = await vi.importActual<
+			typeof import("../../clients/widget-state.js")
+		>("../../clients/widget-state.js");
+		realWS.clearWidgetState();
+		try {
+			realWS.recordDiagnostics(
+				"/proj/src/dup.ts",
+				[
+					{
+						severity: "error",
+						semantic: "blocking",
+						message: "stale blocker",
+						rule: "X",
+					},
+				],
+				1,
+			);
+			realWS.reconcileScanDiagnostics("\\proj\\src\\dup.ts", [], true, 2);
+
+			mockSummaries.length = 0;
+			mockSummaries.push(...realWS.getFileDiagnosticSummaries());
+			// Pre-fix: two summaries reach the tool, one still blocking:1 → 🔴.
+			const result = await run(makeTool(), { mode: "all" });
+			const text = String(result.content[0].text);
+			expect(text).not.toContain("🔴");
+			expect(text).toContain("No");
+		} finally {
+			realWS.clearWidgetState();
+		}
 	});
 
 	it("flushes pending dispatches before reading (so just-fixed files refresh)", async () => {
@@ -1830,7 +2107,7 @@ describe("lens_diagnostics paths", () => {
 				expect.objectContaining({ files: [fileA, fileB] }),
 			);
 		} finally {
-			fs.rmSync(cwd, { recursive: true, force: true });
+			removeTempDirSync(cwd);
 		}
 	});
 
@@ -1865,7 +2142,7 @@ describe("lens_diagnostics paths", () => {
 			const passed = lspService.runWorkspaceDiagnostics.mock.calls[0][1];
 			expect(passed.files).toBeUndefined();
 		} finally {
-			fs.rmSync(cwd, { recursive: true, force: true });
+			removeTempDirSync(cwd);
 		}
 	});
 
@@ -1894,7 +2171,7 @@ describe("lens_diagnostics paths", () => {
 			expect(passed.files).toEqual([]);
 			expect(String(result.content[0].text)).toContain("deleted.ts");
 		} finally {
-			fs.rmSync(cwd, { recursive: true, force: true });
+			removeTempDirSync(cwd);
 		}
 	});
 
@@ -1955,7 +2232,7 @@ describe("lens_diagnostics paths", () => {
 			expect(text).toContain("kept finding");
 			expect(text).not.toContain("excluded finding");
 		} finally {
-			fs.rmSync(cwd, { recursive: true, force: true });
+			removeTempDirSync(cwd);
 		}
 	});
 
@@ -2007,7 +2284,7 @@ describe("lens_diagnostics paths", () => {
 			expect(text).toContain("keep.ts");
 			expect(text).not.toContain("outside.ts");
 		} finally {
-			fs.rmSync(cwd, { recursive: true, force: true });
+			removeTempDirSync(cwd);
 		}
 	});
 
@@ -2047,7 +2324,7 @@ describe("lens_diagnostics paths", () => {
 			expect(text).toContain("not found");
 			expect(text).toContain("deleted-but-staged.ts");
 		} finally {
-			fs.rmSync(cwd, { recursive: true, force: true });
+			removeTempDirSync(cwd);
 		}
 	});
 });
@@ -2108,5 +2385,167 @@ describe("lens_diagnostics wall-clock ceiling (never-hang guarantee)", () => {
 		expect(String(result.content[0].text)).toContain("time budget");
 		expect(result.details).toMatchObject({ mode: "full", timedOut: true });
 		delete process.env.PI_LENS_LENS_DIAGNOSTICS_FULL_TIMEOUT_MS;
+	});
+});
+
+// ── #755: dispositions apply to cached delta/all without a re-dispatch ─────────
+//
+// Repro: a finding is served from the actionable/quality/widget caches (filled
+// at dispatch time), the agent marks it suppress/defer via lens_diagnostic_mark
+// (which writes the store entry but never re-dispatches the file), then re-runs
+// lens_diagnostics. Before the fix the disposed finding reappeared until the
+// file was next edited; these assert it's gone immediately in delta AND all.
+describe("lens_diagnostics disposition read-filter (#755)", () => {
+	let ddTmp: string;
+	let ddPrevDataDir: string | undefined;
+
+	beforeEach(() => {
+		ddTmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-diag-755-"));
+		ddPrevDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(ddTmp, "data");
+		_resetDeferredForTests();
+		_resetStateCacheForTests();
+	});
+
+	afterEach(() => {
+		if (ddPrevDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+		else process.env.PILENS_DATA_DIR = ddPrevDataDir;
+		_resetDeferredForTests();
+		_resetStateCacheForTests();
+		removeTempDirSync(ddTmp);
+	});
+
+	function markTool() {
+		return createLensDiagnosticMarkTool(() => ddTmp);
+	}
+
+	function runMark(params: Record<string, unknown>) {
+		return markTool().execute("m", params, undefined, () => {}, { cwd: ddTmp });
+	}
+
+	it("mode=delta hides a finding suppressed via the mark tool without a re-dispatch", async () => {
+		const filePath = path.join(ddTmp, "a.ts");
+		fs.writeFileSync(filePath, "const a = 1;\nconst target = bad();\n");
+		const cacheData = {
+			"actionable-warnings": {
+				files: [
+					{
+						filePath,
+						displayPath: "a.ts",
+						warnings: [
+							{
+								id: "1",
+								filePath,
+								displayPath: "a.ts",
+								line: 2,
+								severity: "warning",
+								tool: "eslint",
+								rule: "no-bad",
+								message: "bad call",
+								actions: [],
+								suppressed: false,
+								origin: "dispatch",
+							},
+						],
+					},
+				],
+			},
+		};
+
+		// Before the mark: the finding is served from the cache.
+		const before = await run(makeTool(cacheData), { mode: "delta" }, ddTmp);
+		expect(String(before.content[0].text)).toContain("bad call");
+
+		// Mark it suppressed — same fields the tool reported.
+		const marked = await runMark({
+			filePath,
+			line: 2,
+			message: "bad call",
+			rule: "no-bad",
+			tool: "eslint",
+			disposition: "suppress",
+		});
+		expect(marked.isError).toBeFalsy();
+
+		// After the mark, WITHOUT re-dispatching the file: the finding is gone.
+		const after = await run(makeTool(cacheData), { mode: "delta" }, ddTmp);
+		expect(String(after.content[0].text)).not.toContain("bad call");
+		// All cached findings filtered out → delta reports a clean turn.
+		expect(String(after.content[0].text)).toContain("No");
+		expect(after.details).toMatchObject({ mode: "delta" });
+	});
+
+	it("mode=all hides a finding deferred via the mark tool without a re-dispatch", async () => {
+		const filePath = path.join(ddTmp, "b.ts");
+		fs.writeFileSync(filePath, "const target = bad();\n");
+		mockSummaries.push({
+			filePath,
+			blocking: 0,
+			errors: 0,
+			warnings: 1,
+			hasFinalSnapshot: true,
+			diagnostics: [
+				{
+					severity: "warning",
+					message: "bad call",
+					line: 1,
+					rule: "no-bad",
+					tool: "eslint",
+				},
+			],
+		});
+
+		const before = await run(makeTool(), { mode: "all" }, ddTmp);
+		expect(String(before.content[0].text)).toContain("bad call");
+
+		const marked = await runMark({
+			filePath,
+			line: 1,
+			message: "bad call",
+			rule: "no-bad",
+			tool: "eslint",
+			disposition: "defer",
+		});
+		expect(marked.isError).toBeFalsy();
+
+		const after = await run(makeTool(), { mode: "all" }, ddTmp);
+		expect(String(after.content[0].text)).not.toContain("bad call");
+		expect(after.details).toMatchObject({ mode: "all" });
+	});
+
+	it("mode=full filtering is unaffected — its own content-based pass still runs", async () => {
+		// A defer mark also drops in mode=full (applyDispositions there), so the
+		// cache-only weak filter added for delta/all doesn't regress full.
+		const filePath = path.join(ddTmp, "c.ts");
+		fs.writeFileSync(filePath, "const target = bad();\n");
+		mockSummaries.push({
+			filePath,
+			blocking: 0,
+			errors: 0,
+			warnings: 1,
+			hasFinalSnapshot: true,
+			diagnostics: [
+				{
+					severity: "warning",
+					message: "bad call",
+					line: 1,
+					rule: "no-bad",
+					tool: "eslint",
+				},
+			],
+		});
+		await runMark({
+			filePath,
+			line: 1,
+			message: "bad call",
+			rule: "no-bad",
+			tool: "eslint",
+			disposition: "defer",
+		});
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+		};
+		const after = await run(makeTool({}, lspService), { mode: "full" }, ddTmp);
+		expect(String(after.content[0].text)).not.toContain("bad call");
 	});
 });

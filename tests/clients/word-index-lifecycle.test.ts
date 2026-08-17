@@ -250,7 +250,7 @@ describe("word-index lifecycle — full mode (#348)", () => {
 			);
 			expect(
 				dbg2.mock.calls.some(([msg]) =>
-					String(msg).includes("word-index: reused fresh snapshot"),
+					String(msg).includes("word-index: incremental"),
 				),
 			).toBe(true);
 			expect(
@@ -258,6 +258,92 @@ describe("word-index lifecycle — full mode (#348)", () => {
 					String(msg).includes("word-index: rebuilt"),
 				),
 			).toBe(false);
+		} finally {
+			env.cleanup();
+			restore();
+		}
+	}, 15_000);
+	it("full-rebuilds legacy serialization and falls back after refresh refusal", async () => {
+		const env = setupTestEnvironment("pi-lens-wordindex-fallback-");
+		const restore = setStartupMode("full");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"package.json",
+				JSON.stringify({ type: "module" }),
+			);
+			createTempFile(env.tmpDir, "src/current.ts", "export const currentNeedle = 1;");
+			const legacy = serializeWordIndex(
+				buildWordIndex([
+					{ path: "ghost-a.ts", content: "const ghostA = 1;" },
+					{ path: "ghost-b.ts", content: "const ghostB = 1;" },
+				]),
+			) as unknown as Record<string, unknown>;
+			legacy.version = 1;
+			saveProjectSnapshot(env.tmpDir, {
+				version: PROJECT_SNAPSHOT_VERSION,
+				projectRoot: env.tmpDir,
+				generatedAt: new Date().toISOString(),
+				seq: 0,
+				files: {},
+				symbols: {},
+				reverseDeps: {},
+				cachedExports: [],
+				wordIndex: legacy as never,
+			});
+
+			const legacyRuntime = new RuntimeCoordinator();
+			legacyRuntime.resetForSession();
+			const legacyDbg = vi.fn();
+			await handleSessionStart(makeDeps(env.tmpDir, legacyRuntime, legacyDbg));
+			await vi.waitFor(
+				() =>
+					expect(
+						legacyDbg.mock.calls.some(([m]) =>
+							String(m).includes("word-index: rebuilt"),
+						),
+					).toBe(true),
+				{ timeout: 5000 },
+			);
+			expect(legacyRuntime.wordIndex?.docLengths.has("ghost-a.ts")).toBe(false);
+
+			// Seed a current-format index whose file set is mostly gone. The
+			// incremental path refuses >30% churn and the full fallback succeeds.
+			const currentFormat = serializeWordIndex(
+				buildWordIndex([
+					{ path: "ghost-a.ts", content: "const ghostA = 1;" },
+					{ path: "ghost-b.ts", content: "const ghostB = 1;" },
+				]),
+			);
+			const snapshot = loadProjectSnapshot(env.tmpDir)!;
+			snapshot.wordIndex = currentFormat;
+			saveProjectSnapshot(env.tmpDir, snapshot);
+			const fallbackRuntime = new RuntimeCoordinator();
+			fallbackRuntime.resetForSession();
+			const fallbackDbg = vi.fn();
+			await handleSessionStart(
+				makeDeps(env.tmpDir, fallbackRuntime, fallbackDbg),
+			);
+			await vi.waitFor(
+				() =>
+					expect(
+						fallbackDbg.mock.calls.some(([m]) =>
+							String(m).includes(
+								"incremental preflight selected full rebuild (file-set-churn)",
+							),
+						),
+					).toBe(true),
+				{ timeout: 5000 },
+			);
+			await vi.waitFor(
+				() =>
+					expect(
+						fallbackDbg.mock.calls.some(([m]) =>
+							String(m).includes("word-index: rebuilt"),
+						),
+					).toBe(true),
+				{ timeout: 5000 },
+			);
 		} finally {
 			env.cleanup();
 			restore();

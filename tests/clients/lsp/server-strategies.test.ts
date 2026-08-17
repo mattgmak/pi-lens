@@ -1,5 +1,5 @@
 /**
- * Tests for clients/lsp/server-strategies.ts's `resolveAstGrepNativeExe`
+ * Tests for clients/lsp/wait-policy/strategies.ts's `resolveAstGrepNativeExe`
  * (#472) — platform-native ast-grep exe resolution, skipping the node-bin
  * wrapper. Package-name construction is checked for the 3 documented
  * platform/arch combos, plus graceful fallback (undefined) for
@@ -7,7 +7,18 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { resolveAstGrepNativeExe } from "../../../clients/lsp/server-strategies.js";
+import {
+	getStrategy,
+	resolveAstGrepNativeExe,
+} from "../../../clients/lsp/wait-policy/strategies.js";
+
+describe("TypeScript diagnostic strategies (#1412)", () => {
+	it("keeps classic first-push seeding but stabilizes native TS7 pushes", () => {
+		expect(getStrategy("typescript", "classic").seedFirstPush).toBe(true);
+		expect(getStrategy("typescript", "native-ts7").seedFirstPush).toBe(false);
+		expect(getStrategy("typescript", "native-ts7").debounceMs).toBeGreaterThan(0);
+	});
+});
 
 describe("resolveAstGrepNativeExe", () => {
 	it("resolves the real native exe for the CURRENT platform/arch (installed in this repo's node_modules)", () => {

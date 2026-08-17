@@ -1,3 +1,4 @@
+import { logExtension } from "./extension-log.js";
 import type { AgentBehaviorClient } from "./agent-behavior-client.js";
 import type { BiomeClient } from "./biome-client.js";
 import type { ComplexityClient } from "./complexity-client.js";
@@ -69,19 +70,26 @@ async function logBootstrapFailures(
 	failures: { name: string; err: unknown }[],
 ): Promise<void> {
 	for (const { name, err } of failures) {
-		console.error(
-			`[pi-lens] analyzer "${name}" disabled (degraded mode): ${
+		logExtension({
+			subsystem: "bootstrap",
+			message: `analyzer "${name}" disabled (degraded mode): ${
 				(err as Error)?.message ?? String(err)
 			}`,
-		);
+			metadata: { analyzer: name },
+		});
 	}
 	try {
 		const { collectInstallDiagnostics, formatInstallDiagnostics } = await import(
 			"./install-diagnostics.js"
 		);
-		console.error(
-			formatInstallDiagnostics(collectInstallDiagnostics(), failures[0]?.err),
-		);
+		logExtension({
+			subsystem: "bootstrap",
+			message: formatInstallDiagnostics(
+				collectInstallDiagnostics(),
+				failures[0]?.err,
+			),
+			metadata: { kind: "install_diagnostics" },
+		});
 	} catch {
 		// the per-analyzer lines above already named the failures
 	}

@@ -10,6 +10,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	createReadGuard,
 	currentLinesMatchReadSnapshot,
+	READ_GUARD_STATE_VERSION,
 	type ReadRecord,
 } from "../../clients/read-guard.js";
 import { logReadGuardEvent } from "../../clients/read-guard-logger.js";
@@ -78,6 +79,20 @@ describe("ReadGuard", () => {
 			expect(guard.getReadHistory("/src/api.ts")).toHaveLength(2);
 			expect(guard.getReadHistory("/src/db.ts")).toHaveLength(1);
 			expect(guard.getReadHistory("/src/unknown.ts")).toHaveLength(0);
+		});
+
+		it("retains an outstanding read past the former file cap (#1397)", () => {
+			const guard = createReadGuard("test-session");
+			guard.recordRead(createReadRecord("/src/read-first.ts"));
+
+			// Fill beyond the old 256-file bound. None of these reads has been
+			// consumed by a published edit, so eviction must not turn the first file
+			// into a false zero-read block.
+			for (let i = 0; i < 256; i++) {
+				guard.recordRead(createReadRecord(`/src/activity-${i}.ts`));
+			}
+
+			expect(guard.checkEdit("/src/read-first.ts").action).toBe("allow");
 		});
 
 		it("respects one-time user exemptions", () => {
@@ -1011,6 +1026,230 @@ describe("ReadGuard", () => {
 			expect(summary.byFile[normalizeFilePath("/src/api.ts")].blocks).toBe(0);
 			expect(summary.byFile[normalizeFilePath("/src/other.ts")].blocks).toBe(1);
 		});
+	});
+});
+
+describe("ReadGuard Tier-2 idle decay and bounds (#1389)", () => {
+	it("evicts the oldest consumed read at the file cap and requires a re-read", () => {
+		const guard = createReadGuard("tier2-consumed-cap");
+		const consumedPath = "/tmp/consumed-tier2.ts";
+		guard.recordRead(createReadRecord(consumedPath));
+		expect(guard.checkEdit(consumedPath).action).toBe("allow");
+		guard.recordWritten(consumedPath);
+
+		for (let i = 0; i < 256; i += 1) {
+			const filePath = `/tmp/consumed-tier2-${i}.ts`;
+			guard.recordRead(createReadRecord(filePath));
+			expect(guard.checkEdit(filePath).action).toBe("allow");
+			guard.recordWritten(filePath);
+		}
+
+		expect(guard.getReadHistory(consumedPath)).toHaveLength(0);
+		expect(guard.checkEdit(consumedPath).action).toBe("block");
+		guard.recordRead(createReadRecord(consumedPath));
+		expect(guard.checkEdit(consumedPath).action).toBe("allow");
+	});
+
+	it("bounds unconsumed reads with oldest-to-re-read eviction", () => {
+		const guard = createReadGuard("tier2-unconsumed-cap");
+		const oldestPath = "/tmp/unconsumed-tier2-oldest.ts";
+		guard.recordRead(createReadRecord(oldestPath));
+
+		for (let i = 0; i < 4096; i += 1) {
+			guard.recordRead(createReadRecord(`/tmp/unconsumed-tier2-${i}.ts`));
+		}
+
+		expect(guard.getReadHistory(oldestPath)).toHaveLength(0);
+		expect(guard.checkEdit(oldestPath).action).toBe("block");
+		guard.recordRead(createReadRecord(oldestPath));
+		expect(guard.checkEdit(oldestPath).action).toBe("allow");
+	});
+
+	it("does not idle-evict an outstanding read", () => {
+		vi.useFakeTimers();
+		try {
+			const guard = createReadGuard("tier2-read-guard");
+			const oldPath = "/tmp/old-tier2.ts";
+			const recentPath = "/tmp/recent-tier2.ts";
+			guard.recordRead(createReadRecord(oldPath, { timestamp: Date.now() - 31 * 60_000 }));
+			guard.recordRead(createReadRecord(recentPath));
+			vi.advanceTimersByTime(35 * 60_000 + 1);
+			expect(guard.getReadHistory(oldPath)).toHaveLength(1);
+			expect(guard.checkEdit(recentPath).action).toBe("allow");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("retains an old read until an edit consumes it", () => {
+		vi.useFakeTimers();
+		try {
+			const guard = createReadGuard("tier2-read-recovery");
+			const filePath = "/tmp/recover-tier2.ts";
+			guard.recordRead(createReadRecord(filePath));
+			vi.advanceTimersByTime(61 * 60_000 + 1);
+			expect(guard.checkEdit(filePath).action).toBe("allow");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+});
+
+// #1041: export/import of the read-set across a session resume.
+describe("ReadGuard export/import across resume (#1041)", () => {
+	// Write, then backdate mtime to BEFORE any guard's session start so the file
+	// reads as authored in a prior session (not "written this session"), which is
+	// exactly the resume scenario. Otherwise a just-written file's now-ish mtime
+	// makes wasWrittenThisSession() true and every edit is session-authored.
+	const LONG_AGO = new Date("2000-01-01T00:00:00Z");
+	function writeNumberedLines(filePath: string, count: number): void {
+		fs.writeFileSync(
+			filePath,
+			`${Array.from({ length: count }, (_, i) => `line${i + 1}`).join("\n")}\n`,
+		);
+		fs.utimesSync(filePath, LONG_AGO, LONG_AGO);
+	}
+
+	it("rehydrates a prior read so the first post-resume edit is allowed", () => {
+		const env = setupTestEnvironment("read-guard-resume-");
+		try {
+			const filePath = path.join(env.tmpDir, "foo.ts");
+			writeNumberedLines(filePath, 100);
+
+			// Session 1: read lines 1..100, then editing 40..50 is allowed.
+			const guard1 = createReadGuard("session-1");
+			guard1.recordRead(
+				createReadRecord(filePath, {
+					requestedOffset: 1,
+					requestedLimit: 100,
+					effectiveOffset: 1,
+					effectiveLimit: 100,
+				}),
+			);
+			expect(guard1.checkEdit(filePath, [40, 50]).action).toBe("allow");
+
+			// Session 2: a FRESH guard (models resetForSession wiping state) starts
+			// with no reads → would zero-read-block. After importing the persisted
+			// read-set, the same edit is allowed again.
+			const guard2 = createReadGuard("session-2");
+			expect(guard2.checkEdit(filePath, [40, 50]).action).toBe("block");
+
+			const result = guard2.importState(guard1.exportState());
+			expect(result).toEqual({ imported: 1, dropped: 0 });
+			expect(guard2.getReadHistory(filePath)).toHaveLength(1);
+			expect(guard2.checkEdit(filePath, [40, 50]).action).toBe("allow");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("drops a rehydrated read whose file content changed on disk (staleness preserved)", () => {
+		const env = setupTestEnvironment("read-guard-resume-stale-");
+		try {
+			const filePath = path.join(env.tmpDir, "foo.ts");
+			writeNumberedLines(filePath, 100);
+
+			const guard1 = createReadGuard("session-1");
+			guard1.recordRead(
+				createReadRecord(filePath, {
+					requestedOffset: 1,
+					requestedLimit: 100,
+					effectiveOffset: 1,
+					effectiveLimit: 100,
+				}),
+			);
+			const exported = guard1.exportState();
+
+			// The file changes on disk between sessions (line 45 rewritten). Keep the
+			// mtime backdated so the drop is driven by the hash mismatch, not by a
+			// now-ish mtime tripping the session-authored allow.
+			const lines = fs.readFileSync(filePath, "utf-8").split("\n");
+			lines[44] = "line45-CHANGED";
+			fs.writeFileSync(filePath, lines.join("\n"));
+			fs.utimesSync(filePath, LONG_AGO, LONG_AGO);
+
+			// A rehydrated read must never mask a real staleness: the changed read
+			// is dropped, so the edit is (correctly) blocked as zero-read.
+			const guard2 = createReadGuard("session-2");
+			const result = guard2.importState(exported);
+			expect(result).toEqual({ imported: 0, dropped: 1 });
+			expect(guard2.getReadHistory(filePath)).toHaveLength(0);
+			expect(guard2.checkEdit(filePath, [40, 50]).action).toBe("block");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("drops rehydrated reads for a file that no longer exists", () => {
+		const env = setupTestEnvironment("read-guard-resume-missing-");
+		try {
+			const filePath = path.join(env.tmpDir, "gone.ts");
+			writeNumberedLines(filePath, 10);
+			const guard1 = createReadGuard("session-1");
+			guard1.recordRead(
+				createReadRecord(filePath, {
+					requestedOffset: 1,
+					requestedLimit: 10,
+					effectiveOffset: 1,
+					effectiveLimit: 10,
+				}),
+			);
+			const exported = guard1.exportState();
+			fs.rmSync(filePath);
+
+			const guard2 = createReadGuard("session-2");
+			expect(guard2.importState(exported)).toEqual({ imported: 0, dropped: 1 });
+			expect(guard2.getReadHistory(filePath)).toHaveLength(0);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("import is a null-safe no-op for undefined / mismatched version", () => {
+		const env = setupTestEnvironment("read-guard-resume-compat-");
+		try {
+			const guard = createReadGuard("session-x");
+			expect(guard.importState(undefined)).toEqual({ imported: 0, dropped: 0 });
+			expect(
+				guard.importState({ version: 999, reads: [] }),
+			).toEqual({ imported: 0, dropped: 0 });
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("degrades to a no-op on a malformed payload instead of throwing", () => {
+		const env = setupTestEnvironment("read-guard-resume-malformed-");
+		try {
+			const guard = createReadGuard("session-x");
+
+			// `reads` is not an array (corrupt / hand-edited sidecar).
+			const nonArrayReads = {
+				version: READ_GUARD_STATE_VERSION,
+				reads: {} as unknown,
+			} as unknown as import("../../clients/read-guard.js").PersistedReadGuardState;
+			expect(() => guard.importState(nonArrayReads)).not.toThrow();
+			expect(guard.importState(nonArrayReads)).toEqual({
+				imported: 0,
+				dropped: 0,
+			});
+
+			// `reads` array with a non-tuple element mixed in with a valid one.
+			const badElement = {
+				version: READ_GUARD_STATE_VERSION,
+				reads: [[normalizeFilePath("/src/x.ts"), []], 5],
+			} as unknown as import("../../clients/read-guard.js").PersistedReadGuardState;
+			expect(() => guard.importState(badElement)).not.toThrow();
+			expect(guard.importState(badElement)).toEqual({
+				imported: 0,
+				dropped: 0,
+			});
+
+			// The map is uncorrupted — nothing was recorded.
+			expect(guard.getReadHistory("/src/x.ts")).toHaveLength(0);
+		} finally {
+			env.cleanup();
+		}
 	});
 });
 

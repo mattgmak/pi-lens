@@ -15,13 +15,13 @@ Dispatch is diagnostics-oriented: automatic formatting and safe autofix happen i
 | Ruby                  | ✓   | lsp, rubocop, tree-sitter                                                                                      | rubocop, standardrb     |
 | C/C++                 | ✓   | lsp, cpp-check, tree-sitter                                                                                    | clang-format            |
 | Shell                 | ✓   | lsp, shellcheck                                                                                                | shfmt                   |
-| Fish                  | ✓   | lsp, fish-indent                                                                                               | fish_indent             |
+| Fish                  | ✓ (fish-lsp) | lsp, fish-indent                                                                                      | fish_indent             |
 | CSS/SCSS/Less         | ✓   | lsp, stylelint                                                                                                 | biome, prettier         |
 | HTML                  | ✓   | lsp, htmlhint                                                                                                  | prettier                |
 | YAML                  | ✓   | lsp, yamllint, actionlint (GitHub workflows)                                                                   | prettier                |
 | JSON                  | ✓   | lsp                                                                                                            | biome, prettier         |
-| Svelte                | ✓   | lsp                                                                                                            | —                       |
-| Vue                   | ✓   | lsp                                                                                                            | —                       |
+| Svelte                | ✓   | lsp                                                                                                            | oxfmt (needs `svelte` pkg installed + config `svelte: true`) |
+| Vue                   | ✓   | lsp                                                                                                            | prettier, oxfmt         |
 | SQL                   | —   | sqlfluff                                                                                                       | sqlfluff                |
 | Markdown              | —   | spellcheck, markdownlint, vale                                                                                 | prettier                |
 | Docker                | ✓   | lsp, hadolint                                                                                                  | —                       |
@@ -42,7 +42,8 @@ Dispatch is diagnostics-oriented: automatic formatting and safe autofix happen i
 | Gleam                 | ✓   | lsp, gleam-check                                                                                               | gleam format            |
 | OCaml                 | ✓   | lsp                                                                                                            | ocamlformat             |
 | Clojure               | ✓   | lsp                                                                                                            | cljfmt                  |
-| Terraform             | ✓   | lsp, tflint                                                                                                    | terraform fmt           |
+| Terraform             | ✓   | lsp, tflint, trivy-config (opt-in)                                                                             | terraform fmt           |
+| Terragrunt            | —   | terragrunt                                                                                                     | terragrunt hcl fmt      |
 | Nix                   | ✓   | lsp                                                                                                            | nixfmt                  |
 | TOML                  | ✓   | lsp, taplo                                                                                                     | taplo                   |
-| CMake                 | ✓   | lsp                                                                                                            | cmake-format            |
+| CMake                 | ✓ (cmake-language-server) | lsp                                                                                           | cmake-format            |

@@ -22,6 +22,7 @@ import {
 	serializeWordIndex,
 } from "../../clients/word-index.js";
 import {
+	flushProjectSnapshotPersistsForTests,
 	PROJECT_SNAPSHOT_VERSION,
 	saveProjectSnapshot,
 } from "../../clients/project-snapshot.js";
@@ -84,6 +85,11 @@ describe("pilens_analyze (warm) maintains the review graph over MCP", () => {
 			"2025-06-18",
 		);
 		harness.notify("notifications/initialized");
+		// Pay the one-time server startup cost before the asserted request window.
+		await harness.request(2, "tools/call", {
+			name: "pilens_health",
+			arguments: {},
+		});
 	});
 
 	afterAll(() => {
@@ -136,6 +142,7 @@ describe("pilens_analyze (warm) maintains the review graph over MCP", () => {
 // above.
 describe("pilens_analyze (warm) also maintains the word index over MCP (#536 rider)", () => {
 	let projectDir: string;
+	let snapshotDataRoot: string;
 	let harness: McpHarness;
 
 	function parseTrailer(res: Record<string, unknown>): Record<string, unknown> {
@@ -165,19 +172,34 @@ describe("pilens_analyze (warm) also maintains the word index over MCP (#536 rid
 				content: "export function baseFn(): number {\n  return 1;\n}\n",
 			},
 		]);
-		saveProjectSnapshot(projectDir, {
-			version: PROJECT_SNAPSHOT_VERSION,
-			projectRoot: projectDir,
-			generatedAt: new Date().toISOString(),
-			seq: 0,
-			files: {},
-			symbols: {},
-			reverseDeps: {},
-			cachedExports: [],
-			wordIndex: serializeWordIndex(index),
-		});
+		snapshotDataRoot = mkdtempSync(path.join(tmpdir(), "pi-lens-analyze-wordindex-data-"));
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = snapshotDataRoot;
+		try {
+			saveProjectSnapshot(projectDir, {
+				version: PROJECT_SNAPSHOT_VERSION,
+				projectRoot: projectDir,
+				generatedAt: new Date().toISOString(),
+				seq: 0,
+				files: {},
+				symbols: {},
+				reverseDeps: {},
+				cachedExports: [],
+				wordIndex: serializeWordIndex(index),
+			});
+			// The production snapshot body is worker-persisted. Flush the test seed
+			// before spawning a separate MCP process; otherwise a loaded CI worker can
+			// race the child and make a valid pre-seeded index look unavailable.
+			flushProjectSnapshotPersistsForTests();
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+		}
 
-		harness = new McpHarness({ cwd: projectDir });
+		harness = new McpHarness({
+			cwd: projectDir,
+			env: { PILENS_DATA_DIR: snapshotDataRoot },
+		});
 		const init = await harness.request(1, "initialize", {
 			protocolVersion: "2025-06-18",
 			capabilities: {},
@@ -187,12 +209,18 @@ describe("pilens_analyze (warm) also maintains the word index over MCP (#536 rid
 			"2025-06-18",
 		);
 		harness.notify("notifications/initialized");
+		// Pay the one-time server startup cost before the asserted request window.
+		await harness.request(2, "tools/call", {
+			name: "pilens_health",
+			arguments: {},
+		});
 	});
 
 	afterAll(() => {
 		harness.dispose();
 		try {
 			rmSync(projectDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+			rmSync(snapshotDataRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
 		} catch {
 			// OS reclaims the temp dir eventually.
 		}

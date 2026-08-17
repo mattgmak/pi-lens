@@ -27,7 +27,7 @@ description: |
 
 query: |
   (class_declaration
-    (extends_clause
+    superclass: (superclass
       (type_identifier) @PARENT)
     body: (class_body
       (field_declaration

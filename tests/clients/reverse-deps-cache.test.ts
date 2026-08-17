@@ -40,8 +40,10 @@ const mocks = vi.hoisted(() => ({
 	),
 	formatImpactCascade: vi.fn(),
 	getLSPService: vi.fn(),
+	getGraphImportChanges: vi.fn(),
 	getLastGraphBuildInfo: vi.fn(),
 	buildReverseDependencyIndexFromGraph: vi.fn(),
+	patchReverseDependencyIndex: vi.fn(),
 	writeReverseDependencyIndexToSnapshot: vi.fn(),
 }));
 
@@ -61,6 +63,7 @@ vi.mock("../../clients/review-graph/builder.js", async (importOriginal) => {
 		await importOriginal<typeof import("../../clients/review-graph/builder.js")>();
 	return {
 		...actual,
+		getGraphImportChanges: mocks.getGraphImportChanges,
 		getLastGraphBuildInfo: mocks.getLastGraphBuildInfo,
 	};
 });
@@ -72,6 +75,7 @@ vi.mock("../../clients/reverse-deps.js", async (importOriginal) => {
 		...actual,
 		buildReverseDependencyIndexFromGraph:
 			mocks.buildReverseDependencyIndexFromGraph,
+		patchReverseDependencyIndex: mocks.patchReverseDependencyIndex,
 		writeReverseDependencyIndexToSnapshot:
 			mocks.writeReverseDependencyIndexToSnapshot,
 	};
@@ -138,9 +142,13 @@ describe("reverse-deps index cache (#459)", () => {
 			getDiagnostics: vi.fn(),
 		});
 		mocks.getLastGraphBuildInfo.mockReset();
+		mocks.getGraphImportChanges.mockReset().mockReturnValue(undefined);
 		mocks.buildReverseDependencyIndexFromGraph
 			.mockReset()
 			.mockReturnValue(emptyIndex());
+		mocks.patchReverseDependencyIndex
+			.mockReset()
+			.mockImplementation((index) => index);
 		mocks.writeReverseDependencyIndexToSnapshot.mockReset().mockReturnValue(true);
 		delete process.env.PI_LENS_REVERSE_DEPS_REUSE;
 
@@ -250,6 +258,105 @@ describe("reverse-deps index cache (#459)", () => {
 			});
 
 			expect(mocks.buildReverseDependencyIndexFromGraph).toHaveBeenCalledTimes(2);
+			expect(mocks.writeReverseDependencyIndexToSnapshot).toHaveBeenCalledTimes(2);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("reuses across a new graph generation when imports did not change", async () => {
+		const env = setupTestEnvironment("reverse-deps-body-only-");
+		try {
+			const primary = path.join(env.tmpDir, "primary.ts");
+			fs.writeFileSync(primary, "export const x = 1;\n");
+			mocks.computeImpactCascade.mockReturnValue(impact(primary, []));
+			const { computeCascadeForFile } = await import(
+				"../../clients/dispatch/integration.js"
+			);
+
+			mocks.buildOrUpdateGraph.mockResolvedValue(emptyGraph(1));
+			mocks.getLastGraphBuildInfo.mockReturnValue(
+				buildInfo({ mode: "full", reused: false, graphChanged: true }),
+			);
+			await computeCascadeForFile(primary, env.tmpDir, {
+				turnSeq: 1,
+				writeSeq: 1,
+			});
+
+			mocks.buildOrUpdateGraph.mockResolvedValue(emptyGraph(2));
+			mocks.getLastGraphBuildInfo.mockReturnValue(
+				buildInfo({ mode: "seq-fastpath", reused: true, graphChanged: true }),
+			);
+			mocks.getGraphImportChanges.mockReturnValue({
+				// One-step delta from the index's cached generation (1) — contiguous.
+				fromGeneration: 1,
+				changes: [
+				{
+					filePath: primary,
+					existedBefore: true,
+					existsAfter: true,
+					priorTargets: [],
+					newTargets: [],
+				},
+				],
+			});
+			await computeCascadeForFile(primary, env.tmpDir, {
+				turnSeq: 2,
+				writeSeq: 2,
+			});
+
+			expect(mocks.buildReverseDependencyIndexFromGraph).toHaveBeenCalledTimes(1);
+			expect(mocks.patchReverseDependencyIndex).not.toHaveBeenCalled();
+			expect(mocks.writeReverseDependencyIndexToSnapshot).toHaveBeenCalledTimes(1);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("patches the cached index when one file's import targets change", async () => {
+		const env = setupTestEnvironment("reverse-deps-patch-");
+		try {
+			const primary = path.join(env.tmpDir, "primary.ts");
+			const target = path.join(env.tmpDir, "target.ts");
+			fs.writeFileSync(primary, "export const x = 1;\n");
+			mocks.computeImpactCascade.mockReturnValue(impact(primary, []));
+			const { computeCascadeForFile } = await import(
+				"../../clients/dispatch/integration.js"
+			);
+
+			mocks.buildOrUpdateGraph.mockResolvedValue(emptyGraph(1));
+			mocks.getLastGraphBuildInfo.mockReturnValue(
+				buildInfo({ mode: "full", reused: false, graphChanged: true }),
+			);
+			await computeCascadeForFile(primary, env.tmpDir, {
+				turnSeq: 1,
+				writeSeq: 1,
+			});
+
+			mocks.buildOrUpdateGraph.mockResolvedValue(emptyGraph(2));
+			mocks.getLastGraphBuildInfo.mockReturnValue(
+				buildInfo({ mode: "seq-fastpath", reused: true, graphChanged: true }),
+			);
+			mocks.getGraphImportChanges.mockReturnValue({
+				// One-step delta from the index's cached generation (1) — contiguous.
+				fromGeneration: 1,
+				changes: [
+				{
+					filePath: primary,
+					existedBefore: true,
+					existsAfter: true,
+					priorTargets: [],
+					newTargets: [target],
+				},
+				],
+			});
+			await computeCascadeForFile(primary, env.tmpDir, {
+				turnSeq: 2,
+				writeSeq: 2,
+			});
+
+			expect(mocks.buildReverseDependencyIndexFromGraph).toHaveBeenCalledTimes(1);
+			expect(mocks.patchReverseDependencyIndex).toHaveBeenCalledTimes(1);
 			expect(mocks.writeReverseDependencyIndexToSnapshot).toHaveBeenCalledTimes(2);
 		} finally {
 			env.cleanup();

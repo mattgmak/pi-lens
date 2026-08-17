@@ -26,16 +26,13 @@ description: |
   ```
 
 query: |
-  (switch_statement
-    body: (switch_body
-      (switch_case
-        consequence: (statement_block
-          (expression_statement) @LAST))
-      (switch_case) @NEXT))
+  (switch_body
+    (switch_case) @CASE
+    .
+    [(switch_case) (switch_default)])
 
 metavars:
-  - LAST
-  - NEXT
+  - CASE
 
 post_filter: no_terminating_statement
 

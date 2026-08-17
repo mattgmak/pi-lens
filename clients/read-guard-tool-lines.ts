@@ -3,9 +3,17 @@ import * as nodeFs from "node:fs";
 import {
 	hostWouldApplyOldText,
 	normalizeForGuardMatch,
+	normalizeToLF,
+	stripBom,
 } from "./host-edit-normalize.js";
 import type { PartiallyApplicableEdit } from "./partial-edit-apply.js";
-import { logReadGuardEvent } from "./read-guard-logger.js";
+import {
+	boundedIndexesForCount,
+	createReadGuardEditBatchSummary,
+	logReadGuardEvent,
+	type EditBatchRejection,
+	type ReadGuardEditBatchSummary,
+} from "./read-guard-logger.js";
 import { isToolCallEventType } from "./tool-event.js";
 
 export interface GuardLineResult {
@@ -18,6 +26,8 @@ export interface GuardLineResult {
 	// Caller can apply these directly and return a ⚠️ PARTIAL APPLY message.
 	// Shares the host-pinned edit shape with applyPartiallyApplicableEdits.
 	partiallyApplicable?: PartiallyApplicableEdit[];
+	/** Canonical bounded edit-batch telemetry, also reused by partial apply. */
+	editBatchSummary?: ReadGuardEditBatchSummary;
 	// All edits were resolved by exact content match — range snapshot staleness
 	// is irrelevant since the content IS the edit target.
 	contentMatchValidated?: boolean;
@@ -78,35 +88,57 @@ function tokenSimilarity(a: string, b: string): number {
  * its edit from verbatim text in one turn instead of re-reading blind. Scans a
  * ±window around `nearLine` when known (the first-line locator), else the whole
  * file. Returns the top matches above `minScore`, with their real line numbers.
+ *
+ * Scores in normalized space but returns only `{ line, score }` — the caller
+ * renders the text from a structurally-aligned RAW view so a suggestion can
+ * never quote the normalized projection (#1050). NFKC folds CJK full-width
+ * punctuation (`：`→`:`, `，`→`,`, `；`→`;`) and HOST_UNICODE_DASHES folds
+ * `—`→`-`, so a suggestion rendered from normalized content told the agent to
+ * copy bytes the file does not contain; the host's edit tool then fuzzy-matched
+ * it and wrote the folded form onto the touched line. Normalization here is
+ * comparison-only, exactly as everywhere else in this file.
  */
 function findSimilarLines(
 	content: string,
 	target: string,
 	options: { nearLine?: number; window?: number; max?: number; minScore?: number } = {},
-): Array<{ line: number; text: string; score: number }> {
+): Array<{ line: number; score: number }> {
 	const { nearLine, window = 60, max = 3, minScore = 0.5 } = options;
 	const needle = target.trim();
 	if (needle.length < 4) return [];
 	const lines = content.split("\n");
 	const start = nearLine ? Math.max(0, nearLine - 1 - window) : 0;
 	const end = nearLine ? Math.min(lines.length, nearLine - 1 + window) : lines.length;
-	const scored: Array<{ line: number; text: string; score: number }> = [];
+	const scored: Array<{ line: number; score: number }> = [];
 	for (let i = start; i < end; i += 1) {
 		const text = lines[i];
 		if (text.trim() === "") continue;
 		const score = tokenSimilarity(needle, text);
-		if (score >= minScore) scored.push({ line: i + 1, text, score });
+		if (score >= minScore) scored.push({ line: i + 1, score });
 	}
 	scored.sort((a, b) => b.score - a.score);
 	return scored.slice(0, max);
 }
 
+/**
+ * Render did-you-mean rows from the file's real characters rather than the
+ * normalized match space the line numbers were scored in. Taking only
+ * `{ line }` from the scan makes quoting normalized text structurally
+ * impossible (#1050).
+ *
+ * `rawLineAligned` must be `normalizeToLF(stripBom(raw).text)`: the same
+ * STRUCTURAL normalization `normalizeForGuardMatch` applies (so line indices
+ * cross-index 1:1 even for lone-CR or BOM files) but none of its CHARACTER
+ * folding, so full-width punctuation, smart quotes, and NBSP survive.
+ */
 function formatSimilarLines(
-	suggestions: Array<{ line: number; text: string }>,
+	suggestions: Array<{ line: number }>,
+	rawLineAligned: string,
 ): string {
+	const rawLines = rawLineAligned.split("\n");
 	const pad = (n: number) => String(n).padStart(4, " ");
 	const rows = suggestions.map(
-		({ line, text }) => `      ${pad(line)} │ ${text.trimEnd()}`,
+		({ line }) => `      ${pad(line)} │ ${(rawLines[line - 1] ?? "").trimEnd()}`,
 	);
 	return `\n\nDid you mean one of these current lines?\n${rows.join("\n")}`;
 }
@@ -173,6 +205,7 @@ function resolveHashlineEditInput(
 	input: Record<string, unknown>,
 	filePath: string | undefined,
 	sessionId: string | undefined,
+	correlationId?: string,
 ): GuardLineResult | undefined {
 	const operations = getHashlineOperations(input);
 	if (operations.length === 0) return undefined;
@@ -216,9 +249,21 @@ function resolveHashlineEditInput(
 	}
 
 	if (errors.length > 0) {
+		const editBatchSummary = createReadGuardEditBatchSummary({
+			requestedIndexes: boundedIndexesForCount(operations.length),
+			requestedTotal: operations.length,
+			rejectedReasons: boundedIndexesForCount(operations.length).map((index) => ({
+				index,
+				code: "preflight_blocked" as const,
+			})),
+			rejectedTotal: operations.length,
+			durationMs: 0,
+			terminalStatus: "blocked",
+		});
 		if (filePath) {
 			logReadGuardEvent({
 				event: "edit_preflight_blocked",
+				correlationId,
 				sessionId,
 				filePath,
 				metadata: {
@@ -230,6 +275,12 @@ function resolveHashlineEditInput(
 					errors: errors.slice(0, 10),
 				},
 			});
+			logReadGuardEvent({
+				event: "edit_batch_summary",
+				correlationId,
+				filePath,
+				metadata: { tool: "edit", editBatchSummary },
+			});
 		}
 		// Every blocking verdict ends with a single concrete next-action line so
 		// the agent recovers in one turn (#328 — uniform recovery-hint discipline).
@@ -238,6 +289,7 @@ function resolveHashlineEditInput(
 		return {
 			touchedLines: undefined,
 			preflightError: `🔴 BLOCKED — Unsupported hashline edit target\n\n${errors.join("\n")}\n\n${retryHint}`,
+			editBatchSummary,
 		};
 	}
 	if (ranges.length === 0) return undefined;
@@ -245,6 +297,7 @@ function resolveHashlineEditInput(
 	if (filePath) {
 		logReadGuardEvent({
 			event: "touched_lines_detected",
+			correlationId,
 			sessionId,
 			filePath,
 			metadata: {
@@ -345,12 +398,25 @@ function resolveOldTextEdits(
 	edits: Array<{ oldText?: string; newText?: string; originalIndex?: number }>,
 	filePath: string,
 	sessionId: string | undefined,
+	correlationId?: string,
 ): GuardLineResult {
+	const startedAt = Date.now();
+	const requestedIndexes: number[] = [];
+	const logBatchEvent = (
+		entry: Parameters<typeof logReadGuardEvent>[0],
+	): void => logReadGuardEvent({ ...entry, correlationId });
 	let rawContent: string;
 	try {
 		rawContent = nodeFs.readFileSync(filePath, "utf-8");
 	} catch {
-		logReadGuardEvent({
+		const editBatchSummary = createReadGuardEditBatchSummary({
+			requestedIndexes: edits.map((edit, index) => edit.originalIndex ?? index),
+			rejectedReasons: edits.map((edit, index) => ({
+				index: edit.originalIndex ?? index,
+				code: "preflight_blocked" as const,
+			})),
+		});
+		logBatchEvent({
 			event: "touched_lines_missing",
 			sessionId,
 			filePath,
@@ -360,7 +426,12 @@ function resolveOldTextEdits(
 				editCount: edits.length,
 			},
 		});
-		return { touchedLines: undefined };
+		logBatchEvent({
+			event: "edit_batch_summary",
+			filePath,
+			metadata: { tool: "edit", editBatchSummary },
+		});
+		return { touchedLines: undefined, editBatchSummary };
 	}
 
 	const rawContentLf = rawContent.replace(/\r\n/g, "\n");
@@ -369,6 +440,8 @@ function resolveOldTextEdits(
 	const failureKinds: string[] = [];
 	const failedEditIndexes: number[] = [];
 	const failedOldTextPreviews: string[] = [];
+	const rejectedReasons: EditBatchRejection[] = [];
+	const resolvedIndexes: number[] = [];
 	const resolvedRanges: [number, number][] = [];
 	const passedEdits: Array<{
 		oldText: string;
@@ -380,6 +453,7 @@ function resolveOldTextEdits(
 	for (let i = 0; i < edits.length; i++) {
 		const oldText = edits[i].oldText;
 		const editIndex = edits[i].originalIndex ?? i;
+		if (requestedIndexes.length < 100) requestedIndexes.push(editIndex);
 		if (!oldText) continue;
 
 		let needle = normalizeContent(oldText);
@@ -394,7 +468,7 @@ function resolveOldTextEdits(
 				needle = normalizeContent(corrected);
 				occurrenceLines = findOccurrenceLines(content, needle);
 				if (occurrenceLines.length > 0) {
-					logReadGuardEvent({
+					logBatchEvent({
 						event: "oldtext_indent_corrected",
 						sessionId,
 						filePath,
@@ -411,8 +485,13 @@ function resolveOldTextEdits(
 		if (occurrenceLines.length === 0) {
 			const preview = oldText.trimStart().substring(0, 60).replace(/\n/g, "↵");
 			failureKinds.push("oldtext_not_found");
-			failedEditIndexes.push(editIndex);
-			failedOldTextPreviews.push(preview);
+			if (failedEditIndexes.length < 100) {
+				failedEditIndexes.push(editIndex);
+				failedOldTextPreviews.push(preview);
+			}
+			if (rejectedReasons.length < 100) {
+				rejectedReasons.push({ index: editIndex, code: "oldtext_not_found" });
+			}
 			const failCount = trackOldTextFailure(filePath, preview);
 			if (failCount > maxFailCount) maxFailCount = failCount;
 			let errorMsg = `edits[${editIndex}].oldText ("${preview}") was not found in the current file content.`;
@@ -467,7 +546,10 @@ function resolveOldTextEdits(
 			// similarity) so the model can rebuild oldText verbatim in one turn
 			// instead of re-reading blind. Skipped on the quote-style path, which
 			// already names the precise fix. Anchored near the first-line locator
-			// when known, else scans the whole file.
+			// when known, else scans the whole file. Scored against `content`
+			// (normalized) but RENDERED from a structurally-aligned raw view —
+			// quoting the normalized projection told the agent to copy bytes the
+			// file does not contain (#1050).
 			if (!errorMsg.includes("quote style")) {
 				const similarLines = findSimilarLines(
 					content,
@@ -475,7 +557,10 @@ function resolveOldTextEdits(
 					{ nearLine: findFirstLineOfOldText(content, oldText) },
 				);
 				if (similarLines.length > 0) {
-					errorMsg += formatSimilarLines(similarLines);
+					errorMsg += formatSimilarLines(
+						similarLines,
+						normalizeToLF(stripBom(rawContent).text),
+					);
 				}
 			}
 			errors.push(errorMsg);
@@ -484,7 +569,7 @@ function resolveOldTextEdits(
 			// friction the host wouldn't have); false => a genuine miss. This is the
 			// measurement that tells us whether the guard earns its keep (#257).
 			const hostMatch = hostWouldApplyOldText(rawContent, oldText);
-			logReadGuardEvent({
+			logBatchEvent({
 				event: "oldtext_not_found",
 				sessionId,
 				filePath,
@@ -503,6 +588,7 @@ function resolveOldTextEdits(
 			const startLine = occurrenceLines[0];
 			const endLine = startLine + needle.split("\n").length - 1;
 			resolvedRanges.push([startLine, endLine]);
+			if (resolvedIndexes.length < 100) resolvedIndexes.push(editIndex);
 			const applyOldText = exactOldTextForApply(rawContentLf, oldText, needle);
 			if (applyOldText !== undefined) {
 				passedEdits.push({
@@ -511,7 +597,7 @@ function resolveOldTextEdits(
 					originalIndex: editIndex,
 				});
 			}
-			logReadGuardEvent({
+			logBatchEvent({
 				event: "oldtext_resolved",
 				sessionId,
 				filePath,
@@ -525,8 +611,13 @@ function resolveOldTextEdits(
 		} else {
 			const preview = oldText.trimStart().substring(0, 60).replace(/\n/g, "↵");
 			failureKinds.push("oldtext_duplicate");
-			failedEditIndexes.push(editIndex);
-			failedOldTextPreviews.push(preview);
+			if (failedEditIndexes.length < 100) {
+				failedEditIndexes.push(editIndex);
+				failedOldTextPreviews.push(preview);
+			}
+			if (rejectedReasons.length < 100) {
+				rejectedReasons.push({ index: editIndex, code: "oldtext_duplicate" });
+			}
 			const matchSpanLines = needle.split("\n").length;
 			const contextBlock = formatOccurrenceContext(
 				content,
@@ -536,7 +627,7 @@ function resolveOldTextEdits(
 			errors.push(
 				`edits[${editIndex}].oldText ("${preview}") appears ${occurrenceLines.length} times:\n${contextBlock}\nPick the location you want and extend your oldText with the unique line above or below it (shown as context).`,
 			);
-			logReadGuardEvent({
+			logBatchEvent({
 				event: "oldtext_duplicate",
 				sessionId,
 				filePath,
@@ -544,8 +635,8 @@ function resolveOldTextEdits(
 					tool: "edit",
 					source: "edits_without_ranges",
 					editIndex,
+					occurrenceLines: occurrenceLines.slice(0, 100),
 					occurrenceCount: occurrenceLines.length,
-					occurrenceLines,
 					oldTextPreview: preview,
 				},
 			});
@@ -561,8 +652,19 @@ function resolveOldTextEdits(
 						"One or more edit targets could not be resolved to exact lines. Re-read the relevant section and retry with the exact content as it appears in the file.",
 					];
 		const uniqueFailureKinds = [...new Set(failureKinds)];
-		logReadGuardEvent({
+		const editBatchSummary = createReadGuardEditBatchSummary({
+			requestedIndexes,
+			requestedTotal: edits.length,
+			resolvedIndexes,
+			resolvedTotal: resolvedRanges.length,
+			rejectedReasons,
+			rejectedTotal: Math.max(0, oldTextEditCount - resolvedRanges.length),
+			durationMs: Date.now() - startedAt,
+			terminalStatus: "blocked",
+		});
+		logBatchEvent({
 			event: "edit_preflight_blocked",
+			correlationId,
 			sessionId,
 			filePath,
 			metadata: {
@@ -590,15 +692,28 @@ function resolveOldTextEdits(
 			maxFailCount >= 2
 				? `🛑 RE-READ REQUIRED — You have submitted this oldText before and it still does not match.\n\nDo NOT retry from memory. Re-read \`${filePath}\` to get the current content, then rebuild your edit from the verbatim file text.`
 				: `🔄 RETRYABLE — Edit target not found`;
+		logBatchEvent({
+			event: "edit_batch_summary",
+			correlationId,
+			filePath,
+			metadata: { tool: "edit", editBatchSummary },
+		});
 		return {
 			touchedLines: undefined,
 			preflightError: `${header}\n\n${failureDetails.join("\n\n")}${appliedNote}`,
 			partiallyApplicable: passedEdits.length > 0 ? passedEdits : undefined,
+			editBatchSummary,
 		};
 	}
 
 	if (resolvedRanges.length === 0) {
-		logReadGuardEvent({
+		const editBatchSummary = createReadGuardEditBatchSummary({
+			requestedIndexes,
+			requestedTotal: edits.length,
+			rejectedTotal: oldTextEditCount,
+			terminalStatus: "blocked",
+		});
+		logBatchEvent({
 			event: "touched_lines_missing",
 			sessionId,
 			filePath,
@@ -608,7 +723,12 @@ function resolveOldTextEdits(
 				editCount: edits.length,
 			},
 		});
-		return { touchedLines: undefined };
+		logBatchEvent({
+			event: "edit_batch_summary",
+			filePath,
+			metadata: { tool: "edit", editBatchSummary },
+		});
+		return { touchedLines: undefined, editBatchSummary };
 	}
 
 	const starts = resolvedRanges.map(([s]) => s);
@@ -618,7 +738,7 @@ function resolveOldTextEdits(
 		Math.max(...ends),
 	];
 	const editRanges = resolvedRanges.length > 1 ? resolvedRanges : undefined;
-	logReadGuardEvent({
+	logBatchEvent({
 		event: "touched_lines_detected",
 		sessionId,
 		filePath,
@@ -630,7 +750,20 @@ function resolveOldTextEdits(
 			totalEditCount: edits.length,
 		},
 	});
-	return { touchedLines, editRanges, contentMatchValidated: true };
+	const editBatchSummary = createReadGuardEditBatchSummary({
+		requestedIndexes,
+		requestedTotal: edits.length,
+		resolvedIndexes,
+		resolvedTotal: resolvedRanges.length,
+		durationMs: Date.now() - startedAt,
+		terminalStatus: "success",
+	});
+	return {
+		touchedLines,
+		editRanges,
+		contentMatchValidated: true,
+		editBatchSummary,
+	};
 }
 
 /**
@@ -1053,6 +1186,7 @@ export function getTouchedLinesForGuard(
 	event: unknown,
 	filePath?: string,
 	sessionId?: string,
+	correlationId?: string,
 ): GuardLineResult {
 	if (isToolCallEventType("edit", event as any)) {
 		// The host standard-edit fields (path, edits[].oldText/newText) are pinned
@@ -1080,6 +1214,7 @@ export function getTouchedLinesForGuard(
 			editInput as Record<string, unknown>,
 			filePath,
 			sessionId,
+			correlationId,
 		);
 		if (hashlineResult) return hashlineResult;
 		if (editInput.oldRange) {
@@ -1090,6 +1225,7 @@ export function getTouchedLinesForGuard(
 			if (filePath) {
 				logReadGuardEvent({
 					event: "touched_lines_detected",
+					correlationId,
 					sessionId,
 					filePath,
 					metadata: {
@@ -1120,7 +1256,12 @@ export function getTouchedLinesForGuard(
 				);
 			if (rangedEdits.length === 0) {
 				if (filePath) {
-					return resolveOldTextEdits(editInput.edits, filePath, sessionId);
+					return resolveOldTextEdits(
+						editInput.edits,
+						filePath,
+						sessionId,
+						correlationId,
+					);
 				}
 				return { touchedLines: undefined };
 			}
@@ -1131,6 +1272,7 @@ export function getTouchedLinesForGuard(
 					unresolvedOldTextEdits,
 					filePath,
 					sessionId,
+					correlationId,
 				);
 				if (resolved.preflightError) {
 					return resolved;
@@ -1158,6 +1300,7 @@ export function getTouchedLinesForGuard(
 			if (filePath) {
 				logReadGuardEvent({
 					event: "touched_lines_detected",
+					correlationId,
 					sessionId,
 					filePath,
 					metadata: {
@@ -1179,6 +1322,7 @@ export function getTouchedLinesForGuard(
 			const topLevelKeys = Object.keys(editInput as Record<string, unknown>);
 			logReadGuardEvent({
 				event: "touched_lines_missing",
+				correlationId,
 				sessionId,
 				filePath,
 				metadata: {
@@ -1205,6 +1349,7 @@ export function getTouchedLinesForGuard(
 		if (filePath) {
 			logReadGuardEvent({
 				event: "touched_lines_detected",
+				correlationId,
 				sessionId,
 				filePath,
 				metadata: {

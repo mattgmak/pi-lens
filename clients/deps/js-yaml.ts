@@ -3,7 +3,7 @@
  * Exposes both the default export (callers that do `import yaml from …`) and the
  * named `dump`/`load` helpers, sourced from the one import.
  */
-import yaml from "js-yaml";
+import * as yaml from "js-yaml";
 
 export default yaml;
 export const dump = yaml.dump;

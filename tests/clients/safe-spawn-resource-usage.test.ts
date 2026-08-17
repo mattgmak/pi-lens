@@ -129,16 +129,24 @@ describe("safeSpawnAsync resource-usage bracketing (#620)", () => {
 		);
 	});
 
-	it("still stops the sampler exactly once and resolves cleanly for a non-existent command", async () => {
+	it("resolves cleanly for a non-existent command without ever starting the sampler", async () => {
 		stopMock.mockReturnValue(null);
 		const result = await safeSpawnAsync("this-command-does-not-exist-620", []);
 
-		expect(stopMock).toHaveBeenCalledTimes(1);
-		// Windows: shell:true means cmd.exe itself starts fine and reports the
-		// unknown command via a non-zero exit code (not a spawn "error" event);
-		// POSIX: shell:false spawn fails to exec and surfaces via "error".
-		// Either way the sampler must have been stopped exactly once (asserted
-		// above) — that's the behavior under test, not which path fired.
+		// #817: on Windows, command resolution (PATH+PATHEXT walk) now happens
+		// BEFORE any process is spawned. An unresolvable command short-circuits
+		// straight to an ENOENT-shaped SpawnResult.error — no child process ever
+		// exists, so there is nothing for the CPU/RSS sampler to bracket; it
+		// must not be started (and therefore never stopped) at all. On POSIX,
+		// shell:false spawn fails to exec and surfaces via the "error" event,
+		// which DOES start-then-stop the sampler around the failed attempt —
+		// this assertion is Windows-specific behavior.
+		if (process.platform === "win32") {
+			expect(startSpawnUsageSamplerMock).not.toHaveBeenCalled();
+			expect(stopMock).not.toHaveBeenCalled();
+		} else {
+			expect(stopMock).toHaveBeenCalledTimes(1);
+		}
 		expect(result.status !== 0 || result.error !== undefined).toBe(true);
 	});
 

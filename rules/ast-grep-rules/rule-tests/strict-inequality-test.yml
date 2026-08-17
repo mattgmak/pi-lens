@@ -3,6 +3,10 @@ valid:
   - 'a !== b'
   - 'a === b'
   - 'a < b'
+  - 'value != null'
+  - 'null != value'
+  - 'thinkingMap != null'
+  - 'value != undefined'
 invalid:
   - 'a != b'
   - 'a != "x"'

@@ -1,10 +1,10 @@
-import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { js as sgJs, ts as sgTs } from "@ast-grep/napi";
-import yaml from "js-yaml";
+import * as yaml from "js-yaml";
 import { afterEach, describe, expect, it } from "vitest";
+import { safeSpawn } from "../../clients/safe-spawn.js";
 import {
 	evaluateAstGrepRules,
 	type AstGrepEvaluateOptions,
@@ -18,6 +18,7 @@ import {
 	getAstGrepRuleSources,
 	resolveBaselineSgconfig,
 } from "../../clients/sgconfig.js";
+import { removeTempDirSync } from "./test-utils.js";
 
 const PRIMARY_RULES = path.join("rules", "ast-grep-rules", "rules");
 const SECONDARY_RULES = path.join(
@@ -142,11 +143,26 @@ function napiDiagnostics(
 
 function findCli(): string | undefined {
 	for (const command of ["ast-grep", "sg"]) {
-		const result = spawnSync(command, ["--version"], {
-			encoding: "utf8",
-			shell: process.platform === "win32",
-		});
-		if (result.status === 0) return command;
+		// #902: was `spawnSync(command, ..., { shell: process.platform ===
+		// "win32" })` — a fresh, uncached cmd.exe wrapper per call that
+		// intermittently failed to spawn at all under the process-creation
+		// pressure of a full parallel test-suite run on windows-latest CI
+		// (ENOENT/EAGAIN from the OS, not a real "CLI unavailable" signal).
+		// `safeSpawn` (shared with production, `clients/safe-spawn.ts`)
+		// resolves the command via a cached PATH+PATHEXT walk and spawns the
+		// resolved .exe/.com directly — same hardening #817 already gave the
+		// real dispatch spawn path (single source of truth, #883).
+		const result = safeSpawn(command, ["--version"]);
+		// The output must identify ast-grep, not merely exit 0: on Linux `sg` is
+		// util-linux's setgid runner, which exits 0 for `--version` and then fails
+		// every `scan --config` call — so the cliIt tests below ran against the
+		// wrong binary and asserted on its usage error. Same check the production
+		// probes apply (clients/sg-runner.ts `probeCommand`,
+		// clients/dispatch/runners/utils/runner-helpers.ts).
+		const version = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+		if (result.status === 0 && !result.error && /\bast[- ]grep\b/i.test(version)) {
+			return command;
+		}
 	}
 	return undefined;
 }
@@ -156,14 +172,20 @@ const cliIt = astGrepCli ? it : it.skip;
 
 function runCli(configPath: string, filePath: string) {
 	if (!astGrepCli) throw new Error("ast-grep CLI unavailable");
-	return spawnSync(
-		astGrepCli,
-		["scan", "--config", configPath, "--json=compact", filePath],
-		{
-			encoding: "utf8",
-			shell: process.platform === "win32",
-		},
-	);
+	// #902: safeSpawn instead of raw spawnSync(..., { shell: true }) — see
+	// findCli comment above.
+	const result = safeSpawn(astGrepCli, [
+		"scan",
+		"--config",
+		configPath,
+		"--json=compact",
+		filePath,
+	]);
+	return {
+		status: result.status,
+		stderr: result.stderr,
+		stdout: result.stdout,
+	};
 }
 
 afterEach(() => {
@@ -173,18 +195,9 @@ afterEach(() => {
 		// Windows: the raw ast-grep LSP child spawned by the cliIt case can still
 		// hold a handle on the temp dir when teardown runs, making rmSync throw
 		// EPERM (teardown-only — the test's assertions have already passed).
-		// Retry briefly, then swallow: a leaked tmp dir is harmless, a red run
-		// from teardown is not.
-		try {
-			fs.rmSync(root, {
-				recursive: true,
-				force: true,
-				maxRetries: 5,
-				retryDelay: 100,
-			});
-		} catch {
-			// leave the tmp dir for the OS temp cleaner
-		}
+		// The shared helper's retry+warn (#810) swallows a final failure: a
+		// leaked tmp dir is harmless, a red run from teardown is not.
+		removeTempDirSync(root);
 	}
 });
 
@@ -406,11 +419,33 @@ describe("project rule precedence follow-ups", { timeout: HEAVY_IO_TIMEOUT_MS },
 			if (!spawned) throw new Error("ast-grep LSP did not spawn");
 			expect(spawned.process.args).toContain("--config");
 
+			// #1022: use the server's OWN configured initialize budget (as
+			// production does at clients/lsp/index.ts:1358 —
+			// `initializeTimeoutMs: server.initializeTimeoutMs`) as the shared
+			// LSP timing budget here, instead of a shorter, invented constant.
+			// ast-grep's real budget (clients/lsp/server.ts,
+			// `AstGrepServer.initializeTimeoutMs`) is deliberately generous
+			// because the first scan of a session compiles the full rule set
+			// (~350 files incl. the CodeRabbit catalog) — and that compile cost
+			// can land either during the `initialize` handshake OR while
+			// computing the first document's diagnostics, depending on when
+			// the server actually parses the rule config. `waitForDiagnostics`
+			// (clients/lsp/client.ts) resolves silently on timeout rather than
+			// throwing, so a too-short wait here doesn't surface as a timeout
+			// error — it surfaces as a false "diagnostic not found" assertion
+			// failure, which is exactly what #1022 observed. A hardcoded 5s
+			// budget for either step undercut the server's own declared cost
+			// by 3x and could starve under full-parallel-suite CPU contention
+			// (this file is now also phased into its own low-concurrency
+			// vitest project — see vitest.config.ts's `lsp-spawn-heavy`
+			// project — so this budget-alignment is belt-and-braces, not the
+			// sole fix for the contention itself).
+			const lspBudgetMs = server.initializeTimeoutMs ?? 15_000;
 			const client = await createLSPClient({
 				serverId: "ast-grep",
 				process: spawned.process,
 				root,
-				initializeTimeoutMs: 5_000,
+				initializeTimeoutMs: lspBudgetMs,
 			});
 			try {
 				const minVersion = client.diagnosticsVersion;
@@ -419,7 +454,7 @@ describe("project rule precedence follow-ups", { timeout: HEAVY_IO_TIMEOUT_MS },
 					fs.readFileSync(filePath, "utf8"),
 					"typescript",
 				);
-				await client.waitForDiagnostics(filePath, 5_000, { minVersion });
+				await client.waitForDiagnostics(filePath, lspBudgetMs, { minVersion });
 				expect(
 					client
 						.getDiagnostics(filePath)
@@ -433,7 +468,12 @@ describe("project rule precedence follow-ups", { timeout: HEAVY_IO_TIMEOUT_MS },
 				await client.shutdown({ fast: true });
 			}
 		},
-		15_000,
+		// #1022: was a hardcoded 15_000 — too tight once both the initialize
+		// step and the diagnostics wait above can each legitimately consume up
+		// to the server's own ~15s budget. Give room for both budgets in
+		// sequence plus normal spawn/teardown overhead, rather than another
+		// disagreeing magic number.
+		40_000,
 	);
 
 	it("keeps TypeScript and JavaScript project winners aligned in NAPI", () => {

@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { removeTempDirSync } from "./test-utils.js";
 
 const safeSpawnAsync = vi.fn();
 const safeSpawn = vi.fn();
@@ -12,6 +13,14 @@ vi.mock("../../clients/safe-spawn.js", () => ({ safeSpawnAsync, safeSpawn }));
 vi.mock("../../clients/installer/index.js", () => ({ ensureTool }));
 vi.mock("../../clients/dispatch/runners/utils/runner-helpers.js", () => ({
 	getSgCommand,
+	resolveManagedToolClient: vi.fn(async ({ acceptInstalled }) => {
+		const installed = await ensureTool("ast-grep");
+		if (!installed) return { outcome: "missing" };
+		const value = await acceptInstalled(installed);
+		return value === null
+			? { outcome: "non-installable" }
+			: { outcome: "success", value };
+	}),
 }));
 
 describe("SgRunner", () => {
@@ -31,6 +40,29 @@ describe("SgRunner", () => {
 		});
 		getSgCommand.mockReturnValue({ cmd: "ast-grep", args: [] });
 		ensureTool.mockResolvedValue(null);
+	});
+
+	describe("spawn-failure taxonomy consumption (#1214/#1199)", () => {
+		it("cwd-unresolvable with an ENOENT cause is NOT unavailable and does NOT reinstall", async () => {
+			const enoent = Object.assign(new Error("spawn ast-grep ENOENT"), {
+				code: "ENOENT",
+			});
+			safeSpawnAsync.mockResolvedValue({
+				status: null,
+				error: enoent,
+				failure: "spawn",
+				spawnFailure: { kind: "cwd-unresolvable", cause: enoent },
+				stdout: "",
+				stderr: "",
+			});
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const runner = new SgRunner();
+			const result = await runner.execRaw(["run", "--pattern", "x"]);
+			// A raw `error.code === "ENOENT"` consumer regression maps this to
+			// unavailable and drives the #1199 reinstall loop — both must stay off.
+			expect(result.failure).not.toBe("unavailable");
+			expect(ensureTool).not.toHaveBeenCalled();
+		});
 	});
 
 	describe("ensureAvailable()", () => {
@@ -148,7 +180,157 @@ describe("SgRunner", () => {
 				expect(args).toContain("!profiles/**");
 				expect(args).toContain("!**/*.snap");
 			} finally {
-				fs.rmSync(root, { recursive: true, force: true });
+				removeTempDirSync(root);
+			}
+		});
+
+		it("reports invalid generated-rule CLI output instead of an empty success", async () => {
+			const root = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-sg-invalid-"),
+			);
+			try {
+				safeSpawnAsync.mockResolvedValueOnce({
+					status: 8,
+					error: undefined,
+					stdout: "",
+					stderr: "invalid node kind: definitely_not_a_kind",
+				});
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+				const result = await new SgRunner().tempScanDetailedAsync(
+					root,
+					"bad",
+					"id: bad\nlanguage: TypeScript\nrule: { kind: definitely_not_a_kind }\n",
+				);
+
+				expect(result.matches).toEqual([]);
+				expect(result.failure).toBe("cli-failure");
+				expect(result.error).toContain("invalid node kind");
+			} finally {
+				removeTempDirSync(root);
+			}
+		});
+
+		it("treats status-1 with valid JSON matches as success (severity:error linter contract)", async () => {
+			// #1087 P1 regression: ast-grep's linter-style contract — a rule with
+			// `severity: error` that MATCHES exits 1 with valid JSON matches on
+			// stdout and stderr "Scan succeeded and found error level diagnostics".
+			// The old code only exempted status-1 with NO output, so real matches
+			// were dropped as a cli-failure. Verified first-hand against the bundled
+			// ast-grep 0.45.0 binary during the fix.
+			const root = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-sg-err-sev-"),
+			);
+			try {
+				const matchJson = JSON.stringify([
+					{
+						file: path.join(root, "target.js"),
+						range: {
+							start: { line: 0, column: 0 },
+							end: { line: 0, column: 7 },
+						},
+						text: "eval(x)",
+						ruleId: "no-eval-test",
+						severity: "error",
+					},
+				]);
+				safeSpawnAsync.mockResolvedValueOnce({
+					status: 1,
+					error: undefined,
+					stdout: matchJson,
+					stderr: "Error: 1 error(s) found in code.\nHelp: Scan succeeded and found error level diagnostics in the codebase.",
+				});
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+				const result = await new SgRunner().tempScanDetailedAsync(
+					root,
+					"no-eval-test",
+					"id: no-eval-test\nlanguage: JavaScript\nseverity: error\nrule: { pattern: eval($ARG) }\n",
+				);
+
+				expect(result.matches).toHaveLength(1);
+				expect(result.matches[0].ruleId).toBe("no-eval-test");
+				expect(result.failure).toBeUndefined();
+				expect(result.error).toBeUndefined();
+			} finally {
+				removeTempDirSync(root);
+			}
+		});
+
+		it("rejects a status-1 JSON scalar/null stdout as a failure (no phantom match)", async () => {
+			// tryParseSgMatches only accepts an array or object — a JSON scalar
+			// (e.g. an error report serialized as `null`) must not become a match.
+			const root = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-sg-scalar-"),
+			);
+			try {
+				safeSpawnAsync.mockResolvedValueOnce({
+					status: 1,
+					error: undefined,
+					stdout: "null",
+					stderr: "Error: scan aborted",
+				});
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+				const result = await new SgRunner().tempScanDetailedAsync(
+					root,
+					"scalar",
+					"id: scalar\nlanguage: TypeScript\nrule: { kind: function_declaration }\n",
+				);
+
+				expect(result.matches).toEqual([]);
+				expect(result.failure).toBe("cli-failure");
+			} finally {
+				removeTempDirSync(root);
+			}
+		});
+
+		it("keeps status-1 with stderr but unparseable stdout as a failure", async () => {
+			// The complement of the case above: a nonzero status whose stdout is
+			// NOT valid JSON is a real CLI diagnostic, not a match set.
+			const root = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-sg-err-bad-"),
+			);
+			try {
+				safeSpawnAsync.mockResolvedValueOnce({
+					status: 1,
+					error: undefined,
+					stdout: "not json at all",
+					stderr: "Error: something went wrong",
+				});
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+				const result = await new SgRunner().tempScanDetailedAsync(
+					root,
+					"bad",
+					"id: bad\nlanguage: TypeScript\nrule: { kind: function_declaration }\n",
+				);
+
+				expect(result.matches).toEqual([]);
+				expect(result.failure).toBe("cli-failure");
+				expect(result.error).toContain("something went wrong");
+			} finally {
+				removeTempDirSync(root);
+			}
+		});
+
+		it("preserves status-one empty output as a genuine no-match", async () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-sg-empty-"));
+			try {
+				safeSpawnAsync.mockResolvedValueOnce({
+					status: 1,
+					error: undefined,
+					stdout: "",
+					stderr: "",
+				});
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+				const result = await new SgRunner().tempScanDetailedAsync(
+					root,
+					"empty",
+					"id: empty\nrule: { kind: function_declaration }\n",
+				);
+
+				expect(result.matches).toEqual([]);
+				expect(result.failure).toBeUndefined();
+				expect(result.error).toBeUndefined();
+			} finally {
+				removeTempDirSync(root);
 			}
 		});
 	});
@@ -160,7 +342,10 @@ describe("SgRunner", () => {
 			const matches = [
 				{
 					file: "src/foo.ts",
-					range: { start: { line: 0, column: 0 }, end: { line: 0, column: 10 } },
+					range: {
+						start: { line: 0, column: 0 },
+						end: { line: 0, column: 10 },
+					},
 					text: "console.log(x)",
 					language: "TypeScript",
 				},
@@ -176,7 +361,10 @@ describe("SgRunner", () => {
 			const matches = [
 				{
 					file: "src/foo.ts",
-					range: { start: { line: 0, column: 0 }, end: { line: 0, column: 10 } },
+					range: {
+						start: { line: 0, column: 0 },
+						end: { line: 0, column: 10 },
+					},
 					text: "console.log(x)",
 				},
 			];
@@ -190,11 +378,22 @@ describe("SgRunner", () => {
 			const matches = [
 				{
 					file: "src/foo.ts",
-					range: { start: { line: 0, column: 0 }, end: { line: 0, column: 20 } },
+					range: {
+						start: { line: 0, column: 0 },
+						end: { line: 0, column: 20 },
+					},
 					text: "console.log(msg)",
 					language: "TypeScript",
 					metaVariables: {
-						single: { MSG: { text: "msg", range: { start: { line: 0, column: 12 }, end: { line: 0, column: 15 } } } },
+						single: {
+							MSG: {
+								text: "msg",
+								range: {
+									start: { line: 0, column: 12 },
+									end: { line: 0, column: 15 },
+								},
+							},
+						},
 						multi: {},
 						transformed: {},
 					},
@@ -259,7 +458,7 @@ describe("SgRunner", () => {
 				expect(result.error).toBeUndefined();
 				expect(result.matches).toHaveLength(1);
 			} finally {
-				fs.rmSync(root, { recursive: true, force: true });
+				removeTempDirSync(root);
 			}
 		});
 
@@ -285,8 +484,97 @@ describe("SgRunner", () => {
 				);
 				expect(allArgs).not.toContain("--update-all");
 			} finally {
-				fs.rmSync(root, { recursive: true, force: true });
+				removeTempDirSync(root);
 			}
+		});
+	});
+
+	describe("exec() honors the status-1-with-matches linter contract (#1087)", () => {
+		it("parses matches when a severity:error rule exits 1 with JSON stdout", async () => {
+			const matchJson = JSON.stringify([
+				{
+					file: "src/a.js",
+					range: {
+						start: { line: 0, column: 0 },
+						end: { line: 0, column: 7 },
+					},
+					text: "eval(x)",
+				},
+			]);
+			safeSpawnAsync.mockResolvedValueOnce({
+				status: 1,
+				error: undefined,
+				stdout: matchJson,
+				stderr: "Scan succeeded and found error level diagnostics",
+			});
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const result = await new SgRunner().exec(["scan", "--json", "."]);
+			expect(result.matches).toHaveLength(1);
+			expect(result.totalMatches).toBe(1);
+			expect(result.error).toBeUndefined();
+		});
+
+		it("still reports a failure when status-1 stdout is not JSON", async () => {
+			safeSpawnAsync.mockResolvedValueOnce({
+				status: 1,
+				error: undefined,
+				stdout: "garbage",
+				stderr: "Error: bad rule",
+			});
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const result = await new SgRunner().exec(["scan", "--json", "."]);
+			expect(result.matches).toEqual([]);
+			expect(result.error).toContain("bad rule");
+		});
+
+		it("reports a failure for exit 2 even when stdout parses as match JSON", async () => {
+			// Only exit 1 carries the "scan succeeded with findings" linter
+			// contract — any other nonzero exit is a real CLI failure and must
+			// NOT be laundered into matches, however plausible stdout looks.
+			safeSpawnAsync.mockResolvedValueOnce({
+				status: 2,
+				error: undefined,
+				stdout: JSON.stringify([
+					{
+						file: "src/a.js",
+						range: {
+							start: { line: 0, column: 0 },
+							end: { line: 0, column: 7 },
+						},
+						text: "eval(x)",
+					},
+				]),
+				stderr: "Error: invalid scan configuration",
+			});
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const result = await new SgRunner().exec(["scan", "--json", "."]);
+			expect(result.matches).toEqual([]);
+			expect(result.error).toContain("invalid scan configuration");
+		});
+
+		it("treats truncated status-1 stdout as a failure, not as matches", async () => {
+			// A truncated JSON payload may still happen to parse (e.g. cut
+			// exactly at a match boundary) — the truncation flag must veto it.
+			safeSpawnAsync.mockResolvedValueOnce({
+				status: 1,
+				error: undefined,
+				stdout: JSON.stringify([
+					{
+						file: "src/a.js",
+						range: {
+							start: { line: 0, column: 0 },
+							end: { line: 0, column: 7 },
+						},
+						text: "eval(x)",
+					},
+				]),
+				stderr: "Scan succeeded and found error level diagnostics",
+				outputTruncated: true,
+			});
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const result = await new SgRunner().exec(["scan", "--json", "."]);
+			expect(result.matches).toEqual([]);
+			expect(result.error).toBeDefined();
 		});
 	});
 
@@ -295,7 +583,14 @@ describe("SgRunner", () => {
 			const { buildBashRunArgs } = await import("../../clients/sg-runner.js");
 			expect(
 				buildBashRunArgs("ast-grep", ["run", "-p", "console.log($MSG)"]),
-			).toEqual(["-c", '"$0" "$@"', "ast-grep", "run", "-p", "console.log($MSG)"]);
+			).toEqual([
+				"-c",
+				'"$0" "$@"',
+				"ast-grep",
+				"run",
+				"-p",
+				"console.log($MSG)",
+			]);
 		});
 
 		it("never interpolates the command path into the script (no env-path injection)", async () => {
@@ -313,6 +608,29 @@ describe("SgRunner", () => {
 			const { buildBashRunArgs } = await import("../../clients/sg-runner.js");
 			const argv = buildBashRunArgs("sg", ["-p", "$A && $B || $$$REST"]);
 			expect(argv).toContain("$A && $B || $$$REST");
+		});
+	});
+
+	// #533 — the pidusage bug class: a SYNCHRONOUS `spawn()` throw inside
+	// `exec()`'s Promise executor (Windows `spawn UNKNOWN`/EINVAL) must not
+	// reject/crash the host — `exec` is contracted to always resolve with an
+	// `error`, exactly like an asynchronously-emitted spawn `'error'` event.
+	describe("exec() contains a synchronous spawn throw (#533)", () => {
+		it("resolves gracefully instead of rejecting when spawn throws sync", async () => {
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const runner = new SgRunner();
+			// A NUL byte in an argv element makes Node's real `spawn()` throw
+			// SYNCHRONOUSLY (ERR_INVALID_ARG_VALUE) from inside the executor — the
+			// same detached-throw shape as the Windows `spawn UNKNOWN` failure.
+			(runner as unknown as { sgCommand: string }).sgCommand = process.execPath;
+			(runner as unknown as { sgArgsPrefix: string[] }).sgArgsPrefix = [
+				String.fromCharCode(0), // NUL byte -> spawn() throws synchronously
+			];
+
+			// Must RESOLVE (never reject); the failure surfaces in `error`.
+			const result = await runner.exec(["-p", "x"]);
+			expect(result.matches).toEqual([]);
+			expect(result.error).toBeTruthy();
 		});
 	});
 });

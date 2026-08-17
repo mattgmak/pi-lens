@@ -34,7 +34,7 @@ export interface ModifiedRange {
 // --- API Interface ---
 
 export interface PiAgentAPI {
-	getFlag(flag: string): string | boolean | undefined;
+	getFlag(flag: string, filePath?: string): string | boolean | undefined;
 }
 
 // --- Output Semantics ---
@@ -89,6 +89,16 @@ export interface Diagnostic {
 	matchedText?: string;
 	/** Tree-sitter AST node type of the match (e.g. "call_expression", "template_string") */
 	astNodeType?: string;
+	/**
+	 * #692: purely informational provenance label for a diagnostic reconciled
+	 * from a project-wide SCAN path (e.g. `"lens_diagnostics_full"`,
+	 * `"lsp_diagnostics"`) rather than the per-edit dispatch pipeline. This
+	 * field must NEVER participate in identity, dedup, or suppression —
+	 * `id`/`rule` always derive from the diagnostic's own real source (see
+	 * `convertLspDiagnostics`'s `scanOrigin` option). Absent for per-edit
+	 * diagnostics.
+	 */
+	scanOrigin?: string;
 }
 
 export interface DispatchResult {
@@ -170,6 +180,13 @@ export interface DispatchContext {
 	/** Only run blocking rules (severity: error) - used for fast feedback on file write */
 	readonly blockingOnly?: boolean;
 	readonly modifiedRanges?: ModifiedRange[];
+	/** Ordered per-file pipeline token used by widget reconciliation (#1198). */
+	readonly writeIndex?: number;
+	/** Model/provider active for this dispatch, when the runtime knows it
+	 * (#1448) — threaded to the worklog append so repair history can be
+	 * attributed. Blank/absent outside a live agent turn (e.g. project scans). */
+	readonly telemetryModel?: string;
+	readonly telemetryProvider?: string;
 
 	hasTool(command: string): Promise<boolean>;
 	log(message: string): void;

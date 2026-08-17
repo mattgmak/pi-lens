@@ -17,7 +17,7 @@ description: |
   ✅ FIX: Use send(), const_get(), or other metaprogramming instead.
 
 query: |
-  (method_call
+  (call
     method: (identifier) @METHOD
     (#eq? @METHOD "eval")
     arguments: (argument_list) @ARGS)

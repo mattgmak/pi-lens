@@ -17,6 +17,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+	SKIP_FORMATTING,
 	biomeFormatter,
 	blackFormatter,
 	clearFormatterRuntimeState,
@@ -28,8 +29,10 @@ import {
 	ruffFormatter,
 	standardrbFormatter,
 	styluaFormatter,
+	shfmtFormatter,
 } from "../../clients/formatters.ts";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
+import { _getSpotlessGradleReadCountForTests } from "../../clients/tool-policy.js";
 
 // ---------------------------------------------------------------------------
 // Platform helpers
@@ -110,6 +113,20 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("resolveCommand — node_modules/.bin", () => {
+	it("biome: pins detected two-space indentation when unconfigured", async () => {
+		const binPath = nodeModulesBin(tmpDir, "biome");
+		makeFakeExe(binPath);
+		const filePath = fileIn(tmpDir, "index.ts");
+		fs.writeFileSync(filePath, "function f() {\n  return 1;\n}\n");
+
+		const cmd = await biomeFormatter.resolveCommand!(filePath, tmpDir);
+
+		expect(cmd).toContain("--indent-style");
+		expect(cmd).toContain("space");
+		expect(cmd).toContain("--indent-width");
+		expect(cmd).toContain("2");
+	});
+
 	it("biome: prefers local node_modules/.bin/biome over npx", async () => {
 		const binPath = nodeModulesBin(tmpDir, "biome");
 		makeFakeExe(binPath);
@@ -135,6 +152,31 @@ describe("resolveCommand — node_modules/.bin", () => {
 		expect(cmd).toContain("--write");
 		expect(cmd).toContain(filePath);
 	});
+
+	it("prettier: skips when indentation is undetectable and no config exists", async () => {
+		const binPath = nodeModulesBin(tmpDir, "prettier");
+		makeFakeExe(binPath);
+		const filePath = fileIn(tmpDir, "app.tsx");
+		fs.writeFileSync(filePath, "const value = 1;\n");
+
+		expect(await prettierFormatter.resolveCommand!(filePath, tmpDir)).toBe(
+			SKIP_FORMATTING,
+		);
+	});
+});
+
+describe("resolveCommand — shfmt style preservation", () => {
+	it("pins detected two-space indentation when unconfigured", async () => {
+		await withPathShim("shfmt", async () => {
+			const filePath = fileIn(tmpDir, "script.sh");
+			fs.writeFileSync(filePath, "if true; then\n  echo hi\nfi\n");
+
+			const cmd = await shfmtFormatter.resolveCommand!(filePath, tmpDir);
+
+			expect(cmd).toContain("-i");
+			expect(cmd).toContain("2");
+		});
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -153,6 +195,64 @@ describe("resolveCommand — .venv", () => {
 		expect(cmd![0]).toBe(binPath);
 		expect(cmd).toContain("format");
 		expect(cmd).toContain(filePath);
+	});
+
+	// `ruff format` rejects --indent-style/--indent-width ("unexpected argument",
+	// exit 2). Back when exit-code strictness was opt-in and ruff had not opted
+	// in, formatFile reported that as a clean unchanged file — every unconfigured
+	// Python file silently went
+	// unformatted. Style must be pinned via inline TOML overrides instead.
+	it("ruff: pins detected indentation via --config, never bare --indent-* flags", async () => {
+		const binPath = venvBin(tmpDir, "ruff");
+		makeFakeExe(binPath);
+		const filePath = fileIn(tmpDir, "main.py");
+		fs.writeFileSync(filePath, "def f():\n    return 1\n");
+
+		const cmd = await ruffFormatter.resolveCommand!(filePath, tmpDir);
+
+		expect(cmd).not.toBeNull();
+		// Exact argv, not containment: containment stayed green when a review
+		// probe appended an invented flag — only strict equality screens CLI
+		// drift against the real ruff interface (#1336 review finding).
+		expect(cmd).toEqual([
+			binPath,
+			"format",
+			"--config",
+			"indent-width=4",
+			"--config",
+			"format.indent-style='space'",
+			filePath,
+		]);
+	});
+
+	it("ruff: pins detected tab indentation via --config", async () => {
+		const binPath = venvBin(tmpDir, "ruff");
+		makeFakeExe(binPath);
+		const filePath = fileIn(tmpDir, "main.py");
+		fs.writeFileSync(filePath, "def f():\n\treturn 1\n");
+
+		const cmd = await ruffFormatter.resolveCommand!(filePath, tmpDir);
+
+		expect(cmd).toEqual([
+			binPath,
+			"format",
+			"--config",
+			"indent-width=1",
+			"--config",
+			"format.indent-style='tab'",
+			filePath,
+		]);
+	});
+
+	it("ruff: skips when indentation is undetectable and no config exists", async () => {
+		const binPath = venvBin(tmpDir, "ruff");
+		makeFakeExe(binPath);
+		const filePath = fileIn(tmpDir, "main.py");
+		fs.writeFileSync(filePath, "value = 1\n");
+
+		expect(await ruffFormatter.resolveCommand!(filePath, tmpDir)).toBe(
+			SKIP_FORMATTING,
+		);
 	});
 
 	it("ruff: falls back to discovered global install when no venv binary", async () => {
@@ -412,6 +512,13 @@ describe("getFormattersForFile — policy selection", () => {
 		expect(formatters.map((f) => f.name)).toEqual(["prettier"]);
 	});
 
+	it("re-detects after a formatter config is added", async () => {
+		const filePath = fileIn(tmpDir, "README.md");
+		expect(await getFormattersForFile(filePath, tmpDir)).toEqual([]);
+		createTempFile(tmpDir, ".prettierrc", "{}\n");
+		expect((await getFormattersForFile(filePath, tmpDir)).map((f) => f.name)).toEqual(["prettier"]);
+	});
+
 	it("does not force a formatter for unconfigured SQL files", async () => {
 		const filePath = fileIn(tmpDir, "query.sql");
 		const formatters = await getFormattersForFile(filePath, tmpDir);
@@ -444,11 +551,11 @@ describe("getFormattersForFile — policy selection", () => {
 		});
 	});
 
-	it("uses ktlint as the smart default for Kotlin files when available", async () => {
+	it("does not force ktlint on unconfigured Kotlin files", async () => {
 		await withPathShim("ktlint", async () => {
 			const filePath = fileIn(tmpDir, "App.kt");
 			const formatters = await getFormattersForFile(filePath, tmpDir);
-			expect(formatters.map((f) => f.name)).toEqual(["ktlint"]);
+			expect(formatters).toEqual([]);
 		});
 	});
 
@@ -461,36 +568,84 @@ describe("getFormattersForFile — policy selection", () => {
 		});
 	});
 
-	it("uses swiftformat as the smart default for Swift files when available", async () => {
+	it("selects Spotless ktlint on every invocation and never ktfmt (#1306)", async () => {
+		const fixtureRoot = path.resolve(
+			"tests/fixtures/formatter-policy/kotlin-ktlint",
+		);
+		const filePath = path.join(fixtureRoot, "src", "App.kt");
+		for (let invocation = 0; invocation < 5; invocation += 1) {
+			const formatters = await getFormattersForFile(filePath, fixtureRoot);
+			expect(formatters.map((formatter) => formatter.name)).toEqual(["ktlint"]);
+			expect(formatters.some((formatter) => formatter.name === "ktfmt")).toBe(false);
+		}
+	});
+
+	it("selects ktlint for a 76-file multi-directory session with one Gradle read (#1306)", async () => {
+		createTempFile(
+			tmpDir,
+			"settings.gradle.kts",
+			"spotless {\n  kotlin {\n    ktlint()\n  }\n}\n",
+		);
+		const files = Array.from({ length: 76 }, (_, index) => {
+			const filePath = path.join(
+				tmpDir,
+				"modules",
+				`module-${index % 13}`,
+				"src",
+				`File${index}.kt`,
+			);
+			fs.mkdirSync(path.dirname(filePath), { recursive: true });
+			fs.writeFileSync(filePath, `class File${index}\n`);
+			return filePath;
+		});
+		const readsBefore = _getSpotlessGradleReadCountForTests();
+		for (const filePath of files) {
+			const formatters = await getFormattersForFile(filePath, tmpDir);
+			expect(formatters.map((formatter) => formatter.name)).toEqual(["ktlint"]);
+		}
+		expect(_getSpotlessGradleReadCountForTests() - readsBefore).toBe(1);
+	});
+
+	it("selects Spotless ktfmt and never ktlint (#1306)", async () => {
+		createTempFile(
+			tmpDir,
+			"build.gradle.kts",
+			"spotless {\n  kotlin {\n    ktfmt()\n  }\n}\n",
+		);
+		const formatters = await getFormattersForFile(fileIn(tmpDir, "App.kt"), tmpDir);
+		expect(formatters.map((formatter) => formatter.name)).toEqual(["ktfmt"]);
+	});
+
+	it("does not force swiftformat on unconfigured Swift files", async () => {
 		await withPathShim("swiftformat", async () => {
 			const filePath = fileIn(tmpDir, "App.swift");
 			const formatters = await getFormattersForFile(filePath, tmpDir);
-			expect(formatters.map((f) => f.name)).toEqual(["swiftformat"]);
+			expect(formatters).toEqual([]);
 		});
 	});
 
-	it("uses fantomas as the smart default for F# files when available", async () => {
+	it("does not force fantomas on unconfigured F# files", async () => {
 		await withPathShim("fantomas", async () => {
 			const filePath = fileIn(tmpDir, "App.fs");
 			const formatters = await getFormattersForFile(filePath, tmpDir);
-			expect(formatters.map((f) => f.name)).toEqual(["fantomas"]);
+			expect(formatters).toEqual([]);
 		});
 	});
 
-	it("uses nixfmt as the smart default for Nix files when available", async () => {
+	it("does not force nixfmt on unconfigured Nix files", async () => {
 		await withPathShim("nixfmt", async () => {
 			const filePath = fileIn(tmpDir, "flake.nix");
 			const formatters = await getFormattersForFile(filePath, tmpDir);
-			expect(formatters.map((f) => f.name)).toEqual(["nixfmt"]);
+			expect(formatters).toEqual([]);
 		});
 	});
 
-	it("uses mix as the smart default for Elixir files when available in an Elixir project", async () => {
+	it("does not force mix on an unconfigured Elixir project", async () => {
 		createTempFile(tmpDir, "mix.exs", "defmodule Demo.MixProject do\nend\n");
 		await withPathShim("mix", async () => {
 			const filePath = path.join(tmpDir, "lib", "app.ex");
 			const formatters = await getFormattersForFile(filePath, tmpDir);
-			expect(formatters.map((f) => f.name)).toEqual(["mix"]);
+			expect(formatters).toEqual([]);
 		});
 	});
 
@@ -503,19 +658,19 @@ describe("getFormattersForFile — policy selection", () => {
 		});
 	});
 
-	it("uses csharpier as the smart default for C# files when dotnet csharpier is available", async () => {
+	it("does not force csharpier on unconfigured C# files", async () => {
 		await withPathShim("dotnet", async () => {
 			const filePath = fileIn(tmpDir, "Program.cs");
 			const formatters = await getFormattersForFile(filePath, tmpDir);
-			expect(formatters.map((f) => f.name)).toEqual(["csharpier"]);
+			expect(formatters).toEqual([]);
 		});
 	});
 
-	it("uses ormolu as the smart default for Haskell files when available", async () => {
+	it("does not force ormolu on unconfigured Haskell files", async () => {
 		await withPathShim("ormolu", async () => {
 			const filePath = fileIn(tmpDir, "Main.hs");
 			const formatters = await getFormattersForFile(filePath, tmpDir);
-			expect(formatters.map((f) => f.name)).toEqual(["ormolu"]);
+			expect(formatters).toEqual([]);
 		});
 	});
 
@@ -571,11 +726,75 @@ describe("getFormattersForFile — policy selection", () => {
 		expect(formatters.map((f) => f.name)).toEqual(["ocamlformat"]);
 	});
 
-	it("uses taplo as the smart default for TOML files when available", async () => {
+	it("uses terragrunt-hcl as the smart default for terragrunt.hcl when available", async () => {
+		await withPathShim("terragrunt", async () => {
+			const filePath = fileIn(tmpDir, "terragrunt.hcl");
+			const formatters = await getFormattersForFile(filePath, tmpDir);
+			expect(formatters.map((f) => f.name)).toEqual(["terragrunt-hcl"]);
+		});
+	});
+
+	it("uses terragrunt-hcl as the smart default for root.hcl when available", async () => {
+		await withPathShim("terragrunt", async () => {
+			const filePath = fileIn(tmpDir, "root.hcl");
+			const formatters = await getFormattersForFile(filePath, tmpDir);
+			expect(formatters.map((f) => f.name)).toEqual(["terragrunt-hcl"]);
+		});
+	});
+
+	it("matches terragrunt-hcl for Terragrunt.HCL regardless of case", async () => {
+		await withPathShim("terragrunt", async () => {
+			const filePath = fileIn(tmpDir, "Terragrunt.HCL");
+			const formatters = await getFormattersForFile(filePath, tmpDir);
+			expect(formatters.map((f) => f.name)).toEqual(["terragrunt-hcl"]);
+		});
+	});
+
+	it("does not match terragrunt-hcl for a generic .hcl file", async () => {
+		await withPathShim("terragrunt", async () => {
+			const formatters = await getFormattersForFile(
+				fileIn(tmpDir, "packer.hcl"),
+				tmpDir,
+			);
+			expect(formatters).toEqual([]);
+		});
+	});
+
+	it("plain .hcl cached first does not suppress terragrunt.hcl in the same dir", async () => {
+		await withPathShim("terragrunt", async () => {
+			const plain = await getFormattersForFile(
+				fileIn(tmpDir, ".terraform.lock.hcl"),
+				tmpDir,
+			);
+			expect(plain).toEqual([]);
+			const terragrunt = await getFormattersForFile(
+				fileIn(tmpDir, "terragrunt.hcl"),
+				tmpDir,
+			);
+			expect(terragrunt.map((f) => f.name)).toEqual(["terragrunt-hcl"]);
+		});
+	});
+
+	it("terragrunt.hcl cached first does not leak its formatter onto plain .hcl", async () => {
+		await withPathShim("terragrunt", async () => {
+			const terragrunt = await getFormattersForFile(
+				fileIn(tmpDir, "terragrunt.hcl"),
+				tmpDir,
+			);
+			expect(terragrunt.map((f) => f.name)).toEqual(["terragrunt-hcl"]);
+			const plain = await getFormattersForFile(
+				fileIn(tmpDir, ".terraform.lock.hcl"),
+				tmpDir,
+			);
+			expect(plain).toEqual([]);
+		});
+	});
+
+	it("does not force taplo on unconfigured TOML files", async () => {
 		await withPathShim("taplo", async () => {
 			const filePath = fileIn(tmpDir, "config.toml");
 			const formatters = await getFormattersForFile(filePath, tmpDir);
-			expect(formatters.map((f) => f.name)).toEqual(["taplo"]);
+			expect(formatters).toEqual([]);
 		});
 	});
 
@@ -999,5 +1218,117 @@ describe("oxfmt formatter — detection and policy selection", () => {
 			tmpDir,
 		);
 		expect(formatters.map((f) => f.name)).toContain("oxfmt");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// oxfmt + .svelte — a stricter conditional gate than the other oxfmt extensions
+// ---------------------------------------------------------------------------
+//
+// Empirically verified against the real `oxfmt` npm package (0.62.0, scratch
+// fixture outside vitest — see PR body for the full four-cell matrix): unlike
+// oxfmt's other supported extensions, `.svelte` requires BOTH the `svelte`
+// package installed AND the config's `svelte` flag enabled. Either alone
+// always fails at runtime (exit 2), so — unlike the cross-product above —
+// "an oxfmt config file exists" is NOT sufficient for `.svelte` to be offered.
+describe("oxfmt formatter — .svelte conditional gate (#1134)", () => {
+	function svelteComponent(dir: string): string {
+		return fileIn(dir, "Component.svelte");
+	}
+
+	function writePackageJson(
+		dir: string,
+		devDependencies: Record<string, string>,
+	): void {
+		createTempFile(
+			dir,
+			"package.json",
+			JSON.stringify({ devDependencies }),
+		);
+	}
+
+	it("offers oxfmt for Component.svelte with the issue's exact fixture shape", async () => {
+		writePackageJson(tmpDir, { oxfmt: "^0.54.0", svelte: "^5.0.0" });
+		createTempFile(tmpDir, ".oxfmtrc.json", JSON.stringify({ svelte: true }));
+
+		const formatters = await getFormattersForFile(svelteComponent(tmpDir), tmpDir);
+		expect(formatters.map((f) => f.name)).toEqual(["oxfmt"]);
+	});
+
+	it("offers oxfmt for Component.svelte when the svelte flag is set via oxfmt.toml", async () => {
+		writePackageJson(tmpDir, { oxfmt: "^0.54.0", svelte: "^5.0.0" });
+		createTempFile(tmpDir, "oxfmt.toml", "svelte = true\n");
+
+		const formatters = await getFormattersForFile(svelteComponent(tmpDir), tmpDir);
+		expect(formatters.map((f) => f.name)).toEqual(["oxfmt"]);
+	});
+
+	it("does NOT offer oxfmt for Component.svelte without the svelte package (config flag on)", async () => {
+		writePackageJson(tmpDir, { oxfmt: "^0.54.0" });
+		createTempFile(tmpDir, ".oxfmtrc.json", JSON.stringify({ svelte: true }));
+
+		const formatters = await getFormattersForFile(svelteComponent(tmpDir), tmpDir);
+		expect(formatters.map((f) => f.name)).not.toContain("oxfmt");
+	});
+
+	it("does NOT offer oxfmt for Component.svelte without the config flag (svelte package installed)", async () => {
+		writePackageJson(tmpDir, { oxfmt: "^0.54.0", svelte: "^5.0.0" });
+		createTempFile(tmpDir, ".oxfmtrc.json", "{}\n");
+
+		const formatters = await getFormattersForFile(svelteComponent(tmpDir), tmpDir);
+		expect(formatters.map((f) => f.name)).not.toContain("oxfmt");
+	});
+
+	it("does NOT offer oxfmt for Component.svelte when the config flag is explicitly false", async () => {
+		writePackageJson(tmpDir, { oxfmt: "^0.54.0", svelte: "^5.0.0" });
+		createTempFile(tmpDir, ".oxfmtrc.json", JSON.stringify({ svelte: false }));
+
+		const formatters = await getFormattersForFile(svelteComponent(tmpDir), tmpDir);
+		expect(formatters.map((f) => f.name)).not.toContain("oxfmt");
+	});
+
+	it("does NOT offer oxfmt for Component.svelte from a generic oxfmt.toml with no svelte flag", async () => {
+		writePackageJson(tmpDir, { oxfmt: "^0.54.0", svelte: "^5.0.0" });
+		createTempFile(tmpDir, "oxfmt.toml", "# oxfmt config\n");
+
+		const formatters = await getFormattersForFile(svelteComponent(tmpDir), tmpDir);
+		expect(formatters.map((f) => f.name)).not.toContain("oxfmt");
+	});
+
+	it("does NOT offer oxfmt for Component.svelte with neither the package nor the config flag", async () => {
+		writePackageJson(tmpDir, { oxfmt: "^0.54.0" });
+
+		const formatters = await getFormattersForFile(svelteComponent(tmpDir), tmpDir);
+		expect(formatters.map((f) => f.name)).not.toContain("oxfmt");
+	});
+
+	it("still offers oxfmt for a non-svelte extension without the svelte package or flag", async () => {
+		writePackageJson(tmpDir, { oxfmt: "^0.54.0" });
+		createTempFile(tmpDir, "oxfmt.toml", "# oxfmt config\n");
+
+		const formatters = await getFormattersForFile(fileIn(tmpDir, "index.ts"), tmpDir);
+		expect(formatters.map((f) => f.name)).toContain("oxfmt");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Single-source-of-truth drift guard (#1134, the #883 pattern) — belt-and-
+// suspenders alongside deriving oxfmtFormatter.extensions directly from
+// OXFMT_SUPPORTED_EXTENSIONS: this catches a future PR that reintroduces a
+// second hand-maintained copy instead of importing the shared constant.
+// ---------------------------------------------------------------------------
+
+describe("oxfmt extension registries stay in sync (#1134)", () => {
+	it("oxfmtFormatter.extensions matches tool-policy's OXFMT_SUPPORTED_EXTENSIONS exactly", async () => {
+		const { OXFMT_SUPPORTED_EXTENSIONS } = await import(
+			"../../clients/tool-policy.ts"
+		);
+		expect(new Set(oxfmtFormatter.extensions)).toEqual(
+			OXFMT_SUPPORTED_EXTENSIONS,
+		);
+	});
+
+	it("oxfmtFormatter.extensions includes .svelte", () => {
+		expect(oxfmtFormatter.extensions).toContain(".svelte");
 	});
 });

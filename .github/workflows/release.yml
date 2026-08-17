@@ -5,6 +5,10 @@ on:
     branches: [master]
   workflow_dispatch:
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   prepare:
     runs-on: ubuntu-latest
@@ -14,18 +18,15 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       tag: ${{ steps.meta.outputs.tag }}
       should_release: ${{ steps.meta.outputs.should_release }}
-      has_npm_token: ${{ steps.meta.outputs.has_npm_token }}
     steps:
       # yamllint disable-line rule:line-length
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Compute release metadata
         id: meta
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         shell: bash
         run: |
           VERSION=$(node -p "require('./package.json').version")
@@ -40,19 +41,11 @@ jobs:
             SHOULD_RELEASE=true
           fi
 
-          # Check if NPM_TOKEN secret is configured
-          if [ -n "$NPM_TOKEN" ]; then
-            HAS_NPM_TOKEN=true
-          else
-            HAS_NPM_TOKEN=false
-          fi
-
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "should_release=$SHOULD_RELEASE" >> "$GITHUB_OUTPUT"
-          echo "has_npm_token=$HAS_NPM_TOKEN" >> "$GITHUB_OUTPUT"
 
-      - name: Verify changelog entry exists
+      - name: Verify bump PR rolled up changelog entries
         if: steps.meta.outputs.should_release == 'true'
         shell: bash
         env:
@@ -62,37 +55,35 @@ jobs:
             echo "Missing CHANGELOG entry for version $VERSION"
             exit 1
           fi
+          if find .changelog -maxdepth 1 -type f -name '*.md' ! -name README.md \
+               -print -quit | grep -q .; then
+            echo "Unrolled .changelog entries remain; run npm run changelog:release in the bump PR"
+            exit 1
+          fi
 
       # yamllint disable-line rule:line-length
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
-        if: >
-          steps.meta.outputs.should_release == 'true' &&
-          steps.meta.outputs.has_npm_token == 'true'
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        if: steps.meta.outputs.should_release == 'true'
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
       - name: Install dependencies
-        if: >
-          steps.meta.outputs.should_release == 'true' &&
-          steps.meta.outputs.has_npm_token == 'true'
+        if: steps.meta.outputs.should_release == 'true'
         run: npm install --no-audit --no-fund
 
-      - name: Dry-run publish (validates tarball + registry auth)
-        if: >
-          steps.meta.outputs.should_release == 'true' &&
-          steps.meta.outputs.has_npm_token == 'true'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # No registry auth needed here: `npm publish --dry-run` never reaches the
+      # actual publish call (npm skips it when --dry-run is set), so it neither
+      # needs nor uses credentials — it only validates the tarball contents.
+      - name: Dry-run publish (validates tarball)
+        if: steps.meta.outputs.should_release == 'true'
         run: npm publish --dry-run
 
       # The dry-run above runs prepare (tsc → dist/), so the compiled entry now
       # exists in the working tree. Load it to catch a broken/missing-dep entry
       # before we tag and publish (#182).
       - name: Smoke-load compiled entry
-        if: >
-          steps.meta.outputs.should_release == 'true' &&
-          steps.meta.outputs.has_npm_token == 'true'
+        if: steps.meta.outputs.should_release == 'true'
         shell: bash
         run: |
           ENTRY=$(node -p "require('./package.json').pi.extensions[0]")
@@ -113,16 +104,19 @@ jobs:
     if: needs.prepare.outputs.should_release == 'true'
     permissions:
       contents: write
+      pull-requests: read
     steps:
       # yamllint disable-line rule:line-length
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       # The release body is the curated CHANGELOG section for this version, not
       # the auto-generated PR-title list — so the release reads as a meaningful
       # summary of what changed (especially new features). `prepare` already
-      # verified the `## [VERSION]` heading exists, so extraction can't be empty.
+      # verified the bump PR already materialized the version heading and
+      # consumed every per-entry file.
       - name: Extract release notes from CHANGELOG
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
@@ -138,25 +132,46 @@ jobs:
           gh release create "$TAG" --title "$TAG"
           --notes-file "$RUNNER_TEMP/release-notes.md"
 
+      - name: Append contributor thanks
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          git fetch --tags origin
+          node scripts/backfill-release-thanks.mjs --apply --only "$TAG"
+
   publish-npm:
     runs-on: ubuntu-latest
     needs: [prepare, release]
-    if: >
-      needs.prepare.outputs.should_release == 'true' &&
-      needs.prepare.outputs.has_npm_token == 'true'
+    if: needs.prepare.outputs.should_release == 'true'
     permissions:
       contents: read
+      # Required for OIDC trusted publishing: npm exchanges this job's GitHub
+      # Actions ID token for a short-lived registry token, so no NPM_TOKEN
+      # secret is needed. Configured as the trusted publisher for this package
+      # on npmjs.com (repo apmantza/pi-lens, workflow release.yml).
+      id-token: write
     steps:
       # yamllint disable-line rule:line-length
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
       # yamllint disable-line rule:line-length
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+
+      # OIDC trusted publishing needs npm >= 11.5.1. Node 22's bundled npm
+      # isn't guaranteed to be new enough, so pin explicitly. Pinned (not
+      # `@latest`) per repo convention (#731/#732): bump by hand after
+      # verifying a newer release. 11.18.0 is the latest 11.x release —
+      # deliberately not npm 12.x, whose engines requirement
+      # (node ^22.22.2 || ^24.15.0 || >=26.0.0) is stricter than what the
+      # `node-version: 22` pin above guarantees.
+      - name: Pin npm to a version with OIDC trusted-publishing support
+        run: npm install -g npm@11.18.0 --ignore-scripts
 
       # Required: the `prepare` script builds dist/ (tsc), which needs
       # node_modules. `npm install` runs prepare here, and `npm publish` runs it
@@ -166,6 +181,4 @@ jobs:
         run: npm install --no-audit --no-fund
 
       - name: Publish to npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish # zizmor: ignore[use-trusted-publishing]
+        run: npm publish

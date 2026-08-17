@@ -16,12 +16,12 @@ description: |
   ✅ FIX: use Digest::SHA256 or stronger algorithms.
 
 query: |
-  (call_expression
-    receiver: (constant) @MOD
+  (call
+    receiver: (scope_resolution) @MOD
+    (#match? @MOD "^(Digest::MD5|Digest::SHA1)$")
     method: (identifier) @FN
+    (#match? @FN "^(hexdigest|digest|base64digest)$")
     arguments: (argument_list) @ARGS)
-  (#match? @MOD "^(Digest::MD5|Digest::SHA1)$")
-  (#match? @FN "^(hexdigest|digest|base64digest)$")
 
 metavars:
   - MOD

@@ -22,9 +22,10 @@
  *      snapshot) for who-uses-this / flags / imports — never a build. Cold cache
  *      → outline only.
  * `semantic.source` reflects who-uses-this provenance: "review-graph" when the
- * cached graph backs it, else "none" (cold). Live-LSP enrichment is re-homed to
- * #236, where LSP writes provenance-tagged edges INTO the graph (once, persisted)
- * for this path to read as "graph-lsp". That logic lives in clients/module-report-lsp.ts.
+ * cached graph backs it, "unavailable:file-cap" when a size verdict disabled the
+ * graph, else "none" (cold). Live-LSP enrichment is re-homed to #236, where LSP
+ * writes provenance-tagged edges INTO the graph (once, persisted) for this path
+ * to read as "graph-lsp". That logic lives in clients/module-report-lsp.ts.
  *
  * Guard integrity: moduleReport injects NO read records — an outline is not
  * "having seen the body". readSymbol returns the actual body lines so the host
@@ -36,12 +37,21 @@ import * as path from "node:path";
 import { detectFileKind } from "./file-kinds.js";
 import { logLatency } from "./latency-logger.js";
 import { annotateMiddleMan } from "./middle-man-analysis.js";
-import { normalizeMapKey } from "./path-utils.js";
+import { normalizeMapKey, toProjectRelativePath } from "./path-utils.js";
+import {
+	loadCallGraph,
+	type CallGraphCacheIdentity,
+	type CallGraphEvidenceCoverage,
+	type ResolvedCallEdge,
+} from "./call-graph.js";
 import { resolveImportToFiles } from "./review-graph/import-resolvers.js";
 import { buildSymbolId } from "./review-graph/symbol-id.js";
 import type { ReviewGraph, ReviewGraphEdgeKind } from "./review-graph/types.js";
 import type { Symbol as ExtractedSymbol } from "./symbol-types.js";
-import { getSharedTreeSitterClient } from "./tree-sitter-shared.js";
+import {
+	getSharedTreeSitterClient,
+	resolveTreeSitterLanguage,
+} from "./tree-sitter-shared.js";
 import {
 	type ImportRef,
 	TreeSitterSymbolExtractor,
@@ -53,8 +63,16 @@ import {
 // lsp.ts) to be re-homed in #236, where LSP writes provenance-tagged edges INTO
 // the review graph (computed once, persisted) so this path just reads them.
 
+/** Hard payload bound for the per-symbol who-uses-this section. */
+export const MAX_MODULE_REPORT_REFS = 100;
+
+function normalizeMaxRefsPerSymbol(value: number | undefined): number {
+	if (value === undefined || !Number.isFinite(value)) return 10;
+	return Math.min(MAX_MODULE_REPORT_REFS, Math.max(1, Math.floor(value)));
+}
+
 export interface ModuleReportOptions {
-	/** Cap on who-uses-this entries per symbol. */
+	/** Cap on who-uses-this entries per symbol (hard-capped at 100). */
 	maxRefsPerSymbol?: number;
 	/** Optional task hint used only to rank recommendedReads; never expands scope or triggers scans. */
 	focus?: string;
@@ -71,6 +89,10 @@ export interface ModuleReportOptions {
 	/** Max hops for the blast-radius walk (default 3). Only meaningful with
 	 * `blastRadius`. */
 	blastRadiusDepth?: number;
+	/** Include the bounded derived caller/callee view from the cached call graph. */
+	callGraph?: boolean;
+	/** Per-direction cap for call-graph relations (default 20). */
+	maxCallGraphEntries?: number;
 }
 
 export interface ModuleSymbolUsedBy {
@@ -194,6 +216,54 @@ export interface BlastRadius {
 	files: BlastRadiusFile[];
 }
 
+export interface ModuleCallGraphRelation {
+	/** Stable FunctionCallGraph symbol key for the related symbol. */
+	symbolId: string;
+	/** Stable symbol key for the module symbol this relation belongs to. */
+	targetSymbolId: string;
+	file: string;
+	symbol?: string;
+	kind?: string;
+	line?: number;
+	evidenceKind?: "calls" | "references" | "mixed";
+	resolution?: "exact" | "import" | "receiver-type" | "name-only" | "unresolved";
+	evidenceCount?: number;
+	weight?: number;
+}
+
+export interface ModuleCallGraphCoverage {
+	status: "complete" | "partial" | "unavailable";
+	complete: boolean;
+	totalEvidence?: number;
+	callsEvidence?: number;
+	referencesEvidence?: number;
+	eligibleEvidence?: number;
+	resolvedEvidence?: number;
+	unresolvedEvidence?: number;
+	typeOnlyEvidence?: number;
+	unsupportedEvidence?: number;
+	sameFileEvidence?: number;
+	duplicateEvidence?: number;
+	languages?: Record<string, "complete" | "partial" | "unavailable">;
+}
+
+export interface ModuleCallGraph {
+	available: boolean;
+	/** Why the cached view is unavailable; never infer zero calls from this state. */
+	reason?:
+		| "cache-missing"
+		| "review-graph-missing"
+		| "identity-missing"
+		| "partial"
+		| "stale"
+		| "file-cap";
+	callers: ModuleCallGraphRelation[];
+	callees: ModuleCallGraphRelation[];
+	/** True when either bounded relation list is a prefix of the cached data. */
+	truncated: boolean;
+	coverage: ModuleCallGraphCoverage;
+}
+
 export interface ModuleReport {
 	/** False when the file is unreadable or has no symbols and no graph node. */
 	available: boolean;
@@ -224,6 +294,9 @@ export interface ModuleReport {
 	/** Cross-file blast radius (#304) — present only when requested via
 	 * `blastRadius` and the cached graph is warm; omitted otherwise. */
 	blastRadius?: BlastRadius;
+	/** Derived caller/callee relationships — present only when requested via
+	 * `callGraph`, including explicit cache coverage when unavailable. */
+	callGraph?: ModuleCallGraph;
 	/**
 	 * ISO timestamp the cached review graph was last built (`ReviewGraph.builtAt`),
 	 * present whenever a graph was consulted (warm or cold-but-existing). Omitted
@@ -236,14 +309,15 @@ export interface ModuleReport {
 	provenance?: {
 		symbols: "syntax" | "none";
 		imports: "cached-review-graph" | "syntax" | "none";
-		usedBy: "cached-review-graph" | "none";
+		usedBy: "cached-review-graph" | "unavailable:file-cap" | "none";
 		callbacks: "heuristic-tree-sitter" | "none";
-		blastRadius?: "cached-review-graph" | "none";
+		blastRadius?: "cached-review-graph" | "unavailable:file-cap" | "none";
+		callGraph?: "cached-call-graph" | "unavailable:file-cap" | "none";
 	};
 	semantic: {
 		/** Provenance of who-uses-this: AST review graph, future graph-LSP edges
-		 * (#236), or none (cold cache). */
-		source: "review-graph" | "graph-lsp" | "none";
+		 * (#236), an explicit graph-unavailable reason, or none (cold cache). */
+		source: "review-graph" | "graph-lsp" | "unavailable:file-cap" | "none";
 		references: boolean;
 		implementations: boolean;
 	};
@@ -337,10 +411,11 @@ export interface ReadEnclosingOptions {
 
 // kind -> tree-sitter languageId. The languageId keys BOTH the grammar map
 // (tree-sitter-client) and SYMBOL_QUERIES (tree-sitter-symbol-extractor), so it
-// must match a key present in both. jsts/cxx are resolved by extension below so
-// the JSX-aware tsx grammar and the c-vs-cpp split are honoured. Using these
-// gives the primary languages the same rich outline (classes/interfaces/types/
-// signatures) as every other language, not the functions-only FunctionSummary.
+// must match a key present in both. jsts/cxx are extension-split kinds resolved
+// through the SHARED ext→grammar resolver below (never a local extension map —
+// #887). Using these gives the primary languages the same rich outline
+// (classes/interfaces/types/signatures) as every other language, not the
+// functions-only FunctionSummary.
 const KIND_TO_TS_LANG: Record<string, string> = {
 	python: "python",
 	go: "go",
@@ -360,18 +435,26 @@ const KIND_TO_TS_LANG: Record<string, string> = {
 	// cxx resolved by extension below (c vs cpp)
 };
 
-function tsLangForFile(
+export function tsLangForFile(
 	filePath: string,
 	kind: string | undefined,
 ): string | undefined {
-	const ext = path.extname(filePath).toLowerCase();
-	if (kind === "cxx") {
-		return ext === ".c" || ext === ".h" ? "c" : "cpp";
-	}
+	// jsts/cxx are extension-split kinds: resolve them through the shared
+	// ext→grammar authority (tree-sitter-shared.ts EXT_TO_LANG) — the SAME
+	// resolver the dispatch tree-sitter runner, fact providers, project scanner
+	// and read expansion use — so a file is parsed and TreeCache-keyed
+	// (`languageId:path`) under exactly one grammar process-wide. #887: this
+	// used to hand-roll a local map that sent .js/.mjs/.cjs to the typescript
+	// grammar and .jsx to tsx, so every plain-JS file was parsed and cached
+	// twice under two grammars and ran TS-grammar symbol queries on JS trees.
+	// Extensions the shared map does not cover (.svelte/.vue for jsts; the
+	// module-interface/Objective-C/CUDA tail for cxx) keep the historical
+	// kind default.
 	if (kind === "jsts") {
-		// Route JSX-bearing files to the tsx grammar (downloaded), plain TS/JS to
-		// the typescript grammar; both share the same SYMBOL_QUERIES.
-		return ext === ".tsx" || ext === ".jsx" ? "tsx" : "typescript";
+		return resolveTreeSitterLanguage(filePath) ?? "typescript";
+	}
+	if (kind === "cxx") {
+		return resolveTreeSitterLanguage(filePath) ?? "cpp";
 	}
 	return kind ? KIND_TO_TS_LANG[kind] : undefined;
 }
@@ -426,7 +509,8 @@ async function extractFile(
 ): Promise<{
 	symbols: ExtractedSymbol[];
 	imports: ImportRef[];
-	root?: ModuleReportNode;
+	callbacks: ModuleCallbackEntry[];
+	callbackError?: string;
 	error?: string;
 	warnings?: string[];
 }> {
@@ -436,6 +520,7 @@ async function extractFile(
 			return {
 				symbols: [],
 				imports: [],
+				callbacks: [],
 				error: "tree-sitter runtime unavailable (wasm aborted)",
 			};
 		}
@@ -444,29 +529,59 @@ async function extractFile(
 			return {
 				symbols: [],
 				imports: [],
+				callbacks: [],
 				error: "tree-sitter runtime failed to initialize",
 			};
 		}
-		const tree = await tsClient.parseFile(absPath, languageId);
-		if (!tree) {
+		const extractor = await getExtractor(languageId);
+		const extracted = await tsClient.withParsedTree(
+			absPath,
+			languageId,
+			content,
+			(tree) => {
+				const warnings = extractor
+					? []
+					: [`Symbol extractor not available for ${languageId}`];
+				const result = extractor
+					? extractor.extract(tree, absPath, content)
+					: { symbols: [], imports: [] };
+				const owners = result.symbols
+					.filter((candidate) => !candidate.local)
+					.map((candidate) => ({
+						name: candidate.name,
+						startLine: candidate.line,
+						endLine: candidate.endLine ?? candidate.line,
+					}));
+				let callbacks: ModuleCallbackEntry[] = [];
+				let callbackError: string | undefined;
+				try {
+					callbacks = extractCallbacks(
+						tree.rootNode as unknown as ModuleReportNode,
+						owners,
+						languageId,
+						warnings,
+					);
+				} catch (error) {
+					callbackError = diagnosticMessage(error);
+				}
+				return {
+					symbols: result.symbols,
+					imports: result.imports,
+					callbacks,
+					callbackError,
+					warnings,
+				};
+			},
+		);
+		if (!extracted.parsed) {
 			return {
 				symbols: [],
 				imports: [],
+				callbacks: [],
 				error: `tree-sitter failed to parse as ${languageId}`,
 			};
 		}
-		const extractor = await getExtractor(languageId);
-		const root = tree.rootNode as unknown as ModuleReportNode;
-		if (!extractor) {
-			return {
-				symbols: [],
-				imports: [],
-				root,
-				warnings: [`Symbol extractor not available for ${languageId}`],
-			};
-		}
-		const result = extractor.extract(tree, absPath, content);
-		return { symbols: result.symbols, imports: result.imports, root };
+		return extracted.value;
 	} catch (err) {
 		const message = diagnosticMessage(err);
 		logLatency({
@@ -476,7 +591,7 @@ async function extractFile(
 			durationMs: 0,
 			metadata: { error: message },
 		});
-		return { symbols: [], imports: [], error: message };
+		return { symbols: [], imports: [], callbacks: [], error: message };
 	}
 }
 
@@ -530,7 +645,9 @@ function resolveUsedBy(
 			symbol,
 			line,
 			relation: edge.kind,
-			...(edge.resolution ? { resolution: edge.resolution } : {}),
+			...(edge.resolution && edge.resolution !== "unresolved"
+				? { resolution: edge.resolution }
+				: {}),
 		});
 		if (out.length >= cap) break;
 	}
@@ -542,11 +659,7 @@ function resolveUsedBy(
 // `read` args) keep the absolute path so the host's Read tool resolves them
 // unambiguously; only display fields (`path`, `usedBy.file`, imports) relativize.
 function toDisplayPath(p: string, projectRoot: string): string {
-	if (!path.isAbsolute(p)) return p.replace(/\\/g, "/");
-	const rel = path.relative(projectRoot, p);
-	return rel && !rel.startsWith("..")
-		? rel.replace(/\\/g, "/")
-		: p.replace(/\\/g, "/");
+	return toProjectRelativePath(p, projectRoot);
 }
 
 function collectImports(
@@ -1607,6 +1720,139 @@ function extractCallbacks(
 	return callbacks.slice(0, callbackCap);
 }
 
+const CALL_GRAPH_DEFAULT_ENTRY_CAP = 20;
+const CALL_GRAPH_MAX_ENTRY_CAP = 100;
+
+function unavailableCallGraph(
+	reason: ModuleCallGraph["reason"],
+): ModuleCallGraph {
+	return {
+		available: false,
+		reason,
+		callers: [],
+		callees: [],
+		truncated: false,
+		coverage: { status: "unavailable", complete: false },
+	};
+}
+
+function callGraphCoverage(
+	coverage: CallGraphEvidenceCoverage,
+): ModuleCallGraphCoverage {
+	const languages = coverage.languages;
+	const complete = coverage.complete && Object.values(languages ?? {}).every(
+		(status) => status === "complete",
+	);
+	return {
+		status: complete ? "complete" : "partial",
+		complete,
+		totalEvidence: coverage.totalEvidence,
+		callsEvidence: coverage.callsEvidence,
+		referencesEvidence: coverage.referencesEvidence,
+		eligibleEvidence: coverage.eligibleEvidence,
+		resolvedEvidence: coverage.resolvedEvidence,
+		unresolvedEvidence: coverage.unresolvedEvidence,
+		typeOnlyEvidence: coverage.typeOnlyEvidence,
+		unsupportedEvidence: coverage.unsupportedEvidence,
+		sameFileEvidence: coverage.sameFileEvidence,
+		duplicateEvidence: coverage.duplicateEvidence,
+		...(languages ? { languages } : {}),
+	};
+}
+
+function callGraphRelation(
+	edge: ResolvedCallEdge,
+	kind: "caller" | "callee",
+	projectRoot: string,
+): ModuleCallGraphRelation {
+	const caller = kind === "caller";
+	return {
+		symbolId: caller ? edge.callerKey : edge.calleeKey,
+		targetSymbolId: caller ? edge.calleeKey : edge.callerKey,
+		file: toDisplayPath(caller ? edge.callerFile : edge.calleeFile, projectRoot),
+		...(caller
+			? {
+					symbol: edge.callerSymbol,
+					kind: edge.callerKind,
+					line: edge.callerLine,
+				}
+			: {
+					symbol: edge.calleeSymbol,
+					kind: edge.calleeKind,
+					line: edge.calleeLine,
+			}),
+		...(edge.evidenceKind ? { evidenceKind: edge.evidenceKind } : {}),
+		...(edge.resolution ? { resolution: edge.resolution } : {}),
+		...(edge.evidenceCount && edge.evidenceCount > 1
+			? { evidenceCount: edge.evidenceCount }
+			: {}),
+		...(edge.weight !== 1 ? { weight: edge.weight } : {}),
+	};
+}
+
+/**
+ * Read the separately persisted FunctionCallGraph projection. This accessor is
+ * deliberately conservative: the module-report path never walks/builds the
+ * review graph, and a changed source file invalidates the projection rather
+ * than being reported as a clean zero-call result.
+ */
+function readCallGraph(
+	projectRoot: string,
+	normalizedPath: string,
+	maxEntries: number,
+	graphFileCap: number | undefined,
+	identity: CallGraphCacheIdentity | undefined,
+	reviewGraph: ReviewGraph | undefined,
+): ModuleCallGraph {
+	if (graphFileCap !== undefined) return unavailableCallGraph("file-cap");
+	// The canonical review graph is the only freshness authority. This path is
+	// read-only: do not walk source files or compare an independent mtime map.
+	if (!reviewGraph) return unavailableCallGraph("review-graph-missing");
+	if (reviewGraph.persistCoverage?.partial || reviewGraph.persistCoverage?.inProgress) {
+		return unavailableCallGraph("partial");
+	}
+	if (!identity) return unavailableCallGraph("identity-missing");
+	if (!reviewGraph.fileNodes.has(normalizedPath)) return unavailableCallGraph("stale");
+	const cached = loadCallGraph(projectRoot, identity);
+	if (!cached) return unavailableCallGraph("stale");
+
+	const callers: ModuleCallGraphRelation[] = [];
+	const callees: ModuleCallGraphRelation[] = [];
+	for (const edge of cached.graph.edges) {
+		if (normalizeMapKey(edge.calleeFile) === normalizedPath) {
+			callers.push(callGraphRelation(edge, "caller", projectRoot));
+		}
+		if (normalizeMapKey(edge.callerFile) === normalizedPath) {
+			callees.push(callGraphRelation(edge, "callee", projectRoot));
+		}
+	}
+	const stable = (left: ModuleCallGraphRelation, right: ModuleCallGraphRelation) =>
+		left.targetSymbolId.localeCompare(right.targetSymbolId) ||
+		(left.line ?? 0) - (right.line ?? 0) ||
+		left.symbolId.localeCompare(right.symbolId);
+	callers.sort(stable);
+	callees.sort(stable);
+	return {
+		available: true,
+		callers: callers.slice(0, maxEntries),
+		callees: callees.slice(0, maxEntries),
+		truncated: callers.length > maxEntries || callees.length > maxEntries,
+		coverage: callGraphCoverage(cached.graph.coverage ?? {
+			totalEvidence: cached.graph.totalRefs,
+			callsEvidence: cached.graph.totalRefs,
+			referencesEvidence: 0,
+			eligibleEvidence: cached.graph.totalRefs,
+			resolvedEvidence: cached.graph.totalRefs,
+			unresolvedEvidence: cached.graph.unresolvedRefs,
+			typeOnlyEvidence: 0,
+			unsupportedEvidence: 0,
+			sameFileEvidence: 0,
+			duplicateEvidence: 0,
+			complete: false,
+		}),
+	};
+}
+
 function unavailableReport(displayPath: string, error?: string): ModuleReport {
 	return {
 		available: false,
@@ -1637,7 +1883,11 @@ export async function moduleReport(
 	options?: ModuleReportOptions,
 ): Promise<ModuleReport> {
 	const startedAt = Date.now();
-	const maxRefs = Math.max(1, options?.maxRefsPerSymbol ?? 10);
+	const maxRefs = normalizeMaxRefsPerSymbol(options?.maxRefsPerSymbol);
+	const maxCallGraphEntries = Math.min(
+		CALL_GRAPH_MAX_ENTRY_CAP,
+		Math.max(1, Math.floor(options?.maxCallGraphEntries ?? CALL_GRAPH_DEFAULT_ENTRY_CAP)),
+	);
 	const absPath = path.resolve(cwd, file);
 	const normalizedPath = normalizeMapKey(absPath);
 
@@ -1655,7 +1905,8 @@ export async function moduleReport(
 	const {
 		symbols: extracted,
 		imports: extractedImports,
-		root,
+		callbacks,
+		callbackError,
 		error: extractionError,
 		warnings: extractionWarnings,
 	} = languageId
@@ -1663,7 +1914,8 @@ export async function moduleReport(
 		: {
 				symbols: [],
 				imports: [],
-				root: undefined,
+				callbacks: [],
+				callbackError: undefined,
 				error: undefined,
 				warnings: undefined,
 			};
@@ -1675,11 +1927,30 @@ export async function moduleReport(
 	// synchronous full build re-runs every fact provider (TS-compiler ASTs for
 	// jsts) and two racing builds OOM'd pi (#256). Cold cache → outline-only.
 	let graph: ReviewGraph | undefined;
+	let graphFileCap: number | undefined;
+	let callGraphIdentity: CallGraphCacheIdentity | undefined;
 	try {
-		const { getCachedReviewGraph } = await import("./review-graph/builder.js");
+		const {
+			getCachedReviewGraph,
+			getReviewGraphCacheIdentity,
+			getReviewGraphSizeSkipVerdict,
+		} = await import("./review-graph/builder.js");
 		graph = getCachedReviewGraph(cwd);
+		graphFileCap = getReviewGraphSizeSkipVerdict(cwd)?.maxFileCount;
+		callGraphIdentity = graph
+			? (() => {
+					const identity = getReviewGraphCacheIdentity(cwd, graph);
+					return identity
+						? {
+							reviewGraphVersion: identity.version,
+							reviewGraphSignature: identity.signature,
+						}
+						: undefined;
+			  })()
+			: undefined;
 	} catch {
 		graph = undefined;
+		callGraphIdentity = undefined;
 	}
 
 	// Drop function-local declarations (a nested const/arrow/function) from the
@@ -1702,20 +1973,25 @@ export async function moduleReport(
 
 	const api = topLevel.filter((entry) => entry.exported);
 	const internal = topLevel.filter((entry) => !entry.exported);
-	let callbacks: ModuleCallbackEntry[] = [];
 	const warnings: string[] = [...(extractionWarnings ?? [])];
-	try {
-		callbacks = extractCallbacks(root, entries, languageId, warnings);
-	} catch (err) {
-		const message = diagnosticMessage(err);
-		warnings.push(`Failed to extract callbacks: ${message}`);
+	if (callbackError) {
+		warnings.push(`Failed to extract callbacks: ${callbackError}`);
 		logLatency({
 			type: "phase",
 			phase: "module_report_callback_extract_error",
 			filePath: absPath,
 			durationMs: 0,
-			metadata: { error: message },
+			metadata: { error: callbackError },
 		});
+	}
+	if (graphFileCap !== undefined) {
+		warnings.push(
+			`who-uses-this is unavailable: review graph disabled because the project ` +
+				`has more than ${graphFileCap} files (cap ${graphFileCap}) — raise ` +
+				"maxProjectFiles in .pi-lens.json or set " +
+				"PI_LENS_REVIEW_GRAPH_MAX_FILES; for CI/cron, run npx pi-lens " +
+				"build-graph after configuring the cap",
+		);
 	}
 
 	// Imports: the warm review graph is source-of-truth; on a cold cache (or a
@@ -1767,6 +2043,16 @@ export async function moduleReport(
 					Math.max(1, options.blastRadiusDepth ?? 3),
 				)
 			: undefined;
+	const callGraph = options?.callGraph
+		? readCallGraph(
+				cwd,
+				normalizedPath,
+				maxCallGraphEntries,
+				graphFileCap,
+				callGraphIdentity,
+				graph,
+			)
+		: undefined;
 
 	const view = options?.view ?? "default";
 	const summaryView = view === "summary";
@@ -1781,7 +2067,17 @@ export async function moduleReport(
 	} else if (graph) {
 		importsProvenance = "cached-review-graph";
 	}
-	const blastRadiusProvenance = blastRadius ? "cached-review-graph" : "none";
+	const unavailableGraphProvenance = graphFileCap !== undefined
+		? "unavailable:file-cap"
+		: "none";
+	const blastRadiusProvenance = blastRadius
+		? "cached-review-graph"
+		: unavailableGraphProvenance;
+	const callGraphProvenance = callGraph?.available
+		? "cached-call-graph"
+		: callGraph?.reason === "file-cap"
+			? "unavailable:file-cap"
+			: "none";
 	const report: ModuleReport = {
 		available: entries.length > 0 || hasGraphNode,
 		staleness: entries.length === 0 && !hasGraphNode ? "unavailable" : "fresh",
@@ -1808,21 +2104,25 @@ export async function moduleReport(
 		...(summaryView ? { view: "summary" } : {}),
 		...(compactView ? { view: "compact" } : {}),
 		...(blastRadius && !summaryView ? { blastRadius } : {}),
+		...(callGraph ? { callGraph } : {}),
 		...(graph ? { graphBuiltAt: graph.builtAt } : {}),
 		provenance: {
 			symbols: languageId ? "syntax" : "none",
 			imports: importsProvenance,
-			usedBy: hasGraphNode ? "cached-review-graph" : "none",
+			usedBy: hasGraphNode
+				? "cached-review-graph"
+				: unavailableGraphProvenance,
 			callbacks: languageId && !summaryView ? "heuristic-tree-sitter" : "none",
 			...(options?.blastRadius
 				? { blastRadius: blastRadiusProvenance }
 				: {}),
+			...(options?.callGraph ? { callGraph: callGraphProvenance } : {}),
 		},
 		semantic: {
 			// Provenance of who-uses-this / references. The AST review graph is the
 			// only source on this read path; "graph-lsp" is reserved for #236 (LSP
 			// writes provenance edges INTO the graph). Cold cache → "none".
-			source: hasGraphNode ? "review-graph" : "none",
+			source: hasGraphNode ? "review-graph" : unavailableGraphProvenance,
 			references: hasGraphNode,
 			implementations: false,
 		},
@@ -1960,6 +2260,9 @@ export function renderCompactModuleReport(report: ModuleReport): string {
 		`${report.path} ${report.language ?? "?"} ${report.lineCount ?? "?"}L — ` +
 			`${report.summary.symbols} symbols, ${report.summary.exports} exported${importsSuffix}`,
 	];
+	for (const warning of report.warnings ?? []) {
+		lines.push(`WARNING: ${warning}`);
+	}
 
 	if (report.api.length > 0) {
 		lines.push("API:");
@@ -1979,6 +2282,19 @@ export function renderCompactModuleReport(report: ModuleReport): string {
 		lines.push("CALLBACKS:");
 		for (const callback of report.callbacks) {
 			lines.push(compactCallbackLine(callback, width));
+		}
+	}
+	if (report.callGraph) {
+		const callGraph = report.callGraph;
+		const suffix = callGraph.truncated ? " (truncated)" : "";
+		lines.push("CALL GRAPH:");
+		if (!callGraph.available) {
+			lines.push(`  unavailable (${callGraph.reason ?? "unknown"})`);
+		} else {
+			lines.push(
+				`  callers: ${callGraph.callers.length} · callees: ${callGraph.callees.length}` +
+				` · coverage: ${callGraph.coverage.status}${suffix}`,
+			);
 		}
 	}
 	if (report.recommendedReads.length > 0) {
@@ -2158,7 +2474,8 @@ export async function readSymbol(
 
 	const {
 		symbols,
-		root,
+		callbacks: allCallbacks,
+		callbackError,
 		error: extractionError,
 		warnings: extractionWarnings,
 	} = await extractFile(absPath, languageId, content);
@@ -2211,19 +2528,8 @@ export async function readSymbol(
 		};
 	}
 
-	const owners = symbols
-		.filter((candidate) => !candidate.local)
-		.map((candidate) => ({
-			name: candidate.name,
-			startLine: candidate.line,
-			endLine: candidate.endLine ?? candidate.line,
-		}));
-	let allCallbacks: ModuleCallbackEntry[];
-	const callbackWarnings = [...(extractionWarnings ?? [])];
-	try {
-		allCallbacks = extractCallbacks(root, owners, languageId, callbackWarnings);
-	} catch (err) {
-		const message = `Callback extraction failed: ${diagnosticMessage(err)}`;
+	if (callbackError) {
+		const message = `Callback extraction failed: ${callbackError}`;
 		logLatency({
 			type: "phase",
 			phase: "read_symbol_callback_extract_error",
@@ -2234,6 +2540,7 @@ export async function readSymbol(
 		log(false);
 		return { found: false, path: absPath, name: symbolName, error: message };
 	}
+	const callbackWarnings = [...(extractionWarnings ?? [])];
 	const callback = allCallbacks.find(
 		(candidate) => candidate.name === symbolName,
 	);
@@ -2444,7 +2751,8 @@ export async function readEnclosing(
 
 	const {
 		symbols,
-		root,
+		callbacks,
+		callbackError,
 		error: extractionError,
 		warnings: extractionWarnings,
 	} = await extractFile(absPath, languageId, content);
@@ -2461,19 +2769,9 @@ export async function readEnclosing(
 	const filters = new Set(
 		(options?.kinds ?? []).map((value) => value.toLowerCase()),
 	);
-	const owners = symbols
-		.filter((candidate) => !candidate.local)
-		.map((candidate) => ({
-			name: candidate.name,
-			startLine: candidate.line,
-			endLine: candidate.endLine ?? candidate.line,
-		}));
 	const warnings = [...(extractionWarnings ?? [])];
-	let callbacks: ModuleCallbackEntry[] = [];
-	try {
-		callbacks = extractCallbacks(root, owners, languageId, warnings);
-	} catch (err) {
-		const message = `Callback extraction failed: ${diagnosticMessage(err)}`;
+	if (callbackError) {
+		const message = `Callback extraction failed: ${callbackError}`;
 		warnings.push(message);
 		logLatency({
 			type: "phase",

@@ -5,6 +5,7 @@ features.md
 # pi-lens internal
 .pi-lens/
 .harness/
+.pi-subagents/
 
 # Session data
 .pisessionsummaries/
@@ -50,6 +51,8 @@ migrate-*.js
 
 # Documentation files - only keep specific docs in public repo
 *.md
+!tests/fixtures/changelog-entries/*.md
+!.changelog/*.md
 !AGENTS.md
 !README.md
 !CHANGELOG.md
@@ -58,12 +61,12 @@ migrate-*.js
 !LICENSE
 !SECURITY.md
 !docs/audit1.md
+!docs/agent-guide.md
 !docs/agent-tools.md
 !docs/ast-grep_rules_catalog.md
 !docs/tree-sitter_rules_catalog.md
 !docs/custom-rules.md
 !docs/dependencies.md
-!docs/env_variables.md
 !docs/features.md
 !docs/globalconfig.md
 !docs/language-coverage.md
@@ -76,9 +79,12 @@ migrate-*.js
 !docs/mcp.md
 !docs/module-report-read-symbol.md
 !docs/environment-variables.md
+!docs/settings.md
 !docs/fable.md
 !docs/subagent-compat.md
+!docs/dispositions.md
 !docs/word-index.md
+!docs/durable-store-audit-1202.md
 !skills/**/*.md
 !.github/PULL_REQUEST_TEMPLATE.md
 
@@ -120,3 +126,14 @@ AGENTS.md
 autoresearch.jsonl
 coverage/
 PR_issues_Audit.md
+
+# plegma worker handoff artifacts (never commit)
+.plegma-envelope.json
+.plegma/
+
+# C# build output from dotnet-build test fixtures (never commit)
+tests/fixtures/**/obj/
+tests/fixtures/**/bin/
+
+# Live native-TS7 integration temp projects (removed in afterAll; survive hard aborts)
+tests/native-ts7-live-*/

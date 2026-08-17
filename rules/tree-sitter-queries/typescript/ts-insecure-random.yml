@@ -16,22 +16,19 @@ description: |
   ✅ FIX: use crypto.getRandomValues / crypto.randomUUID / secure server-side RNG.
 
 query: |
-  (variable_declarator
-    name: (identifier) @VAR
-    value: (call_expression
-      function: (member_expression
-        object: (identifier) @OBJ
-        property: (property_identifier) @FN)
-      arguments: (arguments) @ARGS)
+  (call_expression
+    function: (member_expression
+      object: (identifier) @OBJ
+      property: (property_identifier) @FN)
+    arguments: (arguments) @ARGS
     (#eq? @OBJ "Math")
-    (#eq? @FN "random")
-    (#match? @VAR "(?i)(token|secret|password|key|nonce|salt|csrf|auth|session|credential|hash|otp|pin)"))
+    (#eq? @FN "random")) @CALL
 
 metavars:
   - OBJ
   - FN
   - ARGS
-  - VAR
+  - CALL
 
 post_filter: ts_insecure_random_source
 

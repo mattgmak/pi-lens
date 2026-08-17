@@ -32,6 +32,16 @@ export class FactStore implements ReadonlyFactStore {
     return this.fileFacts.get(normalizeMapKey(filePath))?.has(factId) ?? false;
   }
 
+  /** Drop one file fact without disturbing the file's derived facts.
+   *  Removes the per-file entry too when the deleted fact was its last value. */
+  deleteFileFact(filePath: string, factId: string): void {
+    const key = normalizeMapKey(filePath);
+    const facts = this.fileFacts.get(key);
+    if (!facts) return;
+    facts.delete(factId);
+    if (facts.size === 0) this.fileFacts.delete(key);
+  }
+
   /** Clear facts for one specific file only. Use at the start of each per-file dispatch call.
    *  Preserves facts for other files computed in the same turn.
    *  Normalizes filePath internally — callers pass raw paths. */

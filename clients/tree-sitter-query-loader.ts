@@ -5,6 +5,7 @@
  * and provides them to the TreeSitterClient.
  */
 
+import { logTreeSitterDiagnostic } from "./tree-sitter-logger.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { resolvePackagePath } from "./package-root.js";
@@ -17,6 +18,93 @@ export function getQueryLanguageKey(directoryName: string): string {
 	return isDisabledQueryDirectoryName(directoryName)
 		? directoryName.slice(0, -"-disabled".length)
 		: directoryName;
+}
+
+/**
+ * Languages that inherit the typescript rule set on top of their own.
+ *
+ * ONLY `tsx`: verified rule-for-rule identical on the same source parsed under
+ * both grammars (console-statement 16/16, ts-path-traversal 277/277, …), which
+ * makes sense — tsx IS typescript plus JSX. `javascript` is deliberately NOT
+ * here. It looks like it should be, and the merge existed for years, but the
+ * queries were compiled against the typescript grammar and run against
+ * javascript trees, so they matched nothing and nobody noticed. Compiled
+ * correctly they misfire: JS parameters are bare `(identifier)` where
+ * typescript has `required_parameter`, so `duplicate-function-arg` alone
+ * reports 59 phantom duplicates across 60 files. Re-enabling it needs the
+ * typescript rules validated against the javascript grammar first.
+ */
+const TYPESCRIPT_RULE_HEIRS = new Set(["tsx"]);
+
+/**
+ * The rule-source languages whose directories make up the effective rule set
+ * for a file parsed as `languageId`. This is the SINGLE SOURCE OF TRUTH for
+ * rule-set composition: `queriesForLanguage` (selection) and
+ * `ruleFilesForLanguage` (the RuleCache fingerprint, #878) both derive from
+ * it, so the cache key can never drift from the rules the runner actually runs.
+ */
+export function ruleSourceLanguages(languageId: string): string[] {
+	return TYPESCRIPT_RULE_HEIRS.has(languageId)
+		? [languageId, "typescript"]
+		: [languageId];
+}
+
+/**
+ * Every rule file contributing to the effective rule set for `languageId`,
+ * from BOTH the project's own `rules/tree-sitter-queries/` tree and the
+ * bundled built-ins, across every rule-source language.
+ *
+ * The dispatch runner hashes this list into the RuleCache key. Fingerprinting
+ * only the language's OWN directory missed inherited rule sets — tsx runs the
+ * typescript rules too, so editing a typescript rule never invalidated the tsx
+ * cache and stale compiled rules kept firing until the process restarted or a
+ * tsx rule happened to change (#878).
+ */
+export function ruleFilesForLanguage(
+	languageId: string,
+	rootDir = process.cwd(),
+): string[] {
+	const resolvedRoot = path.resolve(rootDir);
+	const files = new Set<string>();
+	for (const lang of ruleSourceLanguages(languageId)) {
+		for (const dir of [
+			path.join(resolvedRoot, "rules", "tree-sitter-queries", lang),
+			resolvePackagePath(import.meta.url, "rules", "tree-sitter-queries", lang),
+		]) {
+			if (!fs.existsSync(dir)) continue;
+			for (const f of fs.readdirSync(dir)) {
+				if (f.endsWith(".yml")) files.add(path.join(dir, f));
+			}
+		}
+	}
+	return [...files];
+}
+
+/**
+ * The rule set that applies to a file parsed as `languageId`, in a stable order.
+ *
+ * Excludes `<language>-disabled/` rules. `getQueriesForLanguage` filtered these
+ * for the per-edit runner, but the project scanner read the raw loader map and
+ * ran them anyway — 1,936 of a scan's 2,590 tree-sitter findings came from
+ * rules somebody had explicitly switched off.
+ */
+export function queriesForLanguage(
+	queries: Map<string, TreeSitterQuery[]>,
+	languageId: string,
+): TreeSitterQuery[] {
+	const enabled = (langId: string): TreeSitterQuery[] =>
+		(queries.get(langId) ?? []).filter((q) => !isDisabledQueryFilePath(q.filePath));
+	return ruleSourceLanguages(languageId).flatMap((langId) => enabled(langId));
+}
+
+/**
+ * Drop a trailing ` # comment` from an unquoted YAML scalar. Quoted values keep
+ * their `#` (a message may legitimately contain one), matching YAML's rule that
+ * a comment only starts after whitespace outside quotes.
+ */
+function stripInlineComment(value: string): string {
+	if (value.startsWith('"') || value.startsWith("'")) return value;
+	return value.replace(/\s+#.*$/, "").trim();
 }
 
 export function isDisabledQueryFilePath(filePath: string): boolean {
@@ -62,6 +150,18 @@ export interface TreeSitterQuery {
 	 * matter there), so this is a deliberate per-rule carve-out.
 	 */
 	skip_test_files?: boolean;
+	/**
+	 * Skip this rule on files whose path (relative to the project root,
+	 * forward-slashed) matches any of these glob patterns — e.g. a
+	 * `scripts` directory glob plus a `logger.ts` basename glob for a
+	 * debug-output rule that's expected to fire in CLI entry points and the
+	 * logging sink itself (#965). Same shape/matching as the ast-grep YAML
+	 * rule `ignores` field (`clients/dispatch/runners/yaml-rule-parser.ts`)
+	 * — kept as a separate opt-in field (not reusing `skip_test_files`'s
+	 * boolean) since "is a test file" and "is a CLI script / logger" are
+	 * unrelated axes a rule may need independently.
+	 */
+	ignore_paths?: string[];
 	has_fix: boolean;
 	fix_action?: string;
 	examples?: {
@@ -84,23 +184,36 @@ export class TreeSitterQueryLoader {
 	/** Debug logging helper */
 	private dbg(msg: string): void {
 		if (this.verbose) {
-			console.error(`[query-loader] ${msg}`);
+			// #1333: verbose gate preserved, sink moved to tree-sitter.log.
+			logTreeSitterDiagnostic({
+				subsystem: "query-loader",
+				level: "debug",
+				message: msg,
+			});
 		}
 	}
 
 	/**
-	 * Load all queries from the rules/tree-sitter-queries directory
+	 * Load all queries from the rules/tree-sitter-queries directory.
+	 *
+	 * Returns the in-memory memo when the same root was already loaded.
+	 * `force: true` re-reads from disk even then — the memo has no notion of
+	 * rule-file mtimes, so a caller that KNOWS the files changed (the dispatch
+	 * runner's RuleCache-miss path: a miss means the rule-file fingerprint
+	 * moved) must force, or it gets the pre-edit rules back and persists them
+	 * under the fresh fingerprint (#878).
 	 */
 	async loadQueries(
 		rootDir = process.cwd(),
+		options: { force?: boolean } = {},
 	): Promise<Map<string, TreeSitterQuery[]>> {
 		const resolvedRoot = path.resolve(rootDir);
-		if (this.loaded && this.loadedRoot === resolvedRoot) return this.queries;
-
-		if (this.loadedRoot !== resolvedRoot) {
-			this.queries.clear();
-			this.loaded = false;
+		if (!options.force && this.loaded && this.loadedRoot === resolvedRoot) {
+			return this.queries;
 		}
+
+		this.queries.clear();
+		this.loaded = false;
 
 		// Load from user's project rules AND package built-in rules (coexist)
 		const queryDirs = [
@@ -195,6 +308,9 @@ export class TreeSitterQueryLoader {
 					? (String(parsed.inline_tier) as "blocking" | "warning" | "review")
 					: undefined,
 				skip_test_files: parsed.skip_test_files === true,
+				ignore_paths: Array.isArray(parsed.ignore_paths)
+					? parsed.ignore_paths.map(String)
+					: undefined,
 				// Parse predicates if present
 				predicates: Array.isArray(parsed.predicates)
 					? parsed.predicates.map((p: any) => ({
@@ -235,7 +351,14 @@ export class TreeSitterQueryLoader {
 			const match = line.match(/^([a-z_]+):\s*(.*)$/);
 			if (match) {
 				const key = match[1];
-				let value: string | string[] | boolean = match[2].trim();
+				// Strip a trailing YAML comment (` # …`) on unquoted scalars, as the
+				// array-item branch below already does. Without this, a rule written
+				// `post_filter: not_in_test_block  # skip test blocks` carried the
+				// whole comment as the filter NAME, so the filter never resolved and
+				// the rule reported unfiltered matches.
+				let value: string | string[] | boolean = stripInlineComment(
+					match[2].trim(),
+				);
 
 				// Handle arrays inline: metavars: [A, B, C]
 				if (value.startsWith("[") && value.endsWith("]")) {
@@ -350,12 +473,18 @@ export class TreeSitterQueryLoader {
 			const indent = indentMatch ? indentMatch[1].length : 0;
 			const trimmed = line.trim();
 
-			// Stop at new key with same or less indent (but not at comments)
-			if (
-				indent <= startIndent &&
-				trimmed.match(/^[a-z_]+:/) &&
-				!trimmed.startsWith("#")
-			) {
+			// Stop at a new top-level key (same or less indent than the key).
+			if (indent <= startIndent && trimmed.match(/^[a-z_]+:/)) {
+				break;
+			}
+
+			// A comment at or below the key's indent is a document-level comment
+			// that follows the block, not part of it — stop. Block-scalar content
+			// (including native tree-sitter predicate lines `#eq?`/`#match?`) is
+			// always MORE indented than the key, so those are preserved. Without
+			// this, a stray `# …` line between a `query: |` block and the next key
+			// was appended to the query and made it fail to compile (mixed-async).
+			if (trimmed.startsWith("#") && indent <= startIndent) {
 				break;
 			}
 

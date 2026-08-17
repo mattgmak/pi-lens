@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { suspendAt } from "../interleaving-kit.js";
 
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
@@ -31,10 +32,13 @@ describe("LSPService race hardening", () => {
 	it("deduplicates concurrent spawn for same server/root key", async () => {
 		const { LSPService } = await import("../../../clients/lsp/index.js");
 		const service = new LSPService();
+		const client = {
+			isAlive: () => true,
+			shutdown: vi.fn(async () => {}),
+		};
+		const initialize = suspendAt(createLSPClient, async () => client);
 
-		const spawn = vi.fn(async () => {
-			await new Promise((resolve) => setTimeout(resolve, 10));
-			return {
+		const spawn = vi.fn(async () => ({
 				process: {
 					process: { killed: false },
 					stdin: {} as any,
@@ -42,8 +46,7 @@ describe("LSPService race hardening", () => {
 					stderr: {} as any,
 					pid: 123,
 				},
-			};
-		});
+			}));
 
 		getServersForFileWithConfig.mockReturnValue([
 			{
@@ -56,17 +59,69 @@ describe("LSPService race hardening", () => {
 		]);
 
 		const file = "C:/repo/main.py";
-		const [a, b, c] = await Promise.all([
-			service.getClientForFile(file),
-			service.getClientForFile(file),
-			service.getClientForFile(file),
-		]);
+		const first = service.getClientForFile(file);
+		await initialize.admitted;
+		const second = service.getClientForFile(file);
+		initialize.release();
+		const [a, b] = await Promise.all([first, second]);
 
 		expect(spawn).toHaveBeenCalledTimes(1);
 		expect(createLSPClient).toHaveBeenCalledTimes(1);
 		expect(a?.client).toBeTruthy();
 		expect(b?.client).toBeTruthy();
-		expect(c?.client).toBeTruthy();
+		initialize.restore();
+	});
+
+	it("does not orphan the in-flight client when a waiter times out", async () => {
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+		const spawn = vi.fn(async () => ({
+				process: {
+					process: { killed: false },
+					stdin: {} as any,
+					stdout: {} as any,
+					stderr: {} as any,
+					pid: 321,
+				},
+			}));
+		const client = {
+			isAlive: () => true,
+			shutdown: vi.fn(async () => {}),
+		};
+		const initialize = suspendAt(createLSPClient, async () => client);
+		getServersForFileWithConfig.mockReturnValue([
+			{
+				id: "python",
+				name: "Python",
+				extensions: [".py"],
+				root: async () => "C:/repo",
+				spawn,
+			},
+		]);
+
+		const file = "C:/repo/main.py";
+		const timedOut = service.getClientForFile(file, 1);
+		await initialize.admitted;
+		expect(await timedOut).toBeUndefined();
+		const internal = service as unknown as {
+			state: { inFlight: Map<string, unknown>; clients: Map<string, unknown> };
+			clientLeases: Map<string, number>;
+		};
+		expect(internal.state.inFlight.size).toBe(1);
+		expect(internal.clientLeases.size).toBe(0);
+
+		initialize.release();
+		await service.getClientForFile(file);
+
+		expect(spawn).toHaveBeenCalledTimes(1);
+		expect(createLSPClient).toHaveBeenCalledTimes(1);
+		expect(service.getAliveClientCount()).toBe(1);
+		expect(internal.state.inFlight.size).toBe(0);
+		expect(internal.clientLeases.size).toBe(0);
+		await service.shutdown();
+		expect(client.shutdown).toHaveBeenCalledTimes(1);
+		expect(internal.state.clients.size).toBe(0);
+		initialize.restore();
 	});
 
 	it("retries broken server after cooldown window", async () => {

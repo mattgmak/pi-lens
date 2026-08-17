@@ -160,7 +160,16 @@ export async function runQuietWindow(deps: QuietWindowDeps): Promise<void> {
 				await task.fn();
 			} catch (err) {
 				ok = false;
-				dbg(`quiet_window: task "${task.name}" failed: ${err}`);
+				// Surface the stack (not just the message) so the next failure is
+				// diagnosable from the log alone — a task can fail dozens of times
+				// and `${err}` (message only) may not pin the throw site. Still
+				// non-fatal: the loop continues and runQuietWindow never rethrows
+				// (see the finally below), so one bad task can't break the turn.
+				const detail =
+					err instanceof Error
+						? (err.stack ?? `${err.name}: ${err.message}`)
+						: String(err);
+				dbg(`quiet_window: task "${task.name}" failed: ${detail}`);
 			}
 			results.push({
 				name: task.name,
@@ -223,12 +232,22 @@ const HEARTBEAT_SAMPLE_TIMEOUT_MS = 2000;
  *  a timeout resolves to `{}` (same "leave everything untouched" semantics as
  *  any other sampling failure — see the module docstring below). */
 async function buildHeartbeatResourcePatchBounded(): Promise<HeartbeatPatch> {
-	return Promise.race([
-		buildHeartbeatResourcePatch(),
-		new Promise<HeartbeatPatch>((resolve) =>
-			setTimeout(() => resolve({}), HEARTBEAT_SAMPLE_TIMEOUT_MS),
-		),
-	]);
+	// #1097: clear the timeout once the race settles. An uncleared, REF'D
+	// setTimeout would keep the event loop alive for the full
+	// HEARTBEAT_SAMPLE_TIMEOUT_MS after `agent_settled` fires the quiet window —
+	// a same-class sibling of the LSP client-wait leak: harmless in a long-lived
+	// session, but a keep-alive tail in a one-shot `pi --print` process.
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			buildHeartbeatResourcePatch(),
+			new Promise<HeartbeatPatch>((resolve) => {
+				timer = setTimeout(() => resolve({}), HEARTBEAT_SAMPLE_TIMEOUT_MS);
+			}),
+		]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
 }
 
 /**

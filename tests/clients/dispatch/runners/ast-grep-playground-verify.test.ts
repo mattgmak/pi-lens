@@ -14,10 +14,10 @@
  * in the default `npm test` run; it's opt-in for local dev / nightly.
  */
 
-import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { safeSpawnAsync } from "../../../../clients/safe-spawn.js";
 
 const SCRIPT = join(process.cwd(), "scripts", "playground-verify-rule.mjs");
 const CHROME_CANDIDATES: string[] = [
@@ -42,41 +42,31 @@ interface VerifyResult {
 	engine_ms?: number;
 }
 
-function runVerify(ruleFile: string, args: string[] = [], timeoutMs = 60_000) {
-	return new Promise<VerifyResult>((resolve, reject) => {
-		const proc = spawn(process.execPath, [SCRIPT, ruleFile, ...args], {
-			stdio: ["ignore", "pipe", "pipe"],
-			windowsHide: true,
-		});
-		let stdout = "";
-		let stderr = "";
-		proc.stdout.on("data", (c) => (stdout += c));
-		proc.stderr.on("data", (c) => (stderr += c));
-		const timer = setTimeout(() => {
-			proc.kill();
-			reject(
-				new Error(`timeout after ${timeoutMs}ms: ${stderr.slice(0, 200)}`),
-			);
-		}, timeoutMs);
-		proc.on("close", (code) => {
-			clearTimeout(timer);
-			// Result is always on stdout (JSON) — stderr is diagnostic noise.
-			const last = stdout.trim().split("\n").pop() || "";
-			let parsed: VerifyResult;
-			try {
-				parsed = JSON.parse(last);
-			} catch (e) {
-				reject(
-					new Error(
-						`failed to parse result (exit ${code}): stdout=${stdout.slice(0, 300)} stderr=${stderr.slice(0, 300)}`,
-					),
-				);
-				return;
-			}
-			resolve(parsed);
-		});
-		proc.on("error", reject);
+// #902: was a hand-rolled `spawn(process.execPath, ...)` promise wrapper.
+// `safeSpawnAsync` (shared with production, `clients/safe-spawn.ts`) already
+// does timeout+kill, stdout/stderr accumulation, and spawn-error surfacing —
+// reusing it here instead of a second, hand-rolled spawn strategy (single
+// source of truth, #883). Behavior preserved: a spawn error or timeout still
+// rejects (via `result.error`), and a non-JSON stdout tail still rejects with
+// the same diagnostic message shape.
+async function runVerify(
+	ruleFile: string,
+	args: string[] = [],
+	timeoutMs = 60_000,
+): Promise<VerifyResult> {
+	const result = await safeSpawnAsync(process.execPath, [SCRIPT, ruleFile, ...args], {
+		timeout: timeoutMs,
 	});
+	if (result.error) throw result.error;
+	// Result is always on stdout (JSON) — stderr is diagnostic noise.
+	const last = result.stdout.trim().split("\n").pop() || "";
+	try {
+		return JSON.parse(last);
+	} catch {
+		throw new Error(
+			`failed to parse result (exit ${result.status}): stdout=${result.stdout.slice(0, 300)} stderr=${result.stderr.slice(0, 300)}`,
+		);
+	}
 }
 
 const skip = !chromeAvailable()
